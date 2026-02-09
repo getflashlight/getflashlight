@@ -1,0 +1,42 @@
+bundle:
+  name: simple-test-bundle
+
+resources:
+  jobs:
+    etl_daily:
+      name: "ETL Daily Pipeline"
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: "UTC"
+      tasks:
+        - task_key: ingest
+          new_cluster:
+            num_workers: 4
+            node_type_id: i3.xlarge
+            spark_version: "14.3.x-scala2.12"
+          notebook_task:
+            notebook_path: /Repos/etl/ingest
+
+    ml_training:
+      name: "ML Model Training"
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"
+        timezone_id: "UTC"
+      tasks:
+        - task_key: train
+          new_cluster:
+            num_workers: 8
+            node_type_id: i3.xlarge
+            spark_version: "14.3.x-scala2.12"
+          notebook_task:
+            notebook_path: /Repos/ml/train
+
+  clusters:
+    shared_etl:
+      cluster_name: "Shared ETL Cluster"
+      num_workers: 4
+      node_type_id: i3.xlarge
+      spark_version: "14.3.x-scala2.12"
+      autotermination_minutes: 60
+      spark_conf:
+        spark.sql.adaptive.enabled: "true"

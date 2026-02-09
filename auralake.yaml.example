@@ -1,0 +1,90 @@
+version: "1"
+
+# Default provider (can be overridden with --provider flag)
+provider: databricks
+
+defaults:
+  automation_level: recommend     # recommend | dry_run | apply | auto
+  output_format: table
+  lookback_days: 30
+
+database:
+  url: "postgresql://auralake:password@localhost:5432/auralake"
+  # Or via env var: AURALAKE_DATABASE_URL
+
+# GitHub monorepo containing DAB configs
+github:
+  repo: "org/my-databricks-repo"      # GitHub repo (org/name)
+  token_env: "GITHUB_TOKEN"           # Env var containing GitHub PAT
+  local_path: "/path/to/local/clone"  # Optional: use existing local clone
+  base_branch: "main"
+  pr_labels: ["auralake", "cost-optimization"]
+  bundle_paths:                        # Where DAB bundles live in the repo
+    production: "bundles/production"
+    staging: "bundles/staging"
+
+# Databricks provider config
+databricks:
+  account:
+    host: "https://accounts.cloud.databricks.com"
+    account_id: "xxx"
+
+  workspaces:
+    production:
+      host: "https://dbc-xxx.cloud.databricks.com"
+      is_default: true
+      sql_warehouse_id: "abc123"
+      bundle_path: "production"        # Maps to github.bundle_paths key
+      tags:
+        environment: production
+
+    staging:
+      host: "https://dbc-yyy.cloud.databricks.com"
+      bundle_path: "staging"
+
+  aws:
+    region: "us-east-1"
+    cost_explorer:
+      enabled: true
+      cluster_tag_key: "ClusterId"
+      tag_filters:
+        Vendor: "Databricks"
+
+# Collector agent config
+agent:
+  interval_seconds: 300
+  query_lookback_hours: 24
+  max_queries_per_run: 1000
+
+# Thresholds for analysis
+thresholds:
+  cluster_rightsizing:
+    cpu_utilization_low: 20
+    cpu_utilization_target: 60
+    memory_utilization_low: 30
+    min_savings_dollars: 50
+  idle_resources:
+    idle_cluster_minutes: 60
+    stale_job_days: 90
+  spot_optimization:
+    min_savings_pct: 30
+  delta_maintenance:
+    optimize_threshold_gb: 1
+    vacuum_retention_hours: 168
+    small_file_threshold_mb: 32
+  job_consolidation:
+    min_group_size: 2
+    min_savings_dollars: 100
+    max_group_size: 10
+
+tag_policy:
+  required_tags:
+    - key: "team"
+    - key: "project"
+    - key: "cost_center"
+
+automation:
+  max_auto_risk_level: medium
+  bulk_action_threshold: 5
+  protected_clusters: []
+  protected_jobs: []
