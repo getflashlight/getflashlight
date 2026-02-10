@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import typer
-from auralake_shared.core.output import OutputFormat, print_error, print_success, render_table
 
 from auralake_cli._options import ServerOption
+from auralake_cli._rendering import OutputFormat, print_error, print_success, render_table
 
 agent_app = typer.Typer(no_args_is_help=True)
 

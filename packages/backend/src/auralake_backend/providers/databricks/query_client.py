@@ -16,27 +16,21 @@ class DatabricksQueryClient(AbstractQueryClient):
         self._config = config
         self._client = get_workspace_client(config)
 
-    def get_query_history(self, hours: int = 24, limit: int = 1000) -> list[dict[str, Any]]:
-        """Fetch recent query history from Databricks."""
-        try:
-            from datetime import datetime, timedelta
+    def _fetch_query_history(
+        self, filter_by: Any, limit: int
+    ) -> list[dict[str, Any]]:
+        """Paginate through query_history.list and return flattened results."""
+        results: list[dict[str, Any]] = []
+        page_token: str | None = None
 
-            from databricks.sdk.service.sql import QueryFilter, TimeRange
-
-            start_time = datetime.utcnow() - timedelta(hours=hours)
-            end_time = datetime.utcnow()
-
-            queries = self._client.query_history.list(
-                filter_by=QueryFilter(
-                    query_start_time_range=TimeRange(
-                        start_time_ms=int(start_time.timestamp() * 1000),
-                        end_time_ms=int(end_time.timestamp() * 1000),
-                    ),
-                ),
-                max_results=limit,
+        while len(results) < limit:
+            page_limit = min(limit - len(results), 100)
+            resp = self._client.query_history.list(
+                filter_by=filter_by,
+                max_results=page_limit,
+                page_token=page_token,
             )
-            results = []
-            for q in queries:
+            for q in resp.res or []:
                 results.append(
                     {
                         "query_id": q.query_id,
@@ -51,7 +45,31 @@ class DatabricksQueryClient(AbstractQueryClient):
                         "query_end_time_ms": q.query_end_time_ms,
                     }
                 )
-            return results
+            if not resp.has_next_page or not resp.next_page_token:
+                break
+            page_token = resp.next_page_token
+
+        return results
+
+    def get_query_history(self, hours: int = 24, limit: int = 1000) -> list[dict[str, Any]]:
+        """Fetch recent query history from Databricks."""
+        try:
+            from datetime import datetime, timedelta
+
+            from databricks.sdk.service.sql import QueryFilter, TimeRange
+
+            start_time = datetime.utcnow() - timedelta(hours=hours)
+            end_time = datetime.utcnow()
+
+            filter_by = QueryFilter(
+                query_start_time_range=TimeRange(
+                    start_time_ms=int(start_time.timestamp() * 1000),
+                    end_time_ms=int(end_time.timestamp() * 1000),
+                ),
+            )
+            return self._fetch_query_history(filter_by, limit)
+        except APIError:
+            raise
         except Exception as exc:
             raise APIError("databricks", f"Failed to fetch query history: {exc}") from exc
 
@@ -64,32 +82,15 @@ class DatabricksQueryClient(AbstractQueryClient):
 
             end_time = datetime.utcnow()
 
-            queries = self._client.query_history.list(
-                filter_by=QueryFilter(
-                    query_start_time_range=TimeRange(
-                        start_time_ms=since_ms,
-                        end_time_ms=int(end_time.timestamp() * 1000),
-                    ),
+            filter_by = QueryFilter(
+                query_start_time_range=TimeRange(
+                    start_time_ms=since_ms,
+                    end_time_ms=int(end_time.timestamp() * 1000),
                 ),
-                max_results=limit,
             )
-            results = []
-            for q in queries:
-                results.append(
-                    {
-                        "query_id": q.query_id,
-                        "query_text": q.query_text,
-                        "status": str(q.status.value) if q.status else "UNKNOWN",
-                        "user_name": q.user_name,
-                        "warehouse_id": q.warehouse_id,
-                        "duration_ms": q.duration,
-                        "rows_produced": q.rows_produced,
-                        "executed_as_user_name": q.executed_as_user_name,
-                        "query_start_time_ms": q.query_start_time_ms,
-                        "query_end_time_ms": q.query_end_time_ms,
-                    }
-                )
-            return results
+            return self._fetch_query_history(filter_by, limit)
+        except APIError:
+            raise
         except Exception as exc:
             raise APIError(
                 "databricks", f"Failed to fetch query history since {since_ms}: {exc}"

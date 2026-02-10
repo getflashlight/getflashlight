@@ -40,26 +40,6 @@ services:
       db-migrate:
         condition: service_completed_successfully
 
-  auth:
-    build: apps/auth
-    ports:
-      - "3001:3001"
-    environment:
-      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
-    depends_on:
-      db-migrate:
-        condition: service_completed_successfully
-    profiles: [auth]
-
-  ui:
-    build:
-      context: apps/ui
-    ports:
-      - "3000:3000"
-    environment:
-      NEXT_PUBLIC_API_URL: "http://backend:8000"
-    depends_on: [backend]
-    profiles: [ui]
 
 volumes:
   pgdata:

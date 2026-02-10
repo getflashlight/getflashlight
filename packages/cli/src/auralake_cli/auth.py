@@ -8,7 +8,8 @@ import stat
 from pathlib import Path
 
 import typer
-from auralake_shared.core.output import print_error, print_success
+
+from auralake_cli._rendering import print_error, print_success
 
 auth_app = typer.Typer(no_args_is_help=True)
 

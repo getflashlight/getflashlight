@@ -2,12 +2,10 @@
 name = "auralake-workspace"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = [
-    "duckdb>=1.4.4",
-]
+dependencies = []
 
 [tool.uv.workspace]
-members = ["packages/shared", "packages/backend", "packages/cli"]
+members = ["packages/backend", "packages/cli"]
 
 [dependency-groups]
 dev = [

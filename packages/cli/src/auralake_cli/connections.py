@@ -6,10 +6,15 @@ import json
 from typing import Annotated
 
 import typer
-from auralake_shared.core.output import OutputFormat, render_table
 
 from auralake_cli._options import OutputOption, ServerOption
-from auralake_cli._rendering import confirm_action, print_error, print_success
+from auralake_cli._rendering import (
+    OutputFormat,
+    confirm_action,
+    print_error,
+    print_success,
+    render_table,
+)
 
 connections_app = typer.Typer(no_args_is_help=True)
 

@@ -1,5 +1,0 @@
-{
-  "name": "auralake-monorepo",
-  "private": true,
-  "workspaces": ["apps/ui"]
-}

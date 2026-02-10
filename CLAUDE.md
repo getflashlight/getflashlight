@@ -8,22 +8,20 @@ Auralake is a multi-platform lakehouse cost optimization tool. It analyzes Datab
 
 ## Monorepo Structure
 
-This is a **uv workspace** monorepo with 3 Python packages and a UI placeholder:
+This is a **uv workspace** monorepo with 2 Python packages:
 
 ```
 packages/
-  shared/     → auralake-shared   (core, models, provider ABCs)
   backend/    → auralake-backend  (FastAPI server, analyzers, actions, concrete providers)
+                also ships auralake_shared (core, models, provider ABCs) as a sub-package
   cli/        → auralake-cli      (Typer CLI, talks to backend via HTTP)
-apps/
-  ui/         → auralake-ui       (Next.js — placeholder)
 tests/        → integration tests
 ```
 
 ## Build & Development Commands
 
 ```bash
-# Install all workspace members (resolves shared → backend → cli)
+# Install all workspace members
 uv sync
 
 # Run the CLI
@@ -47,18 +45,17 @@ uv run pytest tests/test_foo.py::test_bar -v
 
 # Docker
 docker compose up -d          # backend + db
-docker compose --profile ui up  # includes UI
 ```
 
 ## Architecture
 
-### `packages/shared/` (`auralake_shared`)
+### `packages/backend/src/auralake_shared/` (shared library, shipped with backend)
 
-- **`core/`** — Cross-cutting infrastructure: YAML config loading with env-var overrides (`config.py`), structlog logging (`logging.py`), Rich output formatting for table/JSON/CSV (`output.py`), execution context dataclass (`context.py`), exception hierarchy (`exceptions.py`).
+- **`core/`** — Cross-cutting infrastructure: structlog logging (`logging.py`), Rich output formatting for table/JSON/CSV (`output.py`), execution context dataclass (`context.py`), exception hierarchy (`exceptions.py`).
 - **`models/`** — Pydantic models for all domain objects. Key model files map to domain areas: `config.py` (app config + thresholds), `billing.py` (cost/TCO records, infra costs, RI/savings plan recs), `compute.py` (cluster info & utilization), `recommendations.py` (recommendations with risk levels & savings estimates), `jobs.py` (job profiles & consolidation groups), `query_plans.py` (Spark plan parsing & anti-pattern detection), `dab.py` (Databricks Asset Bundle config & diffs), `policies.py` (cluster policies & tag violations), `routing.py` (workload portability scoring).
 - **`providers/`** — Provider registry (`__init__.py`) and abstract base classes (`base.py`). Concrete providers live in backend.
 
-### `packages/backend/` (`auralake_backend`)
+### `packages/backend/src/auralake_backend/` (`auralake_backend`)
 
 - **`server/`** — FastAPI application with 12 feature modules (cost, clusters, resources, spot, delta, jobs, query, policies, budgets, tags, routing, agent).
 - **`analyzers/`** — Cost/resource analysis engines.
@@ -72,12 +69,13 @@ docker compose --profile ui up  # includes UI
 ### `packages/cli/` (`auralake_cli`)
 
 - Typer-based CLI that talks to the backend via HTTP (`client.py`).
+- Self-contained Rich rendering (`_rendering.py`) and structlog setup (`_logging.py`) — no `auralake_shared` dependency.
 - `db.py` commands require `auralake-backend` (optional dependency via `pip install auralake-cli[db]`).
 
 ### Key design patterns
 
 - **ExecutionContext** (`core/context.py`) is the central state object threaded through CLI commands — bundles config, provider, automation level, and runtime flags. No global state.
-- **Config resolution** follows a priority chain: explicit path → `AURALAKE_CONFIG` env var → `auralake.yaml` in CWD → `~/.auralake/config.yaml`. Env vars `AURALAKE_DATABASE_URL` and `AURALAKE_PROVIDER` override specific fields.
+- **Config** lives in the database via connections. Env var `AURALAKE_DATABASE_URL` configures the DB connection.
 - **AutomationLevel** (`recommend` → `dry_run` → `apply` → `auto`) controls how aggressively changes are applied, with safety rails via `AutomationConfig` (protected clusters/jobs, bulk action thresholds, max risk level).
 - **Provider registration**: Concrete providers call `register_provider()` from `auralake_shared.providers` on import. Backend's `__init__.py` imports all provider packages to trigger registration.
 - **All exceptions** inherit from `AuraLakeError` for single-catch handling.
