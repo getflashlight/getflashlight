@@ -1,47 +1,21 @@
 [project]
-name = "auralake"
+name = "auralake-workspace"
 version = "0.1.0"
-description = "Lakehouse cost optimization CLI"
 requires-python = ">=3.11"
 
-dependencies = [
-    "alembic>=1.18.3",
-    "boto3>=1.42.45",
-    "databricks-sdk>=0.85.0",
-    "gitpython>=3.1.46",
-    "jinja2>=3.1.6",
-    "psycopg[binary]>=3.3.2",
-    "pygithub>=2.8.1",
-    "pyyaml>=6.0.3",
-    "rich>=14.3.2",
-    "ruamel-yaml>=0.19.1",
-    "sqlmodel>=0.0.32",
-    "structlog>=25.5.0",
-    "typer>=0.21.1",
-]
+[tool.uv.workspace]
+members = ["packages/shared", "packages/backend", "packages/cli"]
 
 [dependency-groups]
 dev = [
     "bandit>=1.9.3",
-    "isort>=7.0.0",
     "mypy>=1.19.1",
-    "pip-audit>=2.10.0",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
     "ruff>=0.15.0",
 ]
-
-[project.scripts]
-auralake = "auralake.cli.main:app"
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/auralake"]
 
 [tool.ruff]
 target-version = "py311"
@@ -52,7 +26,6 @@ select = ["E", "F", "I", "N", "W", "UP"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
 
 [tool.mypy]
 python_version = "3.11"

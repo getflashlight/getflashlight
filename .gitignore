@@ -18,3 +18,5 @@ htmlcov/
 .coverage
 *.log
 uv.lock
+node_modules/
+.next/

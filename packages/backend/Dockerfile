@@ -1,0 +1,20 @@
+FROM python:3.11-slim AS base
+
+WORKDIR /app
+
+# Install uv for fast dependency management
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Copy workspace root and relevant packages
+COPY pyproject.toml uv.lock* ./
+COPY packages/shared/ packages/shared/
+COPY packages/backend/ packages/backend/
+
+# Install dependencies
+RUN cd packages/backend && uv sync --no-dev --no-editable
+
+# Expose server port
+EXPOSE 8000
+
+# Run the server
+CMD ["uv", "run", "--project", "packages/backend", "auralake-server"]
