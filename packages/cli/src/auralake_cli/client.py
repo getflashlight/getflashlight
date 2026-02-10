@@ -7,10 +7,29 @@ analyzers, actions, providers, or DB code.
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import httpx
 from auralake_shared.models.recommendations import ActionResult, AnalysisResult
+
+
+class AuthenticationError(Exception):
+    """Raised when the server returns 401."""
+
+
+def _handle_response(resp: httpx.Response) -> None:
+    """Check response status, raising a friendly error on 401."""
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 401:
+            print(
+                "Error: Authentication required. Run `auralake login` or set AURALAKE_API_KEY.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
+        raise
 
 
 class AuralakeClient:
@@ -36,19 +55,23 @@ class AuralakeClient:
     def _get(self, path: str, **params: Any) -> Any:
         params = {k: v for k, v in params.items() if v is not None}
         resp = self._client.get(path, params=params)
-        resp.raise_for_status()
+        _handle_response(resp)
         return resp.json()
 
     def _post(self, path: str, body: dict[str, Any] | None = None, **params: Any) -> Any:
         params = {k: v for k, v in params.items() if v is not None}
         resp = self._client.post(path, json=body, params=params)
-        resp.raise_for_status()
+        _handle_response(resp)
         return resp.json()
 
     def _put(self, path: str, body: dict[str, Any] | None = None) -> Any:
         resp = self._client.put(path, json=body)
-        resp.raise_for_status()
+        _handle_response(resp)
         return resp.json()
+
+    def _delete(self, path: str) -> None:
+        resp = self._client.delete(path)
+        _handle_response(resp)
 
     def _analysis(self, path: str, **params: Any) -> AnalysisResult:
         data = self._get(path, **params)
@@ -282,6 +305,53 @@ class AuralakeClient:
 
     def agent_stop(self) -> dict:
         return self._post("/api/v1/agent/stop")
+
+    # ------------------------------------------------------------------
+    # Connections
+    # ------------------------------------------------------------------
+
+    def connections_list(self) -> list[dict]:
+        return self._get("/api/v1/connections")
+
+    def connections_get(self, connection_id: str) -> dict:
+        return self._get(f"/api/v1/connections/{connection_id}")
+
+    def connections_create(
+        self,
+        provider: str,
+        name: str,
+        is_default: bool = False,
+        config: dict[str, Any] | None = None,
+        credentials: dict[str, Any] | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "provider": provider,
+            "name": name,
+            "is_default": is_default,
+            "config": config or {},
+        }
+        if credentials is not None:
+            body["credentials"] = credentials
+        return self._post("/api/v1/connections", body)
+
+    def connections_update(
+        self,
+        connection_id: str,
+        is_default: bool | None = None,
+        config: dict[str, Any] | None = None,
+        credentials: dict[str, Any] | None = None,
+    ) -> dict:
+        body: dict[str, Any] = {}
+        if is_default is not None:
+            body["is_default"] = is_default
+        if config is not None:
+            body["config"] = config
+        if credentials is not None:
+            body["credentials"] = credentials
+        return self._put(f"/api/v1/connections/{connection_id}", body)
+
+    def connections_delete(self, connection_id: str) -> None:
+        self._delete(f"/api/v1/connections/{connection_id}")
 
     # ------------------------------------------------------------------
     # Health
