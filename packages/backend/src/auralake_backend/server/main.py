@@ -22,19 +22,9 @@ from auralake_backend.db.engine import get_engine, init_engine
 from auralake_backend.db.models import ApiKey
 from auralake_backend.server.agent.router import router as agent_router
 from auralake_backend.server.auth import create_api_key
-from auralake_backend.server.budgets.router import router as budgets_router
-from auralake_backend.server.clusters.router import router as clusters_router
-from auralake_backend.server.cost.router import router as cost_router
-from auralake_backend.server.delta.router import router as delta_router
+from auralake_backend.server.data.router import router as data_router
 from auralake_backend.server.errors import register_exception_handlers
-from auralake_backend.server.jobs.router import router as jobs_router
-from auralake_backend.server.policies.router import router as policies_router
-from auralake_backend.server.query.router import router as query_router
-from auralake_backend.server.resources.router import router as resources_router
-from auralake_backend.server.routing.router import router as routing_router
 from auralake_backend.server.settings.router import router as settings_router
-from auralake_backend.server.spot.router import router as spot_router
-from auralake_backend.server.tags.router import router as tags_router
 
 logger = structlog.get_logger(__name__)
 
@@ -90,7 +80,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             logger.info(
                 "auto_bootstrap_completed",
                 api_key=raw_key,
-                key_prefix=record.key_prefix,
+                key_id=str(record.id),
                 hint="Save this key — it will not be shown again.",
             )
         else:
@@ -115,10 +105,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         app.state.provider = None
         logger.info("server_started_unconfigured")
 
+    # Collection task manager
+    from auralake_backend.server.agent.task_manager import CollectionTaskManager
+
+    task_manager = CollectionTaskManager()
+    app.state.task_manager = task_manager
+    logger.info("task_manager_initialized")
+
     logger.info("server_started")
 
     yield
 
+    task_manager.shutdown()
     logger.info("server_shutdown")
 
 
@@ -151,27 +149,16 @@ def create_app() -> FastAPI:
     # -- Health check -------------------------------------------------------
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, object]:
-        configured = getattr(app.state, "configured", False) and getattr(
-            app.state, "provider", None
-        ) is not None
+        configured = (
+            getattr(app.state, "configured", False)
+            and getattr(app.state, "provider", None) is not None
+        )
         return {"status": "ok", "configured": configured}
 
-    # -- Settings & auth routers (no require_configured gate) ---------------
+    # -- Routers ------------------------------------------------------------
     app.include_router(settings_router, prefix="/api/v1", tags=["settings"])
-
-    # -- Feature routers ----------------------------------------------------
-    app.include_router(cost_router, prefix="/api/v1/cost", tags=["cost"])
-    app.include_router(clusters_router, prefix="/api/v1/clusters", tags=["clusters"])
-    app.include_router(resources_router, prefix="/api/v1/resources", tags=["resources"])
-    app.include_router(spot_router, prefix="/api/v1/spot", tags=["spot"])
-    app.include_router(delta_router, prefix="/api/v1/delta", tags=["delta"])
-    app.include_router(jobs_router, prefix="/api/v1/jobs", tags=["jobs"])
-    app.include_router(query_router, prefix="/api/v1/query", tags=["query"])
-    app.include_router(policies_router, prefix="/api/v1/policies", tags=["policies"])
-    app.include_router(budgets_router, prefix="/api/v1/budgets", tags=["budgets"])
-    app.include_router(tags_router, prefix="/api/v1/tags", tags=["tags"])
-    app.include_router(routing_router, prefix="/api/v1/routing", tags=["routing"])
     app.include_router(agent_router, prefix="/api/v1/agent", tags=["agent"])
+    app.include_router(data_router, prefix="/api/v1/data", tags=["data"])
 
     return app
 

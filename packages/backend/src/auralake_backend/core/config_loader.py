@@ -75,7 +75,19 @@ def load_config_from_db(session: Session) -> AuraLakeConfig:
     if github_data:
         data["github"] = github_data
 
-    return AuraLakeConfig.model_validate(data)
+    try:
+        return AuraLakeConfig.model_validate(data)
+    except Exception as exc:
+        import structlog
+
+        structlog.get_logger(__name__).warning(
+            "config_validation_failed",
+            error=str(exc),
+        )
+        # Return a minimal config so the server stays up
+        return AuraLakeConfig.model_validate(
+            {"database": data.get("database", {}), "provider": data.get("provider", "databricks")}
+        )
 
 
 def is_configured(session: Session) -> bool:

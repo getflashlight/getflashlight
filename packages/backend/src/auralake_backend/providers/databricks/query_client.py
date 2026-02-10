@@ -55,6 +55,46 @@ class DatabricksQueryClient(AbstractQueryClient):
         except Exception as exc:
             raise APIError("databricks", f"Failed to fetch query history: {exc}") from exc
 
+    def get_query_history_since(self, since_ms: int, limit: int = 1000) -> list[dict[str, Any]]:
+        """Fetch queries that ended after ``since_ms`` (epoch milliseconds)."""
+        try:
+            from datetime import datetime
+
+            from databricks.sdk.service.sql import QueryFilter, TimeRange
+
+            end_time = datetime.utcnow()
+
+            queries = self._client.query_history.list(
+                filter_by=QueryFilter(
+                    query_start_time_range=TimeRange(
+                        start_time_ms=since_ms,
+                        end_time_ms=int(end_time.timestamp() * 1000),
+                    ),
+                ),
+                max_results=limit,
+            )
+            results = []
+            for q in queries:
+                results.append(
+                    {
+                        "query_id": q.query_id,
+                        "query_text": q.query_text,
+                        "status": str(q.status.value) if q.status else "UNKNOWN",
+                        "user_name": q.user_name,
+                        "warehouse_id": q.warehouse_id,
+                        "duration_ms": q.duration,
+                        "rows_produced": q.rows_produced,
+                        "executed_as_user_name": q.executed_as_user_name,
+                        "query_start_time_ms": q.query_start_time_ms,
+                        "query_end_time_ms": q.query_end_time_ms,
+                    }
+                )
+            return results
+        except Exception as exc:
+            raise APIError(
+                "databricks", f"Failed to fetch query history since {since_ms}: {exc}"
+            ) from exc
+
     def execute_query(self, sql: str) -> list[dict[str, Any]]:
         """Execute a SQL query via statement execution API."""
         try:

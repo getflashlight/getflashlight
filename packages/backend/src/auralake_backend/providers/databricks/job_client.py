@@ -51,6 +51,46 @@ class DatabricksJobClient(AbstractJobClient):
         except Exception as exc:
             raise APIError("databricks", f"Failed to list runs for job {job_id}: {exc}") from exc
 
+    def get_job_runs_since(
+        self, job_id: str, since_ms: int, limit: int = 25
+    ) -> list[dict[str, Any]]:
+        """Fetch job runs started after ``since_ms`` (epoch milliseconds)."""
+        try:
+            runs = self._client.jobs.list_runs(
+                job_id=int(job_id),
+                start_time_from=since_ms,
+                limit=limit,
+                expand_tasks=False,
+            )
+            result = []
+            for run in runs:
+                result.append(
+                    {
+                        "run_id": str(run.run_id),
+                        "job_id": str(job_id),
+                        "state": str(run.state.result_state.value)
+                        if run.state and run.state.result_state
+                        else "UNKNOWN",
+                        "start_time": run.start_time,
+                        "end_time": run.end_time,
+                        "execution_duration_ms": run.execution_duration,
+                        "cluster_id": (
+                            run.cluster_instance.cluster_id if run.cluster_instance else None
+                        ),
+                        "trigger": str(run.trigger.value) if run.trigger else None,
+                        "error_message": (
+                            run.state.state_message
+                            if run.state and run.state.state_message
+                            else None
+                        ),
+                    }
+                )
+            return result
+        except Exception as exc:
+            raise APIError(
+                "databricks", f"Failed to list runs since {since_ms} for job {job_id}: {exc}"
+            ) from exc
+
     def cancel_run(self, run_id: str) -> None:
         try:
             self._client.jobs.cancel_run(int(run_id))

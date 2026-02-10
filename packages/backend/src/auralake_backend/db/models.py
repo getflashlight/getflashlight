@@ -248,7 +248,115 @@ class ApiKey(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str
     key_hash: str
-    key_prefix: str = Field(max_length=8)
     is_active: bool = Field(default=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_used_at: datetime | None = Field(default=None)
+
+
+# ---------------------------------------------------------------------------
+# CollectionRun — Track each collection execution
+# ---------------------------------------------------------------------------
+class CollectionRun(SQLModel, table=True):
+    __tablename__ = "collection_runs"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="provider_connections.id")
+    status: str  # pending / running / completed / completed_with_errors / failed / cancelled
+    trigger: str  # manual / auto / scheduled
+    worker_statuses: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
+    error: str | None = Field(default=None)
+    started_at: datetime = Field(default_factory=datetime.utcnow)
+    completed_at: datetime | None = Field(default=None)
+
+
+# ---------------------------------------------------------------------------
+# WorkerCursor — Per-worker watermarks for incremental collection
+# ---------------------------------------------------------------------------
+class WorkerCursor(SQLModel, table=True):
+    __tablename__ = "worker_cursors"
+    __table_args__ = (sa.UniqueConstraint("connection_id", "worker_name"),)
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="provider_connections.id")
+    worker_name: str
+    cursor_value: str
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# JobRunRecord — Job run history
+# ---------------------------------------------------------------------------
+class JobRunRecord(SQLModel, table=True):
+    __tablename__ = "job_runs"
+    __table_args__ = (sa.UniqueConstraint("workspace_id", "run_id"),)
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="provider_connections.id")
+    workspace_id: str | None = Field(default=None)
+    job_id: str
+    run_id: str
+    state: str  # SUCCESS / FAILED / TIMEDOUT / CANCELLED / etc.
+    start_time: datetime | None = Field(default=None)
+    end_time: datetime | None = Field(default=None)
+    duration_ms: int | None = Field(default=None)
+    cluster_id: str | None = Field(default=None)
+    trigger: str | None = Field(default=None)
+    error_message: str | None = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# BillingRecord — DBU billing data
+# ---------------------------------------------------------------------------
+class BillingRecord(SQLModel, table=True):
+    __tablename__ = "billing_records"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="provider_connections.id")
+    usage_date: date
+    sku: str
+    cluster_id: str | None = Field(default=None)
+    job_id: str | None = Field(default=None)
+    workspace_id: str | None = Field(default=None)
+    dbu_usage: float
+    cost_usd: float
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# QueryHistoryRecord — Query history records
+# ---------------------------------------------------------------------------
+class QueryHistoryRecord(SQLModel, table=True):
+    __tablename__ = "query_history"
+    __table_args__ = (sa.UniqueConstraint("workspace_id", "query_id"),)
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="provider_connections.id")
+    workspace_id: str | None = Field(default=None)
+    query_id: str
+    query_text: str | None = Field(default=None)
+    status: str | None = Field(default=None)
+    user_name: str | None = Field(default=None)
+    warehouse_id: str | None = Field(default=None)
+    duration_ms: int | None = Field(default=None)
+    rows_produced: int | None = Field(default=None)
+    query_start_time_ms: int | None = Field(default=None)
+    query_end_time_ms: int | None = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# ClusterPolicyRecord — Cluster policy definitions
+# ---------------------------------------------------------------------------
+class ClusterPolicyRecord(SQLModel, table=True):
+    __tablename__ = "cluster_policies"
+    __table_args__ = (sa.UniqueConstraint("connection_id", "policy_id"),)
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="provider_connections.id")
+    policy_id: str
+    name: str
+    description: str | None = Field(default=None)
+    definition: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
+    last_seen_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=datetime.utcnow)

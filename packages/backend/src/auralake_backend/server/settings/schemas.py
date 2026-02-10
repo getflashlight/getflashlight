@@ -16,10 +16,21 @@ from pydantic import BaseModel, Field, field_validator
 
 class ConnectionCreate(BaseModel):
     provider: ConnectionProvider
-    name: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+    name: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
+        examples=["prod-workspace"],
+    )
     is_default: bool = False
-    config: dict[str, Any] = {}
-    credentials: dict[str, Any] | None = None
+    config: dict[str, Any] = Field(
+        default={},
+        examples=[{"host": "https://myco.cloud.databricks.com", "sql_warehouse_id": "abc123"}],
+    )
+    credentials: dict[str, Any] | None = Field(
+        default=None,
+        examples=[{"token": "dapi..."}],
+    )
 
     @field_validator("config", "credentials")
     @classmethod
@@ -63,13 +74,17 @@ class ConnectionResponse(BaseModel):
 
 
 class ApiKeyCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_ -]*$")
+    name: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_ -]*$",
+        examples=["my-api-key"],
+    )
 
 
 class ApiKeyCreateResponse(BaseModel):
     id: uuid.UUID
     name: str
-    key_prefix: str
     key: str  # raw key — shown once
     created_at: datetime
 
@@ -77,7 +92,6 @@ class ApiKeyCreateResponse(BaseModel):
 class ApiKeyResponse(BaseModel):
     id: uuid.UUID
     name: str
-    key_prefix: str
     is_active: bool
     created_at: datetime
     last_used_at: datetime | None

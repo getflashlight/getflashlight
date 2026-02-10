@@ -1,23 +1,24 @@
+"""Agent service — delegates to CollectionTaskManager."""
+
 from __future__ import annotations
 
-from auralake_shared.core.context import ExecutionContext
+import uuid
+from typing import Any
+
+from auralake_backend.server.agent.task_manager import CollectionTaskManager
 
 
 class AgentService:
-    def __init__(self, context: ExecutionContext) -> None:
-        self.context = context
+    """Thin wrapper around the task manager for use by settings router."""
 
-    def status(self) -> dict:
-        from auralake_backend.db.agent_state_repository import AgentStateRepository
+    def __init__(self, task_manager: CollectionTaskManager) -> None:
+        self._tm = task_manager
 
-        repo = AgentStateRepository(self.context.config)
-        state = repo.get_state()
-        return state.model_dump() if state else {"status": "unknown"}
-
-    def start(self) -> dict:
-        # TODO: collector runs as a server background task; start is a stub
-        return {"status": "started", "detail": "Collector agent start requested."}
-
-    def stop(self) -> dict:
-        # TODO: collector runs as a server background task; stop is a stub
-        return {"status": "stopped", "detail": "Collector agent stop requested."}
+    def trigger_collection(
+        self, connection_id: uuid.UUID, config: Any, trigger: str = "auto"
+    ) -> None:
+        """Start a collection if one is not already running."""
+        try:
+            self._tm.start_collection(connection_id, config, trigger=trigger)
+        except ValueError:
+            pass  # Already running — skip

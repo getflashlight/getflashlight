@@ -66,6 +66,10 @@ class DatabricksCostClient(AbstractCostClient):
         except Exception as exc:
             raise APIError("databricks", f"Failed to query pricing: {exc}") from exc
 
+    def get_usage_since(self, since: date) -> list[CostRecord]:
+        """Fetch billing records from ``since`` to today."""
+        return self.get_usage(since, date.today(), group_by=["sku_name", "cluster_id", "job_id"])
+
     def get_cost_breakdown(self, start: date, end: date) -> CostBreakdown:
         records = self.get_usage(start, end, group_by=["sku_name", "cluster_id", "job_id"])
         by_sku: dict[str, Decimal] = {}

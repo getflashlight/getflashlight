@@ -95,7 +95,7 @@ def create_key(
     with _get_session() as session:
         record, raw_key = create_api_key(session, name)
 
-    print_success(f"API key created: {record.name} (prefix: {record.key_prefix})")
+    print_success(f"API key created: {record.name} (id: {record.id})")
     typer.echo(f"\n  {raw_key}\n")
     typer.echo("Save this key — it cannot be retrieved again.")
 
@@ -120,10 +120,10 @@ def list_keys(
         return
 
     for k in data:
-        prefix = k.get("key_prefix", "?")
+        key_id = k.get("id", "?")
         name = k.get("name", "?")
         active = k.get("is_active", False)
-        typer.echo(f"  {prefix}...  {name}  active={active}")
+        typer.echo(f"  {key_id}  {name}  active={active}")
 
 
 @auth_app.command("setup")

@@ -11,6 +11,7 @@ from auralake_shared.models.config import (
     DatabricksWorkspaceConfig,
 )
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.config import Config
 
 
 def get_workspace_client(
@@ -19,14 +20,18 @@ def get_workspace_client(
     """Get a Databricks WorkspaceClient for the given workspace."""
     ws_config = _resolve_workspace(config, workspace_name)
     try:
-        kwargs: dict[str, Any] = {"host": ws_config.host}
+        cfg_kwargs: dict[str, Any] = {
+            "host": ws_config.host,
+            "http_timeout_seconds": 30,
+            "retry_timeout_seconds": 30,
+        }
         if ws_config.token:
-            kwargs["token"] = ws_config.token
+            cfg_kwargs["token"] = ws_config.token
         if ws_config.client_id:
-            kwargs["client_id"] = ws_config.client_id
+            cfg_kwargs["client_id"] = ws_config.client_id
         if ws_config.client_secret:
-            kwargs["client_secret"] = ws_config.client_secret
-        return WorkspaceClient(**kwargs)
+            cfg_kwargs["client_secret"] = ws_config.client_secret
+        return WorkspaceClient(config=Config(**cfg_kwargs))
     except Exception as exc:
         raise AuthenticationError("databricks", f"Failed to authenticate: {exc}") from exc
 

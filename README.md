@@ -65,6 +65,13 @@ The server automatically creates the first API key on startup when none exist. G
 docker compose logs backend | grep auto_bootstrap
 ```
 
+To generate a new key at any time, exec into the backend container:
+
+```bash
+docker compose exec backend auralake-generate-key
+docker compose exec backend auralake-generate-key --name "CI pipeline"
+```
+
 Alternatively, run the interactive setup wizard:
 
 ```bash
@@ -81,7 +88,47 @@ uv run --project packages/cli auralake auth login \
 
 This writes `~/.auralake/credentials.json` (mode 0600) so you don't need to export `AURALAKE_API_KEY` every session.
 
-5. **Run your first analysis:**
+5. **Add provider connections:**
+
+```bash
+# Add a Databricks connection
+curl -X POST http://localhost:8000/api/v1/connections \
+  -H "Authorization: Bearer al_<your-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "databricks",
+    "name": "prod-workspace",
+    "is_default": true,
+    "config": {
+      "host": "https://mycompany.cloud.databricks.com",
+      "sql_warehouse_id": "abc123def456"
+    },
+    "credentials": {
+      "token": "dapi..."
+    }
+  }'
+
+# Add an AWS connection for infrastructure cost analysis
+curl -X POST http://localhost:8000/api/v1/connections \
+  -H "Authorization: Bearer al_<your-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "aws",
+    "name": "cost-explorer",
+    "config": {
+      "region": "us-east-1",
+      "cluster_tag_key": "ClusterId"
+    },
+    "credentials": {
+      "access_key_id": "AKIA...",
+      "secret_access_key": "..."
+    }
+  }'
+```
+
+Valid providers are: `databricks`, `snowflake`, `lake_formation`, `github`, `aws`. Connection names must start with a letter or digit and contain only letters, digits, hyphens, and underscores.
+
+6. **Run your first analysis:**
 
 ```bash
 auralake cost report

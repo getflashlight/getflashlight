@@ -36,7 +36,6 @@ def create_api_key(session: Session, name: str) -> tuple[ApiKey, str]:
     record = ApiKey(
         name=name,
         key_hash=key_hash,
-        key_prefix=raw_key[:8],
     )
     session.add(record)
     session.commit()

@@ -90,7 +90,24 @@ async def create_connection(
         config=body.config,
         credentials=body.credentials,
     )
-    _reload_app_state(request.app, session)
+    try:
+        _reload_app_state(request.app, session)
+    except Exception:
+        logger.warning("reload_after_create_failed", connection_name=body.name)
+
+    # Auto-trigger collection for databricks connections
+    if body.provider == "databricks":
+        try:
+            from auralake_backend.server.agent.service import AgentService
+
+            tm = getattr(request.app.state, "task_manager", None)
+            config = getattr(request.app.state, "config", None)
+            if tm and config:
+                AgentService(tm).trigger_collection(info.id, config, trigger="auto")
+                logger.info("auto_collection_triggered", connection_id=str(info.id))
+        except Exception:
+            logger.warning("auto_collection_trigger_failed", connection_id=str(info.id))
+
     return ConnectionResponse.model_validate(info, from_attributes=True)
 
 
@@ -161,7 +178,6 @@ async def create_key(
     return ApiKeyCreateResponse(
         id=record.id,
         name=record.name,
-        key_prefix=record.key_prefix,
         key=raw_key,
         created_at=record.created_at,
     )
@@ -177,7 +193,6 @@ async def list_keys(
         ApiKeyResponse(
             id=k.id,
             name=k.name,
-            key_prefix=k.key_prefix,
             is_active=k.is_active,
             created_at=k.created_at,
             last_used_at=k.last_used_at,
@@ -195,6 +210,14 @@ async def revoke_key(
     key = session.get(ApiKey, key_id)
     if not key:
         raise HTTPException(status_code=404, detail="API key not found")
+    active_count = len(
+        list(session.exec(select(ApiKey).where(ApiKey.is_active == True)).all())  # noqa: E712
+    )
+    if active_count <= 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot revoke the last active API key",
+        )
     key.is_active = False
     session.add(key)
     session.commit()

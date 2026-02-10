@@ -21,8 +21,20 @@ class DatabricksComputeClient(AbstractComputeClient):
         self._client = get_workspace_client(config)
 
     def list_clusters(self) -> list[ClusterInfo]:
+        from databricks.sdk.service.compute import ListClustersFilterBy, State
+
         try:
-            clusters = self._client.clusters.list()
+            clusters = self._client.clusters.list(
+                page_size=100,
+                filter_by=ListClustersFilterBy(
+                    cluster_states=[
+                        State.RUNNING,
+                        State.PENDING,
+                        State.RESTARTING,
+                        State.RESIZING,
+                    ],
+                ),
+            )
             return [self._to_cluster_info(c) for c in clusters]
         except Exception as exc:
             raise APIError("databricks", f"Failed to list clusters: {exc}") from exc

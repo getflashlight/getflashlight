@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-from pydantic import BaseModel
-
 from auralake_shared.models.config import AuraLakeConfig
+from pydantic import BaseModel
 
 
 class AgentState(BaseModel):

@@ -13,13 +13,20 @@ from auralake_backend.db.models import (  # noqa: F401
     AnalysisRun,
     ApiKey,
     AuditLog,
+    BillingRecord,
+    ClusterPolicyRecord,
+    CollectionRun,
     ConsolidationGroupRecord,
     InfraCostSnapshot,
     InfraResourceMapping,
     JobProfileRecord,
+    JobRunRecord,
     ProviderConnection,
+    QueryHistoryRecord,
     QueryPlan,
     RecommendationRecord,
+    S3InventoryObject,
+    WorkerCursor,
 )
 from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel

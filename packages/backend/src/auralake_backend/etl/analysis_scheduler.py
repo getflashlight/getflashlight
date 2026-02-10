@@ -17,6 +17,8 @@ from auralake_backend.analyzers.cluster_analyzer import ClusterAnalyzer
 from auralake_backend.analyzers.cost_analyzer import CostAnalyzer
 from auralake_backend.analyzers.delta_analyzer import DeltaAnalyzer
 from auralake_backend.analyzers.idle_resource_analyzer import IdleResourceAnalyzer
+from auralake_backend.analyzers.job_analyzer import JobAnalyzer
+from auralake_backend.analyzers.query_analyzer import QueryAnalyzer
 from auralake_backend.analyzers.s3_tag_analyzer import S3TagAnalyzer
 from auralake_backend.analyzers.spot_analyzer import SpotAnalyzer
 from auralake_backend.db.models import AnalysisRun, RecommendationRecord
@@ -31,6 +33,8 @@ SCHEDULED_ANALYZERS = [
     IdleResourceAnalyzer,
     DeltaAnalyzer,
     S3TagAnalyzer,
+    JobAnalyzer,
+    QueryAnalyzer,
 ]
 
 

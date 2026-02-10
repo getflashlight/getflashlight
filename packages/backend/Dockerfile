@@ -13,6 +13,9 @@ COPY packages/backend/ packages/backend/
 # Install dependencies
 RUN cd packages/backend && uv sync --no-dev --no-editable
 
+# Put uv-managed scripts on PATH so entry points work without "uv run"
+ENV PATH="/app/.venv/bin:$PATH"
+
 # Expose server port
 EXPOSE 8000
 
