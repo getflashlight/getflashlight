@@ -6,7 +6,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from auralake_shared.models.config import ConnectionProvider
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Connections
@@ -14,17 +15,35 @@ from pydantic import BaseModel
 
 
 class ConnectionCreate(BaseModel):
-    provider: str
-    name: str
+    provider: ConnectionProvider
+    name: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
     is_default: bool = False
     config: dict[str, Any] = {}
     credentials: dict[str, Any] | None = None
+
+    @field_validator("config", "credentials")
+    @classmethod
+    def reject_empty_keys(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        if v is not None:
+            bad = [k for k in v if not k or not k.strip()]
+            if bad:
+                raise ValueError("Dictionary keys must be non-empty strings")
+        return v
 
 
 class ConnectionUpdate(BaseModel):
     is_default: bool | None = None
     config: dict[str, Any] | None = None
     credentials: dict[str, Any] | None = None
+
+    @field_validator("config", "credentials")
+    @classmethod
+    def reject_empty_keys(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        if v is not None:
+            bad = [k for k in v if not k or not k.strip()]
+            if bad:
+                raise ValueError("Dictionary keys must be non-empty strings")
+        return v
 
 
 class ConnectionResponse(BaseModel):
@@ -44,20 +63,10 @@ class ConnectionResponse(BaseModel):
 
 
 class ApiKeyCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_ -]*$")
 
 
 class ApiKeyCreateResponse(BaseModel):
-    id: uuid.UUID
-    name: str
-    key_prefix: str
-    key: str  # raw key — shown once
-    created_at: datetime
-
-
-class BootstrapResponse(BaseModel):
-    """Returned by the one-shot /bootstrap endpoint."""
-
     id: uuid.UUID
     name: str
     key_prefix: str

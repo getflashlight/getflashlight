@@ -12,8 +12,23 @@ class AutomationLevel(StrEnum):
     AUTO = "auto"
 
 
+class ConnectionProvider(StrEnum):
+    DATABRICKS = "databricks"
+    SNOWFLAKE = "snowflake"
+    LAKE_FORMATION = "lake_formation"
+    GITHUB = "github"
+    AWS = "aws"
+
+
+class BudgetScope(StrEnum):
+    WORKSPACE = "workspace"
+    ACCOUNT = "account"
+    CLUSTER = "cluster"
+    JOB = "job"
+
+
 class DatabaseConfig(BaseModel):
-    url: str = "postgresql://auralake:password@localhost:5432/auralake"
+    url: str = "postgresql+psycopg://localhost:5432/auralake"
 
 
 class DefaultsConfig(BaseModel):
@@ -25,6 +40,7 @@ class DefaultsConfig(BaseModel):
 class GitHubConfig(BaseModel):
     repo: str = ""
     token_env: str = "GITHUB_TOKEN"
+    token: str | None = Field(default=None, exclude=True)
     local_path: str | None = None
     base_branch: str = "main"
     pr_labels: list[str] = Field(default_factory=lambda: ["auralake", "cost-optimization"])
@@ -34,6 +50,9 @@ class GitHubConfig(BaseModel):
 class DatabricksWorkspaceConfig(BaseModel):
     host: str
     is_default: bool = False
+    token: str | None = Field(default=None, exclude=True)
+    client_id: str | None = Field(default=None, exclude=True)
+    client_secret: str | None = Field(default=None, exclude=True)
     sql_warehouse_id: str | None = None
     bundle_path: str | None = None
     tags: dict[str, str] = Field(default_factory=dict)
@@ -47,6 +66,9 @@ class AWSCostExplorerConfig(BaseModel):
 
 class DatabricksAWSConfig(BaseModel):
     region: str = "us-east-1"
+    access_key_id: str | None = Field(default=None, exclude=True)
+    secret_access_key: str | None = Field(default=None, exclude=True)
+    session_token: str | None = Field(default=None, exclude=True)
     cost_explorer: AWSCostExplorerConfig = Field(default_factory=AWSCostExplorerConfig)
 
 

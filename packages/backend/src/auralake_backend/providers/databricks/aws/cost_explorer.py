@@ -23,7 +23,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
     def __init__(self, db_config: DatabricksConfig, aws_config: DatabricksAWSConfig) -> None:
         self._db_config = db_config
         self._aws_config = aws_config
-        session = get_boto3_session(aws_config.region)
+        session = get_boto3_session(aws_config.region, aws_config=aws_config)
         self._ce = session.client("ce")
         self._ec2 = session.client("ec2")
 

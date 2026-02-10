@@ -47,7 +47,7 @@ class RepoManager:
             self._pull()
         else:
             clone_dir.parent.mkdir(parents=True, exist_ok=True)
-            token = os.environ.get(self._config.token_env, "")
+            token = self._config.token or os.environ.get(self._config.token_env, "")
             url = (
                 f"https://{token}@github.com/{self._config.repo}.git"
                 if token

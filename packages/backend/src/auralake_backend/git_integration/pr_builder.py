@@ -17,7 +17,7 @@ class PRBuilder:
 
     def __init__(self, github_config: GitHubConfig) -> None:
         self._config = github_config
-        token = os.environ.get(github_config.token_env, "")
+        token = github_config.token or os.environ.get(github_config.token_env, "")
         if not token:
             raise GitIntegrationError(
                 f"GitHub token not found in env var '{github_config.token_env}'"

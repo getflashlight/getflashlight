@@ -29,29 +29,36 @@ _DEFAULT_FILENAMES: list[Path] = [
 ]
 
 
-def _resolve_config_path(path: Path | None = None) -> Path:
-    """Return the first configuration file that exists.
+def _resolve_config_path(path: Path | None = None) -> Path | None:
+    """Return the first configuration file that exists, or *None*.
 
-    Raises :class:`ConfigError` when no file can be found.
+    When an explicit *path* or ``AURALAKE_CONFIG`` is given but doesn't exist,
+    raises :class:`ConfigError`.  When only the default locations are checked
+    and none exist, returns *None* so the caller can fall back to defaults.
     """
-    candidates: list[Path] = []
-
+    # Explicitly requested paths — must exist.
+    explicit: list[Path] = []
     if path is not None:
-        candidates.append(Path(path))
-
+        explicit.append(Path(path))
     env_path = os.environ.get("AURALAKE_CONFIG")
     if env_path:
-        candidates.append(Path(env_path))
+        explicit.append(Path(env_path))
 
-    candidates.extend(_DEFAULT_FILENAMES)
+    for candidate in explicit:
+        resolved = candidate.expanduser().resolve()
+        if resolved.is_file():
+            return resolved
+    if explicit:
+        searched = ", ".join(str(c) for c in explicit)
+        raise ConfigError(f"Requested configuration file not found: {searched}")
 
-    for candidate in candidates:
+    # Default locations — optional.
+    for candidate in _DEFAULT_FILENAMES:
         resolved = candidate.expanduser().resolve()
         if resolved.is_file():
             return resolved
 
-    searched = ", ".join(str(c) for c in candidates)
-    raise ConfigError(f"No configuration file found. Searched: {searched}")
+    return None
 
 
 def _apply_env_overrides(data: dict) -> dict:  # type: ignore[type-arg]
@@ -88,18 +95,24 @@ def load_config(path: Path | None = None) -> AuraLakeConfig:
     """
     config_path = _resolve_config_path(path)
 
-    try:
-        raw_text = config_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ConfigError(f"Cannot read config file {config_path}: {exc}") from exc
+    if config_path is None:
+        # No config file — use Pydantic defaults with env-var overrides.
+        data: dict = {}  # type: ignore[type-arg]
+    else:
+        try:
+            raw_text = config_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"Cannot read config file {config_path}: {exc}") from exc
 
-    try:
-        data = yaml.safe_load(raw_text)
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"Invalid YAML in {config_path}: {exc}") from exc
+        try:
+            data = yaml.safe_load(raw_text)
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"Invalid YAML in {config_path}: {exc}") from exc
 
-    if not isinstance(data, dict):
-        raise ConfigError(f"Expected a YAML mapping in {config_path}, got {type(data).__name__}")
+        if not isinstance(data, dict):
+            raise ConfigError(
+                f"Expected a YAML mapping in {config_path}, got {type(data).__name__}"
+            )
 
     data = _apply_env_overrides(data)
 

@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 auralake-server = "auralake_backend.server.main:run"
+auralake-db-migrate = "auralake_backend.db.migrate:run"
 
 [build-system]
 requires = ["hatchling"]

@@ -7,6 +7,7 @@ from auralake_shared.core.exceptions import (
     AuthenticationError,
     ConfigError,
     DatabaseError,
+    DuplicateConnectionError,
     ProviderNotFoundError,
     SafetyError,
 )
@@ -18,6 +19,7 @@ _STATUS_MAP: dict[type[AuraLakeError], int] = {
     AuthenticationError: 401,
     SafetyError: 403,
     ProviderNotFoundError: 404,
+    DuplicateConnectionError: 409,
     DatabaseError: 503,
 }
 

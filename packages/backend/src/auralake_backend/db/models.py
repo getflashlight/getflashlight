@@ -199,3 +199,35 @@ class AgentState(SQLModel, table=True):
     plans_collected: int
     last_run_at: datetime | None = Field(default=None)
     status: str
+
+
+# ---------------------------------------------------------------------------
+# ProviderConnection — Encrypted provider credentials
+# ---------------------------------------------------------------------------
+class ProviderConnection(SQLModel, table=True):
+    __tablename__ = "provider_connections"
+    __table_args__ = (sa.UniqueConstraint("provider", "name"),)
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    provider: str  # "databricks", "github", "aws"
+    name: str  # "production", "staging", "default"
+    is_default: bool = Field(default=False)
+    config: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
+    encrypted_credentials: str | None = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# ApiKey — SHA-256 hashed API keys
+# ---------------------------------------------------------------------------
+class ApiKey(SQLModel, table=True):
+    __tablename__ = "api_keys"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    name: str
+    key_hash: str
+    key_prefix: str = Field(max_length=8)
+    is_active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_used_at: datetime | None = Field(default=None)

@@ -1,0 +1,10 @@
+{
+  "name": "auralake-auth",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "better-auth": "^1",
+    "hono": "^4"
+  }
+}

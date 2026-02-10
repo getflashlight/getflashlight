@@ -21,7 +21,6 @@ from auralake_backend.server.settings.schemas import (
     ApiKeyCreate,
     ApiKeyCreateResponse,
     ApiKeyResponse,
-    BootstrapResponse,
     ConnectionCreate,
     ConnectionResponse,
     ConnectionUpdate,
@@ -60,33 +59,6 @@ def _reload_app_state(app: Any, session: Session) -> None:
             app.state.provider = None
     else:
         app.state.provider = None
-
-
-# ---------------------------------------------------------------------------
-# Bootstrap — unauthenticated, one-shot first key creation
-# ---------------------------------------------------------------------------
-
-
-@router.post("/bootstrap", response_model=BootstrapResponse, status_code=201)
-async def bootstrap(
-    session: Session = Depends(_get_session),
-) -> BootstrapResponse:
-    """Create the first API key. Only works when no keys exist in the database."""
-    existing = session.exec(select(ApiKey).limit(1)).first()
-    if existing:
-        raise HTTPException(
-            status_code=403,
-            detail="Bootstrap already completed. Use an existing key to create more.",
-        )
-    record, raw_key = create_api_key(session, "bootstrap")
-    logger.info("bootstrap_completed", key_prefix=record.key_prefix)
-    return BootstrapResponse(
-        id=record.id,
-        name=record.name,
-        key_prefix=record.key_prefix,
-        key=raw_key,
-        created_at=record.created_at,
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -34,7 +34,62 @@ For development dependencies:
 uv sync --extra dev
 ```
 
-## Quick start
+## Quick start (Docker)
+
+1. **Copy `.env.example` and generate an encryption key:**
+
+```bash
+cp .env.example .env
+
+# Generate AURALAKE_ENCRYPTION_KEY (pick one method):
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# or, if you don't have cryptography installed:
+openssl rand -base64 32
+```
+
+Paste the output into `AURALAKE_ENCRYPTION_KEY=` in `.env`. The server will refuse to start without it — this key encrypts provider credentials (Databricks tokens, AWS keys) at rest in PostgreSQL.
+
+2. **Start the stack:**
+
+```bash
+docker compose up -d
+```
+
+This starts PostgreSQL, runs Alembic migrations, and launches the backend API on port 8000.
+
+3. **Get the auto-generated API key:**
+
+The server automatically creates the first API key on startup when none exist. Grab it from the logs:
+
+```bash
+docker compose logs backend | grep auto_bootstrap
+```
+
+Alternatively, run the interactive setup wizard:
+
+```bash
+uv run --project packages/cli auralake auth setup
+```
+
+4. **Store your API key for CLI use:**
+
+```bash
+uv run --project packages/cli auralake auth login \
+  --server http://localhost:8000 \
+  --key al_<your-key-here>
+```
+
+This writes `~/.auralake/credentials.json` (mode 0600) so you don't need to export `AURALAKE_API_KEY` every session.
+
+5. **Run your first analysis:**
+
+```bash
+auralake cost report
+auralake cost breakdown
+auralake clusters analyze
+```
+
+## Quick start (local dev, no Docker)
 
 1. **Copy and edit the config:**
 
@@ -82,6 +137,7 @@ auralake query plans           # View captured plan anti-patterns
 
 ```
 auralake
+├── auth        setup, login, create-key, list-keys, revoke-key
 ├── cost        report, breakdown, trend, forecast, tco, infra
 ├── clusters    analyze, list, resize, show
 ├── resources   scan, cleanup, report
@@ -113,16 +169,31 @@ auralake
 
 ## Configuration
 
-Aura Lake reads config from (in order):
+### Config file resolution (local dev mode)
+
 1. `--config` flag
 2. `AURALAKE_CONFIG` environment variable
 3. `auralake.yaml` in the current directory
 4. `~/.auralake/config.yaml`
 
-Environment variable overrides:
-- `AURALAKE_DATABASE_URL` — PostgreSQL connection string
-- `AURALAKE_PROVIDER` — default provider
-- `GITHUB_TOKEN` — GitHub PAT for PR creation
+### API credential resolution (server mode)
+
+The CLI resolves the server URL and API key in this order:
+
+1. `--server` / `--key` CLI flags (highest priority)
+2. `AURALAKE_SERVER_URL` / `AURALAKE_API_KEY` environment variables
+3. `~/.auralake/credentials.json` (written by `auralake auth login`)
+
+### Environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `AURALAKE_DATABASE_URL` | PostgreSQL connection string |
+| `AURALAKE_ENCRYPTION_KEY` | Fernet key for encrypting credentials at rest (required for server) |
+| `AURALAKE_PROVIDER` | Default provider |
+| `AURALAKE_SERVER_URL` | Backend API URL for CLI |
+| `AURALAKE_API_KEY` | API key for CLI-to-server auth |
+| `GITHUB_TOKEN` | GitHub PAT for PR creation |
 
 See [`auralake.yaml.example`](auralake.yaml.example) for the full config schema.
 

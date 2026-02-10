@@ -1,6 +1,8 @@
 """Alembic environment configuration for auralake."""
+
 from __future__ import annotations
 
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -9,11 +11,13 @@ from alembic import context
 from auralake_backend.db.models import (  # noqa: F401
     AgentState,
     AnalysisRun,
+    ApiKey,
     AuditLog,
     ConsolidationGroupRecord,
     InfraCostSnapshot,
     InfraResourceMapping,
     JobProfileRecord,
+    ProviderConnection,
     QueryPlan,
     RecommendationRecord,
 )
@@ -24,6 +28,12 @@ config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# Allow AURALAKE_DATABASE_URL to override alembic.ini (used by init container
+# and programmatic callers).
+env_url = os.environ.get("AURALAKE_DATABASE_URL")
+if env_url:
+    config.set_main_option("sqlalchemy.url", env_url)
 
 target_metadata = SQLModel.metadata
 

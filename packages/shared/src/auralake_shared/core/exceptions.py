@@ -67,3 +67,7 @@ class DABParserError(AuraLakeError):
 
 class AnalyzerError(AuraLakeError):
     """Raised when a cost/usage analyzer encounters an error."""
+
+
+class DuplicateConnectionError(AuraLakeError):
+    """Raised when a connection with the same (provider, name) already exists."""

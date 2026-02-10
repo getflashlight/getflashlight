@@ -53,7 +53,7 @@ class Collector:
         self.scheduler.stop()
 
     def _collect(self) -> None:
-        """Single collection run."""
+        """Single collection run: query plans + inventory + analysis."""
         logger.info("collection_run_started", timestamp=datetime.utcnow().isoformat())
 
         try:
@@ -94,6 +94,41 @@ class Collector:
 
         except Exception as exc:
             logger.error("collection_run_failed", error=str(exc))
+
+        # Run inventory snapshot + scheduled analysis
+        self._run_etl()
+
+    def _run_etl(self) -> None:
+        """Run inventory collection and scheduled analysis."""
+        try:
+            from auralake_shared.core.context import ExecutionContext
+            from auralake_shared.models.config import AutomationLevel
+            from auralake_shared.providers import get_provider
+
+            from auralake_backend.db.engine import get_session
+            from auralake_backend.etl.analysis_scheduler import AnalysisScheduler
+            from auralake_backend.etl.inventory_collector import InventoryCollector
+
+            provider = get_provider(self.config.provider, self.config)
+            context = ExecutionContext(
+                config=self.config,
+                provider=provider,
+                automation_level=AutomationLevel.RECOMMEND,
+            )
+
+            with get_session() as session:
+                # Inventory snapshot
+                collector = InventoryCollector(context, session)
+                inventory_results = collector.collect_all()
+                logger.info("etl_inventory_completed", **inventory_results)
+
+                # Scheduled analysis
+                scheduler = AnalysisScheduler(context, session)
+                analysis_results = scheduler.run_all()
+                logger.info("etl_analysis_completed", **analysis_results)
+
+        except Exception as exc:
+            logger.error("etl_run_failed", error=str(exc))
 
     def _store_plan(self, query: dict, spark_plan) -> None:
         """Store a parsed plan in the database."""

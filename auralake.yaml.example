@@ -9,8 +9,8 @@ defaults:
   lookback_days: 30
 
 database:
-  url: "postgresql://auralake:password@localhost:5432/auralake"
-  # Or via env var: AURALAKE_DATABASE_URL
+  # Set via env var AURALAKE_DATABASE_URL (recommended) or inline:
+  # url: "postgresql+psycopg://user:pass@localhost:5432/auralake"
 
 # GitHub monorepo containing DAB configs
 github:

@@ -65,8 +65,8 @@ def login(
     key: str = typer.Option(..., "--key", "-k", help="API key (ak_...)."),
 ) -> None:
     """Store server URL and API key in ~/.auralake/credentials.json."""
-    if not key.startswith("ak_"):
-        print_error("API key must start with 'ak_'.")
+    if not key.startswith("al_"):
+        print_error("API key must start with 'al_'.")
         raise typer.Exit(1)
 
     save_credentials(server, key)
@@ -155,24 +155,13 @@ def setup(
         print_error(f"Cannot reach server at {server}: {exc}")
         raise typer.Exit(1) from None
 
-    # Step 2 — Bootstrap API key
+    # Step 2 — Enter API key (auto-created by the server on first startup)
     typer.echo()
-    typer.echo("Bootstrapping API key ...")
-    try:
-        resp = httpx.post(f"{server}/api/v1/bootstrap", timeout=10.0)
-        if resp.status_code == 201:
-            data = resp.json()
-            api_key = data["key"]
-            print_success(f"API key created: {data['name']} (prefix: {data['key_prefix']})")
-        elif resp.status_code == 403:
-            typer.echo("  Bootstrap already completed — enter an existing API key.")
-            api_key = typer.prompt("  API key (ak_...)")
-        else:
-            print_error(f"Bootstrap failed: {resp.status_code} {resp.text}")
-            raise typer.Exit(1)
-    except httpx.HTTPError as exc:
-        print_error(f"Bootstrap request failed: {exc}")
-        raise typer.Exit(1) from None
+    typer.echo("The server auto-creates the first API key on startup.")
+    typer.echo(
+        "Check the server logs for the key: docker compose logs backend | grep auto_bootstrap"
+    )
+    api_key = typer.prompt("  API key (al_...)")
 
     # Step 3 — Store credentials
     save_credentials(server, api_key)

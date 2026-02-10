@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import structlog
 from auralake_shared.models.recommendations import (
     AnalysisResult,
     Recommendation,
@@ -13,20 +14,45 @@ from auralake_shared.models.recommendations import (
 
 from auralake_backend.analyzers.base import AbstractAnalyzer
 
+logger = structlog.get_logger(__name__)
+
 
 class DeltaAnalyzer(AbstractAnalyzer):
     name = "delta"
 
     def analyze(self) -> AnalysisResult:
+        """Discover all Delta tables and analyze for maintenance needs."""
+        storage = self.context.provider.get_storage_client()
         recommendations = []
+        tables_analyzed = 0
 
-        # Note: table listing requires catalog/schema which depends on workspace config
-        # This analyzer works best when called with specific tables
+        # Try auto-discovery; fall back gracefully if unavailable
+        try:
+            tables = storage.discover_all_tables()
+        except Exception as exc:
+            logger.warning("delta_table_discovery_failed", error=str(exc))
+            tables = []
+
+        for table_info in tables:
+            full_name = table_info.get("full_name", "")
+            if not full_name:
+                continue
+            try:
+                recs = self.analyze_table(full_name)
+                recommendations.extend(recs)
+                tables_analyzed += 1
+            except Exception as exc:
+                logger.warning("delta_table_analysis_failed", table=full_name, error=str(exc))
+
         return AnalysisResult(
             analyzer_name=self.name,
             provider=self.context.config.provider,
             recommendations=recommendations,
-            summary={"tables_analyzed": 0, "recommendations_count": 0},
+            summary={
+                "tables_discovered": len(tables),
+                "tables_analyzed": tables_analyzed,
+                "recommendations_count": len(recommendations),
+            },
         )
 
     def analyze_table(self, table_name: str) -> list[Recommendation]:

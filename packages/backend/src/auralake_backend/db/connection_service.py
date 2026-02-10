@@ -12,8 +12,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from auralake_shared.core.exceptions import AuraLakeError
+from auralake_shared.core.exceptions import AuraLakeError, DuplicateConnectionError
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session
 
 from auralake_backend.core.encryption import encrypt
@@ -89,7 +90,13 @@ class ConnectionService:
             config=config or {},
             encrypted_credentials=encrypted,
         )
-        conn = self._repo.create(conn)
+        try:
+            conn = self._repo.create(conn)
+        except IntegrityError:
+            self._session.rollback()
+            raise DuplicateConnectionError(
+                f"A connection named '{name}' already exists for provider '{provider}'"
+            )
         return _to_info(conn)
 
     def update(
