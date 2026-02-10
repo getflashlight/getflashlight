@@ -64,12 +64,30 @@ class AWSCostExplorerConfig(BaseModel):
     tag_filters: dict[str, str] = Field(default_factory=lambda: {"Vendor": "Databricks"})
 
 
+class S3InventoryConfig(BaseModel):
+    enabled: bool = False
+    destination_bucket: str = ""
+    destination_prefix: str = "auralake-inventory"
+    frequency: str = "Daily"  # "Daily" or "Weekly"
+    included_fields: list[str] = Field(
+        default_factory=lambda: [
+            "Size",
+            "LastModifiedDate",
+            "StorageClass",
+            "ETag",
+            "IsMultipartUploaded",
+            "ObjectLockRetainUntilDate",
+        ]
+    )
+
+
 class DatabricksAWSConfig(BaseModel):
     region: str = "us-east-1"
     access_key_id: str | None = Field(default=None, exclude=True)
     secret_access_key: str | None = Field(default=None, exclude=True)
     session_token: str | None = Field(default=None, exclude=True)
     cost_explorer: AWSCostExplorerConfig = Field(default_factory=AWSCostExplorerConfig)
+    s3_inventory: S3InventoryConfig = Field(default_factory=S3InventoryConfig)
 
 
 class DatabricksAccountConfig(BaseModel):

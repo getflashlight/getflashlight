@@ -17,6 +17,7 @@ from auralake_backend.db.models import (
     InfraCostSnapshot,
     InfraResourceMapping,
     JobProfileRecord,
+    S3InventoryObject,
 )
 
 logger = structlog.get_logger(__name__)
@@ -36,6 +37,7 @@ class InventoryCollector:
         results["clusters"] = self._collect_clusters()
         results["jobs"] = self._collect_jobs()
         results["infra_costs"] = self._collect_infra_costs()
+        results["s3_inventory"] = self._collect_s3_inventory()
 
         logger.info("inventory_collection_completed", **results)
         return results
@@ -190,3 +192,98 @@ class InventoryCollector:
         except AuraLakeError as exc:
             logger.error("infra_cost_collection_failed", error=str(exc))
             return 0
+
+    # ------------------------------------------------------------------
+    # S3 Inventory
+    # ------------------------------------------------------------------
+
+    def _collect_s3_inventory(self) -> int:
+        """Poll S3 Inventory reports and ingest objects into the database.
+
+        1. Discovers Databricks-managed S3 buckets from Delta table locations.
+        2. Ensures inventory configuration exists on each bucket (idempotent).
+        3. Checks for completed inventory reports and reads them via DuckDB.
+        4. Persists each object as an ``S3InventoryObject`` row.
+        """
+        aws_config = self.context.config.databricks.aws
+        inv_config = aws_config.s3_inventory
+        if not inv_config.enabled or not inv_config.destination_bucket:
+            logger.info("s3_inventory_collection_skipped", reason="disabled")
+            return 0
+
+        try:
+            from auralake_backend.providers.databricks.auth import get_boto3_session
+            from auralake_backend.providers.databricks.aws.s3_inventory import (
+                S3InventoryClient,
+            )
+
+            session = get_boto3_session(aws_config=aws_config)
+            s3_client = session.client("s3")  # type: ignore[attr-defined]
+            inventory_client = S3InventoryClient(s3_client, inv_config)
+
+            # Discover buckets from Delta table locations
+            buckets = self._discover_databricks_buckets()
+            if not buckets:
+                logger.info("s3_inventory_no_buckets_found")
+                return 0
+
+            count = 0
+            for bucket in buckets:
+                try:
+                    # Idempotent — ensures config exists
+                    inventory_client.configure_inventory(bucket)
+
+                    manifest = inventory_client.get_latest_manifest(bucket)
+                    if manifest is None:
+                        continue
+
+                    objects = inventory_client.read_inventory_objects(manifest)
+                    for obj in objects:
+                        record = S3InventoryObject(
+                            bucket=obj.bucket,
+                            key=obj.key,
+                            size_bytes=obj.size_bytes,
+                            last_modified=obj.last_modified,
+                            storage_class=obj.storage_class,
+                            etag=obj.etag,
+                            collected_at=datetime.now(UTC),
+                        )
+                        self.session.add(record)
+                        count += 1
+                except Exception as exc:
+                    logger.warning(
+                        "s3_inventory_bucket_failed",
+                        bucket=bucket,
+                        error=str(exc),
+                    )
+
+            self.session.commit()
+            logger.info("s3_inventory_collected", count=count, buckets=len(buckets))
+            return count
+        except AuraLakeError as exc:
+            logger.error("s3_inventory_collection_failed", error=str(exc))
+            return 0
+
+    def _discover_databricks_buckets(self) -> list[str]:
+        """Extract unique S3 bucket names from Delta table locations."""
+        try:
+            storage = self.context.provider.get_storage_client()
+            tables = storage.discover_all_tables()
+            buckets: set[str] = set()
+            for table_info in tables:
+                full_name = table_info.get("full_name", "")
+                if not full_name:
+                    continue
+                try:
+                    stats = storage.get_table_stats(full_name)
+                    location = stats.get("location", "")
+                    if location.startswith("s3://"):
+                        # Extract bucket from s3://bucket/path
+                        bucket = location.split("/")[2]
+                        buckets.add(bucket)
+                except Exception:
+                    pass
+            return sorted(buckets)
+        except Exception as exc:
+            logger.warning("s3_bucket_discovery_failed", error=str(exc))
+            return []

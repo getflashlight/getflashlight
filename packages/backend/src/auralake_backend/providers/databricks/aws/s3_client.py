@@ -47,3 +47,11 @@ class S3Client:
             return resp.get("LocationConstraint") or "us-east-1"
         except Exception as exc:
             raise APIError("databricks", f"S3 get-bucket-location failed: {exc}") from exc
+
+    def get_object_tagging(self, bucket: str, key: str) -> dict[str, str]:
+        """Return the tag set for a single S3 object as a flat dict."""
+        try:
+            resp = self._s3.get_object_tagging(Bucket=bucket, Key=key)
+            return {t["Key"]: t["Value"] for t in resp.get("TagSet", [])}
+        except Exception as exc:
+            raise APIError("databricks", f"S3 get-object-tagging failed: {exc}") from exc

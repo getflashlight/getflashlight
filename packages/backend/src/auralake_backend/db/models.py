@@ -219,6 +219,27 @@ class ProviderConnection(SQLModel, table=True):
 
 
 # ---------------------------------------------------------------------------
+# S3InventoryObject — S3 inventory report objects with table mapping
+# ---------------------------------------------------------------------------
+class S3InventoryObject(SQLModel, table=True):
+    __tablename__ = "s3_inventory_objects"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    bucket: str
+    key: str
+    size_bytes: int
+    last_modified: datetime
+    storage_class: str | None = Field(default=None)
+    etag: str | None = Field(default=None)
+    matched_table: str | None = Field(default=None)
+    matched_table_location: str | None = Field(default=None)
+    is_orphan: bool = Field(default=False)
+    tags: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
+    inventory_run_id: uuid.UUID | None = Field(default=None)
+    collected_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
 # ApiKey — SHA-256 hashed API keys
 # ---------------------------------------------------------------------------
 class ApiKey(SQLModel, table=True):
