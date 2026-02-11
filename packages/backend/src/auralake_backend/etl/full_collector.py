@@ -11,7 +11,7 @@ import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, timedelta
-from threading import Event, Semaphore
+from threading import Event
 from typing import Any
 
 import structlog
@@ -83,36 +83,19 @@ class FullCollector:
             name: {"status": "pending"} for name in self.WORKER_NAMES
         }
 
-        sql_semaphore = Semaphore(2)
-
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=9) as pool:
             # Wave 1: independent workers
-            f_compute = pool.submit(
-                self._run_worker, run_id, "compute", worker_statuses, sql_semaphore
-            )
+            f_compute = pool.submit(self._run_worker, run_id, "compute", worker_statuses)
             f_jobs = pool.submit(self._run_worker, run_id, "jobs", worker_statuses)
-            f_billing = pool.submit(
-                self._run_worker, run_id, "billing", worker_statuses, sql_semaphore
-            )
-            f_queries = pool.submit(
-                self._run_worker, run_id, "query_history", worker_statuses, sql_semaphore
-            )
+            f_billing = pool.submit(self._run_worker, run_id, "billing", worker_statuses)
+            f_queries = pool.submit(self._run_worker, run_id, "query_history", worker_statuses)
             f_policies = pool.submit(self._run_worker, run_id, "policies", worker_statuses)
             f_infra = pool.submit(self._run_worker, run_id, "infra_costs", worker_statuses)
-            f_tables = pool.submit(
-                self._run_worker, run_id, "catalog_tables", worker_statuses, sql_semaphore
-            )
+            f_tables = pool.submit(self._run_worker, run_id, "catalog_tables", worker_statuses)
 
             # Wave 2: dependent workers
             f_job_runs = pool.submit(self._after, f_jobs, run_id, "job_runs", worker_statuses)
-            f_plans = pool.submit(
-                self._after,
-                f_queries,
-                run_id,
-                "query_plans",
-                worker_statuses,
-                sql_semaphore,
-            )
+            f_plans = pool.submit(self._after, f_queries, run_id, "query_plans", worker_statuses)
 
             # Wait for all
             for f in [
@@ -137,14 +120,7 @@ class FullCollector:
     def run_single_worker(self, run_id: uuid.UUID, worker_name: str) -> dict[str, Any]:
         """Run a single worker (for retry). Returns the worker status dict."""
         worker_statuses: dict[str, dict[str, Any]] = {worker_name: {"status": "pending"}}
-        sql_semaphore = Semaphore(2)
-        sem = (
-            sql_semaphore
-            if worker_name
-            in ("compute", "billing", "query_history", "query_plans", "catalog_tables")
-            else None
-        )
-        self._run_worker(run_id, worker_name, worker_statuses, sem)
+        self._run_worker(run_id, worker_name, worker_statuses)
         return worker_statuses
 
     def _run_analysis(self, run_id: uuid.UUID, worker_statuses: dict) -> None:
@@ -192,7 +168,6 @@ class FullCollector:
         run_id: uuid.UUID,
         worker_name: str,
         worker_statuses: dict,
-        sql_semaphore: Semaphore | None = None,
     ) -> None:
         """Wait for a prerequisite future, then run a worker."""
         try:
@@ -203,14 +178,13 @@ class FullCollector:
         if self._cancel.is_set():
             worker_statuses[worker_name] = {"status": "cancelled"}
             return
-        self._run_worker(run_id, worker_name, worker_statuses, sql_semaphore)
+        self._run_worker(run_id, worker_name, worker_statuses)
 
     def _run_worker(
         self,
         run_id: uuid.UUID,
         worker_name: str,
         worker_statuses: dict,
-        sql_semaphore: Semaphore | None = None,
     ) -> None:
         """Execute a single worker with its own session and error boundary."""
         if self._cancel.is_set():
@@ -224,13 +198,7 @@ class FullCollector:
             with Session(get_engine()) as session:
                 cursor = self._read_cursor(session, worker_name)
 
-                if sql_semaphore:
-                    sql_semaphore.acquire()
-                try:
-                    count, new_cursor = self._dispatch_worker(session, worker_name, cursor)
-                finally:
-                    if sql_semaphore:
-                        sql_semaphore.release()
+                count, new_cursor = self._dispatch_worker(session, worker_name, cursor)
 
                 if new_cursor is not None:
                     self._write_cursor(session, worker_name, new_cursor)
@@ -1283,7 +1251,8 @@ class FullCollector:
                 thread_session.commit()
             return True
 
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        num_workers = min(len(delta_tables), 50)
+        with ThreadPoolExecutor(max_workers=max(num_workers, 1)) as pool:
             futures = {pool.submit(_fetch_and_upsert, t): t for t in delta_tables}
             for future in as_completed(futures):
                 if self._cancel.is_set():
