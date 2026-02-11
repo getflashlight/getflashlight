@@ -219,6 +219,33 @@ class DatabricksStorageClient(AbstractStorageClient):
             )
         return {}
 
+    def get_table_history(self, table_name: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Try each workspace until DESCRIBE HISTORY succeeds for the table."""
+        errors: list[str] = []
+        for ws_name, ws_config in self._config.workspaces.items():
+            try:
+                client = get_workspace_client(self._config, ws_name)
+                wh_id = get_warehouse_id(client, ws_config.sql_warehouse_id)
+                result = client.statement_execution.execute_statement(
+                    warehouse_id=wh_id,
+                    statement=f"DESCRIBE HISTORY {table_name} LIMIT {limit}",
+                )
+                if result.result and result.result.data_array:
+                    columns = [col.name for col in (result.manifest.schema.columns or [])]
+                    rows = [dict(zip(columns, row)) for row in result.result.data_array]
+                    maintenance_ops = {"OPTIMIZE", "VACUUM START", "VACUUM END"}
+                    return [r for r in rows if r.get("operation") in maintenance_ops]
+                return []
+            except Exception as exc:
+                errors.append(f"{ws_name}: {exc}")
+                continue
+        if errors:
+            raise APIError(
+                "databricks",
+                f"Failed to get table history for {table_name}: {'; '.join(errors)}",
+            )
+        return []
+
     def optimize_table(self, table_name: str) -> dict[str, Any]:
         try:
             self._execute_sql(f"OPTIMIZE {table_name}")

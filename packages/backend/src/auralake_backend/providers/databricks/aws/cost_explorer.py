@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from typing import Any
 
 from auralake_shared.core.exceptions import APIError
 from auralake_shared.models.billing import (
@@ -27,6 +28,18 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
         self._ce = session.client("ce")
         self._ec2 = session.client("ec2")
 
+    def _paginate_cost_and_usage(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Paginate through get_cost_and_usage results."""
+        all_results: list[dict[str, Any]] = []
+        while True:
+            response = self._ce.get_cost_and_usage(**kwargs)
+            all_results.extend(response.get("ResultsByTime", []))
+            token = response.get("NextPageToken")
+            if not token:
+                break
+            kwargs["NextPageToken"] = token
+        return all_results
+
     def get_compute_costs(self, start: date, end: date) -> list[InfraComputeCost]:
         try:
             tag_filters = self._aws_config.cost_explorer.tag_filters
@@ -42,7 +55,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
             if filter_expr:
                 and_conditions.append(filter_expr)
 
-            response = self._ce.get_cost_and_usage(
+            time_periods = self._paginate_cost_and_usage(
                 TimePeriod={"Start": str(start), "End": str(end)},
                 Granularity="DAILY",
                 Metrics=["UnblendedCost", "UsageQuantity"],
@@ -52,7 +65,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
                 ],
             )
             results = []
-            for time_period in response.get("ResultsByTime", []):
+            for time_period in time_periods:
                 p_start = date.fromisoformat(time_period["TimePeriod"]["Start"])
                 p_end = date.fromisoformat(time_period["TimePeriod"]["End"])
                 for group in time_period.get("Groups", []):
@@ -78,7 +91,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
 
     def get_storage_costs(self, start: date, end: date) -> list[InfraStorageCost]:
         try:
-            response = self._ce.get_cost_and_usage(
+            time_periods = self._paginate_cost_and_usage(
                 TimePeriod={"Start": str(start), "End": str(end)},
                 Granularity="MONTHLY",
                 Metrics=["UnblendedCost", "UsageQuantity"],
@@ -97,7 +110,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
                 ],
             )
             results = []
-            for time_period in response.get("ResultsByTime", []):
+            for time_period in time_periods:
                 p_start = date.fromisoformat(time_period["TimePeriod"]["Start"])
                 p_end = date.fromisoformat(time_period["TimePeriod"]["End"])
                 for group in time_period.get("Groups", []):
@@ -122,7 +135,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
 
     def get_data_transfer_costs(self, start: date, end: date) -> list[DataTransferCost]:
         try:
-            response = self._ce.get_cost_and_usage(
+            time_periods = self._paginate_cost_and_usage(
                 TimePeriod={"Start": str(start), "End": str(end)},
                 Granularity="MONTHLY",
                 Metrics=["UnblendedCost", "UsageQuantity"],
@@ -135,7 +148,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
                 GroupBy=[{"Type": "DIMENSION", "Key": "USAGE_TYPE"}],
             )
             results = []
-            for time_period in response.get("ResultsByTime", []):
+            for time_period in time_periods:
                 p_start = date.fromisoformat(time_period["TimePeriod"]["Start"])
                 p_end = date.fromisoformat(time_period["TimePeriod"]["End"])
                 for group in time_period.get("Groups", []):

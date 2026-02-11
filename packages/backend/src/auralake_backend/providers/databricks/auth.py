@@ -58,6 +58,7 @@ class WarehouseResolver:
         self._client = client
         self._lock = threading.Lock()
         self._warehouses: list[dict[str, Any]] | None = None
+        self._resolved: dict[str | None, str] = {}
 
     def _discover(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -75,15 +76,24 @@ class WarehouseResolver:
             return self._warehouses
 
     def get_warehouse_id(self, configured_id: str | None = None) -> str:
-        """Priority: configured -> RUNNING PRO/SERVERLESS -> RUNNING any -> STOPPED -> any."""
+        """Priority: configured -> RUNNING PRO/SERVERLESS -> RUNNING any -> STOPPED -> any.
+
+        The resolved ID is cached per configured_id so the selection (and log
+        message) happens only once per resolver instance.
+        """
         if configured_id:
             return configured_id
+
+        cached = self._resolved.get(configured_id)
+        if cached is not None:
+            return cached
 
         warehouses = self._discover()
 
         # RUNNING PRO or SERVERLESS
         for wh in warehouses:
             if wh["state"] == "RUNNING" and wh["type"] in ("PRO", "SERVERLESS"):
+                self._resolved[configured_id] = wh["id"]
                 logger.info(
                     "warehouse_selected",
                     warehouse_id=wh["id"],
@@ -94,18 +104,21 @@ class WarehouseResolver:
         # RUNNING CLASSIC
         for wh in warehouses:
             if wh["state"] == "RUNNING" and wh["id"]:
+                self._resolved[configured_id] = wh["id"]
                 logger.info("warehouse_selected", warehouse_id=wh["id"], strategy="running_any")
                 return wh["id"]
 
         # STOPPED (Databricks auto-starts on SQL execution)
         for wh in warehouses:
             if wh["state"] == "STOPPED" and wh["id"]:
+                self._resolved[configured_id] = wh["id"]
                 logger.info("warehouse_selected", warehouse_id=wh["id"], strategy="stopped")
                 return wh["id"]
 
         # Any warehouse with an ID
         for wh in warehouses:
             if wh["id"]:
+                self._resolved[configured_id] = wh["id"]
                 logger.info("warehouse_selected", warehouse_id=wh["id"], strategy="fallback")
                 return wh["id"]
 

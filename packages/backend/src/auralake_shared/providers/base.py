@@ -117,6 +117,9 @@ class AbstractStorageClient(ABC):
     def get_table_stats(self, table_name: str) -> dict[str, Any]: ...
 
     @abstractmethod
+    def get_table_history(self, table_name: str, limit: int = 100) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
     def optimize_table(self, table_name: str) -> dict[str, Any]: ...
 
     @abstractmethod

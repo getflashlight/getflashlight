@@ -464,6 +464,19 @@ class UnityCatalogTableRecord(SQLModel, table=True):
     # DESCRIBE DETAIL error (NULL = success or not yet attempted)
     stats_error: str | None = Field(default=None)
 
+    # Maintenance history (from DESCRIBE HISTORY)
+    last_optimized_at: datetime | None = Field(default=None)
+    last_vacuumed_at: datetime | None = Field(default=None)
+    optimize_count_30d: int | None = Field(default=None)
+    vacuum_count_30d: int | None = Field(default=None)
+    last_optimize_removed_files: int | None = Field(default=None)
+    last_optimize_added_bytes: int | None = Field(
+        default=None, sa_column=sa.Column(sa.BigInteger, nullable=True)
+    )
+    uses_liquid_clustering: bool = Field(default=False)
+    uses_zordering: bool = Field(default=False)
+    history_error: str | None = Field(default=None)
+
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_seen_at: datetime = Field(default_factory=datetime.utcnow)

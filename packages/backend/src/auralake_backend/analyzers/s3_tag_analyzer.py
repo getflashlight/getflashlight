@@ -36,30 +36,24 @@ class S3TagAnalyzer(AbstractAnalyzer):
     name = "s3_tags"
 
     def analyze(self) -> AnalysisResult:
-        storage = self.context.provider.get_storage_client()
         recommendations: list[Recommendation] = []
 
-        # 1. Build table-location map from Delta table metadata
+        # 1. Build table-location map from pre-collected catalog table metadata
         table_locations: dict[str, str] = {}
-        try:
-            tables = storage.discover_all_tables()
-        except Exception as exc:
-            logger.warning("s3_tag_table_discovery_failed", error=str(exc))
-            tables = []
+        from auralake_backend.db.models import UnityCatalogTableRecord
 
-        for table_info in tables:
-            full_name = table_info.get("full_name", "")
-            if not full_name:
-                continue
-            try:
-                stats = storage.get_table_stats(full_name)
-                location = stats.get("location", "")
-                if location.startswith("s3://"):
-                    # Normalise: ensure trailing slash for prefix matching
-                    loc = location.rstrip("/") + "/"
-                    table_locations[loc] = full_name
-            except Exception:
-                pass
+        with Session(get_engine()) as session:  # type: ignore[no-untyped-call]
+            tables = session.exec(
+                select(UnityCatalogTableRecord).where(
+                    UnityCatalogTableRecord.location.isnot(None)  # type: ignore[union-attr]
+                )
+            ).all()
+
+        for table in tables:
+            location = table.location or ""
+            if location.startswith("s3://"):
+                loc = location.rstrip("/") + "/"
+                table_locations[loc] = table.full_name
 
         if not table_locations:
             return AnalysisResult(

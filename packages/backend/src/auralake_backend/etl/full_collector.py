@@ -1136,7 +1136,7 @@ class FullCollector:
                         provider=self.config.provider,
                         period_start=start,
                         period_end=end,
-                        service="storage",
+                        service=cost.service,
                         resource_id=cost.bucket_or_volume,
                         cost_usd=float(cost.cost_usd),
                         usage_quantity=cost.storage_gb,
@@ -1147,6 +1147,63 @@ class FullCollector:
                 count += 1
         except Exception as exc:
             logger.warning("storage_cost_collection_failed", error=str(exc))
+
+        try:
+            for xfer in infra_client.get_data_transfer_costs(start, end):
+                if self._cancel.is_set():
+                    break
+                session.add(
+                    InfraCostSnapshot(
+                        provider=self.config.provider,
+                        period_start=start,
+                        period_end=end,
+                        service="data_transfer",
+                        resource_id=xfer.source,
+                        cost_usd=float(xfer.cost_usd),
+                        usage_quantity=xfer.transfer_gb,
+                        usage_unit="gb",
+                        tags={},
+                    )
+                )
+                count += 1
+        except Exception as exc:
+            logger.warning("data_transfer_cost_collection_failed", error=str(exc))
+
+        now = datetime.now(UTC)
+        try:
+            for mapping in infra_client.map_platform_resources_to_infra():
+                if self._cancel.is_set():
+                    break
+                existing = session.exec(
+                    select(InfraResourceMapping).where(
+                        InfraResourceMapping.platform_resource_id == mapping.platform_resource_id,
+                        InfraResourceMapping.infra_resource_id == mapping.infra_resource_id,
+                    )
+                ).first()
+                if existing:
+                    existing.infra_resource_tags = mapping.tags
+                    existing.hourly_cost_usd = (
+                        float(mapping.hourly_cost_usd) if mapping.hourly_cost_usd else None
+                    )
+                    existing.last_seen_at = now
+                    session.add(existing)
+                else:
+                    session.add(
+                        InfraResourceMapping(
+                            provider=self.config.provider,
+                            platform_resource_type=mapping.platform_resource_type,
+                            platform_resource_id=mapping.platform_resource_id,
+                            infra_resource_type=mapping.infra_resource_type,
+                            infra_resource_id=mapping.infra_resource_id,
+                            infra_resource_tags=mapping.tags,
+                            hourly_cost_usd=(
+                                float(mapping.hourly_cost_usd) if mapping.hourly_cost_usd else None
+                            ),
+                            last_seen_at=now,
+                        )
+                    )
+        except Exception as exc:
+            logger.warning("infra_resource_mapping_collection_failed", error=str(exc))
 
         return count, end.isoformat()
 
@@ -1196,6 +1253,9 @@ class FullCollector:
         def _fetch_and_upsert(t: dict[str, Any]) -> bool:
             stats: dict[str, Any] = {}
             stats_error: str | None = None
+            history: list[dict[str, Any]] = []
+            history_error: str | None = None
+
             try:
                 stats = storage.get_table_stats(t["full_name"])
             except Exception as exc:
@@ -1206,8 +1266,20 @@ class FullCollector:
                     error=stats_error,
                 )
 
+            try:
+                history = storage.get_table_history(t["full_name"])
+            except Exception as exc:
+                history_error = str(exc)
+                logger.warning(
+                    "catalog_table_history_failed",
+                    table=t["full_name"],
+                    error=history_error,
+                )
+
             with Session(engine) as thread_session:
-                self._upsert_catalog_table(thread_session, t, stats, now, stats_error)
+                self._upsert_catalog_table(
+                    thread_session, t, stats, now, stats_error, history, history_error
+                )
                 thread_session.commit()
             return True
 
@@ -1229,6 +1301,93 @@ class FullCollector:
 
         return count, now.isoformat()
 
+    def _parse_maintenance_history(self, history: list[dict[str, Any]]) -> dict[str, Any]:
+        """Extract summary fields from DESCRIBE HISTORY rows (newest-first)."""
+        import json
+
+        last_optimized_at: datetime | None = None
+        last_vacuumed_at: datetime | None = None
+        optimize_count_30d = 0
+        vacuum_count_30d = 0
+        last_optimize_removed_files: int | None = None
+        last_optimize_added_bytes: int | None = None
+        uses_liquid_clustering = False
+        uses_zordering = False
+
+        cutoff_30d = datetime.now(UTC) - timedelta(days=30)
+
+        for row in history:
+            op_name = row.get("operation", "")
+            timestamp_raw = row.get("timestamp")
+            ts: datetime | None = None
+            if timestamp_raw:
+                try:
+                    ts = datetime.fromisoformat(str(timestamp_raw))
+                except (ValueError, TypeError):
+                    pass
+
+            if op_name == "OPTIMIZE":
+                if last_optimized_at is None:
+                    last_optimized_at = ts
+
+                    # Parse operationMetrics for compaction stats
+                    metrics = row.get("operationMetrics")
+                    if isinstance(metrics, str):
+                        try:
+                            metrics = json.loads(metrics)
+                        except (json.JSONDecodeError, TypeError):
+                            metrics = {}
+                    if isinstance(metrics, dict):
+                        try:
+                            last_optimize_removed_files = int(metrics.get("numRemovedFiles", 0))
+                        except (ValueError, TypeError):
+                            pass
+                        try:
+                            last_optimize_added_bytes = int(metrics.get("numAddedBytes", 0))
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Parse operationParameters for clustering info
+                    params = row.get("operationParameters")
+                    if isinstance(params, str):
+                        try:
+                            params = json.loads(params)
+                        except (json.JSONDecodeError, TypeError):
+                            params = {}
+                    if isinstance(params, dict):
+                        z_order_by = params.get("zOrderBy", "")
+                        if z_order_by and z_order_by != "[]":
+                            uses_zordering = True
+                        cluster_by = params.get("clusterBy", "")
+                        if cluster_by and cluster_by != "[]":
+                            uses_liquid_clustering = True
+
+                if ts and ts >= cutoff_30d:
+                    optimize_count_30d += 1
+
+            elif op_name == "VACUUM END":
+                if last_vacuumed_at is None:
+                    last_vacuumed_at = ts
+                if ts and ts >= cutoff_30d:
+                    vacuum_count_30d += 1
+
+            elif op_name == "VACUUM START":
+                # Count towards vacuum if no VACUUM END found
+                if ts and ts >= cutoff_30d:
+                    # Only count if not already counted via VACUUM END
+                    pass
+
+        return {
+            "last_optimized_at": last_optimized_at,
+            "last_vacuumed_at": last_vacuumed_at,
+            "optimize_count_30d": optimize_count_30d,
+            "vacuum_count_30d": vacuum_count_30d,
+            "last_optimize_removed_files": last_optimize_removed_files,
+            "last_optimize_added_bytes": last_optimize_added_bytes,
+            "uses_liquid_clustering": uses_liquid_clustering,
+            "uses_zordering": uses_zordering,
+        }
+
     def _upsert_catalog_table(
         self,
         session: Session,
@@ -1236,6 +1395,8 @@ class FullCollector:
         stats: dict[str, Any],
         now: datetime,
         stats_error: str | None = None,
+        history: list[dict[str, Any]] | None = None,
+        history_error: str | None = None,
     ) -> None:
         """Parse fields from discovery metadata + DESCRIBE DETAIL stats and upsert."""
         full_name = t["full_name"]
@@ -1288,6 +1449,9 @@ class FullCollector:
 
         owner = stats.get("owner") or t.get("owner")
 
+        # Parse maintenance history
+        maint = self._parse_maintenance_history(history or [])
+
         # Upsert by (connection_id, full_name)
         existing = session.exec(
             select(UnityCatalogTableRecord).where(
@@ -1312,6 +1476,15 @@ class FullCollector:
             existing.properties = properties
             existing.table_features = table_features
             existing.stats_error = stats_error
+            existing.last_optimized_at = maint["last_optimized_at"]
+            existing.last_vacuumed_at = maint["last_vacuumed_at"]
+            existing.optimize_count_30d = maint["optimize_count_30d"]
+            existing.vacuum_count_30d = maint["vacuum_count_30d"]
+            existing.last_optimize_removed_files = maint["last_optimize_removed_files"]
+            existing.last_optimize_added_bytes = maint["last_optimize_added_bytes"]
+            existing.uses_liquid_clustering = maint["uses_liquid_clustering"]
+            existing.uses_zordering = maint["uses_zordering"]
+            existing.history_error = history_error
             existing.last_seen_at = now
             session.add(existing)
         else:
@@ -1334,6 +1507,15 @@ class FullCollector:
                     properties=properties,
                     table_features=table_features,
                     stats_error=stats_error,
+                    last_optimized_at=maint["last_optimized_at"],
+                    last_vacuumed_at=maint["last_vacuumed_at"],
+                    optimize_count_30d=maint["optimize_count_30d"],
+                    vacuum_count_30d=maint["vacuum_count_30d"],
+                    last_optimize_removed_files=maint["last_optimize_removed_files"],
+                    last_optimize_added_bytes=maint["last_optimize_added_bytes"],
+                    uses_liquid_clustering=maint["uses_liquid_clustering"],
+                    uses_zordering=maint["uses_zordering"],
+                    history_error=history_error,
                     last_seen_at=now,
                 )
             )

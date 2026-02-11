@@ -27,6 +27,7 @@ from auralake_backend.db.models import (  # noqa: F401
     QueryPlan,
     RecommendationRecord,
     S3InventoryObject,
+    UnityCatalogTableRecord,
     WorkerCursor,
 )
 from sqlalchemy import engine_from_config, pool

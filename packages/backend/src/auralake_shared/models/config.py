@@ -121,6 +121,10 @@ class DeltaMaintenanceThresholds(BaseModel):
     optimize_threshold_gb: int = 1
     vacuum_retention_hours: int = 168
     small_file_threshold_mb: int = 32
+    optimize_stale_days: int = 7
+    vacuum_stale_days: int = 14
+    over_optimize_threshold: int = 3
+    min_table_size_gb_for_history: float = 0.1
 
 
 class JobConsolidationThresholds(BaseModel):
