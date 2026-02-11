@@ -10,7 +10,6 @@ from auralake_shared.models.config import AuraLakeConfig
 from auralake_shared.providers import register_provider
 from auralake_shared.providers.base import (
     AbstractComputeClient,
-    AbstractConfigFormat,
     AbstractCostClient,
     AbstractInfraCostClient,
     AbstractJobClient,
@@ -67,11 +66,5 @@ class DatabricksProvider(AbstractProvider):
         )
 
         return DatabricksQueryClient(self._db_config)
-
-    def get_config_format(self) -> AbstractConfigFormat:
-        from auralake_backend.providers.databricks.dab_parser import DABConfigFormat
-
-        return DABConfigFormat(self.config)
-
 
 register_provider("databricks", DatabricksProvider)

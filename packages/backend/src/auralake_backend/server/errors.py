@@ -9,7 +9,6 @@ from auralake_shared.core.exceptions import (
     DatabaseError,
     DuplicateConnectionError,
     ProviderNotFoundError,
-    SafetyError,
 )
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -17,7 +16,6 @@ from fastapi.responses import JSONResponse
 _STATUS_MAP: dict[type[AuraLakeError], int] = {
     ConfigError: 400,
     AuthenticationError: 401,
-    SafetyError: 403,
     ProviderNotFoundError: 404,
     DuplicateConnectionError: 409,
     DatabaseError: 503,

@@ -1,14 +1,13 @@
 """Abstract interfaces for lakehouse providers.
 
-Every platform (Databricks, Snowflake, Lake Formation) implements these
-interfaces so that analyzers, actions, and CLI commands remain platform-agnostic.
+Every platform implements these interfaces so that analyzers and CLI commands
+remain platform-agnostic.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import date
-from pathlib import Path
 from typing import Any
 
 from auralake_shared.models.billing import (
@@ -164,22 +163,6 @@ class AbstractQueryClient(ABC):
     def explain_query(self, sql: str) -> str: ...
 
 
-# ---- Config Format ----
-
-
-class AbstractConfigFormat(ABC):
-    """Platform-specific config file format (DABs for Databricks, etc.)."""
-
-    @abstractmethod
-    def parse(self, path: Path) -> dict[str, Any]: ...
-
-    @abstractmethod
-    def modify_job(self, path: Path, job_name: str, changes: dict[str, Any]) -> str: ...
-
-    @abstractmethod
-    def modify_cluster(self, path: Path, cluster_name: str, changes: dict[str, Any]) -> str: ...
-
-
 # ---- Provider ----
 
 
@@ -208,6 +191,3 @@ class AbstractProvider(ABC):
 
     @abstractmethod
     def get_query_client(self) -> AbstractQueryClient: ...
-
-    @abstractmethod
-    def get_config_format(self) -> AbstractConfigFormat: ...

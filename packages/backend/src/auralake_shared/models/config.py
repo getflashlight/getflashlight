@@ -169,14 +169,6 @@ class ThresholdsConfig(BaseModel):
     )
 
 
-class RequiredTag(BaseModel):
-    key: str
-
-
-class TagPolicyConfig(BaseModel):
-    required_tags: list[RequiredTag] = Field(default_factory=list)
-
-
 class RuleConfig(BaseModel):
     enabled: bool = True
     thresholds: dict[str, float | int | str] = Field(default_factory=dict)
@@ -215,13 +207,6 @@ class RulesConfig(BaseModel):
     untagged_s3_objects: RuleConfig = Field(default_factory=RuleConfig)
 
 
-class AutomationConfig(BaseModel):
-    max_auto_risk_level: str = "medium"
-    bulk_action_threshold: int = 5
-    protected_clusters: list[str] = Field(default_factory=list)
-    protected_jobs: list[str] = Field(default_factory=list)
-
-
 class AgentConfig(BaseModel):
     interval_seconds: int = 300
     query_lookback_hours: int = 24
@@ -245,6 +230,4 @@ class AuraLakeConfig(BaseModel):
     agent: AgentConfig = Field(default_factory=AgentConfig)
     thresholds: ThresholdsConfig = Field(default_factory=ThresholdsConfig)
     rules: RulesConfig = Field(default_factory=RulesConfig)
-    tag_policy: TagPolicyConfig = Field(default_factory=TagPolicyConfig)
-    automation: AutomationConfig = Field(default_factory=AutomationConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)

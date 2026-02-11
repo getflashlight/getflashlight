@@ -12,12 +12,10 @@ from alembic import context
 from auralake_backend.db.models import (  # noqa: F401
     AnalysisRun,
     ApiKey,
-    AuditLog,
     BillingRecord,
     ClusterPolicyRecord,
     CollectionRun,
     ComputeResourceRecord,
-    ConsolidationGroupRecord,
     InfraCostSnapshot,
     InfraResourceMapping,
     JobProfileRecord,

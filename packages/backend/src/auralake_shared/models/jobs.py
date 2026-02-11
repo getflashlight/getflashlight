@@ -23,12 +23,3 @@ class JobProfile(BaseModel):
     consolidation_group_id: str | None = None
 
 
-class ConsolidationGroup(BaseModel):
-    group_name: str
-    workspace_id: str | None = None
-    job_ids: list[str] = Field(default_factory=list)
-    recommended_cluster_config: dict[str, Any] = Field(default_factory=dict)
-    recommended_dab_changes: list[dict[str, Any]] = Field(default_factory=list)
-    estimated_monthly_savings_usd: float = 0.0
-    status: str = "proposed"
-    pr_url: str | None = None

@@ -86,29 +86,6 @@ class RecommendationRecord(SQLModel, table=True):
 
 
 # ---------------------------------------------------------------------------
-# AuditLog — All actions taken / attempted
-# ---------------------------------------------------------------------------
-class AuditLog(SQLModel, table=True):
-    __tablename__ = "audit_log"
-    __table_args__ = {"schema": "core"}
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    recommendation_id: uuid.UUID | None = Field(default=None, foreign_key="core.recommendations.id")
-    action_type: str
-    resource_id: str
-    workspace_id: str | None = Field(default=None)
-    provider: str
-    automation_level: str
-    before_state: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
-    after_state: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
-    status: str  # started / completed / failed / denied / skipped
-    error_message: str | None = Field(default=None)
-    pr_url: str | None = Field(default=None)
-    executed_by: str | None = Field(default=None)
-    executed_at: datetime
-
-
-# ---------------------------------------------------------------------------
 # JobProfileRecord — Cached job analysis
 # ---------------------------------------------------------------------------
 class JobProfileRecord(SQLModel, table=True):
@@ -130,29 +107,7 @@ class JobProfileRecord(SQLModel, table=True):
     dab_file_path: str | None = Field(default=None)
     dab_job_key: str | None = Field(default=None)
     is_portable: bool
-    consolidation_group_id: uuid.UUID | None = Field(
-        default=None, foreign_key="core.consolidation_groups.id"
-    )
     last_analyzed_at: datetime
-
-
-# ---------------------------------------------------------------------------
-# ConsolidationGroupRecord — Job consolidation recommendations
-# ---------------------------------------------------------------------------
-class ConsolidationGroupRecord(SQLModel, table=True):
-    __tablename__ = "consolidation_groups"
-    __table_args__ = {"schema": "core"}
-
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    workspace_id: str | None = Field(default=None)
-    group_name: str
-    recommended_cluster_config: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
-    recommended_dab_changes: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
-    estimated_monthly_savings_usd: float
-    job_count: int
-    status: str
-    pr_url: str | None = Field(default=None)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ---------------------------------------------------------------------------

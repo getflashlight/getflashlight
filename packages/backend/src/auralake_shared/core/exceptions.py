@@ -49,25 +49,5 @@ class DatabaseError(AuraLakeError):
     """Raised for database connection or query failures."""
 
 
-class AutomationError(AuraLakeError):
-    """Raised for automation engine failures."""
-
-
-class SafetyError(AutomationError):
-    """Raised when an action exceeds configured safety rails."""
-
-
-class GitIntegrationError(AuraLakeError):
-    """Raised for git/GitHub integration failures."""
-
-
-class DABParserError(AuraLakeError):
-    """Raised when Databricks Asset Bundle parsing fails."""
-
-
-class AnalyzerError(AuraLakeError):
-    """Raised when a cost/usage analyzer encounters an error."""
-
-
 class DuplicateConnectionError(AuraLakeError):
     """Raised when a connection with the same (provider, name) already exists."""
