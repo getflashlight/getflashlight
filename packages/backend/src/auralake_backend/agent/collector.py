@@ -88,8 +88,6 @@ class Collector:
                 except Exception as exc:
                     logger.warning("explain_failed", query_id=query_id, error=str(exc))
 
-            # Update agent state
-            self._update_state(len(queries), plans_collected)
             logger.info("collection_run_completed", queries=len(queries), plans=plans_collected)
 
         except Exception as exc:
@@ -155,23 +153,6 @@ class Collector:
                 session.commit()
         except Exception as exc:
             logger.warning("plan_store_failed", query_id=query.get("query_id"), error=str(exc))
-
-    def _update_state(self, queries_count: int, plans_count: int) -> None:
-        """Update agent state in the database."""
-        try:
-            from auralake_backend.db.engine import get_session
-            from auralake_backend.db.repositories import AgentStateRepository
-
-            with get_session() as session:
-                repo = AgentStateRepository(session)
-                state = repo.get_or_create("default")
-                state.queries_collected = (state.queries_collected or 0) + queries_count
-                state.plans_collected = (state.plans_collected or 0) + plans_count
-                state.last_run_at = datetime.utcnow()
-                state.status = "running"
-                repo.update(state)
-        except Exception as exc:
-            logger.warning("state_update_failed", error=str(exc))
 
     async def run_async(self) -> None:
         """Async collection loop for use as a server background task.

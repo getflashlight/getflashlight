@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
+import structlog
 from auralake_shared.core.exceptions import AuthenticationError
 from auralake_shared.models.config import (
     DatabricksAWSConfig,
@@ -12,6 +14,8 @@ from auralake_shared.models.config import (
 )
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.config import Config
+
+logger = structlog.get_logger(__name__)
 
 
 def get_workspace_client(
@@ -45,6 +49,88 @@ def _resolve_workspace(config: DatabricksConfig, name: str | None) -> Databricks
     if config.workspaces:
         return next(iter(config.workspaces.values()))
     raise AuthenticationError("databricks", "No workspaces configured")
+
+
+class WarehouseResolver:
+    """Caches warehouse discovery per workspace. Thread-safe."""
+
+    def __init__(self, client: WorkspaceClient) -> None:
+        self._client = client
+        self._lock = threading.Lock()
+        self._warehouses: list[dict[str, Any]] | None = None
+
+    def _discover(self) -> list[dict[str, Any]]:
+        with self._lock:
+            if self._warehouses is not None:
+                return self._warehouses
+            self._warehouses = []
+            for wh in self._client.warehouses.list():
+                self._warehouses.append(
+                    {
+                        "id": wh.id,
+                        "state": wh.state.value if wh.state else None,
+                        "type": wh.warehouse_type.value if wh.warehouse_type else None,
+                    }
+                )
+            return self._warehouses
+
+    def get_warehouse_id(self, configured_id: str | None = None) -> str:
+        """Priority: configured -> RUNNING PRO/SERVERLESS -> RUNNING any -> STOPPED -> any."""
+        if configured_id:
+            return configured_id
+
+        warehouses = self._discover()
+
+        # RUNNING PRO or SERVERLESS
+        for wh in warehouses:
+            if wh["state"] == "RUNNING" and wh["type"] in ("PRO", "SERVERLESS"):
+                logger.info(
+                    "warehouse_selected",
+                    warehouse_id=wh["id"],
+                    strategy="running_pro_serverless",
+                )
+                return wh["id"]
+
+        # RUNNING CLASSIC
+        for wh in warehouses:
+            if wh["state"] == "RUNNING" and wh["id"]:
+                logger.info("warehouse_selected", warehouse_id=wh["id"], strategy="running_any")
+                return wh["id"]
+
+        # STOPPED (Databricks auto-starts on SQL execution)
+        for wh in warehouses:
+            if wh["state"] == "STOPPED" and wh["id"]:
+                logger.info("warehouse_selected", warehouse_id=wh["id"], strategy="stopped")
+                return wh["id"]
+
+        # Any warehouse with an ID
+        for wh in warehouses:
+            if wh["id"]:
+                logger.info("warehouse_selected", warehouse_id=wh["id"], strategy="fallback")
+                return wh["id"]
+
+        raise AuthenticationError("databricks", "No SQL warehouse found in workspace")
+
+
+_resolver_cache: dict[str, WarehouseResolver] = {}
+_resolver_lock = threading.Lock()
+
+
+def get_warehouse_id(client: WorkspaceClient, configured_id: str | None = None) -> str:
+    """Return a SQL warehouse ID with caching. Same signature — backward compatible."""
+    host = client.config.host or ""
+    with _resolver_lock:
+        resolver = _resolver_cache.get(host)
+        if resolver is None:
+            resolver = WarehouseResolver(client)
+            _resolver_cache[host] = resolver
+    return resolver.get_warehouse_id(configured_id)
+
+
+def clear_warehouse_cache() -> None:
+    """Clear the resolver cache. For test isolation."""
+    with _resolver_lock:
+        _resolver_cache.clear()
 
 
 def get_boto3_session(

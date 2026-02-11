@@ -8,7 +8,7 @@ from auralake_shared.core.exceptions import APIError
 from auralake_shared.models.config import DatabricksConfig
 from auralake_shared.providers.base import AbstractQueryClient
 
-from auralake_backend.providers.databricks.auth import get_workspace_client
+from auralake_backend.providers.databricks.auth import get_warehouse_id, get_workspace_client
 
 
 class DatabricksQueryClient(AbstractQueryClient):
@@ -16,9 +16,7 @@ class DatabricksQueryClient(AbstractQueryClient):
         self._config = config
         self._client = get_workspace_client(config)
 
-    def _fetch_query_history(
-        self, filter_by: Any, limit: int
-    ) -> list[dict[str, Any]]:
+    def _fetch_query_history(self, filter_by: Any, limit: int) -> list[dict[str, Any]]:
         """Paginate through query_history.list and return flattened results."""
         results: list[dict[str, Any]] = []
         page_token: str | None = None
@@ -51,7 +49,7 @@ class DatabricksQueryClient(AbstractQueryClient):
 
         return results
 
-    def get_query_history(self, hours: int = 24, limit: int = 1000) -> list[dict[str, Any]]:
+    def get_query_history(self, hours: int = 24, limit: int = 500_000) -> list[dict[str, Any]]:
         """Fetch recent query history from Databricks."""
         try:
             from datetime import datetime, timedelta
@@ -73,7 +71,7 @@ class DatabricksQueryClient(AbstractQueryClient):
         except Exception as exc:
             raise APIError("databricks", f"Failed to fetch query history: {exc}") from exc
 
-    def get_query_history_since(self, since_ms: int, limit: int = 1000) -> list[dict[str, Any]]:
+    def get_query_history_since(self, since_ms: int, limit: int = 500_000) -> list[dict[str, Any]]:
         """Fetch queries that ended after ``since_ms`` (epoch milliseconds)."""
         try:
             from datetime import datetime
@@ -100,17 +98,20 @@ class DatabricksQueryClient(AbstractQueryClient):
         """Execute a SQL query via statement execution API."""
         try:
             for ws_name, ws_config in self._config.workspaces.items():
-                if ws_config.sql_warehouse_id:
+                try:
                     client = get_workspace_client(self._config, ws_name)
+                    wh_id = get_warehouse_id(client, ws_config.sql_warehouse_id)
                     result = client.statement_execution.execute_statement(
-                        warehouse_id=ws_config.sql_warehouse_id,
+                        warehouse_id=wh_id,
                         statement=sql,
                     )
                     if result.result and result.result.data_array:
                         columns = [col.name for col in (result.manifest.schema.columns or [])]
                         return [dict(zip(columns, row)) for row in result.result.data_array]
                     return []
-            raise APIError("databricks", "No workspace with sql_warehouse_id configured")
+                except Exception:
+                    continue
+            raise APIError("databricks", "No workspace with a reachable SQL warehouse")
         except APIError:
             raise
         except Exception as exc:

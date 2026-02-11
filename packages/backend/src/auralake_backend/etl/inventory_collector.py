@@ -101,7 +101,7 @@ class InventoryCollector:
 
             for job in jobs:
                 try:
-                    runs = job_client.get_job_runs(job.job_id, limit=10)
+                    runs = job_client.get_job_runs(job.job_id)
 
                     avg_duration = 0.0
                     if runs:

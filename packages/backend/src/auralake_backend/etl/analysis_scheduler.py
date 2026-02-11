@@ -7,11 +7,11 @@ tracking and the dashboard.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from auralake_shared.core.context import ExecutionContext
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from auralake_backend.analyzers.cluster_analyzer import ClusterAnalyzer
 from auralake_backend.analyzers.cost_analyzer import CostAnalyzer
@@ -50,6 +50,22 @@ class AnalysisScheduler:
 
         Returns a dict mapping analyzer name → recommendation count.
         """
+        # Clean up stale analysis runs that have been "running" for over 1 hour
+        cutoff = datetime.now(UTC) - timedelta(hours=1)
+        stale_runs = self.session.exec(
+            select(AnalysisRun)
+            .where(AnalysisRun.status == "running")
+            .where(AnalysisRun.started_at < cutoff)
+        ).all()
+        for run in stale_runs:
+            run.status = "failed"
+            run.summary = {"error": "Timed out — marked stale after 1 hour"}
+            run.completed_at = datetime.now(UTC)
+            self.session.add(run)
+        if stale_runs:
+            self.session.commit()
+            logger.warning("stale_analysis_runs_cleaned", count=len(stale_runs))
+
         results: dict[str, int] = {}
 
         for analyzer_cls in SCHEDULED_ANALYZERS:

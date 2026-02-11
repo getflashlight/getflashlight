@@ -276,6 +276,39 @@ Each lakehouse platform implements a common set of interfaces. v1 ships with a f
 | Storage optimization | Delta OPTIMIZE/VACUUM | Reclustering | S3 lifecycle |
 | Config-as-code | DABs (databricks.yml) | Terraform | Terraform/CDK |
 
+## Database Schema
+
+Tables are organized into two PostgreSQL schemas:
+
+### `core` — Application state
+
+| Table | Purpose | Populated By |
+|-------|---------|-------------|
+| `provider_connections` | Encrypted provider credentials | `POST /connections` API |
+| `api_keys` | SHA-256 hashed API keys for auth | `auralake-generate-key` / auto-bootstrap |
+| `collection_runs` | Tracks each collection execution | `POST /agent/collect/{id}` |
+| `worker_cursors` | Per-worker watermarks for incremental collection | Collection pipeline |
+| `analysis_runs` | Analysis execution history | `AnalysisScheduler` (post-collection) |
+| `recommendations` | Generated cost-saving recommendations | Analyzers |
+| `consolidation_groups` | Job consolidation groups | Job analyzer |
+| `audit_log` | Actions taken on recommendations | Automation engine |
+
+### `inventory` — Collected infrastructure data
+
+| Table | Purpose | Populated By |
+|-------|---------|-------------|
+| `billing_records` | Databricks DBU billing (`system.billing.usage`) | `billing` worker |
+| `job_profiles` | Current job metadata (full sync) | `jobs` worker |
+| `job_runs` | Historical job run records (incremental) | `job_runs` worker |
+| `query_history` | Query history from Databricks API | `query_history` worker |
+| `query_plans` | Parsed Spark EXPLAIN plans + anti-patterns | `query_plans` worker |
+| `unity_catalog_tables` | Unity Catalog table metadata + stats | `catalog_tables` worker |
+| `cluster_policies` | Cluster policy definitions (full sync) | `policies` worker |
+| `infra_cost_snapshots` | AWS infrastructure costs (optional) | `infra_costs` worker |
+| `compute_resources` | Full compute config (clusters + SQL warehouses) | `compute` worker |
+| `infra_resource_mappings` | Databricks clusters → AWS EC2 mapping | `compute` worker |
+| `s3_inventory_objects` | S3 inventory for orphan detection | Inventory collector |
+
 ## Development
 
 ```bash

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, date, datetime, timedelta
 from threading import Event, Semaphore
 from typing import Any
@@ -22,19 +22,21 @@ from auralake_backend.db.models import (
     BillingRecord,
     ClusterPolicyRecord,
     CollectionRun,
+    ComputeResourceRecord,
     InfraCostSnapshot,
     InfraResourceMapping,
     JobProfileRecord,
     JobRunRecord,
     QueryHistoryRecord,
     QueryPlan,
+    UnityCatalogTableRecord,
     WorkerCursor,
 )
 
 logger = structlog.get_logger(__name__)
 
 # Workers that always do a full sync (small datasets)
-_FULL_SYNC_WORKERS = {"clusters", "jobs", "policies"}
+_FULL_SYNC_WORKERS = {"compute", "jobs", "policies", "catalog_tables"}
 
 # Default lookback windows for first run
 _DEFAULT_LOOKBACK_DAYS = 90
@@ -45,7 +47,7 @@ class FullCollector:
     """Orchestrates parallel data collection from a Databricks connection."""
 
     WORKER_NAMES = [
-        "clusters",
+        "compute",
         "jobs",
         "job_runs",
         "billing",
@@ -53,6 +55,7 @@ class FullCollector:
         "query_plans",
         "policies",
         "infra_costs",
+        "catalog_tables",
     ]
 
     def __init__(
@@ -75,8 +78,8 @@ class FullCollector:
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             # Wave 1: independent workers
-            f_clusters = pool.submit(
-                self._run_worker, run_id, "clusters", worker_statuses, sql_semaphore
+            f_compute = pool.submit(
+                self._run_worker, run_id, "compute", worker_statuses, sql_semaphore
             )
             f_jobs = pool.submit(self._run_worker, run_id, "jobs", worker_statuses)
             f_billing = pool.submit(
@@ -85,6 +88,9 @@ class FullCollector:
             f_queries = pool.submit(self._run_worker, run_id, "query_history", worker_statuses)
             f_policies = pool.submit(self._run_worker, run_id, "policies", worker_statuses)
             f_infra = pool.submit(self._run_worker, run_id, "infra_costs", worker_statuses)
+            f_tables = pool.submit(
+                self._run_worker, run_id, "catalog_tables", worker_statuses, sql_semaphore
+            )
 
             # Wave 2: dependent workers
             f_job_runs = pool.submit(self._after, f_jobs, run_id, "job_runs", worker_statuses)
@@ -99,12 +105,13 @@ class FullCollector:
 
             # Wait for all
             for f in [
-                f_clusters,
+                f_compute,
                 f_jobs,
                 f_billing,
                 f_queries,
                 f_policies,
                 f_infra,
+                f_tables,
                 f_job_runs,
                 f_plans,
             ]:
@@ -120,7 +127,11 @@ class FullCollector:
         """Run a single worker (for retry). Returns the worker status dict."""
         worker_statuses: dict[str, dict[str, Any]] = {worker_name: {"status": "pending"}}
         sql_semaphore = Semaphore(2)
-        sem = sql_semaphore if worker_name in ("clusters", "billing", "query_plans") else None
+        sem = (
+            sql_semaphore
+            if worker_name in ("compute", "billing", "query_plans", "catalog_tables")
+            else None
+        )
         self._run_worker(run_id, worker_name, worker_statuses, sem)
         return worker_statuses
 
@@ -249,7 +260,7 @@ class FullCollector:
     ) -> tuple[int, str | None]:
         """Route to the correct worker method. Returns (count, new_cursor)."""
         dispatch = {
-            "clusters": self._collect_clusters,
+            "compute": self._collect_compute,
             "jobs": self._collect_jobs,
             "job_runs": self._collect_job_runs,
             "billing": self._collect_billing,
@@ -257,6 +268,7 @@ class FullCollector:
             "query_plans": self._collect_query_plans,
             "policies": self._collect_policies,
             "infra_costs": self._collect_infra_costs,
+            "catalog_tables": self._collect_catalog_tables,
         }
         return dispatch[worker_name](session, cursor)
 
@@ -304,19 +316,163 @@ class FullCollector:
             logger.warning("run_status_update_failed", error=str(exc))
 
     # ------------------------------------------------------------------
-    # Worker: Clusters (full sync, upsert)
+    # Worker: Compute (full sync — clusters + warehouses + infra mappings)
     # ------------------------------------------------------------------
 
-    def _collect_clusters(self, session: Session, cursor: str | None) -> tuple[int, str | None]:
+    def _collect_compute(self, session: Session, cursor: str | None) -> tuple[int, str | None]:
         from auralake_shared.providers import get_provider
 
         provider = get_provider(self.config.provider, self.config)
         compute = provider.get_compute_client()
-        clusters = compute.list_clusters()
-        count = 0
         now = datetime.now(UTC)
+        count = 0
 
-        for cluster in clusters:
+        # Phase 1: All clusters (all states) → compute_resources
+        clusters_with_config = compute.list_all_clusters_with_config()
+        running_clusters = []
+
+        for cluster, raw_config in clusters_with_config:
+            if self._cancel.is_set():
+                break
+            try:
+                resource_type = (
+                    "job_cluster" if cluster.cluster_source == "JOB" else "all_purpose_cluster"
+                )
+                existing = session.exec(
+                    select(ComputeResourceRecord).where(
+                        ComputeResourceRecord.connection_id == self.connection_id,
+                        ComputeResourceRecord.resource_type == resource_type,
+                        ComputeResourceRecord.resource_id == cluster.cluster_id,
+                    )
+                ).first()
+
+                if existing:
+                    existing.resource_name = cluster.cluster_name
+                    existing.state = cluster.state
+                    existing.creator = cluster.creator
+                    existing.driver_node_type = cluster.driver_node_type
+                    existing.worker_node_type = cluster.worker_node_type
+                    existing.num_workers = cluster.num_workers
+                    existing.min_workers = cluster.min_workers
+                    existing.max_workers = cluster.max_workers
+                    existing.autoscale = cluster.autoscale
+                    existing.spot_enabled = cluster.spot_enabled
+                    existing.spot_fallback = cluster.spot_fallback
+                    existing.autotermination_minutes = cluster.autotermination_minutes
+                    existing.cluster_source = cluster.cluster_source
+                    existing.tags = cluster.tags
+                    existing.spark_config = raw_config.get("spark_conf", {})
+                    existing.config = raw_config
+                    existing.started_at = cluster.started_at
+                    existing.last_activity_at = cluster.last_activity_at
+                    existing.last_seen_at = now
+                    session.add(existing)
+                else:
+                    session.add(
+                        ComputeResourceRecord(
+                            connection_id=self.connection_id,
+                            workspace_id=cluster.workspace_id,
+                            resource_type=resource_type,
+                            resource_id=cluster.cluster_id,
+                            resource_name=cluster.cluster_name,
+                            state=cluster.state,
+                            creator=cluster.creator,
+                            driver_node_type=cluster.driver_node_type,
+                            worker_node_type=cluster.worker_node_type,
+                            num_workers=cluster.num_workers,
+                            min_workers=cluster.min_workers,
+                            max_workers=cluster.max_workers,
+                            autoscale=cluster.autoscale,
+                            spot_enabled=cluster.spot_enabled,
+                            spot_fallback=cluster.spot_fallback,
+                            autotermination_minutes=cluster.autotermination_minutes,
+                            cluster_source=cluster.cluster_source,
+                            tags=cluster.tags,
+                            spark_config=raw_config.get("spark_conf", {}),
+                            config=raw_config,
+                            started_at=cluster.started_at,
+                            last_activity_at=cluster.last_activity_at,
+                            last_seen_at=now,
+                        )
+                    )
+                count += 1
+
+                if cluster.state in ("RUNNING", "PENDING", "RESTARTING", "RESIZING"):
+                    running_clusters.append(cluster)
+            except Exception as exc:
+                logger.warning(
+                    "cluster_collect_failed",
+                    cluster_id=cluster.cluster_id,
+                    error=str(exc),
+                )
+
+        # Phase 2: SQL warehouses → compute_resources
+        try:
+            warehouses = compute.list_warehouses()
+            for wh in warehouses:
+                if self._cancel.is_set():
+                    break
+                try:
+                    wh_id = wh["warehouse_id"]
+                    existing = session.exec(
+                        select(ComputeResourceRecord).where(
+                            ComputeResourceRecord.connection_id == self.connection_id,
+                            ComputeResourceRecord.resource_type == "sql_warehouse",
+                            ComputeResourceRecord.resource_id == wh_id,
+                        )
+                    ).first()
+
+                    spot_enabled = wh.get("spot_instance_policy") in (
+                        "COST_OPTIMIZED",
+                        "RELIABILITY_OPTIMIZED",
+                    )
+
+                    if existing:
+                        existing.resource_name = wh["name"]
+                        existing.state = wh["state"]
+                        existing.creator = wh.get("creator_name")
+                        existing.warehouse_type = wh.get("warehouse_type")
+                        existing.warehouse_size = wh.get("cluster_size")
+                        existing.autotermination_minutes = wh.get("auto_stop_mins")
+                        existing.min_workers = wh.get("min_num_clusters")
+                        existing.max_workers = wh.get("max_num_clusters")
+                        existing.spot_enabled = spot_enabled
+                        existing.tags = wh.get("tags", {})
+                        existing.config = wh
+                        existing.last_seen_at = now
+                        session.add(existing)
+                    else:
+                        session.add(
+                            ComputeResourceRecord(
+                                connection_id=self.connection_id,
+                                resource_type="sql_warehouse",
+                                resource_id=wh_id,
+                                resource_name=wh["name"],
+                                state=wh["state"],
+                                creator=wh.get("creator_name"),
+                                warehouse_type=wh.get("warehouse_type"),
+                                warehouse_size=wh.get("cluster_size"),
+                                autotermination_minutes=wh.get("auto_stop_mins"),
+                                min_workers=wh.get("min_num_clusters"),
+                                max_workers=wh.get("max_num_clusters"),
+                                spot_enabled=spot_enabled,
+                                tags=wh.get("tags", {}),
+                                config=wh,
+                                last_seen_at=now,
+                            )
+                        )
+                    count += 1
+                except Exception as exc:
+                    logger.warning(
+                        "warehouse_collect_failed",
+                        warehouse_id=wh.get("warehouse_id"),
+                        error=str(exc),
+                    )
+        except Exception as exc:
+            logger.warning("warehouse_list_failed", error=str(exc))
+
+        # Phase 3: Keep existing infra_resource_mappings for RUNNING clusters
+        for cluster in running_clusters:
             if self._cancel.is_set():
                 break
             try:
@@ -327,7 +483,6 @@ class FullCollector:
                     else None
                 )
 
-                # Upsert by platform_resource_id
                 existing = session.exec(
                     select(InfraResourceMapping).where(
                         InfraResourceMapping.platform_resource_id == cluster.cluster_id,
@@ -354,10 +509,9 @@ class FullCollector:
                             last_seen_at=now,
                         )
                     )
-                count += 1
             except Exception as exc:
                 logger.warning(
-                    "cluster_collect_failed",
+                    "cluster_utilization_failed",
                     cluster_id=cluster.cluster_id,
                     error=str(exc),
                 )
@@ -381,7 +535,7 @@ class FullCollector:
             if self._cancel.is_set():
                 break
             try:
-                runs = job_client.get_job_runs(job.job_id, limit=10)
+                runs = job_client.get_job_runs(job.job_id)
                 avg_duration = 0.0
                 if runs:
                     durations = [
@@ -632,6 +786,23 @@ class FullCollector:
     # Worker: Query Plans (piggybacks on query_history cursor)
     # ------------------------------------------------------------------
 
+    # Statements that cannot be EXPLAIN'd — skip to avoid wasted API calls
+    _SKIP_PREFIXES = (
+        "SHOW",
+        "DESCRIBE",
+        "DESC",
+        "USE",
+        "SET",
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "GRANT",
+        "REVOKE",
+        "EXPLAIN",
+        "CACHE",
+        "UNCACHE",
+    )
+
     def _collect_query_plans(self, session: Session, cursor: str | None) -> tuple[int, str | None]:
         from auralake_shared.providers import get_provider
 
@@ -641,32 +812,46 @@ class FullCollector:
         query_client = provider.get_query_client()
         parser = PlanParser()
 
-        # Find queries that don't have plans yet
-        recent_queries = session.exec(
+        # Incremental: only process queries created since the last cursor
+        query_stmt = (
             select(QueryHistoryRecord)
             .where(QueryHistoryRecord.connection_id == self.connection_id)
             .where(QueryHistoryRecord.query_text.isnot(None))  # type: ignore[union-attr]
-            .order_by(QueryHistoryRecord.created_at.desc())  # type: ignore[union-attr]
-            .limit(200)
-        ).all()
+            .order_by(QueryHistoryRecord.created_at.asc())  # type: ignore[attr-defined]
+        )
+        if cursor:
+            cursor_dt = datetime.fromisoformat(cursor)
+            query_stmt = query_stmt.where(QueryHistoryRecord.created_at >= cursor_dt)
 
-        existing_plan_query_ids = set()
+        recent_queries = session.exec(query_stmt).all()
+
+        # Filter out queries that already have plans
+        existing_plan_query_ids: set[str] = set()
         if recent_queries:
             query_ids = [q.query_id for q in recent_queries]
-            existing_plans = session.exec(
-                select(QueryPlan.query_id).where(
-                    QueryPlan.query_id.in_(query_ids)  # type: ignore[union-attr]
-                )
-            ).all()
-            existing_plan_query_ids = set(existing_plans)
+            # Check in batches to avoid overly long IN clauses
+            for i in range(0, len(query_ids), 500):
+                batch = query_ids[i : i + 500]
+                existing_plans = session.exec(
+                    select(QueryPlan.query_id).where(
+                        QueryPlan.query_id.in_(batch)  # type: ignore[attr-defined]
+                    )
+                ).all()
+                existing_plan_query_ids.update(existing_plans)
 
         count = 0
+        flush_interval = 100
         for q in recent_queries:
             if self._cancel.is_set():
                 break
             if q.query_id in existing_plan_query_ids:
                 continue
             if not q.query_text:
+                continue
+
+            # Skip non-EXPLAIN-able statements
+            trimmed = q.query_text.strip().upper()
+            if any(trimmed.startswith(p) for p in self._SKIP_PREFIXES):
                 continue
 
             try:
@@ -692,6 +877,12 @@ class FullCollector:
                     )
                 )
                 count += 1
+
+                # Flush to DB periodically for progress visibility
+                if count % flush_interval == 0:
+                    session.flush()
+                    logger.info("query_plans_progress", count=count)
+
             except Exception as exc:
                 logger.warning(
                     "query_plan_collect_failed",
@@ -812,3 +1003,191 @@ class FullCollector:
             logger.warning("storage_cost_collection_failed", error=str(exc))
 
         return count, end.isoformat()
+
+    # ------------------------------------------------------------------
+    # Worker: Catalog Tables (full sync, upsert)
+    # ------------------------------------------------------------------
+
+    def _collect_catalog_tables(
+        self, session: Session, cursor: str | None
+    ) -> tuple[int, str | None]:
+        from auralake_shared.providers import get_provider
+
+        provider = get_provider(self.config.provider, self.config)
+        storage = provider.get_storage_client()
+        tables = storage.discover_all_tables()
+        now = datetime.now(UTC)
+
+        # Split: only Delta tables need DESCRIBE DETAIL for physical stats
+        delta_tables = []
+        non_delta_tables = []
+        for t in tables:
+            fmt = (t.get("data_source_format") or "").upper()
+            if fmt == "DELTA" or not fmt:
+                delta_tables.append(t)
+            else:
+                non_delta_tables.append(t)
+
+        logger.info(
+            "catalog_tables_discovered",
+            total=len(tables),
+            delta=len(delta_tables),
+            non_delta=len(non_delta_tables),
+        )
+
+        count = 0
+
+        # Non-Delta tables: upsert with discovery metadata only (no DESCRIBE DETAIL)
+        for t in non_delta_tables:
+            if self._cancel.is_set():
+                break
+            self._upsert_catalog_table(session, t, {}, now)
+            count += 1
+
+        # Delta tables: fetch stats + upsert in parallel, each thread owns its session
+        engine = get_engine()
+
+        def _fetch_and_upsert(t: dict[str, Any]) -> bool:
+            stats: dict[str, Any] = {}
+            stats_error: str | None = None
+            try:
+                stats = storage.get_table_stats(t["full_name"])
+            except Exception as exc:
+                stats_error = str(exc)
+                logger.warning(
+                    "catalog_table_stats_failed",
+                    table=t["full_name"],
+                    error=stats_error,
+                )
+
+            with Session(engine) as thread_session:
+                self._upsert_catalog_table(thread_session, t, stats, now, stats_error)
+                thread_session.commit()
+            return True
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(_fetch_and_upsert, t): t for t in delta_tables}
+            for future in as_completed(futures):
+                if self._cancel.is_set():
+                    break
+                try:
+                    future.result()
+                    count += 1
+                except Exception as exc:
+                    t = futures[future]
+                    logger.warning(
+                        "catalog_table_collect_failed",
+                        table=t["full_name"],
+                        error=str(exc),
+                    )
+
+        return count, now.isoformat()
+
+    def _upsert_catalog_table(
+        self,
+        session: Session,
+        t: dict[str, Any],
+        stats: dict[str, Any],
+        now: datetime,
+        stats_error: str | None = None,
+    ) -> None:
+        """Parse fields from discovery metadata + DESCRIBE DETAIL stats and upsert."""
+        full_name = t["full_name"]
+
+        # Prefer DESCRIBE DETAIL stats, fall back to discovery metadata
+        last_modified_at = None
+        last_mod_raw = (
+            stats.get("lastModified") or stats.get("last_modified") or t.get("last_altered")
+        )
+        if last_mod_raw:
+            try:
+                last_modified_at = datetime.fromisoformat(str(last_mod_raw))
+            except (ValueError, TypeError):
+                pass
+
+        size_bytes = None
+        raw_size = stats.get("sizeInBytes") or stats.get("size_in_bytes")
+        if raw_size is not None:
+            try:
+                size_bytes = int(raw_size)
+            except (ValueError, TypeError):
+                pass
+
+        num_files = None
+        raw_files = stats.get("numFiles") or stats.get("num_files")
+        if raw_files is not None:
+            try:
+                num_files = int(raw_files)
+            except (ValueError, TypeError):
+                pass
+
+        location = stats.get("location")
+        data_format = stats.get("format") or stats.get("data_format") or t.get("data_source_format")
+
+        partition_cols = stats.get("partitionColumns") or stats.get("partition_columns", [])
+        if isinstance(partition_cols, str):
+            partition_cols = [c.strip() for c in partition_cols.split(",") if c.strip()]
+
+        clustering_cols = stats.get("clusteringColumns") or stats.get("clustering_columns", [])
+        if isinstance(clustering_cols, str):
+            clustering_cols = [c.strip() for c in clustering_cols.split(",") if c.strip()]
+
+        properties = stats.get("properties") or {}
+        if isinstance(properties, str):
+            properties = {}
+
+        table_features = stats.get("tableFeatures") or stats.get("table_features", [])
+        if isinstance(table_features, str):
+            table_features = [f.strip() for f in table_features.split(",") if f.strip()]
+
+        owner = stats.get("owner") or t.get("owner")
+
+        # Upsert by (connection_id, full_name)
+        existing = session.exec(
+            select(UnityCatalogTableRecord).where(
+                UnityCatalogTableRecord.connection_id == self.connection_id,
+                UnityCatalogTableRecord.full_name == full_name,
+            )
+        ).first()
+
+        if existing:
+            existing.catalog_name = t["catalog"]
+            existing.schema_name = t["schema"]
+            existing.table_name = t["name"]
+            existing.table_type = t.get("table_type", "UNKNOWN")
+            existing.data_format = data_format
+            existing.location = location
+            existing.size_bytes = size_bytes
+            existing.num_files = num_files
+            existing.owner = owner
+            existing.last_modified_at = last_modified_at
+            existing.partition_columns = partition_cols
+            existing.clustering_columns = clustering_cols
+            existing.properties = properties
+            existing.table_features = table_features
+            existing.stats_error = stats_error
+            existing.last_seen_at = now
+            session.add(existing)
+        else:
+            session.add(
+                UnityCatalogTableRecord(
+                    connection_id=self.connection_id,
+                    catalog_name=t["catalog"],
+                    schema_name=t["schema"],
+                    table_name=t["name"],
+                    full_name=full_name,
+                    table_type=t.get("table_type", "UNKNOWN"),
+                    data_format=data_format,
+                    location=location,
+                    size_bytes=size_bytes,
+                    num_files=num_files,
+                    owner=owner,
+                    last_modified_at=last_modified_at,
+                    partition_columns=partition_cols,
+                    clustering_columns=clustering_cols,
+                    properties=properties,
+                    table_features=table_features,
+                    stats_error=stats_error,
+                    last_seen_at=now,
+                )
+            )

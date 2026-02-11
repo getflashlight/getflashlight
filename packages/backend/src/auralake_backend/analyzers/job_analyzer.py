@@ -27,7 +27,7 @@ class JobAnalyzer(AbstractAnalyzer):
 
         # Detect stale jobs
         for job in jobs:
-            runs = job_client.get_job_runs(job.job_id, limit=5)
+            runs = job_client.get_job_runs(job.job_id)
             if not runs:
                 recommendations.append(
                     Recommendation(

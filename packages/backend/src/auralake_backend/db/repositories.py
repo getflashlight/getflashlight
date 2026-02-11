@@ -8,7 +8,6 @@ from datetime import datetime
 from sqlmodel import Session, select
 
 from auralake_backend.db.models import (
-    AgentState,
     AnalysisRun,
     AuditLog,
     ConsolidationGroupRecord,
@@ -249,28 +248,3 @@ class InfraCostSnapshotRepository:
         if service:
             stmt = stmt.where(InfraCostSnapshot.service == service)
         return list(self.session.exec(stmt).all())
-
-
-class AgentStateRepository:
-    def __init__(self, session: Session) -> None:
-        self.session = session
-
-    def get_or_create(self, workspace_id: str) -> AgentState:
-        existing = self.session.exec(
-            select(AgentState).where(AgentState.workspace_id == workspace_id)
-        ).first()
-        if existing:
-            return existing
-        state = AgentState(
-            workspace_id=workspace_id, queries_collected=0, plans_collected=0, status="idle"
-        )
-        self.session.add(state)
-        self.session.commit()
-        self.session.refresh(state)
-        return state
-
-    def update(self, state: AgentState) -> AgentState:
-        self.session.add(state)
-        self.session.commit()
-        self.session.refresh(state)
-        return state

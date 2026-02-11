@@ -5,17 +5,18 @@ from __future__ import annotations
 import os
 from logging.config import fileConfig
 
+import sqlalchemy as sa
 from alembic import context
 
 # Import all models so they register with SQLModel.metadata
 from auralake_backend.db.models import (  # noqa: F401
-    AgentState,
     AnalysisRun,
     ApiKey,
     AuditLog,
     BillingRecord,
     ClusterPolicyRecord,
     CollectionRun,
+    ComputeResourceRecord,
     ConsolidationGroupRecord,
     InfraCostSnapshot,
     InfraResourceMapping,
@@ -53,6 +54,8 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_schemas=True,
+        version_table_schema="core",
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -66,7 +69,18 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        # Ensure schemas exist before Alembic tries to access the version table
+        # in the core schema. This avoids a chicken-and-egg problem on first run.
+        connection.execute(sa.text("CREATE SCHEMA IF NOT EXISTS core"))
+        connection.execute(sa.text("CREATE SCHEMA IF NOT EXISTS inventory"))
+        connection.commit()
+
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            include_schemas=True,
+            version_table_schema="core",
+        )
         with context.begin_transaction():
             context.run_migrations()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -10,7 +11,7 @@ from auralake_shared.models.compute import ClusterInfo, ClusterUtilization
 from auralake_shared.models.config import DatabricksConfig
 from auralake_shared.providers.base import AbstractComputeClient
 
-from auralake_backend.providers.databricks.auth import get_workspace_client
+from auralake_backend.providers.databricks.auth import get_warehouse_id, get_workspace_client
 
 logger = structlog.get_logger(__name__)
 
@@ -38,6 +39,71 @@ class DatabricksComputeClient(AbstractComputeClient):
             return [self._to_cluster_info(c) for c in clusters]
         except Exception as exc:
             raise APIError("databricks", f"Failed to list clusters: {exc}") from exc
+
+    def list_all_clusters_with_config(self) -> list[tuple[ClusterInfo, dict[str, Any]]]:
+        try:
+            clusters = self._client.clusters.list(page_size=100)
+            results: list[tuple[ClusterInfo, dict[str, Any]]] = []
+            for c in clusters:
+                info = self._to_cluster_info(c)
+                raw_config: dict[str, Any] = {}
+                if c.spark_conf:
+                    raw_config["spark_conf"] = dict(c.spark_conf)
+                if c.spark_env_vars:
+                    raw_config["spark_env_vars"] = dict(c.spark_env_vars)
+                if c.policy_id:
+                    raw_config["policy_id"] = c.policy_id
+                if c.spark_version:
+                    raw_config["spark_version"] = c.spark_version
+                if c.runtime_engine:
+                    raw_config["runtime_engine"] = str(c.runtime_engine.value)
+                if c.data_security_mode:
+                    raw_config["data_security_mode"] = str(c.data_security_mode.value)
+                if c.aws_attributes:
+                    raw_config["aws_attributes"] = {
+                        k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+                        for k, v in c.aws_attributes.as_dict().items()
+                    }
+                results.append((info, raw_config))
+            return results
+        except Exception as exc:
+            raise APIError("databricks", f"Failed to list all clusters with config: {exc}") from exc
+
+    def list_warehouses(self) -> list[dict[str, Any]]:
+        try:
+            warehouses = self._client.warehouses.list()
+            results: list[dict[str, Any]] = []
+            for wh in warehouses:
+                tags: dict[str, str] = {}
+                if wh.tags and wh.tags.custom_tags:
+                    for tag in wh.tags.custom_tags:
+                        if tag.key and tag.value:
+                            tags[tag.key] = tag.value
+                results.append(
+                    {
+                        "warehouse_id": wh.id or "",
+                        "name": wh.name or "",
+                        "state": str(wh.state.value) if wh.state else "UNKNOWN",
+                        "warehouse_type": str(wh.warehouse_type.value)
+                        if wh.warehouse_type
+                        else None,
+                        "cluster_size": wh.cluster_size or None,
+                        "min_num_clusters": wh.min_num_clusters,
+                        "max_num_clusters": wh.max_num_clusters,
+                        "auto_stop_mins": wh.auto_stop_mins,
+                        "creator_name": wh.creator_name,
+                        "tags": tags,
+                        "spot_instance_policy": (
+                            str(wh.spot_instance_policy.value) if wh.spot_instance_policy else None
+                        ),
+                        "channel": (
+                            str(wh.channel.name.value) if wh.channel and wh.channel.name else None
+                        ),
+                    }
+                )
+            return results
+        except Exception as exc:
+            raise APIError("databricks", f"Failed to list warehouses: {exc}") from exc
 
     def get_cluster(self, cluster_id: str) -> ClusterInfo:
         try:
@@ -139,23 +205,51 @@ class DatabricksComputeClient(AbstractComputeClient):
             ) from exc
 
     def _execute_sql(self, sql: str) -> list[dict]:
-        """Execute SQL via a workspace with a SQL warehouse configured."""
+        """Execute SQL via the first workspace with a reachable warehouse."""
         for ws_name, ws_config in self._config.workspaces.items():
-            if ws_config.sql_warehouse_id:
+            try:
                 client = get_workspace_client(self._config, ws_name)
+                wh_id = get_warehouse_id(client, ws_config.sql_warehouse_id)
                 result = client.statement_execution.execute_statement(
-                    warehouse_id=ws_config.sql_warehouse_id,
+                    warehouse_id=wh_id,
                     statement=sql,
                 )
                 if result.result and result.result.data_array:
                     columns = [col.name for col in (result.manifest.schema.columns or [])]
                     return [dict(zip(columns, row)) for row in result.result.data_array]
                 return []
-        raise APIError("databricks", "No workspace with sql_warehouse_id configured")
+            except Exception as exc:
+                logger.warning(
+                    "sql_workspace_failed",
+                    workspace=ws_name,
+                    error=str(exc),
+                )
+                continue
+        raise APIError("databricks", "No workspace with a reachable SQL warehouse")
 
     @staticmethod
     def _to_cluster_info(c) -> ClusterInfo:
         autoscale = c.autoscale is not None
+
+        # Derive spot settings from aws_attributes.availability
+        spot_enabled = False
+        spot_fallback = False
+        if c.aws_attributes and c.aws_attributes.availability:
+            avail = str(c.aws_attributes.availability.value)
+            if avail == "SPOT_WITH_FALLBACK":
+                spot_enabled = True
+                spot_fallback = True
+            elif avail == "SPOT":
+                spot_enabled = True
+
+        # Convert epoch milliseconds to datetime
+        started_at = None
+        if c.start_time:
+            started_at = datetime.fromtimestamp(c.start_time / 1000, tz=UTC)
+        last_activity_at = None
+        if c.last_activity_time:
+            last_activity_at = datetime.fromtimestamp(c.last_activity_time / 1000, tz=UTC)
+
         return ClusterInfo(
             cluster_id=c.cluster_id or "",
             cluster_name=c.cluster_name or "",
@@ -166,8 +260,12 @@ class DatabricksComputeClient(AbstractComputeClient):
             min_workers=c.autoscale.min_workers if autoscale else None,
             max_workers=c.autoscale.max_workers if autoscale else None,
             autoscale=autoscale,
+            spot_enabled=spot_enabled,
+            spot_fallback=spot_fallback,
             autotermination_minutes=c.autotermination_minutes,
             cluster_source=(str(c.cluster_source.value) if c.cluster_source else None),
             creator=c.creator_user_name,
             tags=dict(c.custom_tags) if c.custom_tags else {},
+            started_at=started_at,
+            last_activity_at=last_activity_at,
         )

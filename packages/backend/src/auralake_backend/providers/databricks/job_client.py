@@ -31,9 +31,9 @@ class DatabricksJobClient(AbstractJobClient):
         except Exception as exc:
             raise APIError("databricks", f"Failed to get job {job_id}: {exc}") from exc
 
-    def get_job_runs(self, job_id: str, limit: int = 25) -> list[dict[str, Any]]:
+    def get_job_runs(self, job_id: str) -> list[dict[str, Any]]:
         try:
-            runs = self._client.jobs.list_runs(job_id=int(job_id), limit=limit)
+            runs = self._client.jobs.list_runs(job_id=int(job_id))
             result = []
             for run in runs:
                 result.append(
@@ -51,15 +51,12 @@ class DatabricksJobClient(AbstractJobClient):
         except Exception as exc:
             raise APIError("databricks", f"Failed to list runs for job {job_id}: {exc}") from exc
 
-    def get_job_runs_since(
-        self, job_id: str, since_ms: int, limit: int = 25
-    ) -> list[dict[str, Any]]:
-        """Fetch job runs started after ``since_ms`` (epoch milliseconds)."""
+    def get_job_runs_since(self, job_id: str, since_ms: int) -> list[dict[str, Any]]:
+        """Fetch all job runs started after ``since_ms`` (epoch milliseconds)."""
         try:
             runs = self._client.jobs.list_runs(
                 job_id=int(job_id),
                 start_time_from=since_ms,
-                limit=limit,
                 expand_tasks=False,
             )
             result = []
