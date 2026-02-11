@@ -40,7 +40,16 @@ _FULL_SYNC_WORKERS = {"compute", "jobs", "policies", "catalog_tables"}
 
 # Default lookback windows for first run
 _DEFAULT_LOOKBACK_DAYS = 90
-_DEFAULT_QUERY_LOOKBACK_DAYS = 7
+
+
+def _safe_int(val: Any) -> int | None:
+    """Convert a value to int, handling string representations from SQL results."""
+    if val is None:
+        return None
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
 
 
 class FullCollector:
@@ -85,7 +94,9 @@ class FullCollector:
             f_billing = pool.submit(
                 self._run_worker, run_id, "billing", worker_statuses, sql_semaphore
             )
-            f_queries = pool.submit(self._run_worker, run_id, "query_history", worker_statuses)
+            f_queries = pool.submit(
+                self._run_worker, run_id, "query_history", worker_statuses, sql_semaphore
+            )
             f_policies = pool.submit(self._run_worker, run_id, "policies", worker_statuses)
             f_infra = pool.submit(self._run_worker, run_id, "infra_costs", worker_statuses)
             f_tables = pool.submit(
@@ -129,7 +140,8 @@ class FullCollector:
         sql_semaphore = Semaphore(2)
         sem = (
             sql_semaphore
-            if worker_name in ("compute", "billing", "query_plans", "catalog_tables")
+            if worker_name
+            in ("compute", "billing", "query_history", "query_plans", "catalog_tables")
             else None
         )
         self._run_worker(run_id, worker_name, worker_statuses, sem)
@@ -328,8 +340,12 @@ class FullCollector:
         count = 0
 
         # Phase 1: All clusters (all states) → compute_resources
-        clusters_with_config = compute.list_all_clusters_with_config()
         running_clusters = []
+        try:
+            clusters_with_config = compute.list_all_clusters_with_config()
+        except Exception as exc:
+            logger.warning("cluster_list_failed", error=str(exc))
+            clusters_with_config = []
 
         for cluster, raw_config in clusters_with_config:
             if self._cancel.is_set():
@@ -470,6 +486,144 @@ class FullCollector:
                     )
         except Exception as exc:
             logger.warning("warehouse_list_failed", error=str(exc))
+
+        # Phase 2b: DLT Pipelines → compute_resources
+        try:
+            pipelines = compute.list_pipelines()
+            for pl in pipelines:
+                if self._cancel.is_set():
+                    break
+                try:
+                    pl_id = pl["pipeline_id"]
+                    existing = session.exec(
+                        select(ComputeResourceRecord).where(
+                            ComputeResourceRecord.connection_id == self.connection_id,
+                            ComputeResourceRecord.resource_type == "dlt_pipeline",
+                            ComputeResourceRecord.resource_id == pl_id,
+                        )
+                    ).first()
+
+                    if existing:
+                        existing.resource_name = pl["name"]
+                        existing.state = pl["state"]
+                        existing.creator = pl.get("creator")
+                        existing.config = pl.get("config", {})
+                        existing.last_seen_at = now
+                        session.add(existing)
+                    else:
+                        session.add(
+                            ComputeResourceRecord(
+                                connection_id=self.connection_id,
+                                resource_type="dlt_pipeline",
+                                resource_id=pl_id,
+                                resource_name=pl["name"],
+                                state=pl["state"],
+                                creator=pl.get("creator"),
+                                config=pl.get("config", {}),
+                                last_seen_at=now,
+                            )
+                        )
+                    count += 1
+                except Exception as exc:
+                    logger.warning(
+                        "pipeline_collect_failed",
+                        pipeline_id=pl.get("pipeline_id"),
+                        error=str(exc),
+                    )
+        except Exception as exc:
+            logger.warning("pipeline_list_failed", error=str(exc))
+
+        # Phase 2c: Model Serving Endpoints → compute_resources
+        try:
+            serving_endpoints = compute.list_serving_endpoints()
+            for ep in serving_endpoints:
+                if self._cancel.is_set():
+                    break
+                try:
+                    ep_name = ep["endpoint_name"]
+                    existing = session.exec(
+                        select(ComputeResourceRecord).where(
+                            ComputeResourceRecord.connection_id == self.connection_id,
+                            ComputeResourceRecord.resource_type == "serving_endpoint",
+                            ComputeResourceRecord.resource_id == ep_name,
+                        )
+                    ).first()
+
+                    if existing:
+                        existing.resource_name = ep_name
+                        existing.state = ep["state"]
+                        existing.creator = ep.get("creator")
+                        existing.config = ep.get("config", {})
+                        existing.last_seen_at = now
+                        session.add(existing)
+                    else:
+                        session.add(
+                            ComputeResourceRecord(
+                                connection_id=self.connection_id,
+                                resource_type="serving_endpoint",
+                                resource_id=ep_name,
+                                resource_name=ep_name,
+                                state=ep["state"],
+                                creator=ep.get("creator"),
+                                config=ep.get("config", {}),
+                                last_seen_at=now,
+                            )
+                        )
+                    count += 1
+                except Exception as exc:
+                    logger.warning(
+                        "serving_endpoint_collect_failed",
+                        endpoint_name=ep.get("endpoint_name"),
+                        error=str(exc),
+                    )
+        except Exception as exc:
+            logger.warning("serving_endpoint_list_failed", error=str(exc))
+
+        # Phase 2d: Vector Search Endpoints → compute_resources
+        try:
+            vs_endpoints = compute.list_vector_search_endpoints()
+            for ep in vs_endpoints:
+                if self._cancel.is_set():
+                    break
+                try:
+                    ep_name = ep["endpoint_name"]
+                    existing = session.exec(
+                        select(ComputeResourceRecord).where(
+                            ComputeResourceRecord.connection_id == self.connection_id,
+                            ComputeResourceRecord.resource_type == "vector_search_endpoint",
+                            ComputeResourceRecord.resource_id == ep_name,
+                        )
+                    ).first()
+
+                    if existing:
+                        existing.resource_name = ep_name
+                        existing.state = ep["state"]
+                        existing.creator = ep.get("creator")
+                        existing.config = ep.get("config", {})
+                        existing.last_seen_at = now
+                        session.add(existing)
+                    else:
+                        session.add(
+                            ComputeResourceRecord(
+                                connection_id=self.connection_id,
+                                resource_type="vector_search_endpoint",
+                                resource_id=ep_name,
+                                resource_name=ep_name,
+                                state=ep["state"],
+                                creator=ep.get("creator"),
+                                config=ep.get("config", {}),
+                                last_seen_at=now,
+                            )
+                        )
+                    count += 1
+                except Exception as exc:
+                    logger.warning(
+                        "vector_search_endpoint_collect_failed",
+                        endpoint_name=ep.get("endpoint_name"),
+                        error=str(exc),
+                    )
+        except Exception as exc:
+            logger.warning("vector_search_endpoint_list_failed", error=str(exc))
 
         # Phase 3: Keep existing infra_resource_mappings for RUNNING clusters
         for cluster in running_clusters:
@@ -708,6 +862,10 @@ class FullCollector:
                     sku=r.sku or "unknown",
                     cluster_id=r.cluster_id,
                     job_id=r.job_id,
+                    warehouse_id=r.warehouse_id,
+                    endpoint_id=r.endpoint_id,
+                    pipeline_id=r.pipeline_id,
+                    notebook_id=r.notebook_id,
                     dbu_usage=r.dbu_usage,
                     cost_usd=float(r.cost_usd),
                 )
@@ -730,18 +888,14 @@ class FullCollector:
         query_client = provider.get_query_client()
 
         if cursor:
-            since_ms = int(datetime.fromisoformat(cursor).timestamp() * 1000)
+            since_date = cursor  # ISO date string, e.g. "2026-02-04"
         else:
-            since_ms = int(
-                (datetime.now(UTC) - timedelta(days=_DEFAULT_QUERY_LOOKBACK_DAYS)).timestamp()
-                * 1000
-            )
+            since_date = (date.today() - timedelta(days=_DEFAULT_LOOKBACK_DAYS)).isoformat()
 
-        queries = query_client.get_query_history_since(since_ms)
+        records = query_client.get_query_history_sql(since_date)
         count = 0
-        latest_end_time_ms: int | None = None
 
-        for q in queries:
+        for q in records:
             if self._cancel.is_set():
                 break
             query_id = q.get("query_id", "")
@@ -763,23 +917,15 @@ class FullCollector:
                         status=q.get("status"),
                         user_name=q.get("user_name"),
                         warehouse_id=q.get("warehouse_id"),
-                        duration_ms=q.get("duration_ms"),
-                        rows_produced=q.get("rows_produced"),
-                        query_start_time_ms=q.get("query_start_time_ms"),
-                        query_end_time_ms=q.get("query_end_time_ms"),
+                        duration_ms=_safe_int(q.get("duration_ms")),
+                        rows_produced=_safe_int(q.get("rows_produced")),
+                        query_start_time_ms=_safe_int(q.get("query_start_time_ms")),
+                        query_end_time_ms=_safe_int(q.get("query_end_time_ms")),
                     )
                 )
                 count += 1
 
-            end_ms = q.get("query_end_time_ms")
-            if end_ms and (latest_end_time_ms is None or end_ms > latest_end_time_ms):
-                latest_end_time_ms = end_ms
-
-        new_cursor = (
-            datetime.fromtimestamp(latest_end_time_ms / 1000, tz=UTC).isoformat()
-            if latest_end_time_ms
-            else cursor
-        )
+        new_cursor = date.today().isoformat()
         return count, new_cursor
 
     # ------------------------------------------------------------------

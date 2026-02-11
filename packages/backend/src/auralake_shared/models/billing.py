@@ -11,6 +11,10 @@ class CostRecord(BaseModel):
     workspace_id: str | None = None
     cluster_id: str | None = None
     job_id: str | None = None
+    warehouse_id: str | None = None
+    endpoint_id: str | None = None
+    pipeline_id: str | None = None
+    notebook_id: str | None = None
     sku: str | None = None
     tag: str | None = None
     dbu_usage: float = 0.0
@@ -29,6 +33,9 @@ class CostBreakdown(BaseModel):
     by_sku: dict[str, Decimal] = Field(default_factory=dict)
     by_cluster: dict[str, Decimal] = Field(default_factory=dict)
     by_job: dict[str, Decimal] = Field(default_factory=dict)
+    by_warehouse: dict[str, Decimal] = Field(default_factory=dict)
+    by_endpoint: dict[str, Decimal] = Field(default_factory=dict)
+    by_pipeline: dict[str, Decimal] = Field(default_factory=dict)
     by_tag: dict[str, Decimal] = Field(default_factory=dict)
     period_start: date
     period_end: date

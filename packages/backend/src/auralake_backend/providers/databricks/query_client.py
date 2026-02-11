@@ -94,6 +94,34 @@ class DatabricksQueryClient(AbstractQueryClient):
                 "databricks", f"Failed to fetch query history since {since_ms}: {exc}"
             ) from exc
 
+    def get_query_history_sql(self, since_date: str) -> list[dict[str, Any]]:
+        """Fetch query history from system.query.history via SQL.
+
+        Much faster than the REST API — single SQL call vs thousands of paginated requests.
+        """
+        sql = f"""
+            SELECT
+                statement_id AS query_id,
+                statement_text AS query_text,
+                execution_status AS status,
+                executed_by AS user_name,
+                compute.warehouse_id AS warehouse_id,
+                total_duration_ms AS duration_ms,
+                produced_rows AS rows_produced,
+                UNIX_TIMESTAMP(start_time) * 1000 AS query_start_time_ms,
+                UNIX_TIMESTAMP(end_time) * 1000 AS query_end_time_ms,
+                execution_duration_ms,
+                read_rows,
+                read_bytes,
+                shuffle_read_bytes,
+                spilled_local_bytes,
+                statement_type
+            FROM system.query.history
+            WHERE start_time >= '{since_date}'
+            ORDER BY start_time
+        """
+        return self.execute_query(sql)
+
     def execute_query(self, sql: str) -> list[dict[str, Any]]:
         """Execute a SQL query via statement execution API."""
         try:

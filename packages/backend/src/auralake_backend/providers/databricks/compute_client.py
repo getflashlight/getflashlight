@@ -59,6 +59,8 @@ class DatabricksComputeClient(AbstractComputeClient):
                     raw_config["runtime_engine"] = str(c.runtime_engine.value)
                 if c.data_security_mode:
                     raw_config["data_security_mode"] = str(c.data_security_mode.value)
+                if getattr(c, "single_user_name", None):
+                    raw_config["single_user_name"] = c.single_user_name
                 if c.aws_attributes:
                     raw_config["aws_attributes"] = {
                         k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
@@ -104,6 +106,103 @@ class DatabricksComputeClient(AbstractComputeClient):
             return results
         except Exception as exc:
             raise APIError("databricks", f"Failed to list warehouses: {exc}") from exc
+
+    def list_pipelines(self) -> list[dict[str, Any]]:
+        try:
+            pipelines = self._client.pipelines.list_pipelines()
+            results: list[dict[str, Any]] = []
+            for p in pipelines:
+                spec = p.spec
+                config: dict[str, Any] = {}
+                if spec:
+                    if spec.target:
+                        config["target"] = spec.target
+                    if spec.catalog:
+                        config["catalog"] = spec.catalog
+                    if spec.channel:
+                        config["channel"] = str(spec.channel)
+                    config["photon"] = bool(spec.photon)
+                    config["serverless"] = bool(spec.serverless)
+                    config["continuous"] = bool(spec.continuous)
+                    config["development"] = bool(spec.development)
+                    if spec.clusters:
+                        config["clusters"] = [c.as_dict() for c in spec.clusters if c]
+                    if spec.configuration:
+                        config["configuration"] = dict(spec.configuration)
+                results.append(
+                    {
+                        "pipeline_id": p.pipeline_id or "",
+                        "name": p.name or "",
+                        "state": str(p.state.value) if p.state else "UNKNOWN",
+                        "creator": getattr(p, "creator_user_name", None),
+                        "config": config,
+                    }
+                )
+            return results
+        except Exception as exc:
+            raise APIError("databricks", f"Failed to list pipelines: {exc}") from exc
+
+    def list_serving_endpoints(self) -> list[dict[str, Any]]:
+        try:
+            endpoints = self._client.serving_endpoints.list()
+            results: list[dict[str, Any]] = []
+            for ep in endpoints:
+                config: dict[str, Any] = {}
+                if ep.config:
+                    served = ep.config.served_entities or ep.config.served_models or []
+                    config["served_entities"] = [e.as_dict() for e in served if e]
+                if getattr(ep, "route_optimized", None) is not None:
+                    config["route_optimized"] = ep.route_optimized
+                if getattr(ep, "ai_gateway", None):
+                    config["ai_gateway"] = ep.ai_gateway.as_dict()
+
+                state_str = "UNKNOWN"
+                if ep.state and ep.state.ready:
+                    state_str = str(ep.state.ready.value)
+
+                results.append(
+                    {
+                        "endpoint_name": ep.name or "",
+                        "state": state_str,
+                        "creator": getattr(ep, "creator", None),
+                        "config": config,
+                    }
+                )
+            return results
+        except Exception as exc:
+            raise APIError("databricks", f"Failed to list serving endpoints: {exc}") from exc
+
+    def list_vector_search_endpoints(self) -> list[dict[str, Any]]:
+        try:
+            resp = self._client.vector_search_endpoints.list_endpoints()
+            # SDK may return a generator (iterable) or an object with .endpoints
+            if hasattr(resp, "endpoints"):
+                endpoints = resp.endpoints or []
+            else:
+                endpoints = list(resp) if resp else []
+            results: list[dict[str, Any]] = []
+            for ep in endpoints:
+                config: dict[str, Any] = {}
+                if getattr(ep, "endpoint_type", None):
+                    config["endpoint_type"] = str(ep.endpoint_type.value)
+                if getattr(ep, "num_indexes", None) is not None:
+                    config["num_indexes"] = ep.num_indexes
+
+                state_str = "UNKNOWN"
+                if ep.endpoint_status and ep.endpoint_status.state:
+                    state_str = str(ep.endpoint_status.state.value)
+
+                results.append(
+                    {
+                        "endpoint_name": ep.name or "",
+                        "state": state_str,
+                        "creator": getattr(ep, "creator", None),
+                        "config": config,
+                    }
+                )
+            return results
+        except Exception as exc:
+            raise APIError("databricks", f"Failed to list vector search endpoints: {exc}") from exc
 
     def get_cluster(self, cluster_id: str) -> ClusterInfo:
         try:
@@ -244,11 +343,15 @@ class DatabricksComputeClient(AbstractComputeClient):
 
         # Convert epoch milliseconds to datetime
         started_at = None
-        if c.start_time:
-            started_at = datetime.fromtimestamp(c.start_time / 1000, tz=UTC)
+        start_ms = getattr(c, "start_time", None)
+        if start_ms:
+            started_at = datetime.fromtimestamp(start_ms / 1000, tz=UTC)
         last_activity_at = None
-        if c.last_activity_time:
-            last_activity_at = datetime.fromtimestamp(c.last_activity_time / 1000, tz=UTC)
+        activity_ms = getattr(c, "last_activity_time", None) or getattr(
+            c, "last_activity_time_millis", None
+        )
+        if activity_ms:
+            last_activity_at = datetime.fromtimestamp(activity_ms / 1000, tz=UTC)
 
         return ClusterInfo(
             cluster_id=c.cluster_id or "",

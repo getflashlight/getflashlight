@@ -35,6 +35,10 @@ class DatabricksCostClient(AbstractCostClient):
             "sku_name": "sku_name",
             "cluster_id": "usage_metadata.cluster_id AS cluster_id",
             "job_id": "usage_metadata.job_id AS job_id",
+            "warehouse_id": "usage_metadata.warehouse_id AS warehouse_id",
+            "endpoint_id": "usage_metadata.endpoint_name AS endpoint_id",
+            "pipeline_id": "usage_metadata.dlt_pipeline_id AS pipeline_id",
+            "notebook_id": "usage_metadata.notebook_id AS notebook_id",
         }
         raw_cols = group_by or ["sku_name"]
         select_cols = ", ".join(col_map.get(c, c) for c in raw_cols)
@@ -59,6 +63,10 @@ class DatabricksCostClient(AbstractCostClient):
                     sku=row.get("sku_name"),
                     cluster_id=row.get("cluster_id"),
                     job_id=row.get("job_id"),
+                    warehouse_id=row.get("warehouse_id"),
+                    endpoint_id=row.get("endpoint_id"),
+                    pipeline_id=row.get("pipeline_id"),
+                    notebook_id=row.get("notebook_id"),
                     dbu_usage=float(row.get("dbu_usage", 0)),
                     cost_usd=Decimal(
                         str(
@@ -104,14 +112,36 @@ class DatabricksCostClient(AbstractCostClient):
         return self.get_usage(
             since,
             date.today(),
-            group_by=["sku_name", "cluster_id", "job_id"],
+            group_by=[
+                "sku_name",
+                "cluster_id",
+                "job_id",
+                "warehouse_id",
+                "endpoint_id",
+                "pipeline_id",
+                "notebook_id",
+            ],
         )
 
     def get_cost_breakdown(self, start: date, end: date) -> CostBreakdown:
-        records = self.get_usage(start, end, group_by=["sku_name", "cluster_id", "job_id"])
+        records = self.get_usage(
+            start,
+            end,
+            group_by=[
+                "sku_name",
+                "cluster_id",
+                "job_id",
+                "warehouse_id",
+                "endpoint_id",
+                "pipeline_id",
+            ],
+        )
         by_sku: dict[str, Decimal] = {}
         by_cluster: dict[str, Decimal] = {}
         by_job: dict[str, Decimal] = {}
+        by_warehouse: dict[str, Decimal] = {}
+        by_endpoint: dict[str, Decimal] = {}
+        by_pipeline: dict[str, Decimal] = {}
         total = Decimal("0")
         for r in records:
             total += r.cost_usd
@@ -121,11 +151,26 @@ class DatabricksCostClient(AbstractCostClient):
                 by_cluster[r.cluster_id] = by_cluster.get(r.cluster_id, Decimal("0")) + r.cost_usd
             if r.job_id:
                 by_job[r.job_id] = by_job.get(r.job_id, Decimal("0")) + r.cost_usd
+            if r.warehouse_id:
+                by_warehouse[r.warehouse_id] = (
+                    by_warehouse.get(r.warehouse_id, Decimal("0")) + r.cost_usd
+                )
+            if r.endpoint_id:
+                by_endpoint[r.endpoint_id] = (
+                    by_endpoint.get(r.endpoint_id, Decimal("0")) + r.cost_usd
+                )
+            if r.pipeline_id:
+                by_pipeline[r.pipeline_id] = (
+                    by_pipeline.get(r.pipeline_id, Decimal("0")) + r.cost_usd
+                )
         return CostBreakdown(
             total_cost_usd=total,
             by_sku=by_sku,
             by_cluster=by_cluster,
             by_job=by_job,
+            by_warehouse=by_warehouse,
+            by_endpoint=by_endpoint,
+            by_pipeline=by_pipeline,
             period_start=start,
             period_end=end,
         )

@@ -368,6 +368,10 @@ class BillingRecord(SQLModel, table=True):
     sku: str
     cluster_id: str | None = Field(default=None)
     job_id: str | None = Field(default=None)
+    warehouse_id: str | None = Field(default=None)
+    endpoint_id: str | None = Field(default=None)
+    pipeline_id: str | None = Field(default=None)
+    notebook_id: str | None = Field(default=None)
     workspace_id: str | None = Field(default=None)
     dbu_usage: float
     cost_usd: float

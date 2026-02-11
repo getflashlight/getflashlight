@@ -180,6 +180,97 @@ auralake agent start           # Collect query plans continuously
 auralake query plans           # View captured plan anti-patterns
 ```
 
+## Data Collection
+
+The backend runs a **collector agent** that fetches infrastructure data from Databricks into PostgreSQL. Collection is organized into 9 workers that run in parallel waves.
+
+### Workers
+
+| Worker | Mode | Data Source | Description |
+|--------|------|-------------|-------------|
+| `compute` | Full sync | REST API + SQL | Clusters, SQL warehouses, DLT pipelines, serving/vector search endpoints |
+| `jobs` | Full sync | REST API | Job definitions and metadata |
+| `job_runs` | Incremental | REST API | Historical job run records (depends on `jobs`) |
+| `billing` | Incremental | `system.billing.usage` | DBU billing with full attribution |
+| `query_history` | Incremental | `system.query.history` | SQL query execution history |
+| `query_plans` | Incremental | EXPLAIN API | Parsed Spark plans + anti-patterns (depends on `query_history`) |
+| `policies` | Full sync | REST API | Cluster policy definitions |
+| `infra_costs` | Incremental | AWS Cost Explorer | AWS infrastructure costs (optional) |
+| `catalog_tables` | Full sync | Unity Catalog + SQL | Table metadata, stats, and Delta details |
+
+**Full sync** workers re-fetch all data on every run (small datasets like policies, cluster configs).
+**Incremental** workers track a cursor/watermark in `core.worker_cursors` and only fetch data newer than the last run.
+
+### Triggering a full collection
+
+A full collection runs all 9 workers in parallel (with dependency ordering):
+
+```bash
+# Via CLI
+auralake agent collect <connection-id>
+
+# Via API
+curl -X POST http://localhost:8000/api/v1/agent/collect/<connection-id> \
+  -H "Authorization: Bearer al_<key>"
+```
+
+### Retrying a single worker
+
+If a worker fails or you want to re-run just one, use the retry endpoint. This runs only the specified worker with its existing cursor:
+
+```bash
+# Via CLI
+auralake agent retry <connection-id> <worker-name>
+
+# Via API — retry only the query_history worker
+curl -X POST http://localhost:8000/api/v1/agent/retry/<connection-id>/query_history \
+  -H "Authorization: Bearer al_<key>"
+```
+
+Valid worker names: `compute`, `jobs`, `job_runs`, `billing`, `query_history`, `query_plans`, `policies`, `infra_costs`, `catalog_tables`.
+
+### Checking status
+
+```bash
+# All active collections
+auralake agent status
+
+# Specific connection — shows per-worker status, count, and duration
+auralake agent status <connection-id>
+
+# Collection history
+auralake agent history
+
+# Via API
+curl http://localhost:8000/api/v1/agent/status/<connection-id> \
+  -H "Authorization: Bearer al_<key>"
+```
+
+### Cancelling a collection
+
+```bash
+auralake agent cancel <connection-id>
+
+curl -X POST http://localhost:8000/api/v1/agent/cancel/<connection-id> \
+  -H "Authorization: Bearer al_<key>"
+```
+
+### Incremental vs full behavior
+
+- **Incremental workers** (`billing`, `query_history`, `query_plans`, `job_runs`, `infra_costs`) store a cursor in `core.worker_cursors`. On the first run they use a default lookback window (90 days for billing/jobs, 7 days for queries). Subsequent runs only fetch data since the last cursor.
+- **Full sync workers** (`compute`, `jobs`, `policies`, `catalog_tables`) always re-fetch all data and upsert by primary key.
+- To force a full re-collection of an incremental worker, delete its cursor row from `core.worker_cursors` and retry the worker.
+
+### Pipeline execution order
+
+```
+Wave 1 (parallel):  compute, jobs, billing, query_history, policies, infra_costs, catalog_tables
+Wave 2 (dependent):  job_runs (after jobs), query_plans (after query_history)
+Post-collection:     Analysis (runs all analyzers)
+```
+
+Workers that query system tables via SQL (`compute`, `billing`, `query_history`, `query_plans`, `catalog_tables`) share a semaphore (max 2 concurrent) to avoid overloading the SQL warehouse.
+
 ## CLI commands
 
 ```
@@ -297,15 +388,15 @@ Tables are organized into two PostgreSQL schemas:
 
 | Table | Purpose | Populated By |
 |-------|---------|-------------|
-| `billing_records` | Databricks DBU billing (`system.billing.usage`) | `billing` worker |
+| `billing_records` | Databricks DBU billing with full attribution (cluster, job, warehouse, endpoint, pipeline, notebook) | `billing` worker |
 | `job_profiles` | Current job metadata (full sync) | `jobs` worker |
 | `job_runs` | Historical job run records (incremental) | `job_runs` worker |
-| `query_history` | Query history from Databricks API | `query_history` worker |
+| `query_history` | Query history from `system.query.history` | `query_history` worker |
 | `query_plans` | Parsed Spark EXPLAIN plans + anti-patterns | `query_plans` worker |
 | `unity_catalog_tables` | Unity Catalog table metadata + stats | `catalog_tables` worker |
 | `cluster_policies` | Cluster policy definitions (full sync) | `policies` worker |
 | `infra_cost_snapshots` | AWS infrastructure costs (optional) | `infra_costs` worker |
-| `compute_resources` | Full compute config (clusters + SQL warehouses) | `compute` worker |
+| `compute_resources` | Full compute config (clusters, SQL warehouses, DLT pipelines, serving endpoints, vector search endpoints) | `compute` worker |
 | `infra_resource_mappings` | Databricks clusters → AWS EC2 mapping | `compute` worker |
 | `s3_inventory_objects` | S3 inventory for orphan detection | Inventory collector |
 
