@@ -18,12 +18,14 @@ from auralake_shared.models.config import DatabricksAWSConfig, DatabricksConfig
 from auralake_shared.providers.base import AbstractInfraCostClient
 
 from auralake_backend.providers.databricks.auth import get_boto3_session
+from auralake_backend.providers.databricks.pricing import PricingService
 
 
 class AWSCostExplorerClient(AbstractInfraCostClient):
     def __init__(self, db_config: DatabricksConfig, aws_config: DatabricksAWSConfig) -> None:
         self._db_config = db_config
         self._aws_config = aws_config
+        self._pricing_service = PricingService(db_config.discounts)
         session = get_boto3_session(aws_config.region, aws_config=aws_config)
         self._ce = session.client("ce")
         self._ec2 = session.client("ec2")
@@ -71,6 +73,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
                 for group in time_period.get("Groups", []):
                     resource_id = group["Keys"][0]
                     cost = Decimal(group["Metrics"]["UnblendedCost"]["Amount"])
+                    cost = self._pricing_service.apply_aws_discount(cost)
                     hours = float(group["Metrics"]["UsageQuantity"]["Amount"])
                     results.append(
                         InfraComputeCost(
@@ -117,6 +120,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
                     service = group["Keys"][0]
                     resource_id = group["Keys"][1]
                     cost = Decimal(group["Metrics"]["UnblendedCost"]["Amount"])
+                    cost = self._pricing_service.apply_aws_discount(cost)
                     results.append(
                         InfraStorageCost(
                             bucket_or_volume=resource_id,
@@ -154,6 +158,7 @@ class AWSCostExplorerClient(AbstractInfraCostClient):
                 for group in time_period.get("Groups", []):
                     usage_type = group["Keys"][0]
                     cost = Decimal(group["Metrics"]["UnblendedCost"]["Amount"])
+                    cost = self._pricing_service.apply_aws_discount(cost)
                     gb = float(group["Metrics"]["UsageQuantity"]["Amount"])
                     results.append(
                         DataTransferCost(

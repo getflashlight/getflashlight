@@ -76,6 +76,10 @@ class RecommendationRecord(SQLModel, table=True):
     savings_confidence: str
     evidence: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
     status: str  # pending / applied / dismissed / pr_created
+    pricing_basis: str = Field(default="list")  # "list" or "negotiated"
+    baseline_monthly_cost_usd: float | None = Field(default=None)
+    actual_monthly_savings_usd: float | None = Field(default=None)
+    savings_verified_at: datetime | None = Field(default=None)
     applied_at: datetime | None = Field(default=None)
     pr_url: str | None = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)

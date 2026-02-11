@@ -11,6 +11,9 @@ Multi-platform lakehouse cost optimization CLI. Analyzes compute, storage, job, 
 - **Query analysis** — expensive query detection, Spark plan anti-pattern detection (full scans, bad joins, skew, excessive shuffle)
 - **Governance** — cluster policy auditing, tag enforcement, budget alerts
 - **Workload portability** — Databricks feature lock-in detection with open-source alternative suggestions
+- **Discount-aware pricing** — configurable negotiated rates (global DBU discount, SKU overrides, AWS EDP); recommendations reflect actual costs
+- **Savings tracking** — projected vs actual savings verified automatically from collected billing data after recommendations are applied
+- **Config-driven rules** — 21 analysis rules toggled and tuned per-connection via API without redeploy
 - **Progressive automation** — recommend → dry-run → apply → auto, with safety rails and audit trail
 - **DAB-aware PR workflow** — modifies Databricks Asset Bundle YAML configs and creates GitHub PRs with savings estimates
 - **Collector agent** — continuously captures Spark query plans and metrics to PostgreSQL
@@ -126,7 +129,7 @@ curl -X POST http://localhost:8000/api/v1/connections \
   }'
 ```
 
-Valid providers are: `databricks`, `snowflake`, `lake_formation`, `github`, `aws`. Connection names must start with a letter or digit and contain only letters, digits, hyphens, and underscores.
+Valid providers are: `databricks`, `snowflake`, `lake_formation`, `github`, `aws`, `config` (rule overrides and threshold tuning). Connection names must start with a letter or digit and contain only letters, digits, hyphens, and underscores.
 
 6. **Run your first analysis:**
 
@@ -271,6 +274,153 @@ Post-collection:     Analysis (runs all analyzers)
 
 Workers that query system tables via SQL (`compute`, `billing`, `query_history`, `query_plans`, `catalog_tables`) share a semaphore (max 2 concurrent) to avoid overloading the SQL warehouse.
 
+## Processing & Analysis
+
+After each collection completes, the backend automatically runs the **analysis pipeline**. This is the processing layer that turns raw collected data into cost-saving recommendations.
+
+```
+Collection (FullCollector) → Processing (Analyzers + PricingService) → Recommendations → Dashboard/API
+                                                                          ↓
+                                                                   SavingsTracker (verifies actual $ from collected data)
+```
+
+`AnalysisScheduler.run_all()` executes 8 analyzers in sequence, then runs savings verification:
+
+| # | Analyzer | Rules |
+|---|----------|-------|
+| 1 | `CostAnalyzer` | `cost_high_sku` |
+| 2 | `ClusterAnalyzer` | `cluster_rightsize`, `cluster_idle`, `cluster_no_autotermination`, `cluster_spot_eligible` |
+| 3 | `SpotAnalyzer` | `spot_eligible` |
+| 4 | `IdleResourceAnalyzer` | `idle_cluster` |
+| 5 | `DeltaAnalyzer` | `delta_small_files`, `delta_stale_optimize`, `delta_stale_vacuum`, `delta_over_optimized`, `delta_migrate_to_liquid_clustering`, `delta_enable_clustering` |
+| 6 | `S3TagAnalyzer` | `orphan_s3_objects`, `untagged_s3_objects` |
+| 7 | `JobAnalyzer` | `job_stale`, `job_failing`, `job_consolidation` |
+| 8 | `QueryAnalyzer` | `query_expensive`, `query_anti_pattern` |
+
+Each analyzer checks its rules config (enabled/disabled + thresholds), applies discount-aware pricing when configured, and persists recommendations to `core.recommendations`. After all analyzers finish, `SavingsTracker` verifies actual savings on previously applied recommendations using already-collected billing data.
+
+### Discount-Aware Pricing
+
+Configure negotiated pricing on a Databricks connection to ensure recommendations reflect your actual costs instead of list prices:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/connections \
+  -H "Authorization: Bearer al_<your-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "databricks",
+    "name": "production",
+    "config": {
+      "host": "https://mycompany.cloud.databricks.com",
+      "sql_warehouse_id": "abc123def456",
+      "discounts": {
+        "databricks": { "global_dbu_discount_pct": 0.25 },
+        "aws": { "edp_discount_pct": 0.10 }
+      }
+    },
+    "credentials": { "token": "dapi..." }
+  }'
+```
+
+Price resolution order: **SKU override > global discount > list price**.
+
+- `databricks.global_dbu_discount_pct` — percentage off list DBU price (e.g. `0.25` = 25% off)
+- `databricks.sku_overrides` — map of SKU name → negotiated $/DBU (takes priority over global discount)
+- `aws.edp_discount_pct` — AWS Enterprise Discount Program percentage (e.g. `0.10` = 10% off)
+
+When any discount is configured, recommendations include `pricing_basis: "negotiated"` instead of `"list"`.
+
+### Config-Driven Rules
+
+All 21 analysis rules default to enabled. Toggle or tune rules per-connection via a `config` provider connection — no redeploy required:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/connections \
+  -H "Authorization: Bearer al_<your-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "config",
+    "name": "rules",
+    "config": {
+      "rules": {
+        "cluster_rightsize": { "thresholds": { "cpu_utilization_low": 15 } },
+        "spot_eligible": { "enabled": false }
+      }
+    }
+  }'
+```
+
+Each rule supports:
+- `enabled` (bool, default `true`) — disable a rule entirely
+- `thresholds` (dict) — analyzer-specific tuning knobs (e.g. utilization %, staleness days)
+
+**Rule reference:**
+
+| Analyzer | Rule ID | Description |
+|----------|---------|-------------|
+| Cost | `cost_high_sku` | Flag expensive Databricks SKUs |
+| Cluster | `cluster_rightsize` | Right-size under-utilized clusters |
+| Cluster | `cluster_idle` | Detect idle clusters |
+| Cluster | `cluster_no_autotermination` | Flag missing autotermination |
+| Cluster | `cluster_spot_eligible` | Recommend spot instances for clusters |
+| Spot | `spot_eligible` | Broader spot instance adoption |
+| Idle | `idle_cluster` | Detect long-idle compute resources |
+| Delta | `delta_small_files` | Detect small file problems |
+| Delta | `delta_stale_optimize` | Tables needing OPTIMIZE |
+| Delta | `delta_stale_vacuum` | Tables needing VACUUM |
+| Delta | `delta_over_optimized` | Excessively optimized tables |
+| Delta | `delta_migrate_to_liquid_clustering` | Migrate to liquid clustering |
+| Delta | `delta_enable_clustering` | Enable clustering on unclustered tables |
+| S3 | `orphan_s3_objects` | Detect orphan S3 objects |
+| S3 | `untagged_s3_objects` | Detect untagged S3 objects |
+| Job | `job_stale` | Detect stale/unused jobs |
+| Job | `job_failing` | Detect persistently failing jobs |
+| Job | `job_consolidation` | Consolidate jobs onto shared clusters |
+| Query | `query_expensive` | Flag expensive queries |
+| Query | `query_anti_pattern` | Detect Spark plan anti-patterns |
+| Infra | `infra_high_transfer` | Flag high data transfer costs |
+
+### Savings Tracking
+
+Auralake automatically verifies whether applied recommendations deliver the projected savings. No separate job is required — verification runs as part of the normal analysis pipeline using already-collected `billing_records` and `infra_cost_snapshots`.
+
+**Three-column model on each recommendation:**
+
+| Column | Description |
+|--------|-------------|
+| `estimated_monthly_savings_usd` | Projected savings at recommendation time |
+| `baseline_monthly_cost_usd` | Actual monthly cost from billing data *before* the recommendation was applied |
+| `actual_monthly_savings_usd` | Difference between pre- and post-application cost from billing data |
+
+Verification triggers automatically for recommendations that have been in `applied` status for 14+ days. `SavingsTracker` compares 30-day billing windows before and after the `applied_at` date, normalizes to monthly rates, and writes the results back to the recommendation record along with `savings_verified_at`.
+
+### Adding a New Rule
+
+Three steps to add a new analysis rule:
+
+1. **Add the rule field to `RulesConfig`** in `packages/backend/src/auralake_shared/models/config.py`:
+   ```python
+   class RulesConfig(BaseModel):
+       # ... existing rules ...
+       my_new_rule: RuleConfig = Field(default_factory=RuleConfig)
+   ```
+
+2. **Write analysis logic** in the relevant analyzer, gated with `self.rule_enabled()`:
+   ```python
+   if self.rule_enabled("my_new_rule"):
+       # analysis logic that yields Recommendation objects
+   ```
+
+3. **(Optional) Add billing column mapping** in `savings_tracker.py` for cost verification:
+   ```python
+   _BILLING_COLUMN_MAP = {
+       # ... existing mappings ...
+       "my_new_rule": "cluster_id",  # or job_id, warehouse_id, sku
+   }
+   ```
+
+The rule auto-activates on deploy (defaults to `enabled: True`). Users can disable or tune it at runtime via the config API without a redeploy.
+
 ## CLI commands
 
 ```
@@ -348,7 +498,10 @@ CLI (Typer)
       │    ├── QueryClient       — query history + EXPLAIN
       │    ├── StorageClient     — Delta table operations
       │    └── ConfigFormat      — DAB YAML parsing (ruamel.yaml)
-      ├── Analyzers              — read-only analysis → Recommendations
+      ├── Processing Layer
+      │    ├── PricingService    — discount-aware DBU + AWS pricing
+      │    ├── Analyzers (8)     — config-driven rules → Recommendations
+      │    └── SavingsTracker    — verifies actual $ from billing data
       ├── Actions                — mutating operations with risk levels
       ├── AutomationEngine       — recommend / dry-run / apply / auto / PR
       ├── Git Integration        — branch, commit, push, PR via PyGithub
@@ -380,9 +533,19 @@ Tables are organized into two PostgreSQL schemas:
 | `collection_runs` | Tracks each collection execution | `POST /agent/collect/{id}` |
 | `worker_cursors` | Per-worker watermarks for incremental collection | Collection pipeline |
 | `analysis_runs` | Analysis execution history | `AnalysisScheduler` (post-collection) |
-| `recommendations` | Generated cost-saving recommendations | Analyzers |
+| `recommendations` | Cost-saving recommendations with pricing basis, projected and verified savings | Analyzers + SavingsTracker |
 | `consolidation_groups` | Job consolidation groups | Job analyzer |
 | `audit_log` | Actions taken on recommendations | Automation engine |
+
+**`recommendations` columns of note:**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `pricing_basis` | `str` | `"list"` or `"negotiated"` — indicates whether discounts were applied |
+| `baseline_monthly_cost_usd` | `float?` | Pre-application monthly cost from billing data (set by SavingsTracker) |
+| `actual_monthly_savings_usd` | `float?` | Verified savings: baseline minus post-application cost |
+| `savings_verified_at` | `datetime?` | When SavingsTracker last verified this recommendation |
+| `applied_at` | `datetime?` | When the recommendation was applied (used as the before/after boundary) |
 
 ### `inventory` — Collected infrastructure data
 

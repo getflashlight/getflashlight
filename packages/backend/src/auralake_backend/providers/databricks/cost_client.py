@@ -12,6 +12,7 @@ from auralake_shared.models.config import DatabricksConfig
 from auralake_shared.providers.base import AbstractCostClient
 
 from auralake_backend.providers.databricks.auth import get_warehouse_id, get_workspace_client
+from auralake_backend.providers.databricks.pricing import PricingService
 
 logger = structlog.get_logger(__name__)
 
@@ -20,6 +21,7 @@ class DatabricksCostClient(AbstractCostClient):
     def __init__(self, config: DatabricksConfig) -> None:
         self._config = config
         self._client = get_workspace_client(config)
+        self._pricing_service = PricingService(config.discounts)
 
     def get_usage(
         self, start: date, end: date, group_by: list[str] | None = None
@@ -99,10 +101,15 @@ class DatabricksCostClient(AbstractCostClient):
             raise APIError("databricks", f"Failed to query pricing: {exc}") from exc
 
     def _get_pricing_map(self) -> dict[str, Decimal]:
-        """Return {sku_name: unit_price_usd} for cost calculation."""
+        """Return {sku_name: effective_price_usd} for cost calculation.
+
+        List prices are fetched from Databricks, then adjusted through
+        ``PricingService`` which applies negotiated discounts.
+        """
         try:
             prices = self.get_pricing()
-            return {p.sku: p.unit_price_usd for p in prices}
+            list_prices = {p.sku: p.unit_price_usd for p in prices}
+            return self._pricing_service.get_effective_prices(list_prices)
         except Exception as exc:
             logger.warning("pricing_fetch_failed", error=str(exc))
             return {}

@@ -33,28 +33,34 @@ class InfraCostAnalyzer(AbstractAnalyzer):
         total_transfer = sum((t.cost_usd for t in transfer_costs), Decimal("0"))
 
         recommendations = []
+        basis = self.pricing_basis()
 
         # Flag high data transfer costs
-        if total_transfer > Decimal("500"):
-            recommendations.append(
-                Recommendation(
-                    type="infra_high_transfer",
-                    risk_level=RiskLevel.MEDIUM,
-                    resource_id="data_transfer",
-                    resource_name="AWS Data Transfer",
-                    title="High data transfer costs detected",
-                    description=(
-                        f"Data transfer costs of ${total_transfer:.2f} "
-                        f"over {days} days. Consider VPC endpoints or "
-                        f"S3 gateway."
-                    ),
-                    estimated_monthly_savings_usd=(total_transfer * Decimal("0.3")),
-                    savings_confidence=SavingsConfidence.LOW,
-                    evidence={
-                        "total_transfer_usd": str(total_transfer),
-                    },
-                )
+        if self.rule_enabled("infra_high_transfer"):
+            min_transfer = Decimal(
+                str(self.rule_threshold("infra_high_transfer", "min_transfer_usd", 500))
             )
+            if total_transfer > min_transfer:
+                recommendations.append(
+                    Recommendation(
+                        type="infra_high_transfer",
+                        risk_level=RiskLevel.MEDIUM,
+                        resource_id="data_transfer",
+                        resource_name="AWS Data Transfer",
+                        title="High data transfer costs detected",
+                        description=(
+                            f"Data transfer costs of ${total_transfer:.2f} "
+                            f"over {days} days. Consider VPC endpoints or "
+                            f"S3 gateway."
+                        ),
+                        estimated_monthly_savings_usd=(total_transfer * Decimal("0.3")),
+                        savings_confidence=SavingsConfidence.LOW,
+                        pricing_basis=basis,
+                        evidence={
+                            "total_transfer_usd": str(total_transfer),
+                        },
+                    )
+                )
 
         return AnalysisResult(
             analyzer_name=self.name,

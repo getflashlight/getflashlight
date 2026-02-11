@@ -42,6 +42,10 @@ class Recommendation(BaseModel):
     savings_confidence: SavingsConfidence = SavingsConfidence.MEDIUM
     evidence: dict[str, Any] = Field(default_factory=dict)
     status: RecommendationStatus = RecommendationStatus.PENDING
+    pricing_basis: str = "list"  # "list" or "negotiated"
+    baseline_monthly_cost_usd: Decimal | None = None
+    actual_monthly_savings_usd: Decimal | None = None
+    savings_verified_at: datetime | None = None
     pr_url: str | None = None
 
 

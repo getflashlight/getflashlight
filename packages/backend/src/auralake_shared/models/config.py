@@ -18,6 +18,7 @@ class ConnectionProvider(StrEnum):
     LAKE_FORMATION = "lake_formation"
     GITHUB = "github"
     AWS = "aws"
+    CONFIG = "config"
 
 
 class BudgetScope(StrEnum):
@@ -95,10 +96,31 @@ class DatabricksAccountConfig(BaseModel):
     account_id: str = ""
 
 
+class DatabricksDiscountConfig(BaseModel):
+    """Company-negotiated Databricks pricing."""
+
+    global_dbu_discount_pct: float = 0.0  # e.g. 0.25 = 25% off list
+    sku_overrides: dict[str, float] = Field(default_factory=dict)  # sku → negotiated $/DBU
+
+
+class AWSDiscountConfig(BaseModel):
+    """Company-negotiated AWS pricing."""
+
+    edp_discount_pct: float = 0.0  # e.g. 0.10 = 10% EDP discount
+    has_reserved_instances: bool = False
+    has_savings_plans: bool = False
+
+
+class DiscountConfig(BaseModel):
+    databricks: DatabricksDiscountConfig = Field(default_factory=DatabricksDiscountConfig)
+    aws: AWSDiscountConfig = Field(default_factory=AWSDiscountConfig)
+
+
 class DatabricksConfig(BaseModel):
     account: DatabricksAccountConfig = Field(default_factory=DatabricksAccountConfig)
     workspaces: dict[str, DatabricksWorkspaceConfig] = Field(default_factory=dict)
     aws: DatabricksAWSConfig = Field(default_factory=DatabricksAWSConfig)
+    discounts: DiscountConfig = Field(default_factory=DiscountConfig)
 
 
 class ClusterRightsizingThresholds(BaseModel):
@@ -155,6 +177,44 @@ class TagPolicyConfig(BaseModel):
     required_tags: list[RequiredTag] = Field(default_factory=list)
 
 
+class RuleConfig(BaseModel):
+    enabled: bool = True
+    thresholds: dict[str, float | int | str] = Field(default_factory=dict)
+
+
+class RulesConfig(BaseModel):
+    # Cluster rules
+    cluster_rightsize: RuleConfig = Field(default_factory=RuleConfig)
+    cluster_idle: RuleConfig = Field(default_factory=RuleConfig)
+    cluster_no_autotermination: RuleConfig = Field(default_factory=RuleConfig)
+    cluster_spot_eligible: RuleConfig = Field(default_factory=RuleConfig)
+    # Cost rules
+    cost_high_sku: RuleConfig = Field(default_factory=RuleConfig)
+    # Delta rules
+    delta_small_files: RuleConfig = Field(default_factory=RuleConfig)
+    delta_stale_optimize: RuleConfig = Field(default_factory=RuleConfig)
+    delta_stale_vacuum: RuleConfig = Field(default_factory=RuleConfig)
+    delta_over_optimized: RuleConfig = Field(default_factory=RuleConfig)
+    delta_migrate_to_liquid_clustering: RuleConfig = Field(default_factory=RuleConfig)
+    delta_enable_clustering: RuleConfig = Field(default_factory=RuleConfig)
+    # Job rules
+    job_stale: RuleConfig = Field(default_factory=RuleConfig)
+    job_failing: RuleConfig = Field(default_factory=RuleConfig)
+    job_consolidation: RuleConfig = Field(default_factory=RuleConfig)
+    # Query rules
+    query_expensive: RuleConfig = Field(default_factory=RuleConfig)
+    query_anti_pattern: RuleConfig = Field(default_factory=RuleConfig)
+    # Infra rules
+    infra_high_transfer: RuleConfig = Field(default_factory=RuleConfig)
+    # Spot rules
+    spot_eligible: RuleConfig = Field(default_factory=RuleConfig)
+    # Idle rules
+    idle_cluster: RuleConfig = Field(default_factory=RuleConfig)
+    # S3 rules
+    orphan_s3_objects: RuleConfig = Field(default_factory=RuleConfig)
+    untagged_s3_objects: RuleConfig = Field(default_factory=RuleConfig)
+
+
 class AutomationConfig(BaseModel):
     max_auto_risk_level: str = "medium"
     bulk_action_threshold: int = 5
@@ -184,6 +244,7 @@ class AuraLakeConfig(BaseModel):
     databricks: DatabricksConfig = Field(default_factory=DatabricksConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     thresholds: ThresholdsConfig = Field(default_factory=ThresholdsConfig)
+    rules: RulesConfig = Field(default_factory=RulesConfig)
     tag_policy: TagPolicyConfig = Field(default_factory=TagPolicyConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)

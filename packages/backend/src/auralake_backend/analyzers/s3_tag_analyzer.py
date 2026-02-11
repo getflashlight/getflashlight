@@ -37,6 +37,7 @@ class S3TagAnalyzer(AbstractAnalyzer):
 
     def analyze(self) -> AnalysisResult:
         recommendations: list[Recommendation] = []
+        basis = self.pricing_basis()
 
         # 1. Build table-location map from pre-collected catalog table metadata
         table_locations: dict[str, str] = {}
@@ -130,7 +131,7 @@ class S3TagAnalyzer(AbstractAnalyzer):
         orphan_gb = orphan_bytes / (1024**3)
         orphan_monthly_cost = Decimal(str(orphan_gb)) * _S3_COST_PER_GB_MONTH
 
-        if orphan_count > 0:
+        if self.rule_enabled("orphan_s3_objects") and orphan_count > 0:
             recommendations.append(
                 Recommendation(
                     type="orphan_s3_objects",
@@ -151,10 +152,11 @@ class S3TagAnalyzer(AbstractAnalyzer):
                     recommended_state={"action": "review_and_delete_orphans"},
                     estimated_monthly_savings_usd=orphan_monthly_cost,
                     savings_confidence=SavingsConfidence.MEDIUM,
+                    pricing_basis=basis,
                 )
             )
 
-        if untagged_count > 0:
+        if self.rule_enabled("untagged_s3_objects") and untagged_count > 0:
             recommendations.append(
                 Recommendation(
                     type="untagged_s3_objects",
@@ -171,6 +173,7 @@ class S3TagAnalyzer(AbstractAnalyzer):
                     recommended_state={"action": "apply_tags"},
                     estimated_monthly_savings_usd=Decimal("0"),
                     savings_confidence=SavingsConfidence.LOW,
+                    pricing_basis=basis,
                 )
             )
 

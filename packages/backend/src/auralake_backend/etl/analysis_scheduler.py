@@ -77,6 +77,16 @@ class AnalysisScheduler:
                 logger.error("scheduled_analysis_failed", analyzer=name, error=str(exc))
                 results[name] = 0
 
+        # Verify actual savings on previously-applied recommendations
+        try:
+            from auralake_backend.analyzers.savings_tracker import SavingsTracker
+
+            tracker = SavingsTracker(self.session)
+            verified = tracker.verify_applied_recommendations()
+            results["_savings_verified"] = verified
+        except Exception as exc:
+            logger.warning("savings_verification_error", error=str(exc))
+
         logger.info("scheduled_analysis_completed", results=results)
         return results
 
@@ -121,6 +131,7 @@ class AnalysisScheduler:
                     savings_confidence=rec.savings_confidence.value,
                     evidence=rec.evidence,
                     status="pending",
+                    pricing_basis=rec.pricing_basis,
                 )
                 self.session.add(record)
 

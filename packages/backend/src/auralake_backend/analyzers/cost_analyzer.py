@@ -26,26 +26,30 @@ class CostAnalyzer(AbstractAnalyzer):
 
         breakdown = cost_client.get_cost_breakdown(start, end)
         recommendations = []
+        basis = self.pricing_basis()
 
         # Flag high-cost SKUs
-        for sku, cost in breakdown.by_sku.items():
-            if cost > Decimal("1000"):
-                recommendations.append(
-                    Recommendation(
-                        type="cost_high_sku",
-                        risk_level=RiskLevel.LOW,
-                        resource_id=sku,
-                        resource_name=sku,
-                        title=f"High cost SKU: {sku}",
-                        description=(f"SKU {sku} cost ${cost:.2f} over {days} days."),
-                        estimated_monthly_savings_usd=Decimal("0"),
-                        savings_confidence=SavingsConfidence.LOW,
-                        evidence={
-                            "cost_usd": str(cost),
-                            "period_days": days,
-                        },
+        if self.rule_enabled("cost_high_sku"):
+            threshold = self.rule_threshold("cost_high_sku", "min_cost_usd", 1000)
+            for sku, cost in breakdown.by_sku.items():
+                if cost > Decimal(str(threshold)):
+                    recommendations.append(
+                        Recommendation(
+                            type="cost_high_sku",
+                            risk_level=RiskLevel.LOW,
+                            resource_id=sku,
+                            resource_name=sku,
+                            title=f"High cost SKU: {sku}",
+                            description=(f"SKU {sku} cost ${cost:.2f} over {days} days."),
+                            estimated_monthly_savings_usd=Decimal("0"),
+                            savings_confidence=SavingsConfidence.LOW,
+                            pricing_basis=basis,
+                            evidence={
+                                "cost_usd": str(cost),
+                                "period_days": days,
+                            },
+                        )
                     )
-                )
 
         return AnalysisResult(
             analyzer_name=self.name,

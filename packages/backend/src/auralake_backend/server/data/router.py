@@ -205,7 +205,14 @@ async def list_recommendations(
             "description": r.description,
             "estimated_monthly_savings_usd": r.estimated_monthly_savings_usd,
             "savings_confidence": r.savings_confidence,
+            "pricing_basis": r.pricing_basis,
+            "baseline_monthly_cost_usd": r.baseline_monthly_cost_usd,
+            "actual_monthly_savings_usd": r.actual_monthly_savings_usd,
+            "savings_verified_at": r.savings_verified_at.isoformat()
+            if r.savings_verified_at
+            else None,
             "status": r.status,
+            "applied_at": r.applied_at.isoformat() if r.applied_at else None,
             "created_at": r.created_at.isoformat() if r.created_at else None,
         }
         for r in rows

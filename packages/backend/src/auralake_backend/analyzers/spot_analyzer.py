@@ -22,6 +22,15 @@ class SpotAnalyzer(AbstractAnalyzer):
         clusters = compute.list_clusters()
         min_savings = self.context.config.thresholds.spot_optimization.min_savings_pct
         recommendations = []
+        basis = self.pricing_basis()
+
+        if not self.rule_enabled("spot_eligible"):
+            return AnalysisResult(
+                analyzer_name=self.name,
+                provider=self.context.config.provider,
+                recommendations=[],
+                summary={"clusters_analyzed": len(clusters), "spot_eligible": 0},
+            )
 
         for cluster in clusters:
             if cluster.spot_enabled or cluster.num_workers == 0:
@@ -50,6 +59,7 @@ class SpotAnalyzer(AbstractAnalyzer):
                         recommended_state={"spot_enabled": True, "spot_fallback": True},
                         estimated_monthly_savings_usd=monthly_savings,
                         savings_confidence=SavingsConfidence.MEDIUM,
+                        pricing_basis=basis,
                     )
                 )
 

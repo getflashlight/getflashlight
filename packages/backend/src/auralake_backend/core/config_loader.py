@@ -48,6 +48,11 @@ def load_config_from_db(session: Session) -> AuraLakeConfig:
                 ws_cfg["client_id"] = creds["client_id"]
             if "client_secret" in creds:
                 ws_cfg["client_secret"] = creds["client_secret"]
+            # Extract discounts into the databricks section (not per-workspace)
+            if "discounts" in ws_cfg:
+                discounts_data = ws_cfg.pop("discounts")
+                # Will be placed on databricks section below
+                data.setdefault("_discounts", discounts_data)
             workspaces[conn.name] = ws_cfg
 
         elif conn.provider == "github":
@@ -64,12 +69,20 @@ def load_config_from_db(session: Session) -> AuraLakeConfig:
             if "session_token" in creds:
                 aws_data["session_token"] = creds["session_token"]
 
+        elif conn.provider == "config":
+            if "rules" in cfg:
+                data["rules"] = cfg["rules"]
+            if "thresholds" in cfg:
+                data["thresholds"] = cfg["thresholds"]
+
     if workspaces or aws_data:
         db_section: dict[str, Any] = {}
         if workspaces:
             db_section["workspaces"] = workspaces
         if aws_data:
             db_section["aws"] = aws_data
+        if "_discounts" in data:
+            db_section["discounts"] = data.pop("_discounts")
         data["databricks"] = db_section
 
     if github_data:
