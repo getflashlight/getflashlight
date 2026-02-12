@@ -327,6 +327,7 @@ class BillingRecord(SQLModel, table=True):
     sku: str
     cluster_id: str | None = Field(default=None)
     job_id: str | None = Field(default=None)
+    job_name: str | None = Field(default=None)
     warehouse_id: str | None = Field(default=None)
     endpoint_id: str | None = Field(default=None)
     pipeline_id: str | None = Field(default=None)
@@ -334,6 +335,27 @@ class BillingRecord(SQLModel, table=True):
     workspace_id: str | None = Field(default=None)
     dbu_usage: float
     cost_usd: float
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# BillingResourceMonthly — Pre-aggregated billing by resource + month
+# ---------------------------------------------------------------------------
+class BillingResourceMonthly(SQLModel, table=True):
+    __tablename__ = "billing_resource_monthly"
+    __table_args__ = {"schema": "inventory"}
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
+    month: date  # 1st of month
+    sku: str
+    resource_type: str  # job, cluster, warehouse, pipeline, endpoint
+    resource_key: str  # grouping key (job_name, creator, warehouse_id, ...)
+    resource_name: str | None = Field(default=None)
+    creator: str | None = Field(default=None)
+    dbu_usage: float = Field(default=0.0)
+    cost_usd: float = Field(default=0.0)
+    resource_ids: list = Field(default_factory=list, sa_column=sa.Column(sa.JSON))
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 

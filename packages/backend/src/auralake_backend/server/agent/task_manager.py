@@ -33,6 +33,7 @@ class CollectionTaskManager:
         connection_id: uuid.UUID,
         config: Any,
         trigger: str = "manual",
+        mode: str = "incremental",
     ) -> CollectionRun:
         """Launch a background collection for a connection.
 
@@ -59,7 +60,7 @@ class CollectionTaskManager:
         self._cancel_events[connection_id] = cancel_event
 
         task = asyncio.get_event_loop().create_task(
-            self._run_collection(connection_id, run_id, config, cancel_event)
+            self._run_collection(connection_id, run_id, config, cancel_event, mode)
         )
         self._tasks[connection_id] = task
         return run
@@ -70,11 +71,12 @@ class CollectionTaskManager:
         run_id: uuid.UUID,
         config: Any,
         cancel_event: Event,
+        mode: str = "incremental",
     ) -> None:
         """Execute the full collection pipeline in a thread."""
         from auralake_backend.etl.full_collector import FullCollector
 
-        collector = FullCollector(connection_id, config, cancel_event)
+        collector = FullCollector(connection_id, config, cancel_event, mode=mode)
 
         try:
             worker_statuses = await asyncio.to_thread(collector.run, run_id)

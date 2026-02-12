@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from auralake_backend.db.models import ApiKey
 from auralake_backend.server.auth import require_auth
@@ -51,13 +51,14 @@ async def connection_status(
 @router.post("/collect/{connection_id}")
 async def trigger_collection(
     connection_id: uuid.UUID,
+    mode: str = Query(default="incremental"),
     _auth: ApiKey = Depends(require_auth),
     tm=Depends(_get_task_manager),
     config=Depends(_get_config),
 ) -> dict:
     """Manually trigger a full collection for a connection."""
     try:
-        run = tm.start_collection(connection_id, config, trigger="manual")
+        run = tm.start_collection(connection_id, config, trigger="manual", mode=mode)
         return {"status": "started", "run_id": str(run.id)}
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Generator
+from datetime import date
 
 from fastapi import APIRouter, Depends, Query
 from sqlmodel import Session, func, select
@@ -11,6 +13,7 @@ from auralake_backend.db.engine import get_engine
 from auralake_backend.db.models import (
     ApiKey,
     BillingRecord,
+    BillingResourceMonthly,
     ClusterPolicyRecord,
     InfraResourceMapping,
     JobProfileRecord,
@@ -153,23 +156,334 @@ async def list_job_runs(
     ]
 
 
+def _months_back(ref: date, n: int) -> date:
+    """First day of the month *n* months before *ref*'s month."""
+    m = ref.month - n
+    y = ref.year
+    while m <= 0:
+        m += 12
+        y -= 1
+    return date(y, m, 1)
+
+
+_MIN_CONTRIBUTOR_DBU_CHANGE = 500
+
+
+def _compute_reasons(
+    session: Session,
+    contributors: list[dict],
+    prev_date: date,
+    curr_date: date,
+) -> None:
+    """Enrich contributors with a human-readable 'reason' field in-place."""
+
+    def _next_month_first(d: date) -> date:
+        return date(d.year + (d.month // 12), (d.month % 12) + 1, 1)
+
+    prev_start = prev_date.replace(day=1)
+    prev_end = _next_month_first(prev_start)
+    curr_start = curr_date.replace(day=1)
+    curr_end = _next_month_first(curr_start)
+
+    # Collect all underlying job_ids from resource_ids for job-type contributors
+    all_job_ids: list[str] = []
+    for c in contributors:
+        if c["type"] == "job":
+            all_job_ids.extend(c.get("resource_ids", []))
+
+    prev_runs: dict[str, int] = {}
+    curr_runs: dict[str, int] = {}
+    if all_job_ids:
+        for target_start, target_end, target_dict in [
+            (prev_start, prev_end, prev_runs),
+            (curr_start, curr_end, curr_runs),
+        ]:
+            rows = session.exec(
+                select(JobRunRecord.job_id, func.count())
+                .where(
+                    JobRunRecord.job_id.in_(all_job_ids),  # type: ignore[union-attr]
+                    JobRunRecord.start_time >= target_start,  # type: ignore[operator]
+                    JobRunRecord.start_time < target_end,  # type: ignore[operator]
+                )
+                .group_by(JobRunRecord.job_id)
+            ).all()
+            for r in rows:
+                target_dict[r[0]] = r[1]
+
+    # Batch fetch applied recommendations for resource_keys and resource_ids
+    all_keys = [c["resource_key"] for c in contributors]
+    all_resource_ids: list[str] = []
+    for c in contributors:
+        all_resource_ids.extend(c.get("resource_ids", []))
+    lookup_ids = list(set(all_keys + all_resource_ids))
+
+    applied_recs: dict[str, str] = {}
+    if lookup_ids:
+        rows = session.exec(
+            select(
+                RecommendationRecord.resource_id,
+                RecommendationRecord.title,
+            ).where(
+                RecommendationRecord.resource_id.in_(lookup_ids),  # type: ignore[union-attr]
+                RecommendationRecord.status == "applied",
+            )
+        ).all()
+        for r in rows:
+            applied_recs[r[0]] = r[1]
+
+    for c in contributors:
+        reasons: list[str] = []
+
+        # New / Removed
+        if c["prev_dbu"] == 0 and c["dbu"] > 0:
+            reasons.append("New")
+        elif c["dbu"] == 0 and c["prev_dbu"] > 0:
+            reasons.append("Removed")
+
+        # Run count change (jobs only) — aggregate across all underlying job_ids
+        if c["type"] == "job":
+            rids = c.get("resource_ids", [])
+            p = sum(prev_runs.get(jid, 0) for jid in rids)
+            n = sum(curr_runs.get(jid, 0) for jid in rids)
+            prev_has_data = p > 0 or c["prev_dbu"] == 0
+            curr_has_data = n > 0 or c["dbu"] == 0
+            if (p or n) and prev_has_data and curr_has_data:
+                reasons.append(f"Runs: {p} \u2192 {n}")
+
+        # Applied optimization — check resource_key and all resource_ids
+        matched_rec = applied_recs.get(c["resource_key"])
+        if not matched_rec:
+            for rid in c.get("resource_ids", []):
+                matched_rec = applied_recs.get(rid)
+                if matched_rec:
+                    break
+        if matched_rec:
+            reasons.append(f"Applied: {matched_rec}")
+
+        c["reason"] = "; ".join(reasons) if reasons else None
+
+
+def _compute_insights(
+    session: Session,
+    monthly_by_sku: list[dict],
+    by_sku_rows: list,
+) -> list[dict]:
+    """Compare two most recent complete months and surface biggest movers."""
+    # Find the two most recent months
+    months = sorted({r["month"] for r in monthly_by_sku})
+    if len(months) < 2:
+        return []
+
+    curr_month = months[-1]
+    prev_month = months[0]
+
+    # Build month+sku -> dbu lookup
+    sku_month_dbu: dict[str, dict[str, float]] = defaultdict(dict)
+    for r in monthly_by_sku:
+        sku_month_dbu[r["sku"]][r["month"]] = r["dbu_usage"]
+
+    # Top 10 SKUs by total DBU
+    top_skus = [row[0] for row in by_sku_rows[:10]]
+
+    insights = []
+    for sku in top_skus:
+        curr_dbu = sku_month_dbu.get(sku, {}).get(curr_month, 0.0)
+        prev_dbu = sku_month_dbu.get(sku, {}).get(prev_month, 0.0)
+        change_dbu = curr_dbu - prev_dbu
+        change_pct = (change_dbu / prev_dbu * 100) if prev_dbu else 0.0
+
+        # Top contributors: break down by job_id and cluster_id for this SKU
+        month_col = func.date_trunc("month", BillingRecord.usage_date)
+        top_contributors = _get_top_contributors(session, sku, month_col, curr_month, prev_month)
+
+        insights.append(
+            {
+                "sku": sku,
+                "prev_month": prev_month,
+                "curr_month": curr_month,
+                "prev_dbu": prev_dbu,
+                "curr_dbu": curr_dbu,
+                "change_dbu": round(change_dbu, 2),
+                "change_pct": round(change_pct, 2),
+                "top_contributors": top_contributors,
+            }
+        )
+
+    return insights
+
+
+def _get_top_contributors(
+    session: Session,
+    sku: str,
+    month_col,  # noqa: ANN001
+    curr_month: str,
+    prev_month: str,
+) -> list[dict]:
+    """Find top resources driving MoM change for a given SKU.
+
+    Queries the pre-aggregated billing_resource_monthly table instead of
+    computing on-the-fly from raw billing_records.
+    """
+    curr_date = date.fromisoformat(f"{curr_month}-01")
+    prev_date = date.fromisoformat(f"{prev_month}-01")
+
+    rows = session.exec(
+        select(
+            BillingResourceMonthly.resource_type,
+            BillingResourceMonthly.resource_key,
+            BillingResourceMonthly.resource_name,
+            BillingResourceMonthly.month,
+            BillingResourceMonthly.dbu_usage,
+            BillingResourceMonthly.resource_ids,
+        ).where(
+            BillingResourceMonthly.sku == sku,
+            BillingResourceMonthly.month.in_([prev_date, curr_date]),  # type: ignore[union-attr]
+        )
+    ).all()
+
+    # Pivot by resource_key: collect prev/curr month DBU
+    resource_data: dict[str, dict] = {}
+    for row in rows:
+        rkey = row[1]
+        if rkey not in resource_data:
+            resource_data[rkey] = {
+                "type": row[0],
+                "resource_key": rkey,
+                "name": row[2] or rkey,
+                "prev_dbu": 0.0,
+                "curr_dbu": 0.0,
+                "resource_ids": [],
+            }
+        if row[3] == prev_date:
+            resource_data[rkey]["prev_dbu"] = float(row[4] or 0)
+        elif row[3] == curr_date:
+            resource_data[rkey]["curr_dbu"] = float(row[4] or 0)
+        # Merge resource_ids from both months
+        for rid in row[5] or []:
+            if rid not in resource_data[rkey]["resource_ids"]:
+                resource_data[rkey]["resource_ids"].append(rid)
+
+    # Compute changes and filter
+    contributors: list[dict] = []
+    for rkey, data in resource_data.items():
+        curr_dbu = data["curr_dbu"]
+        prev_dbu = data["prev_dbu"]
+        change_dbu = curr_dbu - prev_dbu
+        change_pct = ((change_dbu) / prev_dbu * 100) if prev_dbu else (100.0 if curr_dbu else 0.0)
+
+        if abs(change_pct) < 20:
+            continue
+        if abs(change_dbu) < _MIN_CONTRIBUTOR_DBU_CHANGE:
+            continue
+
+        contributors.append(
+            {
+                "type": data["type"],
+                "resource_key": rkey,
+                "name": data["name"],
+                "prev_dbu": round(prev_dbu, 2),
+                "dbu": round(curr_dbu, 2),
+                "change_dbu": round(change_dbu, 2),
+                "change_pct": round(change_pct, 1),
+                "resource_ids": data["resource_ids"],
+            }
+        )
+
+    contributors.sort(key=lambda x: abs(x["change_dbu"]), reverse=True)
+    result = contributors[:5]
+
+    _compute_reasons(session, result, prev_date, curr_date)
+    return result
+
+
 @router.get("/billing")
 async def billing_summary(
     _auth: ApiKey = Depends(require_auth),
     session: Session = Depends(_get_session),
+    from_date: date | None = Query(default=None),
+    to_date: date | None = Query(default=None),
 ) -> dict:
-    """Billing summary — total cost and breakdown by SKU."""
-    total = session.exec(select(func.sum(BillingRecord.cost_usd))).one() or 0.0
+    """Billing summary — total cost, DBU usage, and breakdown by SKU."""
+    # Default: last 3 months from the most recent data point
+    if from_date is None or to_date is None:
+        max_d = session.exec(select(func.max(BillingRecord.usage_date))).one()
+        if max_d:
+            if to_date is None:
+                to_date = max_d
+            if from_date is None:
+                from_date = _months_back(max_d, 2)
 
-    by_sku_rows = session.exec(
-        select(BillingRecord.sku, func.sum(BillingRecord.cost_usd))
+    def _date_filter(stmt):  # noqa: ANN001, ANN202
+        if from_date:
+            stmt = stmt.where(BillingRecord.usage_date >= from_date)
+        if to_date:
+            stmt = stmt.where(BillingRecord.usage_date <= to_date)
+        return stmt
+
+    stmt_cost = select(func.sum(BillingRecord.cost_usd))
+    stmt_dbu = select(func.sum(BillingRecord.dbu_usage))
+    total = session.exec(_date_filter(stmt_cost)).one() or 0.0
+    total_dbu = session.exec(_date_filter(stmt_dbu)).one() or 0.0
+
+    stmt_sku = (
+        select(
+            BillingRecord.sku,
+            func.sum(BillingRecord.cost_usd),
+            func.sum(BillingRecord.dbu_usage),
+        )
         .group_by(BillingRecord.sku)
-        .order_by(func.sum(BillingRecord.cost_usd).desc())
-    ).all()
+        .order_by(func.sum(BillingRecord.dbu_usage).desc())
+    )
+    by_sku_rows = session.exec(_date_filter(stmt_sku)).all()
+
+    # Monthly trend by SKU
+    month_col = func.date_trunc("month", BillingRecord.usage_date)
+    stmt_monthly = (
+        select(
+            month_col,
+            BillingRecord.sku,
+            func.sum(BillingRecord.cost_usd),
+            func.sum(BillingRecord.dbu_usage),
+        )
+        .group_by(month_col, BillingRecord.sku)
+        .order_by(month_col)
+    )
+    monthly_sku_rows = session.exec(_date_filter(stmt_monthly)).all()
+
+    monthly_by_sku = [
+        {
+            "month": row[0].strftime("%Y-%m"),
+            "sku": row[1],
+            "cost_usd": float(row[2]),
+            "dbu_usage": float(row[3]),
+        }
+        for row in monthly_sku_rows
+    ]
+
+    # Date range (reflects the filtered window)
+    stmt_range = select(
+        func.min(BillingRecord.usage_date),
+        func.max(BillingRecord.usage_date),
+    )
+    date_range_row = session.exec(_date_filter(stmt_range)).one()
+    date_range = None
+    if date_range_row[0] and date_range_row[1]:
+        date_range = {
+            "min": date_range_row[0].strftime("%Y-%m"),
+            "max": date_range_row[1].strftime("%Y-%m"),
+        }
+
+    # Insights: compare first and last month in the filtered range
+    insights = _compute_insights(session, monthly_by_sku, by_sku_rows)
 
     return {
         "total_cost_usd": float(total),
+        "total_dbu_usage": float(total_dbu),
         "by_sku": {row[0]: float(row[1]) for row in by_sku_rows},
+        "by_sku_dbu": {row[0]: float(row[2]) for row in by_sku_rows},
+        "monthly_by_sku": monthly_by_sku,
+        "date_range": date_range,
+        "insights": insights,
     }
 
 

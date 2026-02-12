@@ -22,6 +22,7 @@ from auralake_backend.db.engine import get_engine, init_engine
 from auralake_backend.db.models import ApiKey
 from auralake_backend.server.agent.router import router as agent_router
 from auralake_backend.server.auth import create_api_key
+from auralake_backend.server.chat.router import router as chat_router
 from auralake_backend.server.data.router import router as data_router
 from auralake_backend.server.errors import register_exception_handlers
 from auralake_backend.server.settings.router import router as settings_router
@@ -159,6 +160,7 @@ def create_app() -> FastAPI:
     app.include_router(settings_router, prefix="/api/v1", tags=["settings"])
     app.include_router(agent_router, prefix="/api/v1/agent", tags=["agent"])
     app.include_router(data_router, prefix="/api/v1/data", tags=["data"])
+    app.include_router(chat_router, prefix="/api/v1", tags=["chat"])
 
     return app
 

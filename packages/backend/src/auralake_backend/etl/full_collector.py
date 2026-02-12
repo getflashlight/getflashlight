@@ -15,7 +15,7 @@ from threading import Event
 from typing import Any
 
 import structlog
-from sqlmodel import Session, select
+from sqlmodel import Session, delete, select
 
 from auralake_backend.db.engine import get_engine
 from auralake_backend.db.models import (
@@ -32,6 +32,7 @@ from auralake_backend.db.models import (
     UnityCatalogTableRecord,
     WorkerCursor,
 )
+from auralake_backend.etl.billing_aggregator import BillingAggregator
 
 logger = structlog.get_logger(__name__)
 
@@ -50,6 +51,16 @@ def _safe_int(val: Any) -> int | None:
         return int(float(val))
     except (ValueError, TypeError):
         return None
+
+
+def _months_back(ref: date, n: int) -> date:
+    """Return the 1st of the month that is *n* months before *ref*."""
+    m = ref.month - n
+    y = ref.year
+    while m <= 0:
+        m += 12
+        y -= 1
+    return date(y, m, 1)
 
 
 class FullCollector:
@@ -72,10 +83,12 @@ class FullCollector:
         connection_id: uuid.UUID,
         config: Any,
         cancel_event: Event | None = None,
+        mode: str = "incremental",
     ) -> None:
         self.connection_id = connection_id
         self.config = config
         self._cancel = cancel_event or Event()
+        self._mode = mode
 
     def run(self, run_id: uuid.UUID) -> dict[str, Any]:
         """Execute the full collection pipeline. Returns worker_statuses dict."""
@@ -111,8 +124,9 @@ class FullCollector:
             ]:
                 f.result()
 
-        # Run analysis after collection completes
+        # Run billing aggregation + analysis after collection completes
         if not self._cancel.is_set():
+            self._run_billing_aggregation(run_id, worker_statuses)
             self._run_analysis(run_id, worker_statuses)
 
         return worker_statuses
@@ -122,6 +136,28 @@ class FullCollector:
         worker_statuses: dict[str, dict[str, Any]] = {worker_name: {"status": "pending"}}
         self._run_worker(run_id, worker_name, worker_statuses)
         return worker_statuses
+
+    def _run_billing_aggregation(self, run_id: uuid.UUID, worker_statuses: dict) -> None:
+        """Aggregate billing records into billing_resource_monthly."""
+        try:
+            with Session(get_engine()) as session:
+                aggregator = BillingAggregator(self.connection_id, session)
+                count = aggregator.run()
+                session.commit()
+
+            worker_statuses["billing_aggregation"] = {
+                "status": "completed",
+                "count": count,
+            }
+            self._update_run_statuses(run_id, worker_statuses)
+            logger.info("billing_aggregation_completed", count=count)
+        except Exception as exc:
+            worker_statuses["billing_aggregation"] = {
+                "status": "failed",
+                "error": str(exc),
+            }
+            self._update_run_statuses(run_id, worker_statuses)
+            logger.error("billing_aggregation_failed", error=str(exc))
 
     def _run_analysis(self, run_id: uuid.UUID, worker_statuses: dict) -> None:
         """Run all analyzers after collection completes."""
@@ -812,7 +848,17 @@ class FullCollector:
         provider = get_provider(self.config.provider, self.config)
         cost_client = provider.get_cost_client()
 
-        if cursor:
+        if self._mode == "full":
+            today = date.today()
+            since = _months_back(today, 3)
+            # Delete existing records in the window to avoid duplicates
+            session.execute(
+                delete(BillingRecord).where(
+                    BillingRecord.connection_id == self.connection_id,
+                    BillingRecord.usage_date >= since,
+                )
+            )
+        elif cursor:
             since = date.fromisoformat(cursor)
         else:
             since = date.today() - timedelta(days=_DEFAULT_LOOKBACK_DAYS)
@@ -830,6 +876,7 @@ class FullCollector:
                     sku=r.sku or "unknown",
                     cluster_id=r.cluster_id,
                     job_id=r.job_id,
+                    job_name=r.job_name,
                     warehouse_id=r.warehouse_id,
                     endpoint_id=r.endpoint_id,
                     pipeline_id=r.pipeline_id,

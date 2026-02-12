@@ -41,6 +41,7 @@ class DatabricksCostClient(AbstractCostClient):
             "endpoint_id": "usage_metadata.endpoint_name AS endpoint_id",
             "pipeline_id": "usage_metadata.dlt_pipeline_id AS pipeline_id",
             "notebook_id": "usage_metadata.notebook_id AS notebook_id",
+            "job_name": "usage_metadata.job_name AS job_name",
         }
         raw_cols = group_by or ["sku_name"]
         select_cols = ", ".join(col_map.get(c, c) for c in raw_cols)
@@ -69,6 +70,7 @@ class DatabricksCostClient(AbstractCostClient):
                     endpoint_id=row.get("endpoint_id"),
                     pipeline_id=row.get("pipeline_id"),
                     notebook_id=row.get("notebook_id"),
+                    job_name=row.get("job_name"),
                     dbu_usage=float(row.get("dbu_usage", 0)),
                     cost_usd=Decimal(
                         str(
@@ -123,6 +125,7 @@ class DatabricksCostClient(AbstractCostClient):
                 "sku_name",
                 "cluster_id",
                 "job_id",
+                "job_name",
                 "warehouse_id",
                 "endpoint_id",
                 "pipeline_id",

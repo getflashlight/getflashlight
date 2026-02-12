@@ -11,6 +11,7 @@ class CostRecord(BaseModel):
     workspace_id: str | None = None
     cluster_id: str | None = None
     job_id: str | None = None
+    job_name: str | None = None
     warehouse_id: str | None = None
     endpoint_id: str | None = None
     pipeline_id: str | None = None

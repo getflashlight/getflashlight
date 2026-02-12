@@ -18,6 +18,8 @@ dependencies = [
     "pydantic>=2.0",
     "rich>=14.3.2",
     "structlog>=25.5.0",
+    "openai>=2.20.0",
+    "cryptography>=46.0.4",
 ]
 
 [project.scripts]
