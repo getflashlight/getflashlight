@@ -200,7 +200,9 @@ class DatabricksStorageClient(AbstractStorageClient):
         for ws_name, ws_config in self._config.workspaces.items():
             try:
                 client = get_workspace_client(self._config, ws_name)
-                wh_id = get_warehouse_id(client, ws_config.sql_warehouse_id)
+                wh_id = get_warehouse_id(
+                    client, ws_config.sql_warehouse_id, prefer_pro=True
+                )
                 result = client.statement_execution.execute_statement(
                     warehouse_id=wh_id,
                     statement=f"DESCRIBE DETAIL {table_name}",
@@ -225,7 +227,9 @@ class DatabricksStorageClient(AbstractStorageClient):
         for ws_name, ws_config in self._config.workspaces.items():
             try:
                 client = get_workspace_client(self._config, ws_name)
-                wh_id = get_warehouse_id(client, ws_config.sql_warehouse_id)
+                wh_id = get_warehouse_id(
+                    client, ws_config.sql_warehouse_id, prefer_pro=True
+                )
                 result = client.statement_execution.execute_statement(
                     warehouse_id=wh_id,
                     statement=f"DESCRIBE HISTORY {table_name} LIMIT {limit}",

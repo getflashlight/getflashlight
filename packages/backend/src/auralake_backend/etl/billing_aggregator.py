@@ -110,7 +110,7 @@ class BillingAggregator:
     # ------------------------------------------------------------------
 
     def _aggregate_clusters(self) -> int:
-        creator_map = self._get_cluster_creators()
+        cluster_info = self._get_cluster_info()
 
         month_col = func.date_trunc("month", BillingRecord.usage_date)
 
@@ -134,30 +134,48 @@ class BillingAggregator:
         grouped: dict[tuple[str, date, str], dict] = {}
         for row in rows:
             cluster_id = row[2]
-            creator = creator_map.get(cluster_id, cluster_id)  # fallback to cluster_id
+            name, creator = cluster_info.get(cluster_id, (None, None))
+            group_key = creator or cluster_id  # group by creator, fallback to cluster_id
             month = _month_trunc(row[1].date() if hasattr(row[1], "date") else row[1])
-            key = (row[0], month, creator)
+            key = (row[0], month, group_key)
 
             if key not in grouped:
                 grouped[key] = {
                     "dbu": 0.0,
                     "cost": 0.0,
                     "cluster_ids": set(),
+                    "names": set(),
+                    "creator": creator,
                 }
             grouped[key]["dbu"] += float(row[3] or 0)
             grouped[key]["cost"] += float(row[4] or 0)
             grouped[key]["cluster_ids"].add(cluster_id)
+            if name:
+                grouped[key]["names"].add(name)
 
         count = 0
-        for (sku, month, creator), data in grouped.items():
+        for (sku, month, group_key), data in grouped.items():
+            creator = data["creator"]
+            names = sorted(data["names"])
+            # Build display name: "name (creator)" if both, name if only name,
+            # creator if only creator, cluster_id as last fallback
+            if names and creator:
+                display_name = f"{', '.join(names)} ({creator})"
+            elif names:
+                display_name = ", ".join(names)
+            elif creator:
+                display_name = creator
+            else:
+                display_name = group_key
+
             self.session.add(
                 BillingResourceMonthly(
                     connection_id=self.connection_id,
                     month=month,
                     sku=sku,
                     resource_type="cluster",
-                    resource_key=creator,
-                    resource_name=creator,
+                    resource_key=group_key,
+                    resource_name=display_name,
                     creator=creator,
                     dbu_usage=data["dbu"],
                     cost_usd=data["cost"],
@@ -307,21 +325,21 @@ class BillingAggregator:
     # Inventory lookups
     # ------------------------------------------------------------------
 
-    def _get_cluster_creators(self) -> dict[str, str]:
-        """Return cluster_id -> creator email mapping."""
+    def _get_cluster_info(self) -> dict[str, tuple[str | None, str | None]]:
+        """Return cluster_id -> (name, creator) mapping."""
         rows = self.session.exec(
             select(
                 ComputeResourceRecord.resource_id,
+                ComputeResourceRecord.resource_name,
                 ComputeResourceRecord.creator,
             ).where(
                 ComputeResourceRecord.connection_id == self.connection_id,
                 ComputeResourceRecord.resource_type.in_(  # type: ignore[union-attr]
                     ["all_purpose_cluster", "job_cluster"]
                 ),
-                ComputeResourceRecord.creator.isnot(None),  # type: ignore[union-attr]
             )
         ).all()
-        return {r[0]: r[1] for r in rows}
+        return {r[0]: (r[1], r[2]) for r in rows}
 
     def _get_warehouse_info(self) -> dict[str, tuple[str, str | None]]:
         """Return warehouse_id -> (name, creator) mapping."""

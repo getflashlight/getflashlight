@@ -51,6 +51,19 @@ def _resolve_workspace(config: DatabricksConfig, name: str | None) -> Databricks
     raise AuthenticationError("databricks", "No workspaces configured")
 
 
+_SIZE_ORDER = {
+    "2X-Small": 0,
+    "X-Small": 1,
+    "Small": 2,
+    "Medium": 3,
+    "Large": 4,
+    "X-Large": 5,
+    "2X-Large": 6,
+    "3X-Large": 7,
+    "4X-Large": 8,
+}
+
+
 class WarehouseResolver:
     """Caches warehouse discovery per workspace. Thread-safe."""
 
@@ -58,7 +71,7 @@ class WarehouseResolver:
         self._client = client
         self._lock = threading.Lock()
         self._warehouses: list[dict[str, Any]] | None = None
-        self._resolved: dict[str | None, str] = {}
+        self._resolved: dict[tuple[str | None, bool], str] = {}
 
     def _discover(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -69,31 +82,51 @@ class WarehouseResolver:
                 self._warehouses.append(
                     {
                         "id": wh.id,
+                        "name": wh.name,
                         "state": wh.state.value if wh.state else None,
                         "type": wh.warehouse_type.value if wh.warehouse_type else None,
+                        "size": wh.cluster_size if wh.cluster_size else None,
                     }
                 )
             return self._warehouses
 
-    def get_warehouse_id(self, configured_id: str | None = None) -> str:
-        """Priority: configured -> RUNNING PRO/SERVERLESS -> RUNNING any -> STOPPED -> any.
+    def get_warehouse_id(
+        self, configured_id: str | None = None, *, prefer_pro: bool = False
+    ) -> str:
+        """Select a SQL warehouse ID.
 
-        The resolved ID is cached per configured_id so the selection (and log
-        message) happens only once per resolver instance.
+        When *prefer_pro* is ``False`` (default, existing behaviour):
+            configured -> RUNNING PRO/SERVERLESS -> RUNNING any -> STOPPED -> any
+
+        When *prefer_pro* is ``True`` (for bulk DESCRIBE queries):
+            configured -> RUNNING PRO (smallest) -> STOPPED PRO (smallest)
+            -> RUNNING SERVERLESS -> STOPPED SERVERLESS -> any fallback
         """
         if configured_id:
             return configured_id
 
-        cached = self._resolved.get(configured_id)
+        cache_key = (configured_id, prefer_pro)
+        cached = self._resolved.get(cache_key)
         if cached is not None:
             return cached
 
         warehouses = self._discover()
 
-        # RUNNING PRO or SERVERLESS
+        if prefer_pro:
+            result = self._select_prefer_pro(warehouses)
+        else:
+            result = self._select_default(warehouses)
+
+        if result is None:
+            raise AuthenticationError("databricks", "No SQL warehouse found in workspace")
+
+        self._resolved[cache_key] = result
+        return result
+
+    def _select_default(self, warehouses: list[dict[str, Any]]) -> str | None:
+        """Original selection: RUNNING PRO/SERVERLESS -> RUNNING any -> STOPPED -> any."""
         for wh in warehouses:
             if wh["state"] == "RUNNING" and wh["type"] in ("PRO", "SERVERLESS"):
-                self._resolved[configured_id] = wh["id"]
                 logger.info(
                     "warehouse_selected",
                     warehouse_id=wh["id"],
@@ -101,35 +134,104 @@ class WarehouseResolver:
                 )
                 return wh["id"]
 
-        # RUNNING CLASSIC
         for wh in warehouses:
             if wh["state"] == "RUNNING" and wh["id"]:
-                self._resolved[configured_id] = wh["id"]
-                logger.info("warehouse_selected", warehouse_id=wh["id"], strategy="running_any")
+                logger.info(
+                    "warehouse_selected", warehouse_id=wh["id"], strategy="running_any"
+                )
                 return wh["id"]
 
-        # STOPPED (Databricks auto-starts on SQL execution)
         for wh in warehouses:
             if wh["state"] == "STOPPED" and wh["id"]:
-                self._resolved[configured_id] = wh["id"]
                 logger.info("warehouse_selected", warehouse_id=wh["id"], strategy="stopped")
                 return wh["id"]
 
-        # Any warehouse with an ID
         for wh in warehouses:
             if wh["id"]:
-                self._resolved[configured_id] = wh["id"]
                 logger.info("warehouse_selected", warehouse_id=wh["id"], strategy="fallback")
                 return wh["id"]
 
-        raise AuthenticationError("databricks", "No SQL warehouse found in workspace")
+        return None
+
+    def _select_prefer_pro(self, warehouses: list[dict[str, Any]]) -> str | None:
+        """PRO-first selection for bulk DESCRIBE queries (cheapest option)."""
+
+        def _size_key(wh: dict[str, Any]) -> int:
+            return _SIZE_ORDER.get(wh.get("size") or "", 99)
+
+        # 1. RUNNING PRO — smallest first
+        running_pro = sorted(
+            [w for w in warehouses if w["state"] == "RUNNING" and w["type"] == "PRO"],
+            key=_size_key,
+        )
+        if running_pro:
+            wh = running_pro[0]
+            logger.info(
+                "warehouse_selected",
+                warehouse_id=wh["id"],
+                name=wh["name"],
+                size=wh["size"],
+                strategy="running_pro",
+            )
+            return wh["id"]
+
+        # 2. STOPPED PRO — smallest first (auto-starts on SQL)
+        stopped_pro = sorted(
+            [w for w in warehouses if w["state"] == "STOPPED" and w["type"] == "PRO"],
+            key=_size_key,
+        )
+        if stopped_pro:
+            wh = stopped_pro[0]
+            logger.info(
+                "warehouse_selected",
+                warehouse_id=wh["id"],
+                name=wh["name"],
+                size=wh["size"],
+                strategy="stopped_pro",
+            )
+            return wh["id"]
+
+        # 3. RUNNING SERVERLESS — only if no PRO exists at all
+        for wh in warehouses:
+            if wh["state"] == "RUNNING" and wh["type"] == "SERVERLESS":
+                logger.info(
+                    "warehouse_selected",
+                    warehouse_id=wh["id"],
+                    strategy="running_serverless_no_pro",
+                )
+                return wh["id"]
+
+        # 4. STOPPED SERVERLESS — last resort
+        for wh in warehouses:
+            if wh["state"] == "STOPPED" and wh["type"] == "SERVERLESS":
+                logger.info(
+                    "warehouse_selected",
+                    warehouse_id=wh["id"],
+                    strategy="stopped_serverless_no_pro",
+                )
+                return wh["id"]
+
+        # 5. Any fallback
+        for wh in warehouses:
+            if wh["id"]:
+                logger.info(
+                    "warehouse_selected", warehouse_id=wh["id"], strategy="fallback"
+                )
+                return wh["id"]
+
+        return None
 
 
 _resolver_cache: dict[str, WarehouseResolver] = {}
 _resolver_lock = threading.Lock()
 
 
-def get_warehouse_id(client: WorkspaceClient, configured_id: str | None = None) -> str:
+def get_warehouse_id(
+    client: WorkspaceClient,
+    configured_id: str | None = None,
+    *,
+    prefer_pro: bool = False,
+) -> str:
     """Return a SQL warehouse ID with caching. Same signature — backward compatible."""
     host = client.config.host or ""
     with _resolver_lock:
@@ -137,7 +239,7 @@ def get_warehouse_id(client: WorkspaceClient, configured_id: str | None = None) 
         if resolver is None:
             resolver = WarehouseResolver(client)
             _resolver_cache[host] = resolver
-    return resolver.get_warehouse_id(configured_id)
+    return resolver.get_warehouse_id(configured_id, prefer_pro=prefer_pro)
 
 
 def clear_warehouse_cache() -> None:

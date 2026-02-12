@@ -6,7 +6,8 @@ from collections import defaultdict
 from collections.abc import Generator
 from datetime import date
 
-from fastapi import APIRouter, Depends, Query
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel import Session, func, select
 
 from auralake_backend.db.engine import get_engine
@@ -24,6 +25,8 @@ from auralake_backend.db.models import (
     S3InventoryObject,
 )
 from auralake_backend.server.auth import require_auth
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -485,6 +488,127 @@ async def billing_summary(
         "date_range": date_range,
         "insights": insights,
     }
+
+
+@router.get("/billing/validate")
+async def billing_validate(
+    request: Request,
+    _auth: ApiKey = Depends(require_auth),
+    session: Session = Depends(_get_session),
+    from_date: date = Query(...),
+    to_date: date = Query(...),
+    sku: str | None = Query(default=None),
+) -> dict:
+    """Compare local billing records against Databricks system.billing.usage."""
+    config = getattr(request.app.state, "config", None)
+    if config is None:
+        raise HTTPException(status_code=503, detail="Server not configured")
+
+    # Query Databricks directly
+    from auralake_backend.providers.databricks.auth import get_warehouse_id, get_workspace_client
+
+    sku_filter = f"AND sku_name = '{sku}'" if sku else ""
+    sql = (
+        f"SELECT DATE_TRUNC('month', usage_date) AS month, sku_name, "
+        f"SUM(usage_quantity) AS dbu_usage "
+        f"FROM system.billing.usage "
+        f"WHERE usage_date BETWEEN '{from_date}' AND '{to_date}' "
+        f"{sku_filter} "
+        f"GROUP BY 1, 2 ORDER BY 1, 2"
+    )
+
+    databricks_rows: list[dict] = []
+    databricks_errors: list[str] = []
+    for ws_name, ws_config in config.databricks.workspaces.items():
+        try:
+            client = get_workspace_client(config.databricks, ws_name)
+            wh_id = get_warehouse_id(client, ws_config.sql_warehouse_id)
+            result = client.statement_execution.execute_statement(
+                warehouse_id=wh_id, statement=sql
+            )
+            if result.result and result.result.data_array:
+                columns = [col.name for col in (result.manifest.schema.columns or [])]  # type: ignore[union-attr]
+                databricks_rows = [dict(zip(columns, row)) for row in result.result.data_array]
+            databricks_errors = []
+            break
+        except Exception as exc:
+            databricks_errors.append(f"{ws_name}: {exc}")
+            logger.warning("billing_validate_workspace_failed", workspace=ws_name, error=str(exc))
+    if databricks_errors and not databricks_rows:
+        logger.error("billing_validate_all_workspaces_failed", errors=databricks_errors)
+
+    # Query local BillingRecord table with matching grouping
+    month_col = func.date_trunc("month", BillingRecord.usage_date)
+    local_stmt = (
+        select(
+            month_col.label("month"),
+            BillingRecord.sku,
+            func.sum(BillingRecord.dbu_usage),
+        )
+        .where(
+            BillingRecord.usage_date >= from_date,
+            BillingRecord.usage_date <= to_date,
+        )
+        .group_by(month_col, BillingRecord.sku)
+        .order_by(month_col, BillingRecord.sku)
+    )
+    if sku:
+        local_stmt = local_stmt.where(BillingRecord.sku == sku)
+    local_rows_raw = session.exec(local_stmt).all()
+
+    local_data = [
+        {
+            "month": row[0].strftime("%Y-%m"),
+            "sku": row[1],
+            "dbu_usage": float(row[2] or 0),
+        }
+        for row in local_rows_raw
+    ]
+
+    db_data = [
+        {
+            "month": r.get("month", "")[:7] if r.get("month") else "",
+            "sku": r.get("sku_name", ""),
+            "dbu_usage": float(r.get("dbu_usage", 0)),
+        }
+        for r in databricks_rows
+    ]
+
+    # Compute discrepancies
+    db_lookup: dict[tuple[str, str], float] = {
+        (d["month"], d["sku"]): d["dbu_usage"] for d in db_data
+    }
+    local_lookup: dict[tuple[str, str], float] = {
+        (d["month"], d["sku"]): d["dbu_usage"] for d in local_data
+    }
+    all_keys = set(db_lookup.keys()) | set(local_lookup.keys())
+
+    discrepancies = []
+    for key in sorted(all_keys):
+        db_val = db_lookup.get(key, 0.0)
+        local_val = local_lookup.get(key, 0.0)
+        diff = local_val - db_val
+        if abs(diff) > 0.01:
+            pct = (diff / db_val * 100) if db_val else None
+            discrepancies.append(
+                {
+                    "month": key[0],
+                    "sku": key[1],
+                    "databricks_dbu": round(db_val, 2),
+                    "local_dbu": round(local_val, 2),
+                    "diff_dbu": round(diff, 2),
+                    "diff_pct": round(pct, 2) if pct is not None else None,
+                }
+            )
+
+    result: dict = {
+        "databricks": db_data,
+        "local": local_data,
+        "discrepancies": discrepancies,
+    }
+    if databricks_errors and not db_data:
+        result["errors"] = databricks_errors
+    return result
 
 
 @router.get("/recommendations")

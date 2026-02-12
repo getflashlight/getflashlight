@@ -104,24 +104,35 @@ class FullCollector:
             f_queries = pool.submit(self._run_worker, run_id, "query_history", worker_statuses)
             f_policies = pool.submit(self._run_worker, run_id, "policies", worker_statuses)
             f_infra = pool.submit(self._run_worker, run_id, "infra_costs", worker_statuses)
-            f_tables = pool.submit(self._run_worker, run_id, "catalog_tables", worker_statuses)
+
+            # Skip catalog_tables on incremental — DESCRIBE DETAIL/HISTORY is
+            # expensive (~$160/run) and table stats don't change frequently.
+            f_tables: Future | None = None
+            if self._mode == "full":
+                f_tables = pool.submit(
+                    self._run_worker, run_id, "catalog_tables", worker_statuses
+                )
+            else:
+                worker_statuses["catalog_tables"] = {"status": "skipped"}
 
             # Wave 2: dependent workers
             f_job_runs = pool.submit(self._after, f_jobs, run_id, "job_runs", worker_statuses)
             f_plans = pool.submit(self._after, f_queries, run_id, "query_plans", worker_statuses)
 
             # Wait for all
-            for f in [
+            all_futures = [
                 f_compute,
                 f_jobs,
                 f_billing,
                 f_queries,
                 f_policies,
                 f_infra,
-                f_tables,
                 f_job_runs,
                 f_plans,
-            ]:
+            ]
+            if f_tables is not None:
+                all_futures.append(f_tables)
+            for f in all_futures:
                 f.result()
 
         # Run billing aggregation + analysis after collection completes
