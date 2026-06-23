@@ -257,21 +257,47 @@ class DatabricksConnector(Connector):
                 return []
             cols = [c.name or "" for c in (manifest.schema.columns or [])]
 
+            # Iterate EVERY chunk by index (0..total-1). The continuation index for
+            # EXTERNAL_LINKS lives on the ExternalLink, not ResultData, so following
+            # ResultData.next_chunk_index silently stops after chunk 0 — driving by
+            # total_chunk_count is unambiguous and can't truncate.
+            total_chunks = manifest.total_chunk_count or 1
             rows: list[dict[str, Any]] = []
-            chunk = resp.result
-            while chunk:
-                for link in chunk.external_links or []:
+            for idx in range(total_chunks):
+                data = (
+                    resp.result
+                    if idx == 0
+                    else exec_api.get_statement_result_chunk_n(resp.statement_id, idx)
+                )
+                for link in (data.external_links if data else None) or []:
                     rows.extend(
                         dict(zip(cols, r, strict=False))
                         for r in self._download_chunk(link.external_link)
                     )
-                if chunk.next_chunk_index is None:
-                    break
-                chunk = exec_api.get_statement_result_chunk_n(
-                    resp.statement_id, chunk.next_chunk_index
+
+            # Self-check: the manifest declares the row total; a mismatch means we
+            # dropped (or double-read) a chunk — surface it loudly rather than ingest
+            # a partial month silently.
+            expected = manifest.total_row_count
+            if expected is not None and len(rows) != expected:
+                logger.error(
+                    "databricks_row_count_mismatch",
+                    statement_id=resp.statement_id,
+                    got=len(rows),
+                    expected=expected,
+                    chunks=total_chunks,
+                    manifest_truncated=manifest.truncated,
                 )
-            logger.debug(
-                "databricks_statement_done", statement_id=resp.statement_id, rows=len(rows)
+                raise ConnectorError(
+                    self.name,
+                    f"read {len(rows)} rows but manifest declares {expected} "
+                    f"({total_chunks} chunks) — refusing partial result",
+                )
+            logger.info(
+                "databricks_statement_done",
+                statement_id=resp.statement_id,
+                rows=len(rows),
+                chunks=total_chunks,
             )
             return rows
         except ConnectorError:

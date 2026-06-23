@@ -66,6 +66,24 @@ CATALOG: tuple[GoldView, ...] = (
         measures=("net_cost",),
     ),
     GoldView(
+        name="gold.sku_month_over_month",
+        title="SKU month-over-month variance",
+        description="Per-SKU cost change decomposed into volume_effect (Δusage × prior rate) "
+        "and rate_effect (price/mix), which sum to cost_delta. Answers whether a SKU's cost "
+        "moved because of more usage or a higher per-unit rate.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=("provider_name", "sku_id", "charge_month"),
+        measures=(
+            "net_cost",
+            "consumed_quantity",
+            "unit_rate",
+            "cost_delta",
+            "cost_pct_change",
+            "volume_effect",
+            "rate_effect",
+        ),
+    ),
+    GoldView(
         name="gold.savings_summary_month",
         title="Savings summary",
         description="List vs effective cost and realized discount % per provider per month. "

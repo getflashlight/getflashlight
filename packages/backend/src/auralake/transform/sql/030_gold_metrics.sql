@@ -189,3 +189,56 @@ FULL OUTER JOIN unattributed u ON u.charge_month = a.charge_month;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_tco_summary_month
     ON gold.tco_summary_month (charge_month);
+
+
+-- ── "What changed month-over-month, and why?" — per-SKU cost variance ────────────
+-- Decomposes each SKU's cost change into VOLUME vs RATE so you can tell "more jobs
+-- ran" from "the same jobs cost more per DBU":
+--   cost_delta   = net_cost − prev_cost
+--   volume_effect = Δquantity × prior unit rate          (consumption changed)
+--   rate_effect   = cost_delta − volume_effect           (price/mix changed)
+-- These two always sum to cost_delta. Rolled up to pure SKU (matches invoice lines).
+CREATE MATERIALIZED VIEW IF NOT EXISTS gold.sku_month_over_month AS
+WITH base AS (
+    SELECT
+        provider_name,
+        coalesce(sku_id, '(unknown)')                    AS sku_id,
+        charge_month,
+        sum(cost)                                        AS net_cost,
+        sum(consumed_quantity)                           AS consumed_quantity,
+        bool_or(is_partial_period)                       AS is_partial_period
+    FROM silver.focus_normalized
+    GROUP BY provider_name, coalesce(sku_id, '(unknown)'), charge_month
+),
+lagged AS (
+    SELECT base.*,
+        lag(net_cost) OVER w           AS prev_cost,
+        lag(consumed_quantity) OVER w  AS prev_qty
+    FROM base
+    WINDOW w AS (PARTITION BY provider_name, sku_id ORDER BY charge_month)
+)
+SELECT
+    provider_name,
+    sku_id,
+    charge_month,
+    is_partial_period,
+    net_cost,
+    consumed_quantity,
+    CASE WHEN consumed_quantity > 0 THEN net_cost / consumed_quantity END   AS unit_rate,
+    prev_cost,
+    net_cost - prev_cost                                                    AS cost_delta,
+    CASE WHEN prev_cost > 0
+         THEN round((100 * (net_cost - prev_cost) / prev_cost)::numeric, 1) END AS cost_pct_change,
+    consumed_quantity - prev_qty                                            AS qty_delta,
+    CASE WHEN prev_qty > 0
+         THEN (consumed_quantity - prev_qty) * (prev_cost / prev_qty) END   AS volume_effect,
+    CASE WHEN prev_cost IS NOT NULL
+         THEN (net_cost - prev_cost)
+              - CASE WHEN prev_qty > 0
+                     THEN (consumed_quantity - prev_qty) * (prev_cost / prev_qty)
+                     ELSE 0 END
+    END                                                                     AS rate_effect
+FROM lagged;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_sku_month_over_month
+    ON gold.sku_month_over_month (provider_name, sku_id, charge_month);
