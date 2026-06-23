@@ -1,55 +1,73 @@
-"""Aura Lake CLI — lakehouse cost optimization tool."""
+"""Auralake CLI entry point."""
 
 from __future__ import annotations
 
-import os
-
 import typer
+from rich.console import Console
+from rich.table import Table
 
-from auralake_cli.agent import agent_app
-from auralake_cli.auth import auth_app
-from auralake_cli.client import AuralakeClient
-from auralake_cli.connections import connections_app
-from auralake_cli.db import db_app
+from auralake_cli.client import Client
 
-app = typer.Typer(
-    name="auralake",
-    help="Aura Lake — multi-platform lakehouse cost optimization CLI.",
-    no_args_is_help=True,
-    rich_markup_mode="rich",
-)
-
-DEFAULT_SERVER_URL = "http://localhost:8000"
+app = typer.Typer(help="Auralake — FOCUS-based TCO spend visualization", no_args_is_help=True)
+console = Console()
 
 
-def build_client(server: str | None = None) -> AuralakeClient:
-    """Build an HTTP client pointing at the Auralake server.
-
-    Resolution priority (highest to lowest):
-    1. Explicit ``server`` argument (from CLI flags)
-    2. ``AURALAKE_SERVER_URL`` / ``AURALAKE_API_KEY`` environment variables
-    3. ``~/.auralake/credentials.json`` file
-    """
-    from auralake_cli.auth import load_credentials
-
-    creds = load_credentials()
-
-    url = (
-        server
-        or os.environ.get("AURALAKE_SERVER_URL")
-        or creds.get("server_url")
-        or DEFAULT_SERVER_URL
-    )
-    api_key = os.environ.get("AURALAKE_API_KEY") or creds.get("api_key")
-    return AuralakeClient(base_url=url, api_key=api_key)
+@app.command()
+def health() -> None:
+    """Check backend health."""
+    console.print(Client().get("/health"))
 
 
-app.add_typer(agent_app, name="agent", help="Collector agent management.")
-app.add_typer(db_app, name="db", help="Database management.")
-app.add_typer(auth_app, name="auth", help="Authentication and API key management.")
-app.add_typer(connections_app, name="connections", help="Provider connection management.")
+@app.command()
+def metrics() -> None:
+    """List available GOLD metric views."""
+    rows = Client().get("/api/v1/metrics")
+    table = Table(title="Auralake metrics")
+    table.add_column("name", style="cyan")
+    table.add_column("title")
+    table.add_column("cost metric", style="green")
+    for r in rows:
+        table.add_row(r["name"], r["title"], r["cost_metric"])
+    console.print(table)
 
 
-@app.callback()
-def main_callback() -> None:
-    """Aura Lake — multi-platform lakehouse cost optimization."""
+@app.command()
+def metric(
+    name: str,
+    limit: int = typer.Option(50, help="Max rows"),
+    order_by: str = typer.Option(None, help="Column to sort by"),
+    desc: bool = typer.Option(False, help="Sort descending"),
+) -> None:
+    """Show rows from a single metric view (with or without the 'gold.' prefix)."""
+    params: dict[str, object] = {"limit": limit, "descending": desc}
+    if order_by:
+        params["order_by"] = order_by
+    data = Client().get(f"/api/v1/metrics/{name}", params=params)
+    rows = data["rows"]
+    if not rows:
+        console.print("[yellow]No rows.[/]")
+        return
+    table = Table(title=data["view"])
+    for col in rows[0]:
+        table.add_column(str(col))
+    for row in rows:
+        table.add_row(*[str(v) for v in row.values()])
+    console.print(table)
+
+
+@app.command()
+def ingest(
+    start: str = typer.Option(None, help="ISO start date"),
+    end: str = typer.Option(None, help="ISO end date"),
+) -> None:
+    """Trigger ingestion + view refresh on the backend."""
+    body: dict[str, object] = {}
+    if start:
+        body["start"] = start
+    if end:
+        body["end"] = end
+    console.print(Client().post("/api/v1/ingest", json=body))
+
+
+if __name__ == "__main__":
+    app()
