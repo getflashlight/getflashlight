@@ -14,9 +14,13 @@ from sqlmodel import Field, SQLModel
 # ---------------------------------------------------------------------------
 class QueryPlan(SQLModel, table=True):
     __tablename__ = "query_plans"
-    __table_args__ = {"schema": "inventory"}
+    __table_args__ = (
+        sa.UniqueConstraint("connection_id", "query_id"),
+        {"schema": "inventory"},
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
     workspace_id: str
     query_id: str
     job_id: str | None = Field(default=None)
@@ -62,7 +66,9 @@ class RecommendationRecord(SQLModel, table=True):
     __table_args__ = {"schema": "core"}
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
-    analysis_run_id: uuid.UUID | None = Field(default=None, foreign_key="core.analysis_runs.id")
+    analysis_run_id: uuid.UUID | None = Field(
+        default=None, foreign_key="core.analysis_runs.id"
+    )
     type: str
     risk_level: str
     resource_id: str
@@ -90,9 +96,15 @@ class RecommendationRecord(SQLModel, table=True):
 # ---------------------------------------------------------------------------
 class JobProfileRecord(SQLModel, table=True):
     __tablename__ = "job_profiles"
-    __table_args__ = {"schema": "inventory"}
+    __table_args__ = (
+        sa.UniqueConstraint("connection_id", "job_id"),
+        {"schema": "inventory"},
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(
+        default=None, foreign_key="core.provider_connections.id"
+    )
     workspace_id: str | None = Field(default=None)
     job_id: str
     job_name: str
@@ -103,7 +115,9 @@ class JobProfileRecord(SQLModel, table=True):
     worker_count: int
     spark_config: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
     data_sources: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
-    databricks_features_used: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
+    databricks_features_used: dict = Field(
+        default_factory=dict, sa_column=sa.Column(sa.JSON)
+    )
     dab_file_path: str | None = Field(default=None)
     dab_job_key: str | None = Field(default=None)
     is_portable: bool
@@ -115,16 +129,26 @@ class JobProfileRecord(SQLModel, table=True):
 # ---------------------------------------------------------------------------
 class InfraResourceMapping(SQLModel, table=True):
     __tablename__ = "infra_resource_mappings"
-    __table_args__ = {"schema": "inventory"}
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "connection_id", "platform_resource_type", "platform_resource_id"
+        ),
+        {"schema": "inventory"},
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(
+        default=None, foreign_key="core.provider_connections.id"
+    )
     workspace_id: str | None = Field(default=None)
     provider: str
     platform_resource_type: str
     platform_resource_id: str
     infra_resource_type: str
     infra_resource_id: str
-    infra_resource_tags: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
+    infra_resource_tags: dict = Field(
+        default_factory=dict, sa_column=sa.Column(sa.JSON)
+    )
     hourly_cost_usd: float | None = Field(default=None)
     last_seen_at: datetime
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -181,9 +205,15 @@ class ComputeResourceRecord(SQLModel, table=True):
 # ---------------------------------------------------------------------------
 class InfraCostSnapshot(SQLModel, table=True):
     __tablename__ = "infra_cost_snapshots"
-    __table_args__ = {"schema": "inventory"}
+    __table_args__ = (
+        sa.UniqueConstraint("connection_id", "period_start", "service", "resource_id"),
+        {"schema": "inventory"},
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(
+        default=None, foreign_key="core.provider_connections.id"
+    )
     workspace_id: str | None = Field(default=None)
     provider: str
     period_start: date
@@ -223,9 +253,15 @@ class ProviderConnection(SQLModel, table=True):
 # ---------------------------------------------------------------------------
 class S3InventoryObject(SQLModel, table=True):
     __tablename__ = "s3_inventory_objects"
-    __table_args__ = {"schema": "inventory"}
+    __table_args__ = (
+        sa.UniqueConstraint("connection_id", "bucket", "key"),
+        {"schema": "inventory"},
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(
+        default=None, foreign_key="core.provider_connections.id"
+    )
     bucket: str
     key: str
     size_bytes: int
@@ -319,10 +355,14 @@ class JobRunRecord(SQLModel, table=True):
 # ---------------------------------------------------------------------------
 class BillingRecord(SQLModel, table=True):
     __tablename__ = "billing_records"
-    __table_args__ = {"schema": "inventory"}
+    __table_args__ = (
+        sa.UniqueConstraint("record_hash"),
+        {"schema": "inventory"},
+    )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
+    record_hash: str | None = Field(default=None, index=True)
     usage_date: date
     sku: str
     cluster_id: str | None = Field(default=None)
@@ -433,7 +473,9 @@ class UnityCatalogTableRecord(SQLModel, table=True):
     location: str | None = Field(default=None)  # s3://bucket/path
 
     # DESCRIBE DETAIL metrics (for optimization decisions)
-    size_bytes: int | None = Field(default=None, sa_column=sa.Column(sa.BigInteger, nullable=True))
+    size_bytes: int | None = Field(
+        default=None, sa_column=sa.Column(sa.BigInteger, nullable=True)
+    )
     num_files: int | None = Field(default=None)
     owner: str | None = Field(default=None)
     last_modified_at: datetime | None = Field(default=None)
@@ -461,3 +503,246 @@ class UnityCatalogTableRecord(SQLModel, table=True):
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.utcnow)
     last_seen_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# ClusterUtilizationSnapshot — Captured utilization during collection
+# ---------------------------------------------------------------------------
+class ClusterUtilizationSnapshot(SQLModel, table=True):
+    __tablename__ = "cluster_utilization_snapshots"
+    __table_args__ = (
+        sa.UniqueConstraint("connection_id", "cluster_id", "captured_at"),
+        {"schema": "inventory"},
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
+    cluster_id: str
+    avg_cpu_percent: float = Field(default=0.0)
+    avg_memory_percent: float = Field(default=0.0)
+    active_hours: float = Field(default=0.0)
+    idle_hours: float = Field(default=0.0)
+    total_cost_usd: float = Field(default=0.0)
+    captured_at: datetime
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ===========================================================================
+# LAYER 2: CLEANED — deduplicated, grain-enforced
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# CleanedBillingSkuDay — Daily billing by SKU + resource
+# ---------------------------------------------------------------------------
+class CleanedBillingSkuDay(SQLModel, table=True):
+    __tablename__ = "billing_sku_day"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "connection_id", "usage_date", "sku", "resource_type", "resource_id"
+        ),
+        sa.Index("ix_cleaned_billing_conn_date", "connection_id", "usage_date"),
+        sa.Index("ix_cleaned_billing_sku_date", "sku", "usage_date"),
+        sa.Index("ix_cleaned_billing_resource", "resource_type", "resource_id"),
+        {"schema": "cleaned"},
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
+    usage_date: date
+    sku: str
+    resource_type: str  # job / cluster / warehouse / pipeline / endpoint / unknown
+    resource_id: str  # actual ID or "unattributed"
+    resource_name: str | None = Field(default=None)
+    workspace_id: str | None = Field(default=None)
+    dbu_usage: float = Field(default=0.0)
+    cost_usd: float = Field(default=0.0)
+    record_count: int = Field(default=0)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ===========================================================================
+# LAYER 3: ENRICHED — cross-table joins
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# EnrichedBillingResource — billing + compute metadata
+# ---------------------------------------------------------------------------
+class EnrichedBillingResource(SQLModel, table=True):
+    __tablename__ = "billing_resource"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "connection_id", "usage_date", "sku", "resource_type", "resource_id"
+        ),
+        {"schema": "enriched"},
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
+    usage_date: date
+    sku: str
+    resource_type: str
+    resource_id: str
+    resource_name: str | None = Field(default=None)
+    workspace_id: str | None = Field(default=None)
+    dbu_usage: float = Field(default=0.0)
+    cost_usd: float = Field(default=0.0)
+    record_count: int = Field(default=0)
+    # Compute metadata
+    creator: str | None = Field(default=None)
+    worker_node_type: str | None = Field(default=None)
+    num_workers: int | None = Field(default=None)
+    autoscale: bool | None = Field(default=None)
+    spot_enabled: bool | None = Field(default=None)
+    autotermination_minutes: int | None = Field(default=None)
+    warehouse_type: str | None = Field(default=None)
+    warehouse_size: str | None = Field(default=None)
+    compute_state: str | None = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# EnrichedJobRun — job runs + profiles + cluster config + estimated cost
+# ---------------------------------------------------------------------------
+class EnrichedJobRun(SQLModel, table=True):
+    __tablename__ = "job_runs"
+    __table_args__ = (
+        sa.UniqueConstraint("connection_id", "run_id"),
+        {"schema": "enriched"},
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
+    workspace_id: str | None = Field(default=None)
+    job_id: str
+    run_id: str
+    job_name: str | None = Field(default=None)
+    state: str
+    start_time: datetime | None = Field(default=None)
+    end_time: datetime | None = Field(default=None)
+    duration_ms: int | None = Field(default=None)
+    cluster_id: str | None = Field(default=None)
+    trigger: str | None = Field(default=None)
+    error_message: str | None = Field(default=None)
+    # From JobProfileRecord
+    schedule_cron: str | None = Field(default=None)
+    instance_type: str | None = Field(default=None)
+    worker_count: int | None = Field(default=None)
+    avg_dbu_cost: float | None = Field(default=None)
+    is_portable: bool | None = Field(default=None)
+    # From ComputeResourceRecord
+    cluster_name: str | None = Field(default=None)
+    spot_enabled: bool | None = Field(default=None)
+    cluster_creator: str | None = Field(default=None)
+    # Prorated from billing
+    estimated_run_cost_usd: float | None = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# EnrichedQuery — query history + plans + warehouse config
+# ---------------------------------------------------------------------------
+class EnrichedQuery(SQLModel, table=True):
+    __tablename__ = "queries"
+    __table_args__ = (
+        sa.UniqueConstraint("connection_id", "query_id"),
+        {"schema": "enriched"},
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
+    workspace_id: str | None = Field(default=None)
+    query_id: str
+    query_text: str | None = Field(default=None)
+    status: str | None = Field(default=None)
+    user_name: str | None = Field(default=None)
+    warehouse_id: str | None = Field(default=None)
+    duration_ms: int | None = Field(default=None)
+    rows_produced: int | None = Field(default=None)
+    query_start_time_ms: int | None = Field(
+        default=None, sa_column=sa.Column(sa.BigInteger, nullable=True)
+    )
+    query_end_time_ms: int | None = Field(
+        default=None, sa_column=sa.Column(sa.BigInteger, nullable=True)
+    )
+    # From QueryPlan
+    has_plan: bool = Field(default=False)
+    anti_patterns: dict = Field(default_factory=dict, sa_column=sa.Column(sa.JSON))
+    anti_pattern_count: int = Field(default=0)
+    rows_scanned: int | None = Field(default=None)
+    bytes_read: int | None = Field(default=None)
+    shuffle_bytes: int | None = Field(default=None)
+    spill_bytes: int | None = Field(default=None)
+    # From ComputeResourceRecord
+    warehouse_name: str | None = Field(default=None)
+    warehouse_type: str | None = Field(default=None)
+    warehouse_size: str | None = Field(default=None)
+    # From billing
+    estimated_cost_usd: float | None = Field(default=None)
+    # From QueryPlan / JobProfileRecord
+    job_id: str | None = Field(default=None)
+    job_name: str | None = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ===========================================================================
+# LAYER 4: AGGREGATED — dashboard-ready
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# AggBillingResourceMonthly — replaces inventory.billing_resource_monthly
+# ---------------------------------------------------------------------------
+class AggBillingResourceMonthly(SQLModel, table=True):
+    __tablename__ = "billing_resource_monthly"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "connection_id", "month", "sku", "resource_type", "resource_key"
+        ),
+        {"schema": "aggregated"},
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
+    month: date  # 1st of month
+    sku: str
+    resource_type: str
+    resource_key: str
+    resource_name: str | None = Field(default=None)
+    creator: str | None = Field(default=None)
+    workspace_id: str | None = Field(default=None)
+    dbu_usage: float = Field(default=0.0)
+    cost_usd: float = Field(default=0.0)
+    resource_ids: list = Field(default_factory=list, sa_column=sa.Column(sa.JSON))
+    avg_daily_dbu: float | None = Field(default=None)
+    peak_daily_dbu: float | None = Field(default=None)
+    active_days: int | None = Field(default=None)
+    spot_enabled: bool | None = Field(default=None)
+    worker_node_type: str | None = Field(default=None)
+    warehouse_type: str | None = Field(default=None)
+    prev_month_cost_usd: float | None = Field(default=None)
+    cost_change_pct: float | None = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# AggRecommendationSummary — rollup of recommendations by type/month
+# ---------------------------------------------------------------------------
+class AggRecommendationSummary(SQLModel, table=True):
+    __tablename__ = "recommendation_summary"
+    __table_args__ = (
+        sa.UniqueConstraint("connection_id", "month", "recommendation_type"),
+        {"schema": "aggregated"},
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    connection_id: uuid.UUID = Field(foreign_key="core.provider_connections.id")
+    month: date
+    recommendation_type: str
+    count: int = Field(default=0)
+    total_estimated_savings_usd: float = Field(default=0.0)
+    total_actual_savings_usd: float = Field(default=0.0)
+    applied_count: int = Field(default=0)
+    dismissed_count: int = Field(default=0)
+    created_at: datetime = Field(default_factory=datetime.utcnow)

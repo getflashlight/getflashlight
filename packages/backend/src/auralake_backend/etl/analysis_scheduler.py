@@ -92,7 +92,7 @@ class AnalysisScheduler:
 
     def _run_analyzer(self, analyzer_cls: type) -> int:
         """Run a single analyzer and persist its recommendations."""
-        analyzer = analyzer_cls(self.context)
+        analyzer = analyzer_cls(self.context, session=self.session)
         name = analyzer.name
         started_at = datetime.now(UTC)
 

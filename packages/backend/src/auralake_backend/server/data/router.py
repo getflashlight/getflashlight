@@ -12,10 +12,13 @@ from sqlmodel import Session, func, select
 
 from auralake_backend.db.engine import get_engine
 from auralake_backend.db.models import (
+    AggBillingResourceMonthly,
     ApiKey,
     BillingRecord,
     BillingResourceMonthly,
     ClusterPolicyRecord,
+    EnrichedJobRun,
+    EnrichedQuery,
     InfraResourceMapping,
     JobProfileRecord,
     JobRunRecord,
@@ -43,13 +46,17 @@ async def data_summary(
 ) -> dict:
     """Counts of all collected data."""
     clusters = session.exec(
-        select(func.count()).where(InfraResourceMapping.platform_resource_type == "cluster")
+        select(func.count()).where(
+            InfraResourceMapping.platform_resource_type == "cluster"
+        )
     ).one()
     jobs = session.exec(select(func.count()).select_from(JobProfileRecord)).one()
     job_runs = session.exec(select(func.count()).select_from(JobRunRecord)).one()
     billing = session.exec(select(func.count()).select_from(BillingRecord)).one()
     queries = session.exec(select(func.count()).select_from(QueryHistoryRecord)).one()
-    recommendations = session.exec(select(func.count()).select_from(RecommendationRecord)).one()
+    recommendations = session.exec(
+        select(func.count()).select_from(RecommendationRecord)
+    ).one()
 
     query_plans = session.exec(select(func.count()).select_from(QueryPlan)).one()
     policies = session.exec(select(func.count()).select_from(ClusterPolicyRecord)).one()
@@ -121,7 +128,9 @@ async def list_jobs(
             "instance_type": r.instance_type,
             "worker_count": r.worker_count,
             "is_portable": r.is_portable,
-            "last_analyzed_at": (r.last_analyzed_at.isoformat() if r.last_analyzed_at else None),
+            "last_analyzed_at": (
+                r.last_analyzed_at.isoformat() if r.last_analyzed_at else None
+            ),
         }
         for r in rows
     ]
@@ -136,6 +145,44 @@ async def list_job_runs(
     offset: int = Query(default=0, ge=0),
 ) -> list[dict]:
     """Job run history for a specific job."""
+    # Try enriched table first
+    enriched_count = session.exec(
+        select(func.count())
+        .select_from(EnrichedJobRun)
+        .where(EnrichedJobRun.job_id == job_id)
+    ).one()
+
+    if enriched_count > 0:
+        rows = session.exec(
+            select(EnrichedJobRun)
+            .where(EnrichedJobRun.job_id == job_id)
+            .order_by(EnrichedJobRun.start_time.desc())  # type: ignore[union-attr]
+            .offset(offset)
+            .limit(limit)
+        ).all()
+        return [
+            {
+                "run_id": r.run_id,
+                "job_id": r.job_id,
+                "job_name": r.job_name,
+                "state": r.state,
+                "start_time": r.start_time.isoformat() if r.start_time else None,
+                "end_time": r.end_time.isoformat() if r.end_time else None,
+                "duration_ms": r.duration_ms,
+                "cluster_id": r.cluster_id,
+                "cluster_name": r.cluster_name,
+                "trigger": r.trigger,
+                "error_message": r.error_message,
+                "schedule_cron": r.schedule_cron,
+                "instance_type": r.instance_type,
+                "worker_count": r.worker_count,
+                "spot_enabled": r.spot_enabled,
+                "estimated_run_cost_usd": r.estimated_run_cost_usd,
+            }
+            for r in rows
+        ]
+
+    # Fallback to raw job runs
     rows = session.exec(
         select(JobRunRecord)
         .where(JobRunRecord.job_id == job_id)
@@ -297,7 +344,9 @@ def _compute_insights(
 
         # Top contributors: break down by job_id and cluster_id for this SKU
         month_col = func.date_trunc("month", BillingRecord.usage_date)
-        top_contributors = _get_top_contributors(session, sku, month_col, curr_month, prev_month)
+        top_contributors = _get_top_contributors(
+            session, sku, month_col, curr_month, prev_month
+        )
 
         insights.append(
             {
@@ -324,23 +373,31 @@ def _get_top_contributors(
 ) -> list[dict]:
     """Find top resources driving MoM change for a given SKU.
 
-    Queries the pre-aggregated billing_resource_monthly table instead of
-    computing on-the-fly from raw billing_records.
+    Queries the aggregated billing_resource_monthly table (preferred) or
+    falls back to inventory.billing_resource_monthly.
     """
     curr_date = date.fromisoformat(f"{curr_month}-01")
     prev_date = date.fromisoformat(f"{prev_month}-01")
 
+    # Try aggregated table first
+    agg_count = session.exec(
+        select(func.count()).select_from(AggBillingResourceMonthly)
+    ).one()
+    source_model = (
+        AggBillingResourceMonthly if agg_count > 0 else BillingResourceMonthly
+    )
+
     rows = session.exec(
         select(
-            BillingResourceMonthly.resource_type,
-            BillingResourceMonthly.resource_key,
-            BillingResourceMonthly.resource_name,
-            BillingResourceMonthly.month,
-            BillingResourceMonthly.dbu_usage,
-            BillingResourceMonthly.resource_ids,
+            source_model.resource_type,
+            source_model.resource_key,
+            source_model.resource_name,
+            source_model.month,
+            source_model.dbu_usage,
+            source_model.resource_ids,
         ).where(
-            BillingResourceMonthly.sku == sku,
-            BillingResourceMonthly.month.in_([prev_date, curr_date]),  # type: ignore[union-attr]
+            source_model.sku == sku,
+            source_model.month.in_([prev_date, curr_date]),  # type: ignore[union-attr]
         )
     ).all()
 
@@ -372,7 +429,11 @@ def _get_top_contributors(
         curr_dbu = data["curr_dbu"]
         prev_dbu = data["prev_dbu"]
         change_dbu = curr_dbu - prev_dbu
-        change_pct = ((change_dbu) / prev_dbu * 100) if prev_dbu else (100.0 if curr_dbu else 0.0)
+        change_pct = (
+            ((change_dbu) / prev_dbu * 100)
+            if prev_dbu
+            else (100.0 if curr_dbu else 0.0)
+        )
 
         if abs(change_pct) < 20:
             continue
@@ -505,7 +566,10 @@ async def billing_validate(
         raise HTTPException(status_code=503, detail="Server not configured")
 
     # Query Databricks directly
-    from auralake_backend.providers.databricks.auth import get_warehouse_id, get_workspace_client
+    from auralake_backend.providers.databricks.auth import (
+        get_warehouse_id,
+        get_workspace_client,
+    )
 
     sku_filter = f"AND sku_name = '{sku}'" if sku else ""
     sql = (
@@ -528,12 +592,16 @@ async def billing_validate(
             )
             if result.result and result.result.data_array:
                 columns = [col.name for col in (result.manifest.schema.columns or [])]  # type: ignore[union-attr]
-                databricks_rows = [dict(zip(columns, row)) for row in result.result.data_array]
+                databricks_rows = [
+                    dict(zip(columns, row)) for row in result.result.data_array
+                ]
             databricks_errors = []
             break
         except Exception as exc:
             databricks_errors.append(f"{ws_name}: {exc}")
-            logger.warning("billing_validate_workspace_failed", workspace=ws_name, error=str(exc))
+            logger.warning(
+                "billing_validate_workspace_failed", workspace=ws_name, error=str(exc)
+            )
     if databricks_errors and not databricks_rows:
         logger.error("billing_validate_all_workspaces_failed", errors=databricks_errors)
 
@@ -664,7 +732,45 @@ async def list_queries(
     limit: int = Query(default=100, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> list[dict]:
-    """Collected query history."""
+    """Collected query history with plan anti-patterns inline."""
+    # Try enriched table first, fall back to raw
+    enriched_count = session.exec(select(func.count()).select_from(EnrichedQuery)).one()
+
+    if enriched_count > 0:
+        rows = session.exec(
+            select(EnrichedQuery)
+            .order_by(EnrichedQuery.created_at.desc())  # type: ignore[union-attr]
+            .offset(offset)
+            .limit(limit)
+        ).all()
+        return [
+            {
+                "query_id": r.query_id,
+                "workspace_id": r.workspace_id,
+                "query_text": r.query_text,
+                "status": r.status,
+                "user_name": r.user_name,
+                "warehouse_id": r.warehouse_id,
+                "duration_ms": r.duration_ms,
+                "rows_produced": r.rows_produced,
+                "query_start_time_ms": r.query_start_time_ms,
+                "query_end_time_ms": r.query_end_time_ms,
+                "has_plan": r.has_plan,
+                "anti_patterns": r.anti_patterns,
+                "anti_pattern_count": r.anti_pattern_count,
+                "rows_scanned": r.rows_scanned,
+                "bytes_read": r.bytes_read,
+                "warehouse_name": r.warehouse_name,
+                "warehouse_type": r.warehouse_type,
+                "warehouse_size": r.warehouse_size,
+                "estimated_cost_usd": r.estimated_cost_usd,
+                "job_id": r.job_id,
+                "job_name": r.job_name,
+            }
+            for r in rows
+        ]
+
+    # Fallback to raw query history
     rows = session.exec(
         select(QueryHistoryRecord)
         .order_by(QueryHistoryRecord.created_at.desc())  # type: ignore[union-attr]

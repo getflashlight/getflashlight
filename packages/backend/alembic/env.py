@@ -10,12 +10,19 @@ from alembic import context
 
 # Import all models so they register with SQLModel.metadata
 from auralake_backend.db.models import (  # noqa: F401
+    AggBillingResourceMonthly,
+    AggRecommendationSummary,
     AnalysisRun,
     ApiKey,
     BillingRecord,
+    CleanedBillingSkuDay,
     ClusterPolicyRecord,
+    ClusterUtilizationSnapshot,
     CollectionRun,
     ComputeResourceRecord,
+    EnrichedBillingResource,
+    EnrichedJobRun,
+    EnrichedQuery,
     InfraCostSnapshot,
     InfraResourceMapping,
     JobProfileRecord,
@@ -72,6 +79,9 @@ def run_migrations_online() -> None:
         # in the core schema. This avoids a chicken-and-egg problem on first run.
         connection.execute(sa.text("CREATE SCHEMA IF NOT EXISTS core"))
         connection.execute(sa.text("CREATE SCHEMA IF NOT EXISTS inventory"))
+        connection.execute(sa.text("CREATE SCHEMA IF NOT EXISTS cleaned"))
+        connection.execute(sa.text("CREATE SCHEMA IF NOT EXISTS enriched"))
+        connection.execute(sa.text("CREATE SCHEMA IF NOT EXISTS aggregated"))
         connection.commit()
 
         context.configure(

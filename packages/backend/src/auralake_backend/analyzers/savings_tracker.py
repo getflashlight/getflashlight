@@ -81,7 +81,11 @@ class SavingsTracker:
         if rec.applied_at is None:
             return None
 
-        applied = rec.applied_at.date() if isinstance(rec.applied_at, datetime) else rec.applied_at
+        applied = (
+            rec.applied_at.date()
+            if isinstance(rec.applied_at, datetime)
+            else rec.applied_at
+        )
 
         pre_start = applied - timedelta(days=_WINDOW_DAYS)
         pre_end = applied
@@ -97,7 +101,9 @@ class SavingsTracker:
 
         # Route to the right cost table based on recommendation type
         if rec_type.startswith("infra_") or rec_type.startswith("orphan_s3"):
-            return self._compare_infra_costs(resource_id, pre_start, pre_end, post_start, post_end)
+            return self._compare_infra_costs(
+                resource_id, pre_start, pre_end, post_start, post_end
+            )
 
         return self._compare_billing_costs(
             resource_id, rec_type, pre_start, pre_end, post_start, post_end

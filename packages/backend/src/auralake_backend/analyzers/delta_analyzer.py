@@ -126,7 +126,9 @@ class DeltaAnalyzer(AbstractAnalyzer):
                 thresholds.optimize_stale_days,  # type: ignore[attr-defined]
             )
             if table.last_optimized_at:
-                days_since_optimize = (now - table.last_optimized_at.replace(tzinfo=UTC)).days
+                days_since_optimize = (
+                    now - table.last_optimized_at.replace(tzinfo=UTC)
+                ).days
                 if days_since_optimize > optimize_stale_days:
                     savings = max(Decimal(str(size_gb * 0.023 * 0.3)), Decimal("5"))
                     recommendations.append(
@@ -167,7 +169,9 @@ class DeltaAnalyzer(AbstractAnalyzer):
                         resource_id=table.full_name,
                         resource_name=table.full_name,
                         title=f"Table '{table.full_name}' has never been optimized",
-                        description=(f"No OPTIMIZE history found. Table size: {size_gb:.1f} GB."),
+                        description=(
+                            f"No OPTIMIZE history found. Table size: {size_gb:.1f} GB."
+                        ),
                         current_state={
                             "last_optimized_at": None,
                             "size_gb": round(size_gb, 2),
@@ -187,7 +191,9 @@ class DeltaAnalyzer(AbstractAnalyzer):
                 thresholds.vacuum_stale_days,  # type: ignore[attr-defined]
             )
             if table.last_vacuumed_at:
-                days_since_vacuum = (now - table.last_vacuumed_at.replace(tzinfo=UTC)).days
+                days_since_vacuum = (
+                    now - table.last_vacuumed_at.replace(tzinfo=UTC)
+                ).days
                 if days_since_vacuum > vacuum_stale_days:
                     savings = max(Decimal(str(size_gb * 0.1 * 0.023)), Decimal("1"))
                     recommendations.append(
@@ -290,7 +296,9 @@ class DeltaAnalyzer(AbstractAnalyzer):
                         risk_level=RiskLevel.MEDIUM,
                         resource_id=table.full_name,
                         resource_name=table.full_name,
-                        title=(f"Migrate '{table.full_name}' from Z-ORDER to liquid clustering"),
+                        title=(
+                            f"Migrate '{table.full_name}' from Z-ORDER to liquid clustering"
+                        ),
                         description=(
                             f"Table uses Z-ORDER but not liquid clustering."
                             f" Liquid clustering avoids full data rewrites and"
@@ -302,7 +310,9 @@ class DeltaAnalyzer(AbstractAnalyzer):
                             "uses_liquid_clustering": False,
                             "size_gb": round(size_gb, 2),
                         },
-                        recommended_state={"action": "ALTER TABLE ... CLUSTER BY (...)"},
+                        recommended_state={
+                            "action": "ALTER TABLE ... CLUSTER BY (...)"
+                        },
                         estimated_monthly_savings_usd=savings,
                         savings_confidence=SavingsConfidence.LOW,
                         pricing_basis=basis,
@@ -311,7 +321,9 @@ class DeltaAnalyzer(AbstractAnalyzer):
 
         # 6. Enable clustering for large unpartitioned/unclustered tables
         if self.rule_enabled("delta_enable_clustering"):
-            min_size_gb = self.rule_threshold("delta_enable_clustering", "min_size_gb", 10)
+            min_size_gb = self.rule_threshold(
+                "delta_enable_clustering", "min_size_gb", 10
+            )
             has_partitioning = bool(table.partition_columns)
             has_clustering = bool(table.clustering_columns)
             if (
@@ -340,7 +352,9 @@ class DeltaAnalyzer(AbstractAnalyzer):
                             "uses_zordering": False,
                             "uses_liquid_clustering": False,
                         },
-                        recommended_state={"action": "ALTER TABLE ... CLUSTER BY (...)"},
+                        recommended_state={
+                            "action": "ALTER TABLE ... CLUSTER BY (...)"
+                        },
                         estimated_monthly_savings_usd=Decimal("0"),
                         savings_confidence=SavingsConfidence.LOW,
                         pricing_basis=basis,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from sqlmodel import Session
+
 from auralake_shared.core.context import ExecutionContext
 from auralake_shared.models.recommendations import AnalysisResult
 
@@ -13,8 +15,11 @@ class AbstractAnalyzer(ABC):
 
     name: str
 
-    def __init__(self, context: ExecutionContext) -> None:
+    def __init__(
+        self, context: ExecutionContext, session: Session | None = None
+    ) -> None:
         self.context = context
+        self.session = session
 
     @abstractmethod
     def analyze(self) -> AnalysisResult:
@@ -26,7 +31,9 @@ class AbstractAnalyzer(ABC):
         rule_cfg = getattr(self.context.config.rules, rule_id, None)
         return rule_cfg.enabled if rule_cfg else True
 
-    def rule_threshold(self, rule_id: str, key: str, default: float | int) -> float | int:
+    def rule_threshold(
+        self, rule_id: str, key: str, default: float | int
+    ) -> float | int:
         """Get per-rule threshold override, falling back to default."""
         rule_cfg = getattr(self.context.config.rules, rule_id, None)
         if rule_cfg and key in rule_cfg.thresholds:

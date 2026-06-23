@@ -21,6 +21,7 @@ from auralake_backend.db.engine import get_engine
 from auralake_backend.db.models import (
     BillingRecord,
     ClusterPolicyRecord,
+    ClusterUtilizationSnapshot,
     CollectionRun,
     ComputeResourceRecord,
     InfraCostSnapshot,
@@ -33,6 +34,7 @@ from auralake_backend.db.models import (
     WorkerCursor,
 )
 from auralake_backend.etl.billing_aggregator import BillingAggregator
+from auralake_backend.etl.layer_transformer import LayerTransformer
 
 logger = structlog.get_logger(__name__)
 
@@ -135,8 +137,9 @@ class FullCollector:
             for f in all_futures:
                 f.result()
 
-        # Run billing aggregation + analysis after collection completes
+        # Run transformations + analysis after collection completes
         if not self._cancel.is_set():
+            self._run_layer_transformation(run_id, worker_statuses)
             self._run_billing_aggregation(run_id, worker_statuses)
             self._run_analysis(run_id, worker_statuses)
 
@@ -147,6 +150,28 @@ class FullCollector:
         worker_statuses: dict[str, dict[str, Any]] = {worker_name: {"status": "pending"}}
         self._run_worker(run_id, worker_name, worker_statuses)
         return worker_statuses
+
+    def _run_layer_transformation(self, run_id: uuid.UUID, worker_statuses: dict) -> None:
+        """Transform raw data through cleaned → enriched → aggregated layers."""
+        try:
+            with Session(get_engine()) as session:
+                transformer = LayerTransformer(self.connection_id, session)
+                results = transformer.run()
+                session.commit()
+
+            worker_statuses["layer_transformation"] = {
+                "status": "completed",
+                **results,
+            }
+            self._update_run_statuses(run_id, worker_statuses)
+            logger.info("layer_transformation_completed", results=results)
+        except Exception as exc:
+            worker_statuses["layer_transformation"] = {
+                "status": "failed",
+                "error": str(exc),
+            }
+            self._update_run_statuses(run_id, worker_statuses)
+            logger.error("layer_transformation_failed", error=str(exc))
 
     def _run_billing_aggregation(self, run_id: uuid.UUID, worker_statuses: dict) -> None:
         """Aggregate billing records into billing_resource_monthly."""
@@ -646,6 +671,21 @@ class FullCollector:
                 break
             try:
                 utilization = compute.get_utilization(cluster.cluster_id, days=7)
+
+                # Persist utilization snapshot
+                session.add(
+                    ClusterUtilizationSnapshot(
+                        connection_id=self.connection_id,
+                        cluster_id=cluster.cluster_id,
+                        avg_cpu_percent=utilization.avg_cpu_percent,
+                        avg_memory_percent=utilization.avg_memory_percent,
+                        active_hours=utilization.active_hours,
+                        idle_hours=utilization.idle_hours,
+                        total_cost_usd=utilization.total_cost_usd,
+                        captured_at=now,
+                    )
+                )
+
                 hourly_cost = (
                     utilization.total_cost_usd / max(utilization.active_hours, 1)
                     if utilization.total_cost_usd > 0
