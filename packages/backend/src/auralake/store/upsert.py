@@ -34,7 +34,7 @@ def _to_row(record: FocusRecord, ingest_run_id: int) -> dict[str, object]:
     return {
         "dedupe_key": record.dedupe_key(),
         "ingest_run_id": ingest_run_id,
-        "provider_name": record.provider_name.value,
+        "provider_name": str(record.provider_name),
         "billing_account_id": record.billing_account_id,
         "billing_account_name": record.billing_account_name,
         "sub_account_id": record.sub_account_id,

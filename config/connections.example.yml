@@ -3,6 +3,14 @@
 # named by the *_env fields (set them in .env / your shell / secrets manager).
 
 connectors:
+  # Local FOCUS file (CSV or Parquet) — easiest way to load sample data or any
+  # vendor's FOCUS export with no cloud credentials. See data/README.md to fetch
+  # the official FinOps FOCUS sample dataset.
+  - type: focus_file
+    enabled: false
+    path: /data/focus_sample.csv
+    respect_window: false   # ingest all rows regardless of the run's date window
+
   # AWS native FOCUS export (preferred). Point at the S3 location of your
   # AWS Data Exports FOCUS 1.0 dataset. Includes Redshift, S3, EC2/EBS lines.
   - type: aws_focus

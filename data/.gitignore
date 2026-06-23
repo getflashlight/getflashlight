@@ -1,0 +1,6 @@
+# Don't commit third-party / downloaded FOCUS data files.
+*.csv
+*.parquet
+*.pq
+!.gitignore
+!README.md

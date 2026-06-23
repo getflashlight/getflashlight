@@ -27,6 +27,15 @@ class AwsFocusConfig(BaseModel):
     secret_key_env: str = "AWS_SECRET_ACCESS_KEY"
 
 
+class FocusFileConfig(BaseModel):
+    type: str = "focus_file"
+    enabled: bool = True
+    path: str  # local path to a FOCUS CSV or Parquet file
+    # Sample/backfill files often predate the ingest window — ingest all rows by
+    # default rather than filtering by the run's date range.
+    respect_window: bool = False
+
+
 class DatabricksConfig(BaseModel):
     type: str = "databricks"
     enabled: bool = True
@@ -47,15 +56,16 @@ class AwsInfraConfig(BaseModel):
 
 _CONFIG_TYPES: dict[str, type[BaseModel]] = {
     "aws_focus": AwsFocusConfig,
+    "focus_file": FocusFileConfig,
     "databricks": DatabricksConfig,
     "aws_infra": AwsInfraConfig,
 }
 
 
 class ConnectionsFile(BaseModel):
-    connectors: list[AwsFocusConfig | DatabricksConfig | AwsInfraConfig] = Field(
-        default_factory=list
-    )
+    connectors: list[
+        AwsFocusConfig | FocusFileConfig | DatabricksConfig | AwsInfraConfig
+    ] = Field(default_factory=list)
 
 
 def env(name: str) -> str | None:

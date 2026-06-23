@@ -20,12 +20,14 @@ from auralake.ingest.config import (
     AwsFocusConfig,
     AwsInfraConfig,
     DatabricksConfig,
+    FocusFileConfig,
     load_connections,
 )
 from auralake.ingest.connectors import (
     AwsFocusConnector,
     AwsInfraConnector,
     DatabricksConnector,
+    FocusFileConnector,
 )
 from auralake.store.engine import session_scope
 from auralake.store.models import IngestRun
@@ -35,6 +37,7 @@ logger = get_logger(__name__)
 
 _REGISTRY: dict[type[BaseModel], type[Connector]] = {
     AwsFocusConfig: AwsFocusConnector,
+    FocusFileConfig: FocusFileConnector,
     DatabricksConfig: DatabricksConnector,
     AwsInfraConfig: AwsInfraConnector,
 }

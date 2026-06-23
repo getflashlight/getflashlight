@@ -17,7 +17,6 @@ from auralake.focus.enums import (
     ChargeCategory,
     ChargeClass,
     ComputeClass,
-    ProviderName,
     ServiceCategory,
 )
 
@@ -34,7 +33,10 @@ class FocusRecord(BaseModel):
     """
 
     # ── Provenance / accounts ──────────────────────────────────────────────
-    provider_name: ProviderName  # FOCUS: ProviderName
+    # ProviderName is an OPEN dimension in FOCUS (AWS, Microsoft, Oracle, Google,
+    # Databricks, …) — kept as a free string, not a closed enum. See
+    # auralake.focus.enums.ProviderName for the constants our connectors emit.
+    provider_name: str  # FOCUS: ProviderName
     billing_account_id: str  # FOCUS: BillingAccountId
     billing_account_name: str | None = None
     sub_account_id: str | None = None  # FOCUS: SubAccountId (e.g. workspace, project)
@@ -94,7 +96,7 @@ class FocusRecord(BaseModel):
         never compare equal, which would let duplicates slip through).
         """
         parts = [
-            self.provider_name.value,
+            str(self.provider_name),
             self.billing_account_id,
             self.sub_account_id or "",
             self.charge_period_start.isoformat(),

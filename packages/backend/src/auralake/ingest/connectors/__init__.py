@@ -3,6 +3,7 @@
 from auralake.ingest.connectors.aws_focus import AwsFocusConnector
 from auralake.ingest.connectors.aws_infra import AwsInfraConnector
 from auralake.ingest.connectors.databricks import DatabricksConnector
+from auralake.ingest.connectors.focus_file import FocusFileConnector
 from auralake.ingest.connectors.stubs import (
     BigQueryConnector,
     RedshiftConnector,
@@ -14,6 +15,7 @@ __all__ = [
     "AwsInfraConnector",
     "BigQueryConnector",
     "DatabricksConnector",
+    "FocusFileConnector",
     "RedshiftConnector",
     "SnowflakeConnector",
 ]
