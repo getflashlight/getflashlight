@@ -25,10 +25,12 @@ logger = get_logger(__name__)
 
 
 def _alembic_config() -> Config:
-    # alembic.ini lives at the backend package root (two levels up from src/auralake/store).
-    backend_root = Path(__file__).resolve().parents[3]
-    cfg = Config(str(backend_root / "alembic.ini"))
-    cfg.set_main_option("script_location", str(backend_root / "alembic"))
+    # Migrations ship inside the package (src/auralake/migrations) so they're
+    # present in a --no-editable wheel. Resolve relative to this module, and build
+    # the Config in code so we don't depend on a packaged alembic.ini.
+    migrations_dir = Path(__file__).resolve().parent.parent / "migrations"
+    cfg = Config()
+    cfg.set_main_option("script_location", str(migrations_dir))
     cfg.set_main_option("sqlalchemy.url", get_settings().database_url)
     return cfg
 

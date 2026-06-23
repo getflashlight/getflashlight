@@ -12,12 +12,16 @@ Schemas:
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from sqlalchemy import Column, DateTime, Numeric, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 class IngestRun(SQLModel, table=True):
@@ -30,7 +34,7 @@ class IngestRun(SQLModel, table=True):
     connector: str = Field(index=True)
     status: str = "running"  # running | success | failed
     started_at: datetime = Field(
-        default_factory=datetime.utcnow, sa_column=Column(DateTime(timezone=True))
+        default_factory=_utcnow, sa_column=Column(DateTime(timezone=True))
     )
     finished_at: datetime | None = Field(
         default=None, sa_column=Column(DateTime(timezone=True))

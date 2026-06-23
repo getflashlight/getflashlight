@@ -1,0 +1,9 @@
+# Local default — all sources disabled so `/ingest` runs the transform path
+# without needing real cloud credentials. Enable + fill in to pull real billing.
+connectors:
+  - type: aws_focus
+    enabled: false
+    s3_bucket: ""
+  - type: databricks
+    enabled: false
+    host: ""

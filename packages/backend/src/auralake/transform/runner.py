@@ -19,18 +19,18 @@ SQL_DIR = Path(__file__).parent / "sql"
 
 
 def _statements(sql_text: str) -> list[str]:
-    """Split a SQL file into individual statements (semicolon-terminated)."""
-    statements = []
-    for chunk in sql_text.split(";"):
-        # Drop fragments that are only whitespace or SQL comments.
-        code_lines = [
-            line
-            for line in chunk.splitlines()
-            if line.strip() and not line.strip().startswith("--")
-        ]
-        if code_lines:
-            statements.append(chunk.strip())
-    return statements
+    """Split a SQL file into individual statements (semicolon-terminated).
+
+    Line comments are stripped first, because a ``;`` inside a ``--`` comment must
+    not be treated as a statement terminator. (Our SQL has no string literals or
+    dollar-quoted bodies containing ``--`` or ``;``, so this is sufficient.)
+    """
+    decommented = []
+    for line in sql_text.splitlines():
+        idx = line.find("--")
+        decommented.append(line[:idx] if idx != -1 else line)
+    cleaned = "\n".join(decommented)
+    return [stmt.strip() for stmt in cleaned.split(";") if stmt.strip()]
 
 
 def apply_views() -> int:
