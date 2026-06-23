@@ -1,21 +1,18 @@
-FROM python:3.14-slim AS base
+FROM python:3.12-slim AS base
 
 WORKDIR /app
 
-# Install uv for fast dependency management
+# uv for fast, reproducible installs.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Copy backend package
+# Backend is a self-contained package — copy just it.
 COPY packages/backend/ packages/backend/
 
-# Install dependencies
 RUN cd packages/backend && uv sync --no-dev --no-editable
 
-# Put uv-managed scripts on PATH so entry points work without "uv run"
+# Put the venv's console scripts on PATH.
 ENV PATH="/app/packages/backend/.venv/bin:$PATH"
 
-# Expose server port
-EXPOSE 8000
+EXPOSE 8000 8002
 
-# Run the server
-CMD ["uv", "run", "--project", "packages/backend", "auralake-server"]
+CMD ["auralake-server"]

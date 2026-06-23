@@ -1,0 +1,30 @@
+# Auralake connector configuration. Copy to config/connections.yml and edit.
+# Credentials are NOT stored here — they're read from the environment variables
+# named by the *_env fields (set them in .env / your shell / secrets manager).
+
+connectors:
+  # AWS native FOCUS export (preferred). Point at the S3 location of your
+  # AWS Data Exports FOCUS 1.0 dataset. Includes Redshift, S3, EC2/EBS lines.
+  - type: aws_focus
+    enabled: true
+    s3_bucket: my-cur-exports
+    s3_prefix: focus/auralake/data
+    region: us-east-1
+    access_key_env: AWS_ACCESS_KEY_ID
+    secret_key_env: AWS_SECRET_ACCESS_KEY
+
+  # Databricks DBU usage from system tables (mapped to FOCUS).
+  - type: databricks
+    enabled: true
+    host: https://dbc-xxxxxxxx.cloud.databricks.com
+    token_env: DATABRICKS_TOKEN
+    sql_warehouse_id: null   # null → auto-pick a warehouse
+
+  # AWS infra via Cost Explorer — only needed if you do NOT have a native FOCUS
+  # export. Attributes EC2/EBS/S3 to clusters via the cluster tag. Disabled by default.
+  - type: aws_infra
+    enabled: false
+    region: us-east-1
+    cluster_tag_key: ClusterId
+    tag_filters:
+      Vendor: Databricks

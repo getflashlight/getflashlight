@@ -1,89 +1,71 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code when working in this repository.
 
 ## What is Auralake
 
-Auralake is a multi-platform lakehouse cost optimization tool. It analyzes Databricks (and potentially other lakehouse providers) usage, billing, compute, and job data to generate cost-saving recommendations. It can apply changes via Databricks Asset Bundle (DAB) modifications and submit them as GitHub pull requests.
+Auralake is a **FOCUS-based, multi-cloud TCO spend-visualization** platform. It
+ingests cloud billing in the FinOps FOCUS format, standardizes it into a layered
+data model (BRONZE → SILVER → GOLD), and serves preconfigured Grafana dashboards
+and an MCP server. It visualizes **current spend** — its headline is **Total Cost
+of Ownership** (e.g. Databricks DBU cost + the underlying AWS infra). It does
+**not** produce optimization recommendations in v1.
 
-## Monorepo Structure
+(Auralake was previously a Databricks cost-optimization tool; that code was
+removed in the FOCUS pivot. Don't reintroduce analyzers/recommendations.)
 
-This is a **uv workspace** monorepo with 2 Python packages:
+## Monorepo
+
+uv workspace (virtual root `pyproject.toml`), two packages:
 
 ```
-packages/
-  backend/    → auralake-backend  (FastAPI server, analyzers, actions, concrete providers)
-                also ships auralake_shared (core, models, provider ABCs) as a sub-package
-  cli/        → auralake-cli      (Typer CLI, talks to backend via HTTP)
-tests/        → integration tests
+packages/backend/  → auralake-backend (the platform)
+packages/cli/      → auralake-cli (thin HTTP client)
 ```
 
-## Build & Development Commands
+## Commands
 
 ```bash
-# Install all workspace members
 uv sync
-
-# Run the CLI
-uv run --project packages/cli auralake --help
-
-# Run the backend server
-uv run --project packages/backend auralake-server
-
-# Lint
-uv run ruff check packages/
-uv run ruff format --check packages/
-
-# Type check
-uv run mypy packages/
-
-# Run tests
-uv run pytest
-
-# Run a single test
-uv run pytest tests/test_foo.py::test_bar -v
-
-# Docker
-docker compose up -d          # backend + db
+uv run --project packages/backend auralake-server      # API :8000
+uv run --project packages/backend auralake-mcp         # MCP :8002
+uv run --project packages/backend auralake-ingest      # pull billing → BRONZE
+uv run --project packages/backend auralake-transform   # (re)build SILVER/GOLD views
+uv run --project packages/backend auralake-db-migrate  # alembic upgrade head
+uv run ruff check packages/ && uv run mypy packages/backend && uv run pytest
+docker compose up -d                                   # full stack
 ```
 
-## Architecture
+## Architecture (`packages/backend/src/auralake/`)
 
-### `packages/backend/src/auralake_shared/` (shared library, shipped with backend)
+- **`focus/`** — the canonical internal FOCUS record (`model.py`) and controlled
+  vocab (`enums.py`). Every connector maps its source into a `FocusRecord`; this
+  is the one contract between ingestion and storage.
+- **`ingest/`** — `Connector` ABC (`base.py`), YAML config (`config.py`), the
+  `runner.py` orchestrator, and `connectors/` (aws_focus, databricks, aws_infra,
+  plus stubs for bigquery/snowflake/redshift).
+- **`store/`** — SQLModel BRONZE tables (`models.py`: `raw.focus_record`,
+  `meta.ingest_run`), engine, idempotent `upsert.py`, and read-only `query.py`.
+- **`transform/`** — `sql/` holds the SILVER/GOLD views (the metrics contract);
+  `runner.py` applies them; `catalog.py` describes the GOLD views for consumers.
+- **`server/`** — FastAPI: `/api/v1/metrics*` read API + `/api/v1/ingest` trigger.
+- **`mcp/`** — FastMCP server exposing the same GOLD views to agents.
 
-- **`core/`** — Cross-cutting infrastructure: structlog logging (`logging.py`), Rich output formatting for table/JSON/CSV (`output.py`), execution context dataclass (`context.py`), exception hierarchy (`exceptions.py`).
-- **`models/`** — Pydantic models for all domain objects. Key model files map to domain areas: `config.py` (app config + thresholds), `billing.py` (cost/TCO records, infra costs, RI/savings plan recs), `compute.py` (cluster info & utilization), `recommendations.py` (recommendations with risk levels & savings estimates), `jobs.py` (job profiles & consolidation groups), `query_plans.py` (Spark plan parsing & anti-pattern detection), `dab.py` (Databricks Asset Bundle config & diffs), `policies.py` (cluster policies & tag violations), `routing.py` (workload portability scoring).
-- **`providers/`** — Provider registry (`__init__.py`) and abstract base classes (`base.py`). Concrete providers live in backend.
+## Key invariants (do not violate)
 
-### `packages/backend/src/auralake_backend/` (`auralake_backend`)
+- **GOLD is the only consumer surface.** Grafana and MCP read `gold.*`, never raw/
+  silver — so charts and agents always agree.
+- **One cost metric per aggregation.** Canonical is `EffectiveCost` (mapped to
+  `cost` in SILVER). Never sum across FOCUS cost columns.
+- **Charge-period grain only** when aggregating; never the billing period.
+- **TCO double-count guard** (`silver.tco_resource_month`): classic compute = DBU +
+  attributed AWS infra; serverless = DBU only. The `x_compute_class` stamped by the
+  Databricks connector drives this.
+- **Idempotent ingest**: upsert on `dedupe_key`; re-ingesting a restatement corrects.
+- **Single currency**: ingest asserts `billing_currency == AURALAKE_BASE_CURRENCY`.
+- **Attribution honesty**: unattributed AWS spend is surfaced, never silently dropped.
 
-- **`server/`** — FastAPI application with 12 feature modules (cost, clusters, resources, spot, delta, jobs, query, policies, budgets, tags, routing, agent).
-- **`analyzers/`** — Cost/resource analysis engines.
-- **`actions/`** — Action executors for recommendations.
-- **`automation/`** — Approval workflows, audit logging, automation engine.
-- **`agent/`** — Metrics collector, scheduler, plan parser.
-- **`db/`** — SQLModel models, engine init, repositories.
-- **`git_integration/`** — DAB diff rendering, PR builder, repo operations.
-- **`providers/`** — Concrete provider implementations: `databricks/`, `snowflake/`, `lake_formation/`. Auto-registered on import.
+## Code style
 
-### `packages/cli/` (`auralake_cli`)
-
-- Typer-based CLI that talks to the backend via HTTP (`client.py`).
-- Self-contained Rich rendering (`_rendering.py`) and structlog setup (`_logging.py`) — no `auralake_shared` dependency.
-- `db.py` commands require `auralake-backend` (optional dependency via `pip install auralake-cli[db]`).
-
-### Key design patterns
-
-- **ExecutionContext** (`core/context.py`) is the central state object threaded through CLI commands — bundles config, provider, automation level, and runtime flags. No global state.
-- **Config** lives in the database via connections. Env var `AURALAKE_DATABASE_URL` configures the DB connection.
-- **AutomationLevel** (`recommend` → `dry_run` → `apply` → `auto`) controls how aggressively changes are applied, with safety rails via `AutomationConfig` (protected clusters/jobs, bulk action thresholds, max risk level).
-- **Provider registration**: Concrete providers call `register_provider()` from `auralake_shared.providers` on import. Backend's `__init__.py` imports all provider packages to trigger registration.
-- **All exceptions** inherit from `AuraLakeError` for single-catch handling.
-
-## Code Style
-
-- Python 3.11+ target (ruff target-version), line length 100
-- Ruff lint rules: E, F, I, N, W, UP
-- Strict mypy with pydantic plugin
-- All models use Pydantic v2 (`BaseModel` with `model_validate`)
-- Enums use `StrEnum`
+Python 3.11+, ruff (E,F,I,N,W,UP), line length 100, strict mypy with the pydantic
+plugin. Pydantic v2 models, `StrEnum` for enums.

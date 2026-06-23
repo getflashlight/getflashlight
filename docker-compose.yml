@@ -1,59 +1,101 @@
+# Auralake — batteries-included FOCUS TCO stack.
+#   db → migrate → (server, mcp) → grafana
+# Ingest is on-demand (see the `ingest` profile / README), not a daemon.
+
+x-backend-env: &backend-env
+  AURALAKE_DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER:-auralake}:${POSTGRES_PASSWORD:-auralake}@db:5432/${POSTGRES_DB:-auralake}"
+  # The dedicated `migrate` service applies migrations; server need not re-run them.
+  AURALAKE_AUTO_MIGRATE: "false"
+  AURALAKE_API_KEY: "${AURALAKE_API_KEY:-}"
+  AURALAKE_CONNECTIONS_PATH: "/config/connections.yml"
+  DATABRICKS_TOKEN: "${DATABRICKS_TOKEN:-}"
+  AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
+  AWS_SECRET_ACCESS_KEY: "${AWS_SECRET_ACCESS_KEY:-}"
+
 services:
   db:
-    image: postgres:18-alpine
+    image: postgres:16-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:-auralake}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-auralake}
+      POSTGRES_DB: ${POSTGRES_DB:-auralake}
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-auralake}"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
 
-  db-migrate:
+  migrate:
     build:
       context: .
       dockerfile: packages/backend/Dockerfile
-    environment:
-      AURALAKE_DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
+    environment: *backend-env
+    command: ["auralake-db-migrate"]
     depends_on:
       db:
         condition: service_healthy
     restart: "no"
-    command: ["uv", "run", "--project", "packages/backend", "auralake-db-migrate"]
 
-  backend:
+  server:
     build:
       context: .
       dockerfile: packages/backend/Dockerfile
+    environment: *backend-env
+    command: ["auralake-server"]
     ports:
       - "8001:8000"
-    environment:
-      AURALAKE_DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
-      AURALAKE_ENCRYPTION_KEY: ${AURALAKE_ENCRYPTION_KEY}
-      DATABRICKS_TOKEN: ${DATABRICKS_TOKEN}
-      DATABRICKS_HOST: ${DATABRICKS_HOST}
+    volumes:
+      - ./config:/config:ro
     depends_on:
-      db-migrate:
+      migrate:
         condition: service_completed_successfully
 
-  dashboard:
+  mcp:
     build:
-      context: ./packages/dashboard
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: packages/backend/Dockerfile
+    environment: *backend-env
+    command: ["auralake-mcp"]
     ports:
-      - "8501:8501"
-    environment:
-      AURALAKE_API_URL: "http://backend:8000"
-      AURALAKE_API_KEY: ${AURALAKE_API_KEY:-}
+      - "8002:8002"
     depends_on:
-      - backend
+      migrate:
+        condition: service_completed_successfully
 
+  # On-demand ingest: `docker compose --profile ingest run --rm ingest`
+  ingest:
+    build:
+      context: .
+      dockerfile: packages/backend/Dockerfile
+    environment: *backend-env
+    command: ["auralake-ingest"]
+    volumes:
+      - ./config:/config:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    profiles: ["ingest"]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-admin}"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      AURALAKE_DB_USER: "${POSTGRES_USER:-auralake}"
+      AURALAKE_DB_PASSWORD: "${POSTGRES_PASSWORD:-auralake}"
+      AURALAKE_DB_NAME: "${POSTGRES_DB:-auralake}"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - db
 
 volumes:
   pgdata:
