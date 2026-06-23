@@ -69,9 +69,11 @@ def transform(
 
 @aws_app.command("create-export")
 def aws_create_export(
-    bucket: str | None = typer.Option(None, help="Destination S3 bucket (default: from config)"),
-    prefix: str | None = typer.Option(None, help="Destination S3 prefix (default: from config)"),
-    s3_region: str | None = typer.Option(None, "--s3-region", help="Bucket region"),
+    bucket: str | None = typer.Option(None, help="Destination S3 bucket (flag → config → prompt)"),
+    prefix: str | None = typer.Option(None, help="Destination S3 prefix (flag → config → prompt)"),
+    s3_region: str | None = typer.Option(
+        None, "--s3-region", help="Bucket region (config → prompt)"
+    ),
     name: str = typer.Option("auralake-focus", help="Export name"),
     description: str = typer.Option("FOCUS 1.2 export consumed by Auralake"),
     time_granularity: str = typer.Option("DAILY", help="HOURLY | DAILY | MONTHLY"),
@@ -81,7 +83,26 @@ def aws_create_export(
     apply: bool = typer.Option(False, help="Actually create the export (default: dry-run)"),
 ) -> None:
     """Create the AWS FOCUS 1.2 Data Export this platform consumes."""
-    from auralake.ingest.aws_export_setup import perform_create_export
+    from auralake.ingest.aws_export_setup import (
+        load_aws_focus_defaults,
+        perform_create_export,
+    )
+
+    # Resolve the values that lack a static default: flag → connections.yml →
+    # interactive prompt. (Plain `prompt=True` can't see the config fallback.)
+    defaults = load_aws_focus_defaults(connections)
+    bucket = bucket or defaults.get("s3_bucket") or typer.prompt("Destination S3 bucket")
+    if prefix is None:
+        prefix = defaults.get("s3_prefix")
+        if not prefix:
+            prefix = typer.prompt(
+                "S3 export-root prefix (the folder with data/ and metadata/)", default=""
+            )
+    s3_region = (
+        s3_region or defaults.get("region") or typer.prompt("Bucket region", default="us-east-1")
+    )
+
+    from botocore.exceptions import BotoCoreError, ClientError
 
     try:
         perform_create_export(
@@ -98,6 +119,43 @@ def aws_create_export(
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    except (ClientError, BotoCoreError) as exc:
+        # Expected operational failure — show a clean message, not a traceback.
+        typer.secho(f"CreateExport failed: {exc}", fg=typer.colors.RED, err=True)
+        if "bucket permission" in str(exc).lower() or "AccessDenied" in str(exc):
+            from auralake.ingest.aws_export_setup import bucket_policy_hint
+
+            typer.echo(bucket_policy_hint(bucket, connections), err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@aws_app.command("bucket-policy")
+def aws_bucket_policy(
+    bucket: str | None = typer.Option(None, help="S3 bucket (flag → config → prompt)"),
+    region: str | None = typer.Option(None, help="Bucket region (default: config)"),
+    connections: str | None = typer.Option(None, help="connections.yml for defaults"),
+    apply: bool = typer.Option(False, help="Merge-apply to the bucket (default: print only)"),
+) -> None:
+    """Print or --apply the S3 bucket policy AWS Data Exports needs to write the export."""
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from auralake.ingest.aws_export_setup import (
+        apply_bucket_policy,
+        load_aws_focus_defaults,
+        print_bucket_policy,
+    )
+
+    defaults = load_aws_focus_defaults(connections)
+    bucket = bucket or defaults.get("s3_bucket") or typer.prompt("S3 bucket")
+    if not apply:
+        print_bucket_policy(bucket=bucket, connections=connections)
+        return
+    try:
+        apply_bucket_policy(bucket=bucket, region=region, connections=connections)
+    except (ClientError, BotoCoreError) as exc:
+        typer.secho(f"Failed to apply bucket policy: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Applied the Data Exports bucket policy to {bucket}.")
 
 
 if __name__ == "__main__":

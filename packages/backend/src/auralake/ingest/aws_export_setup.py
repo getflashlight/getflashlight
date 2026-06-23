@@ -92,7 +92,7 @@ def build_export_request(
     }
 
 
-def _load_aws_focus_defaults(path: str | None) -> dict[str, Any]:
+def load_aws_focus_defaults(path: str | None) -> dict[str, Any]:
     """Read the aws_focus block from connections.yml (even if disabled) for defaults."""
     cfg_path = Path(path or get_settings().connections_path)
     if not cfg_path.exists():
@@ -122,7 +122,7 @@ def perform_create_export(
     Dry-run by default — prints the request. Pass ``apply=True`` to call CreateExport.
     Raises ``ValueError`` if no bucket can be resolved.
     """
-    defaults = _load_aws_focus_defaults(connections)
+    defaults = load_aws_focus_defaults(connections)
     bucket = bucket or defaults.get("s3_bucket")
     prefix = prefix if prefix is not None else defaults.get("s3_prefix", "")
     s3_region = s3_region or defaults.get("region", "us-east-1")
@@ -160,3 +160,95 @@ def perform_create_export(
     logger.info("aws_export_created", arn=arn, bucket=bucket, prefix=prefix)
     print(f"Created export: {arn}")
     print("First data delivery can take up to 24 hours. Then run: auralake ingest")
+
+
+# ── S3 bucket policy (the CreateExport prerequisite) ─────────────────────────
+# AWS validates, at CreateExport time, that the destination bucket grants the
+# Data Exports service principal s3:PutObject. We build that exact policy (from
+# the AWS docs) and can print it or merge-apply it.
+_BUCKET_POLICY_SID = "EnableAWSDataExportsToWriteToS3"
+
+
+def bucket_policy_statement(bucket: str, account_id: str) -> dict[str, Any]:
+    """The single statement Data Exports needs on the destination bucket."""
+    return {
+        "Sid": _BUCKET_POLICY_SID,
+        "Effect": "Allow",
+        "Principal": {"Service": ["bcm-data-exports.amazonaws.com"]},
+        "Action": ["s3:PutObject"],
+        "Resource": f"arn:aws:s3:::{bucket}/*",
+        "Condition": {
+            "ArnLike": {
+                "aws:SourceArn": f"arn:aws:bcm-data-exports:{_API_REGION}:{account_id}:export/*"
+            },
+            "StringEquals": {"aws:SourceAccount": account_id},
+        },
+    }
+
+
+def bucket_policy_document(bucket: str, account_id: str) -> dict[str, Any]:
+    """A complete, standalone bucket policy containing just the Data Exports grant."""
+    return {"Version": "2012-10-17", "Statement": [bucket_policy_statement(bucket, account_id)]}
+
+
+def _resolve_account_id(defaults: dict[str, Any]) -> str:
+    """Look up the caller's AWS account id via STS; placeholder if unavailable."""
+    try:
+        sts = boto3.client(
+            "sts",
+            region_name=_API_REGION,
+            aws_access_key_id=env(defaults.get("access_key_env", "AWS_ACCESS_KEY_ID")),
+            aws_secret_access_key=env(defaults.get("secret_key_env", "AWS_SECRET_ACCESS_KEY")),
+        )
+        return str(sts.get_caller_identity()["Account"])
+    except Exception:  # noqa: BLE001 - best-effort; fall back to a placeholder
+        return "<your-account-id>"
+
+
+def bucket_policy_hint(bucket: str, connections: str | None) -> str:
+    """Actionable guidance shown when CreateExport fails on bucket permissions."""
+    account_id = _resolve_account_id(load_aws_focus_defaults(connections))
+    policy = json.dumps(bucket_policy_document(bucket, account_id), indent=2)
+    return (
+        f"\nThe bucket '{bucket}' is not authorized for AWS Data Exports yet.\n"
+        f"Apply this bucket policy, then retry with --apply:\n\n{policy}\n\n"
+        f"Or let Auralake do it:  auralake aws bucket-policy --bucket {bucket} --apply"
+    )
+
+
+def print_bucket_policy(bucket: str, connections: str | None) -> None:
+    account_id = _resolve_account_id(load_aws_focus_defaults(connections))
+    print(json.dumps(bucket_policy_document(bucket, account_id), indent=2))
+    print(
+        f"\nApply with:\n  aws s3api put-bucket-policy --bucket {bucket} "
+        f"--policy file://policy.json\nor: auralake aws bucket-policy --bucket {bucket} --apply"
+    )
+
+
+def apply_bucket_policy(bucket: str, region: str | None, connections: str | None) -> None:
+    """Merge the Data Exports grant into the bucket's policy (preserving the rest).
+
+    Replaces any existing statement with our Sid, so re-running is idempotent and
+    never clobbers unrelated statements.
+    """
+    from botocore.exceptions import ClientError
+
+    defaults = load_aws_focus_defaults(connections)
+    account_id = _resolve_account_id(defaults)
+    s3 = boto3.client(
+        "s3",
+        region_name=region or defaults.get("region", "us-east-1"),
+        aws_access_key_id=env(defaults.get("access_key_env", "AWS_ACCESS_KEY_ID")),
+        aws_secret_access_key=env(defaults.get("secret_key_env", "AWS_SECRET_ACCESS_KEY")),
+    )
+    try:
+        existing = json.loads(s3.get_bucket_policy(Bucket=bucket)["Policy"])
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "NoSuchBucketPolicy":
+            existing = {"Version": "2012-10-17", "Statement": []}
+        else:
+            raise
+    kept = [s for s in existing.get("Statement", []) if s.get("Sid") != _BUCKET_POLICY_SID]
+    existing["Statement"] = [*kept, bucket_policy_statement(bucket, account_id)]
+    s3.put_bucket_policy(Bucket=bucket, Policy=json.dumps(existing))
+    logger.info("aws_bucket_policy_applied", bucket=bucket, account_id=account_id)

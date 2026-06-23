@@ -38,7 +38,22 @@ def test_aws_create_export_dry_run_emits_request(tmp_path) -> None:  # type: ign
     assert "DRY RUN" in result.output
 
 
-def test_aws_create_export_requires_a_bucket(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_aws_create_export_prompts_for_missing_inputs(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # No --bucket and empty config → interactively prompt; then prefix/region
+    # accept their defaults (blank lines).
     missing = tmp_path / "none.yml"
-    result = runner.invoke(app, ["aws", "create-export", "--connections", str(missing)])
-    assert result.exit_code != 0  # ValueError -> BadParameter
+    result = runner.invoke(
+        app,
+        ["aws", "create-export", "--connections", str(missing)],
+        input="prompted-bucket\n\n\n",
+    )
+    assert result.exit_code == 0
+    assert "prompted-bucket" in result.output
+    assert "DRY RUN" in result.output
+
+
+def test_aws_create_export_aborts_without_bucket_input(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Non-interactive (no input) → the bucket prompt hits EOF and aborts.
+    missing = tmp_path / "none.yml"
+    result = runner.invoke(app, ["aws", "create-export", "--connections", str(missing)], input="")
+    assert result.exit_code != 0

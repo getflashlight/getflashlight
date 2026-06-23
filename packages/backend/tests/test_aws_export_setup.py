@@ -3,6 +3,7 @@ a FOCUS 1.2 export aligned with what the connector ingests."""
 
 from auralake.ingest.aws_export_setup import (
     FOCUS_TABLE,
+    bucket_policy_document,
     build_export_request,
     default_query_statement,
 )
@@ -56,3 +57,14 @@ def test_build_export_request_shape() -> None:
         "Overwrite": "OVERWRITE_REPORT",
     }
     assert req["RefreshCadence"] == {"Frequency": "SYNCHRONOUS"}
+
+
+def test_bucket_policy_grants_data_exports_put_object() -> None:
+    doc = bucket_policy_document("my-bucket", "123456789012")
+    stmt = doc["Statement"][0]
+    assert stmt["Principal"]["Service"] == ["bcm-data-exports.amazonaws.com"]
+    assert stmt["Action"] == ["s3:PutObject"]
+    assert stmt["Resource"] == "arn:aws:s3:::my-bucket/*"
+    # Scoped to the caller's account on both the source ARN and source account.
+    assert stmt["Condition"]["StringEquals"]["aws:SourceAccount"] == "123456789012"
+    assert "123456789012" in stmt["Condition"]["ArnLike"]["aws:SourceArn"]
