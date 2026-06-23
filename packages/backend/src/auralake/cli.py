@@ -83,26 +83,24 @@ def aws_create_export(
     apply: bool = typer.Option(False, help="Actually create the export (default: dry-run)"),
 ) -> None:
     """Create the AWS FOCUS 1.2 Data Export this platform consumes."""
-    from auralake.ingest.aws_export_setup import (
-        load_aws_focus_defaults,
-        perform_create_export,
-    )
-
-    # Resolve the values that lack a static default: flag → connections.yml →
-    # interactive prompt. (Plain `prompt=True` can't see the config fallback.)
-    defaults = load_aws_focus_defaults(connections)
-    bucket = bucket or defaults.get("s3_bucket") or typer.prompt("Destination S3 bucket")
-    if prefix is None:
-        prefix = defaults.get("s3_prefix")
-        if not prefix:
-            prefix = typer.prompt(
-                "S3 export-root prefix (the folder with data/ and metadata/)", default=""
-            )
-    s3_region = (
-        s3_region or defaults.get("region") or typer.prompt("Bucket region", default="us-east-1")
-    )
-
     from botocore.exceptions import BotoCoreError, ClientError
+
+    from auralake.ingest.aws_export_setup import (
+        perform_create_export,
+        resolved_targets,
+        save_state,
+    )
+
+    # Resolve the values lacking a static default: flag → connections.yml →
+    # remembered → prompt. (Plain `prompt=True` can't see those fallbacks.)
+    bucket, prefix, s3_region, _ = resolved_targets(bucket, prefix, s3_region, connections)
+    bucket = bucket or typer.prompt("Destination S3 bucket")
+    if prefix is None:
+        prefix = typer.prompt(
+            "S3 export-root prefix (the folder with data/ and metadata/)", default=""
+        )
+    s3_region = s3_region or typer.prompt("Bucket region", default="us-east-1")
+    save_state(bucket=bucket, prefix=prefix, region=s3_region)
 
     try:
         perform_create_export(
@@ -141,12 +139,14 @@ def aws_bucket_policy(
 
     from auralake.ingest.aws_export_setup import (
         apply_bucket_policy,
-        load_aws_focus_defaults,
         print_bucket_policy,
+        resolved_targets,
+        save_state,
     )
 
-    defaults = load_aws_focus_defaults(connections)
-    bucket = bucket or defaults.get("s3_bucket") or typer.prompt("S3 bucket")
+    bucket, _, region, _ = resolved_targets(bucket, None, region, connections)
+    bucket = bucket or typer.prompt("S3 bucket")
+    save_state(bucket=bucket, region=region)
     if not apply:
         print_bucket_policy(bucket=bucket, connections=connections)
         return
@@ -156,6 +156,30 @@ def aws_bucket_policy(
         typer.secho(f"Failed to apply bucket policy: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Applied the Data Exports bucket policy to {bucket}.")
+
+
+@aws_app.command("describe-export")
+def aws_describe_export(
+    bucket: str | None = typer.Option(None, help="S3 bucket (flag → config → remembered → prompt)"),
+    prefix: str | None = typer.Option(None, help="Export-root prefix (flag → config → remembered)"),
+    region: str | None = typer.Option(None, "--s3-region", help="Bucket region"),
+    connections: str | None = typer.Option(None, help="connections.yml for defaults"),
+) -> None:
+    """Report how much FOCUS data has landed in S3 (billing periods, file count, size)."""
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from auralake.ingest.aws_export_setup import describe_export, resolved_targets, save_state
+
+    bucket, prefix, region, _ = resolved_targets(bucket, prefix, region, connections)
+    bucket = bucket or typer.prompt("S3 bucket")
+    if prefix is None:
+        prefix = typer.prompt("Export-root prefix", default="")
+    save_state(bucket=bucket, prefix=prefix, region=region)
+    try:
+        describe_export(bucket=bucket, prefix=prefix, region=region, connections=connections)
+    except (ClientError, BotoCoreError) as exc:
+        typer.secho(f"describe-export failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
 
 
 if __name__ == "__main__":

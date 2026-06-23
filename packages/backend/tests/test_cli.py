@@ -1,9 +1,17 @@
 """The unified `auralake` CLI exposes only the operator surface (MCP-only)."""
 
+import pytest
 from auralake.cli import app
 from typer.testing import CliRunner
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # Point the remembered-target state file at a fresh dir so persisted buckets
+    # never leak between tests (or in from a real run).
+    monkeypatch.setenv("AURALAKE_STATE_DIR", str(tmp_path / "state"))
 
 
 def test_root_help_lists_operator_commands() -> None:
@@ -20,10 +28,33 @@ def test_no_rest_api_or_db_commands() -> None:
     assert "db" not in result.output
 
 
+def test_aws_group_lists_all_subcommands() -> None:
+    result = runner.invoke(app, ["aws", "--help"])
+    assert result.exit_code == 0
+    for cmd in ("create-export", "bucket-policy", "describe-export"):
+        assert cmd in result.output
+
+
 def test_aws_create_export_is_under_aws_group() -> None:
     result = runner.invoke(app, ["aws", "create-export", "--help"])
     assert result.exit_code == 0
     assert "--apply" in result.output
+
+
+def test_target_is_remembered_across_aws_commands(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    missing = tmp_path / "none.yml"
+    # First run records bucket/prefix/region…
+    first = runner.invoke(
+        app,
+        ["aws", "create-export", "--bucket", "remembered-bkt", "--prefix", "focus/export",
+         "--s3-region", "us-west-2", "--connections", str(missing)],
+    )
+    assert first.exit_code == 0
+    # …so a second run with no flags or input reuses them (no prompts).
+    second = runner.invoke(app, ["aws", "create-export", "--connections", str(missing)], input="")
+    assert second.exit_code == 0
+    assert "remembered-bkt" in second.output
+    assert "us-west-2" in second.output
 
 
 def test_aws_create_export_dry_run_emits_request(tmp_path) -> None:  # type: ignore[no-untyped-def]
