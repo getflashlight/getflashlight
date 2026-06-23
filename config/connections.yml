@@ -2,14 +2,28 @@
 # (see data/README.md to fetch it). Enable real sources by filling them in.
 connectors:
   - type: focus_file
-    enabled: true
+    enabled: false
     path: /data/focus_sample.csv
     respect_window: false
 
   - type: aws_focus
-    enabled: false
+    enabled: true
     s3_bucket: ""
+    s3_prefix: ""
+    region: "us-west-1"
+    include_services:
+      - "Amazon Redshift"                       
+      - "Amazon Simple Storage Service"         
+      - "Amazon Elastic Kubernetes Service"     
+      - "Amazon Elastic Compute Cloud - Compute"
+      - "Amazon Elastic Block Store"            
+      - "Amazon EMR"                            
+      - "AWS Glue"                              
+      - "AWS Lake Formation"                    
+      - "Amazon Bedrock"                        
 
   - type: databricks
-    enabled: false
+    enabled: true
     host: ""
+    token_env: DATABRICKS_TOKEN
+    sql_warehouse_id: ""
