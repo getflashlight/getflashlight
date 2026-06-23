@@ -43,6 +43,13 @@ def _f(value: Any) -> float | None:
 def _tags(value: Any) -> dict[str, str]:
     if isinstance(value, dict):
         return {str(k): str(v) for k, v in value.items()}
+    # DuckDB surfaces a Parquet MAP column (how AWS FOCUS delivers Tags) as a list
+    # of (key, value) pairs — coerce it back to a dict rather than dropping it.
+    if isinstance(value, list):
+        try:
+            return {str(k): str(v) for k, v in value}
+        except (TypeError, ValueError):
+            return {}
     text = _s(value)
     if not text or text == "{}":
         return {}

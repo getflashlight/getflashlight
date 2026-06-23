@@ -34,14 +34,14 @@ DuckDB / BigQuery / Redshift / Databricks).
 ```bash
 cp .env.example .env
 cp config/connections.example.yml config/connections.yml   # edit sources
-docker compose up -d                                        # db, migrate, server, mcp, grafana
+docker compose up -d                                        # db, mcp, grafana
 docker compose --profile ingest run --rm ingest            # pull billing data
 open http://localhost:3000                                  # Grafana → Auralake → TCO Overview
 ```
 
-* API: `http://localhost:8001` (`/health`, `/api/v1/metrics`)
-* MCP: `http://localhost:8002` (streamable-http)
-* CLI: `uv run --project packages/cli auralake metrics`
+* Grafana: `http://localhost:3000` (consumer surface for humans; reads Postgres)
+* MCP: `http://localhost:8002` (streamable-http; consumer surface for agents)
+* CLI: `uv run --project packages/backend auralake serve | ingest | transform | aws create-export`
 
 ## FOCUS handling (why the numbers are trustworthy)
 
@@ -105,8 +105,10 @@ packages/backend/src/auralake/
   ingest/     connectors (aws_focus, databricks, aws_infra) + runner
   transform/  SILVER/GOLD SQL + runner + metric catalog
   store/      engine, BRONZE models, idempotent upsert, read-only query
-  server/     FastAPI read API + ingest triggers
-  mcp/        MCP server over the GOLD views
-packages/cli/ thin HTTP CLI
+  mcp/        MCP server over the GOLD views (the agent consumer surface)
+  cli.py      the unified `auralake` command (serve / ingest / transform / aws)
 deploy/grafana/ provisioned datasource + TCO dashboard
 ```
+
+`auralake serve` runs the MCP server; Grafana reads Postgres GOLD directly. There
+is no REST API. Migrations self-apply on startup.

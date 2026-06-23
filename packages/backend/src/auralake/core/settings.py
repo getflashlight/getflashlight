@@ -20,12 +20,10 @@ class Settings(BaseSettings):
     api_key: str | None = None
     base_currency: str = "USD"
     connections_path: str = "connections.yml"
-    # Apply Alembic migrations on server startup as a fallback when the dedicated
-    # migrate service/init-container isn't part of the deployment. Idempotent.
+    # Apply Alembic migrations automatically on `serve`/`ingest` startup.
+    # Idempotent; set false to manage schema out of band.
     auto_migrate: bool = True
 
-    server_host: str = "0.0.0.0"
-    server_port: int = 8000
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8002
 

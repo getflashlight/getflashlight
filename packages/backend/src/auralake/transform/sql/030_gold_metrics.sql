@@ -4,7 +4,7 @@
 -- These are MATERIALIZED views: the ingest pipeline refreshes them after BRONZE is
 -- updated (REFRESH MATERIALIZED VIEW CONCURRENTLY), so dashboards read precomputed
 -- data without recomputing joins on every query. Each has a UNIQUE index so the
--- concurrent refresh works. Created WITH DATA on first run; `auralake-transform
+-- concurrent refresh works. Created WITH DATA on first run; `auralake transform
 -- --rebuild` drops + recreates them when a definition here changes.
 --
 -- Cost rules carried from SILVER: the single canonical metric is `cost`
@@ -158,6 +158,29 @@ FROM silver.tco_resource_month;
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_tco_by_cluster_month
     ON gold.tco_by_cluster_month (charge_month, sub_account_id, cluster_id);
+
+
+-- ── EKS TCO per cluster per month (control plane + AWS-attributed node EC2/EBS) ──
+-- Node spend is keyed on AWS-generated tags (aws:eks:cluster-name /
+-- kubernetes.io/cluster/<name>); the control-plane line carries the cluster ARN.
+-- nodes_attributed = false with control_plane_cost > 0 flags clusters whose node
+-- tags were not activated as cost-allocation tags upstream (under-attribution
+-- surfaced, not hidden).
+CREATE MATERIALIZED VIEW IF NOT EXISTS gold.tco_eks_by_cluster_month AS
+SELECT
+    charge_month,
+    coalesce(cluster_name, '(unresolved)')               AS cluster_name,
+    control_plane_cost,
+    node_ec2_cost,
+    node_ebs_cost,
+    node_cost,
+    eks_tco,
+    (node_cost > 0)                                      AS nodes_attributed,
+    is_partial_period
+FROM silver.tco_eks_resource_month;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_tco_eks_by_cluster_month
+    ON gold.tco_eks_by_cluster_month (charge_month, cluster_name);
 
 
 -- ── Monthly TCO rollup: total DBU vs infra vs the unattributed AWS bucket ────────

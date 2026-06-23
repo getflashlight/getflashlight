@@ -109,6 +109,17 @@ CATALOG: tuple[GoldView, ...] = (
         measures=("dbu_cost", "infra_cost", "tco_cost", "infra_pct_of_tco"),
     ),
     GoldView(
+        name="gold.tco_eks_by_cluster_month",
+        title="TCO by EKS cluster / month",
+        description="Per-EKS-cluster control-plane + AWS-attributed node (EC2/EBS) cost. Node "
+        "spend is keyed on AWS-generated tags (aws:eks:cluster-name / kubernetes.io/cluster). "
+        "nodes_attributed=false with control-plane cost present flags clusters whose node tags "
+        "were not activated as cost-allocation tags upstream.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=("charge_month", "cluster_name", "nodes_attributed"),
+        measures=("control_plane_cost", "node_ec2_cost", "node_ebs_cost", "node_cost", "eks_tco"),
+    ),
+    GoldView(
         name="gold.tco_summary_month",
         title="Monthly TCO summary",
         description="DBU vs attributed infra vs the unattributed AWS bucket, plus total, by month.",

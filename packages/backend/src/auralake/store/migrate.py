@@ -1,12 +1,9 @@
-"""Alembic migrations. Entry point ``auralake-db-migrate`` and in-process helper.
+"""Alembic migrations, applied automatically on service startup.
 
-Two ways migrations get applied:
-  1. The dedicated ``migrate`` service in docker-compose (the init-container
-     pattern) — the primary path; server/mcp wait for it to complete.
-  2. ``upgrade_to_head()`` called on server startup when ``AURALAKE_AUTO_MIGRATE``
-     is true — a fallback for deployments that don't run the migrate service.
-
-Both are idempotent: running against an already-current database is a no-op.
+``upgrade_to_head()`` runs at the start of ``auralake serve`` and ``auralake
+ingest`` when ``AURALAKE_AUTO_MIGRATE`` is true (the default). There is no separate
+migrate command or init-container — the schema self-applies. Idempotent: running
+against an already-current database is a no-op.
 """
 
 from __future__ import annotations
@@ -18,7 +15,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
 
-from auralake.core.logging import get_logger, setup_logging
+from auralake.core.logging import get_logger
 from auralake.core.settings import get_settings
 
 logger = get_logger(__name__)
@@ -54,18 +51,13 @@ def _wait_for_db(database_url: str, attempts: int = 30, delay: float = 1.0) -> N
 
 
 def upgrade_to_head(wait: bool = True) -> None:
-    """Apply all pending migrations. Optionally wait for the DB to be ready first."""
+    """Apply all pending migrations. Optionally wait for the DB to be ready first.
+
+    Run automatically on ``auralake serve`` / ``auralake ingest`` startup (gated by
+    ``AURALAKE_AUTO_MIGRATE``); there is no separate migrate command.
+    """
     if wait:
         _wait_for_db(get_settings().database_url)
-    command.upgrade(_alembic_config(), "head")
-
-
-def run() -> None:
-    setup_logging()
     logger.info("migrate_start")
-    upgrade_to_head()
+    command.upgrade(_alembic_config(), "head")
     logger.info("migrate_done")
-
-
-if __name__ == "__main__":
-    run()

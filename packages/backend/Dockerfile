@@ -26,9 +26,9 @@ FROM python:3.14-slim AS runtime
 WORKDIR /app
 COPY --from=builder /app/packages/backend/.venv /app/packages/backend/.venv
 
-# Console scripts (auralake-server / -mcp / -ingest / -transform / -db-migrate) on PATH.
+# The unified `auralake` console script (serve/ingest/transform/aws) on PATH.
 ENV PATH="/app/packages/backend/.venv/bin:$PATH"
 
-EXPOSE 8000 8002
+EXPOSE 8002
 
-CMD ["auralake-server"]
+CMD ["auralake", "serve"]

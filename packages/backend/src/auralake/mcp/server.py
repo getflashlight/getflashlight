@@ -80,10 +80,21 @@ def run_sql(sql: str, limit: int = 200) -> dict[str, Any]:
     return {"row_count": len(rows), "rows": rows}
 
 
-def run() -> None:
+def serve_mcp() -> None:
+    """Run the MCP server. Backs the ``auralake serve`` command.
+
+    Applies pending migrations first (gated by AURALAKE_AUTO_MIGRATE) since this is
+    now the primary long-running service — there is no separate migrate step.
+    """
+    from auralake.core.settings import get_settings
+
+    if get_settings().auto_migrate:
+        from auralake.store.migrate import upgrade_to_head
+
+        upgrade_to_head()
     init_engine()
     mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
-    run()
+    serve_mcp()

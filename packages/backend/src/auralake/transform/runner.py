@@ -1,6 +1,6 @@
 """Apply SILVER views + GOLD materialized views, then refresh GOLD.
 
-Entry point: ``auralake-transform [--rebuild]``. The ingest pipeline calls
+Subcommand: ``auralake transform [--rebuild]``. The ingest pipeline calls
 ``apply_views()`` right after upserting BRONZE, so GOLD is always current without a
 separate step.
 
@@ -16,13 +16,12 @@ from the previous (view-based) GOLD layer.
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from auralake.core.logging import get_logger, setup_logging
+from auralake.core.logging import get_logger
 from auralake.store.engine import get_engine
 
 logger = get_logger(__name__)
@@ -101,19 +100,3 @@ def apply_views(rebuild: bool = False) -> int:
     return _refresh_gold()
 
 
-def run() -> None:
-    setup_logging()
-    parser = argparse.ArgumentParser(description="Apply SILVER/GOLD and refresh GOLD matviews")
-    parser.add_argument(
-        "--rebuild",
-        action="store_true",
-        help="Drop + recreate GOLD matviews to apply changed definitions in sql/",
-    )
-    args = parser.parse_args()
-    logger.info("transform_start", rebuild=args.rebuild)
-    refreshed = apply_views(rebuild=args.rebuild)
-    logger.info("transform_done", refreshed=refreshed)
-
-
-if __name__ == "__main__":
-    run()

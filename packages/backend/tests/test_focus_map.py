@@ -53,6 +53,13 @@ def test_credit_and_unknown_category_fallbacks() -> None:
     assert rec is not None and rec.service_category == ServiceCategory.OTHER
 
 
+def test_tags_from_duckdb_map_pairs() -> None:
+    # DuckDB returns a Parquet MAP (AWS FOCUS Tags) as a list of (k, v) pairs.
+    rec = map_focus_row(_row(Tags=[("aws:eks:cluster-name", "prod-eks"), ("env", "prod")]), "f")
+    assert rec is not None
+    assert rec.tags == {"aws:eks:cluster-name": "prod-eks", "env": "prod"}
+
+
 def test_missing_charge_period_skipped() -> None:
     assert map_focus_row(_row(ChargePeriodStart="NULL"), "f") is None
 

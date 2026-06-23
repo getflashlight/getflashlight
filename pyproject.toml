@@ -2,7 +2,7 @@
 # Members are the deployable packages under packages/*.
 
 [tool.uv.workspace]
-members = ["packages/backend", "packages/cli"]
+members = ["packages/backend"]
 
 [tool.ruff]
 line-length = 100

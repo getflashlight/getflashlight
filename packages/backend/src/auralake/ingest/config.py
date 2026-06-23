@@ -25,6 +25,11 @@ class AwsFocusConfig(BaseModel):
     region: str = "us-east-1"
     access_key_env: str = "AWS_ACCESS_KEY_ID"
     secret_key_env: str = "AWS_SECRET_ACCESS_KEY"
+    # Optional allow-list of FOCUS ServiceName values to ingest. AWS Data Exports
+    # is account-wide and cannot be scoped per service at the source, so a
+    # data-platform deployment narrows here instead. Empty list = ingest every
+    # service (the full account).
+    include_services: list[str] = Field(default_factory=list)
 
 
 class FocusFileConfig(BaseModel):

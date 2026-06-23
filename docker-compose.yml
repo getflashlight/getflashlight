@@ -1,12 +1,11 @@
 # Auralake — batteries-included FOCUS TCO stack.
-#   db → migrate → (server, mcp) → grafana
+#   db → mcp → grafana   (Grafana reads Postgres directly; agents use MCP)
 # Ingest is on-demand (see the `ingest` profile / README), not a daemon.
 
 x-backend-env: &backend-env
   AURALAKE_DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER:-auralake}:${POSTGRES_PASSWORD:-auralake}@db:5432/${POSTGRES_DB:-auralake}"
-  # The dedicated `migrate` service applies migrations; server need not re-run them.
-  AURALAKE_AUTO_MIGRATE: "false"
-  AURALAKE_API_KEY: "${AURALAKE_API_KEY:-}"
+  # Migrations self-apply on `auralake serve` / `auralake ingest` startup.
+  AURALAKE_AUTO_MIGRATE: "true"
   AURALAKE_CONNECTIONS_PATH: "/config/connections.yml"
   DATABRICKS_TOKEN: "${DATABRICKS_TOKEN:-}"
   AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
@@ -29,43 +28,20 @@ services:
       timeout: 3s
       retries: 10
 
-  migrate:
-    build:
-      context: .
-      dockerfile: packages/backend/Dockerfile
-    environment: *backend-env
-    command: ["auralake-db-migrate"]
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: "no"
-
-  server:
-    build:
-      context: .
-      dockerfile: packages/backend/Dockerfile
-    environment: *backend-env
-    command: ["auralake-server"]
-    ports:
-      - "8001:8000"
-    volumes:
-      - ./config:/config:ro
-      - ./data:/data:ro
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-
   mcp:
     build:
       context: .
       dockerfile: packages/backend/Dockerfile
     environment: *backend-env
-    command: ["auralake-mcp"]
+    command: ["auralake", "serve"]
     ports:
       - "8002:8002"
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data:ro
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      db:
+        condition: service_healthy
 
   # On-demand ingest: `docker compose --profile ingest run --rm ingest`
   ingest:
@@ -73,13 +49,13 @@ services:
       context: .
       dockerfile: packages/backend/Dockerfile
     environment: *backend-env
-    command: ["auralake-ingest"]
+    command: ["auralake", "ingest"]
     volumes:
       - ./config:/config:ro
       - ./data:/data:ro
     depends_on:
-      migrate:
-        condition: service_completed_successfully
+      db:
+        condition: service_healthy
     profiles: ["ingest"]
 
   grafana:

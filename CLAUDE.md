@@ -16,22 +16,26 @@ removed in the FOCUS pivot. Don't reintroduce analyzers/recommendations.)
 
 ## Monorepo
 
-uv workspace (virtual root `pyproject.toml`), two packages:
+uv workspace (virtual root `pyproject.toml`), one package:
 
 ```
-packages/backend/  → auralake-backend (the platform)
-packages/cli/      → auralake-cli (thin HTTP client)
+packages/backend/  → auralake-backend (the platform + the unified `auralake` CLI)
 ```
+
+The single `auralake` console script is the operator surface: `serve` (the MCP
+server), `ingest`, `transform`, and `aws create-export`. End users don't use the
+CLI — they read Grafana dashboards (Postgres direct) and talk to MCP. There is no
+REST API and no migrate command: migrations self-apply on `serve`/`ingest` startup
+(gated by `AURALAKE_AUTO_MIGRATE`). See `src/auralake/cli.py`.
 
 ## Commands
 
 ```bash
 uv sync
-uv run --project packages/backend auralake-server      # API :8000
-uv run --project packages/backend auralake-mcp         # MCP :8002
-uv run --project packages/backend auralake-ingest      # pull billing → BRONZE
-uv run --project packages/backend auralake-transform   # (re)build SILVER/GOLD views
-uv run --project packages/backend auralake-db-migrate  # alembic upgrade head
+uv run --project packages/backend auralake serve          # MCP server :8002 (auto-migrates)
+uv run --project packages/backend auralake ingest         # pull billing → BRONZE
+uv run --project packages/backend auralake transform      # (re)build SILVER/GOLD views
+uv run --project packages/backend auralake aws create-export  # create the AWS FOCUS export
 uv run ruff check packages/ && uv run mypy packages/backend && uv run pytest
 docker compose up -d                                   # full stack
 ```
@@ -52,8 +56,8 @@ docker compose up -d                                   # full stack
   `meta.ingest_run`), engine, idempotent `upsert.py`, and read-only `query.py`.
 - **`transform/`** — `sql/` holds the SILVER/GOLD views (the metrics contract);
   `runner.py` applies them; `catalog.py` describes the GOLD views for consumers.
-- **`server/`** — FastAPI: `/api/v1/metrics*` read API + `/api/v1/ingest` trigger.
-- **`mcp/`** — FastMCP server exposing the same GOLD views to agents.
+- **`mcp/`** — FastMCP server (`auralake serve`) exposing the GOLD views to agents;
+  the only programmatic consumer surface. Grafana reads Postgres GOLD directly.
 
 ## Key invariants (do not violate)
 

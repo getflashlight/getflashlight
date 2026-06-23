@@ -1,4 +1,4 @@
-"""Ingest orchestration. Entry point: ``auralake-ingest [--start --end]``.
+"""Ingest orchestration. Subcommand: ``auralake ingest [--start --end]``.
 
 For each enabled connector: open an IngestRun, stream FOCUS records, upsert them
 idempotently, and close the run with a status. A failing connector is isolated —
@@ -7,13 +7,12 @@ its run is marked failed and the others still proceed.
 
 from __future__ import annotations
 
-import argparse
 from datetime import UTC, date, datetime, timedelta
 
 from pydantic import BaseModel
 
 from auralake.core.exceptions import FocusValidationError
-from auralake.core.logging import get_logger, setup_logging
+from auralake.core.logging import get_logger
 from auralake.core.settings import get_settings
 from auralake.ingest.base import Connector, IngestWindow
 from auralake.ingest.config import (
@@ -92,25 +91,31 @@ def run_connector(connector: Connector, window: IngestWindow) -> int:
             return 0
 
 
-def run() -> None:
-    parser = argparse.ArgumentParser(description="Run Auralake FOCUS ingestion")
-    parser.add_argument("--start", type=date.fromisoformat, default=None)
-    parser.add_argument("--end", type=date.fromisoformat, default=None)
-    parser.add_argument("--connections", default=None, help="Path to connections.yml")
-    parser.add_argument(
-        "--no-transform", action="store_true", help="Skip refreshing SILVER/GOLD views"
-    )
-    args = parser.parse_args()
+def run_ingest(
+    start: date | None = None,
+    end: date | None = None,
+    connections: str | None = None,
+    no_transform: bool = False,
+) -> int:
+    """Pull all enabled connectors for the window, then refresh views. Returns rows.
 
-    setup_logging()
-    end = args.end or date.today()
-    start = args.start or (end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+    Backs the ``auralake ingest`` subcommand.
+    """
+    # Self-apply schema so an on-demand ingest works without a separate migrate
+    # step (no-op if already current; gated by AURALAKE_AUTO_MIGRATE).
+    if get_settings().auto_migrate:
+        from auralake.store.migrate import upgrade_to_head
+
+        upgrade_to_head()
+
+    end = end or date.today()
+    start = start or (end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
     window = IngestWindow(start=start, end=end)
 
-    configs = load_connections(args.connections)
+    configs = load_connections(connections)
     if not configs:
         logger.warning("ingest_no_connectors")
-        return
+        return 0
 
     total = 0
     for config in configs:
@@ -118,11 +123,8 @@ def run() -> None:
         total += run_connector(connector, window)
 
     # Refresh SILVER/GOLD so the data is immediately queryable (the bundled flow).
-    if not args.no_transform:
+    if not no_transform:
         apply_views()
         logger.info("transform_done")
     logger.info("ingest_complete", connectors=len(configs), rows=total)
-
-
-if __name__ == "__main__":
-    run()
+    return total
