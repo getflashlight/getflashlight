@@ -34,6 +34,7 @@ SELECT
     f.tags,
     f.x_compute_class,
     f.x_source_connector,
+    f.x_effective_is_list,
     f.charge_period_start,
     f.charge_period_end,
     -- Derived dimensions.

@@ -111,3 +111,4 @@ class RawFocusRecord(SQLModel, table=True):
     x_compute_class: str = "n/a"
     x_focus_version: str = "1.1"
     x_source_connector: str = "unknown"
+    x_effective_is_list: bool = False

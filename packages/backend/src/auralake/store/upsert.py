@@ -27,6 +27,7 @@ _MUTABLE_FIELDS = (
     "tags",
     "x_compute_class",
     "x_focus_version",
+    "x_effective_is_list",
 )
 
 
@@ -64,6 +65,7 @@ def _to_row(record: FocusRecord, ingest_run_id: int) -> dict[str, object]:
         "x_compute_class": record.x_compute_class.value,
         "x_focus_version": record.x_focus_version,
         "x_source_connector": record.x_source_connector,
+        "x_effective_is_list": record.x_effective_is_list,
     }
 
 

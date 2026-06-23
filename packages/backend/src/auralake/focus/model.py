@@ -82,6 +82,10 @@ class FocusRecord(BaseModel):
     x_compute_class: ComputeClass = ComputeClass.NOT_APPLICABLE
     x_focus_version: str = FOCUS_VERSION
     x_source_connector: str = "unknown"
+    # True when EffectiveCost could only be sourced from list/rack rates (no
+    # negotiated account-price table available) — i.e. discounts are NOT reflected.
+    # Surfaced rather than hidden so consumers know the cost may read high.
+    x_effective_is_list: bool = False
 
     @field_validator("billing_currency")
     @classmethod

@@ -30,8 +30,6 @@ connectors:
     host: https://dbc-xxxxxxxx.cloud.databricks.com
     token_env: DATABRICKS_TOKEN
     sql_warehouse_id: null   # null → auto-pick a warehouse
-    # Use system.billing.account_prices only if you're in the Account Prices Preview.
-    account_prices_table: system.billing.list_prices
 
   # AWS infra via Cost Explorer — only needed if you do NOT have a native FOCUS
   # export. Attributes EC2/EBS/S3 to clusters via the cluster tag. Disabled by default.

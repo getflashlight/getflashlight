@@ -42,9 +42,6 @@ class DatabricksConfig(BaseModel):
     host: str
     token_env: str = "DATABRICKS_TOKEN"
     sql_warehouse_id: str | None = None
-    # Account-prices table for the vendored FOCUS query. Use system.billing.list_prices
-    # unless you're in the Databricks Account Prices Preview (then system.billing.account_prices).
-    account_prices_table: str = "system.billing.list_prices"
 
 
 class AwsInfraConfig(BaseModel):

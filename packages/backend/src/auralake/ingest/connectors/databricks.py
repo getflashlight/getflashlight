@@ -34,6 +34,33 @@ logger = get_logger(__name__)
 _QUERY_PATH = Path(__file__).parent / "sql" / "databricks_focus_1_3.sql"
 _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELED", "CLOSED"}
 
+# Public list/rack rates — always present. The connector falls back to this for the
+# account-prices join when no negotiated table is available (effective cost = list).
+_LIST_PRICES_TABLE = "system.billing.list_prices"
+# Negotiated account rates — an AWS/GCP-only preview, absent in most accounts.
+_ACCOUNT_PRICES_TABLE = "system.billing.account_prices"
+# Existence probe for the account-prices table (system tables expose it here).
+_ACCOUNT_PRICES_PROBE = (
+    "SELECT 1 FROM system.information_schema.tables "
+    "WHERE table_catalog = 'system' AND table_schema = 'billing' "
+    "AND table_name = 'account_prices' LIMIT 1"
+)
+
+
+def _statement_error(resp: Any) -> tuple[str, str]:
+    """Pull (error_code, message) out of a failed statement response, defensively.
+
+    The SDK nests the real cause at ``status.error.{error_code,message}``; any of
+    those may be absent, so fall back to ``UNKNOWN``/empty rather than raising while
+    building the error we're about to report.
+    """
+    err = getattr(getattr(resp, "status", None), "error", None)
+    if err is None:
+        return "UNKNOWN", ""
+    code = getattr(err, "error_code", None)
+    code_str = str(getattr(code, "value", code)) if code else "UNKNOWN"
+    return code_str, getattr(err, "message", "") or ""
+
 
 def compute_class_for_sku(sku: str | None) -> ComputeClass:
     """Classic vs serverless from the SKU name (drives the TCO double-count guard)."""
@@ -49,44 +76,130 @@ class DatabricksConnector(Connector):
         if not token:
             raise ConnectorError(self.name, f"Missing token env {config.token_env}")
         self._client = WorkspaceClient(host=config.host, token=token)
+        self._account_prices_table: str | None = None  # resolved lazily on first fetch
+        self._resolved_warehouse_id: str | None = None  # cached after first lookup
+        logger.info(
+            "databricks_connector_init",
+            host=config.host,
+            warehouse_id=config.sql_warehouse_id or "auto",
+        )
 
     def fetch(self, window: IngestWindow) -> Iterator[FocusRecord]:
+        account_prices_table = self._resolve_account_prices()
+        effective_is_list = account_prices_table == _LIST_PRICES_TABLE
+        logger.info(
+            "databricks_fetch_start",
+            window_start=str(window.start),
+            window_end=str(window.end),
+            account_prices_table=account_prices_table,
+            effective_is_list=effective_is_list,
+        )
+
+        fetched = mapped = skipped = 0
         for row in self._execute(self._render_query(window)):
+            fetched += 1
             record = map_focus_row(row, self.name)
             if record is None:
+                skipped += 1
                 continue
+            mapped += 1
             yield record.model_copy(
                 update={
                     "x_compute_class": compute_class_for_sku(record.sku_id),
                     "x_focus_version": "1.3",
+                    "x_effective_is_list": effective_is_list,
                 }
             )
 
+        logger.info(
+            "databricks_fetch_done",
+            rows_fetched=fetched,
+            rows_mapped=mapped,
+            rows_skipped=skipped,
+        )
+
+    def _resolve_account_prices(self) -> str:
+        """Pick the account-prices table: negotiated rates if available, else list.
+
+        The negotiated ``account_prices`` table is an AWS/GCP-only preview that most
+        accounts don't have. We probe for it once; if it's absent (or the probe
+        fails) we fall back to list rates and warn — EffectiveCost then equals
+        ListCost and discounts are NOT reflected, which downstream surfaces via the
+        ``x_effective_is_list`` flag rather than hiding.
+        """
+        if self._account_prices_table is not None:
+            return self._account_prices_table
+
+        logger.debug("databricks_account_prices_probe", table=_ACCOUNT_PRICES_TABLE)
+        try:
+            present = bool(self._execute(_ACCOUNT_PRICES_PROBE))
+        except ConnectorError as exc:
+            # The probe shares the auth/warehouse path with the real query, so a
+            # failure here usually means the connection is broken (bad token, no
+            # warehouse) — not just a missing table. Warn loudly; the main query
+            # will surface the underlying error next.
+            logger.warning(
+                "databricks_account_prices_probe_failed",
+                error=str(exc),
+                fallback=_LIST_PRICES_TABLE,
+            )
+            present = False
+
+        if present:
+            logger.info("databricks_account_prices_found", table=_ACCOUNT_PRICES_TABLE)
+            self._account_prices_table = _ACCOUNT_PRICES_TABLE
+        else:
+            logger.warning(
+                "databricks_account_prices_unavailable",
+                table=_LIST_PRICES_TABLE,
+                detail="no negotiated account-prices table; EffectiveCost = ListCost "
+                "(discounts not reflected)",
+            )
+            self._account_prices_table = _LIST_PRICES_TABLE
+        return self._account_prices_table
+
     def _render_query(self, window: IngestWindow) -> str:
         sql = _QUERY_PATH.read_text()
-        # Substitute the account-prices table parameter (a config-controlled identifier).
-        sql = sql.replace(":account_prices", f"'{self._config.account_prices_table}'")
+        # Substitute the resolved account-prices table identifier into the join.
+        sql = sql.replace(":account_prices", f"'{self._resolve_account_prices()}'")
         # Bound the scan to the ingest window (final FROM aliases the CTE as `u`).
         sql = sql.rstrip().rstrip(";")
         return f"{sql}\nWHERE u.usage_date BETWEEN '{window.start}' AND '{window.end}'"
 
     def _warehouse_id(self) -> str:
+        if self._resolved_warehouse_id is not None:
+            return self._resolved_warehouse_id
+
         if self._config.sql_warehouse_id:
-            return self._config.sql_warehouse_id
+            self._resolved_warehouse_id = self._config.sql_warehouse_id
+            logger.debug(
+                "databricks_warehouse_configured", warehouse_id=self._config.sql_warehouse_id
+            )
+            return self._resolved_warehouse_id
+
         for wh in self._client.warehouses.list():
             if wh.id:
+                self._resolved_warehouse_id = wh.id
+                logger.info(
+                    "databricks_warehouse_autoselected",
+                    warehouse_id=wh.id,
+                    warehouse_name=wh.name,
+                )
                 return wh.id
         raise ConnectorError(self.name, "No SQL warehouse available")
 
     def _execute(self, sql: str) -> list[dict[str, Any]]:
         exec_api = self._client.statement_execution
+        warehouse_id = self._warehouse_id()
+        logger.debug("databricks_statement_submit", warehouse_id=warehouse_id, sql_chars=len(sql))
         try:
             resp = exec_api.execute_statement(
-                warehouse_id=self._warehouse_id(), statement=sql, wait_timeout="50s"
+                warehouse_id=warehouse_id, statement=sql, wait_timeout="50s"
             )
             resp = self._await_completion(resp)
             manifest = resp.manifest
             if not (manifest and manifest.schema):
+                logger.debug("databricks_statement_done", statement_id=resp.statement_id, rows=0)
                 return []
             cols = [c.name or "" for c in (manifest.schema.columns or [])]
 
@@ -99,6 +212,9 @@ class DatabricksConnector(Connector):
                 chunk = exec_api.get_statement_result_chunk_n(
                     resp.statement_id, chunk.next_chunk_index
                 )
+            logger.debug(
+                "databricks_statement_done", statement_id=resp.statement_id, rows=len(rows)
+            )
             return rows
         except ConnectorError:
             raise
@@ -112,7 +228,18 @@ class DatabricksConnector(Connector):
             state = resp.status.state.value if (resp.status and resp.status.state) else None
             if state in _TERMINAL_STATES:
                 if state != "SUCCEEDED":
-                    raise ConnectorError(self.name, f"Statement {state}")
+                    # Surface Databricks' own error (message + code) — without it,
+                    # "Statement FAILED" gives no clue (perms, missing table, syntax).
+                    code, message = _statement_error(resp)
+                    logger.error(
+                        "databricks_statement_failed",
+                        statement_id=resp.statement_id,
+                        state=state,
+                        error_code=code,
+                        error=message,
+                    )
+                    detail = f": {message}" if message else ""
+                    raise ConnectorError(self.name, f"Statement {state} [{code}]{detail}")
                 return resp
             time.sleep(1)
             resp = exec_api.get_statement(resp.statement_id)

@@ -16,6 +16,8 @@ SELECT
     sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
     sum(cost) FILTER (WHERE is_credit)                   AS credit_cost,
     bool_or(is_partial_period)                           AS is_partial_period,
+    -- True if any cost here is at list rates (no negotiated price) — not discounted.
+    bool_or(x_effective_is_list)                          AS effective_is_list,
     max(billing_currency)                                AS currency
 FROM silver.focus_normalized
 GROUP BY provider_name, service_category, service_name, charge_month;
