@@ -407,10 +407,10 @@
       ]
     },
     {
-      "id": 10,
+      "id": 11,
       "type": "table",
       "title": "SKU \u00d7 month \u2014 spend ($)",
-      "description": "EffectiveCost per SKU per month. Each month has two columns: the absolute spend ('Jan') and a per-ROW heat indicator ('Jan %') = that month as a % of THIS SKU's own busiest month. The heat % is colored yellow\u2192red, so within each row that SKU's peak month(s) glow red regardless of the SKU's absolute size \u2014 a small SKU's worst month reads just as red as a big SKU's. Dollars stay neutral for reference; 'Total' is absolute lifetime spend. 'Jun' is a partial month. SKU names have the shared 'ENTERPRISE_' prefix stripped. Sorted highest total spend first.",
+      "description": "Absolute EffectiveCost per SKU per month + grand total \u2014 the reference numbers behind the month-over-month change heatmap below. 'Jun' is a partial month. SKU names have the shared 'ENTERPRISE_' prefix stripped. Sorted highest total spend first.",
       "datasource": {
         "type": "postgres",
         "uid": "auralake_pg"
@@ -439,45 +439,87 @@
         "overrides": [
           {
             "matcher": {
-              "id": "byRegexp",
-              "options": "/%$/"
+              "id": "byName",
+              "options": "sku_id"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "percent"
-              },
-              {
-                "id": "decimals",
-                "value": 0
-              },
-              {
-                "id": "min",
-                "value": 0
-              },
-              {
-                "id": "max",
-                "value": 100
+                "id": "custom.align",
+                "value": "left"
               },
               {
                 "id": "custom.width",
-                "value": 70
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-background",
-                  "mode": "gradient"
-                }
-              },
-              {
-                "id": "color",
-                "value": {
-                  "mode": "continuous-YlRd"
-                }
+                "value": 460
               }
             ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "footer": {
+          "show": true,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT replace(sku_id,'ENTERPRISE_','') AS sku_id, round(sum(net_cost) FILTER (WHERE charge_month='2026-01-01'),2) AS \"Jan\", round(sum(net_cost) FILTER (WHERE charge_month='2026-02-01'),2) AS \"Feb\", round(sum(net_cost) FILTER (WHERE charge_month='2026-03-01'),2) AS \"Mar\", round(sum(net_cost) FILTER (WHERE charge_month='2026-04-01'),2) AS \"Apr\", round(sum(net_cost) FILTER (WHERE charge_month='2026-05-01'),2) AS \"May\", round(sum(net_cost) FILTER (WHERE charge_month='2026-06-01'),2) AS \"Jun (partial)\", round(sum(net_cost),2) AS \"Total\" FROM gold.spend_by_sku_month GROUP BY sku_id ORDER BY \"Total\" DESC",
+          "datasource": {
+            "type": "postgres",
+            "uid": "auralake_pg"
+          }
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "SKU \u00d7 month \u2014 month-over-month change (%)",
+      "description": "Month-over-month % change in EffectiveCost per SKU, colored by RELATIVE growth so runaway spikes glare regardless of absolute size -- a SKU going $29 to $2K (+6800%) screams louder than a flat-but-large line item that only moved +30%. 'Jan' is the baseline absolute spend; each later month shows % change vs the prior month. Color bands (solid): 1-25% = yellow, 25-100% = orange, 100%+ (doubled) = red, 500%+ (runaway) = deep red. A $250 materiality FLOOR gates color: a change smaller than $250 is treated as flat (blank), so trivial-dollar noise cannot false-alarm even at a huge %. Decreases show as negative % and stay neutral. Absolute dollars and $ changes are in the spend table directly above. 'Total' is absolute lifetime spend. 'Jun' is partial. SKU names have the shared 'ENTERPRISE_' prefix stripped. Sorted highest total spend first.",
+      "datasource": {
+        "type": "postgres",
+        "uid": "auralake_pg"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 24,
+        "h": 11
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 0,
+          "custom": {
+            "align": "right",
+            "cellOptions": {
+              "type": "color-background",
+              "mode": "basic"
+            }
           },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "transparent" },
+              { "value": 0, "color": "transparent" },
+              { "value": 1, "color": "light-yellow" },
+              { "value": 25, "color": "orange" },
+              { "value": 100, "color": "red" },
+              { "value": 500, "color": "dark-red" }
+            ]
+          }
+        },
+        "overrides": [
           {
             "matcher": {
               "id": "byName",
@@ -490,7 +532,70 @@
               },
               {
                 "id": "custom.width",
-                "value": 380
+                "value": 460
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Jan"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "auto"
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
               }
             ]
           }
@@ -506,11 +611,6 @@
           "countRows": false,
           "fields": [
             "Jan",
-            "Feb",
-            "Mar",
-            "Apr",
-            "May",
-            "Jun (partial)",
             "Total"
           ]
         }
@@ -519,7 +619,7 @@
         {
           "refId": "A",
           "format": "table",
-          "rawSql": "WITH m AS (SELECT replace(sku_id,'ENTERPRISE_','') AS sku_id, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-01-01'),0) AS m1, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-02-01'),0) AS m2, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-03-01'),0) AS m3, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-04-01'),0) AS m4, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-05-01'),0) AS m5, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-06-01'),0) AS m6, sum(net_cost) AS total FROM gold.spend_by_sku_month GROUP BY sku_id) SELECT sku_id, round(m1,2) AS \"Jan\", round(100*m1/NULLIF(GREATEST(m1,m2,m3,m4,m5,m6),0)) AS \"Jan %\", round(m2,2) AS \"Feb\", round(100*m2/NULLIF(GREATEST(m1,m2,m3,m4,m5,m6),0)) AS \"Feb %\", round(m3,2) AS \"Mar\", round(100*m3/NULLIF(GREATEST(m1,m2,m3,m4,m5,m6),0)) AS \"Mar %\", round(m4,2) AS \"Apr\", round(100*m4/NULLIF(GREATEST(m1,m2,m3,m4,m5,m6),0)) AS \"Apr %\", round(m5,2) AS \"May\", round(100*m5/NULLIF(GREATEST(m1,m2,m3,m4,m5,m6),0)) AS \"May %\", round(m6,2) AS \"Jun (partial)\", round(100*m6/NULLIF(GREATEST(m1,m2,m3,m4,m5,m6),0)) AS \"Jun %\", round(total,2) AS \"Total\" FROM m ORDER BY \"Total\" DESC",
+          "rawSql": "WITH m AS (SELECT replace(sku_id,'ENTERPRISE_','') AS sku_id, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-01-01'),0) AS m1, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-02-01'),0) AS m2, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-03-01'),0) AS m3, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-04-01'),0) AS m4, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-05-01'),0) AS m5, coalesce(sum(net_cost) FILTER (WHERE charge_month='2026-06-01'),0) AS m6, sum(net_cost) AS total FROM gold.spend_by_sku_month GROUP BY sku_id) SELECT sku_id, round(m1,2) AS \"Jan\", CASE WHEN abs(m2-m1)<250 THEN NULL WHEN m1<=0 THEN 9999 ELSE round((m2-m1)/m1*100) END AS \"Feb Δ%\", CASE WHEN abs(m3-m2)<250 THEN NULL WHEN m2<=0 THEN 9999 ELSE round((m3-m2)/m2*100) END AS \"Mar Δ%\", CASE WHEN abs(m4-m3)<250 THEN NULL WHEN m3<=0 THEN 9999 ELSE round((m4-m3)/m3*100) END AS \"Apr Δ%\", CASE WHEN abs(m5-m4)<250 THEN NULL WHEN m4<=0 THEN 9999 ELSE round((m5-m4)/m4*100) END AS \"May Δ%\", CASE WHEN abs(m6-m5)<250 THEN NULL WHEN m5<=0 THEN 9999 ELSE round((m6-m5)/m5*100) END AS \"Jun Δ% (partial)\", round(total,2) AS \"Total\" FROM m ORDER BY \"Total\" DESC",
           "datasource": {
             "type": "postgres",
             "uid": "auralake_pg"
