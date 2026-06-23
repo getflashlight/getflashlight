@@ -86,6 +86,13 @@ class FocusRecord(BaseModel):
     # negotiated account-price table available) — i.e. discounts are NOT reflected.
     # Surfaced rather than hidden so consumers know the cost may read high.
     x_effective_is_list: bool = False
+    # Source-record identity. For Databricks these come from system.billing.usage's
+    # append-only correction model: a correction emits a RETRACTION (same record_id,
+    # negated quantity) + RESTATEMENT, leaving the ORIGINAL. Both are part of the
+    # dedupe key so all three survive as distinct rows; aggregation SUMs them, and the
+    # negative retraction nets out the original. (Empty for sources without this model.)
+    x_record_id: str | None = None
+    x_record_type: str | None = None  # ORIGINAL | RETRACTION | RESTATEMENT
 
     @field_validator("billing_currency")
     @classmethod
@@ -111,5 +118,10 @@ class FocusRecord(BaseModel):
             self.charge_category.value,
             self.charge_class.value if self.charge_class else "",
             self.x_source_connector,
+            # Keep correction records distinct (see x_record_id/x_record_type). Empty
+            # for sources without an append-only correction model, so their key is
+            # unchanged.
+            self.x_record_id or "",
+            self.x_record_type or "",
         ]
         return hashlib.sha256("|".join(parts).encode()).hexdigest()

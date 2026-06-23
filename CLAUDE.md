@@ -65,7 +65,13 @@ docker compose up -d                                   # full stack
 - **TCO double-count guard** (`silver.tco_resource_month`): classic compute = DBU +
   attributed AWS infra; serverless = DBU only. The `x_compute_class` stamped by the
   Databricks connector drives this.
-- **Idempotent ingest**: upsert on `dedupe_key`; re-ingesting a restatement corrects.
+- **Partition-replace ingest**: each run is authoritative for the (connector,
+  charge-period window) it pulls — `delete_window` purges that range, then a plain
+  insert loads the fresh pull, atomically in one savepoint. Re-running is idempotent
+  and self-purging (bad/orphaned rows can't survive). `dedupe_key` (incl.
+  `record_id`/`record_type`) is now only a within-batch uniqueness guard, not an
+  upsert key. Databricks corrections (RETRACTION/RESTATEMENT) land as distinct rows
+  and net via `SUM` downstream.
 - **Single currency**: ingest asserts `billing_currency == AURALAKE_BASE_CURRENCY`.
 - **Attribution honesty**: unattributed AWS spend is surfaced, never silently dropped.
 

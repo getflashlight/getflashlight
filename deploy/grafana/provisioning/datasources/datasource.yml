@@ -10,7 +10,7 @@ datasources:
     jsonData:
       database: $AURALAKE_DB_NAME
       sslmode: disable
-      postgresVersion: 1600
+      postgresVersion: 1800
       timescaledb: false
     secureJsonData:
       password: $AURALAKE_DB_PASSWORD

@@ -31,7 +31,7 @@ from auralake.ingest.connectors import (
 )
 from auralake.store.engine import session_scope
 from auralake.store.models import IngestRun
-from auralake.store.upsert import upsert_focus_records
+from auralake.store.upsert import delete_window, insert_focus_records
 from auralake.transform.runner import apply_views
 
 logger = get_logger(__name__)
@@ -73,7 +73,11 @@ def run_connector(connector: Connector, window: IngestWindow) -> int:
                     )
                 records.append(record)
 
-            written = upsert_focus_records(session, records, run_id)
+            # Partition-replace, atomically: clear the window then insert the fresh
+            # pull in one savepoint, so a failed insert can't leave the window emptied.
+            with session.begin_nested():
+                delete_window(session, connector.name, window.start, window.end)
+                written = insert_focus_records(session, records, run_id)
             run.status = "success"
             run.rows_ingested = written
             run.finished_at = datetime.now(UTC)

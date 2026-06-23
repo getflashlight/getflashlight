@@ -56,6 +56,7 @@ account_prices as (
 usage_with_pricing AS (
   SELECT
     u.record_id,
+    u.record_type,  -- Auralake addition: ORIGINAL | RETRACTION | RESTATEMENT (correction model)
     u.account_id,
     u.workspace_id,
     w.workspace_name,
@@ -532,6 +533,11 @@ SELECT
   -- 3.58 Sub Account Type (Conditional)
   'Workspace' AS SubAccountType,
   -- 3.59 Tags (Conditional)
-  u.custom_tags AS Tags
+  u.custom_tags AS Tags,
+  -- Auralake additions: identity of the physical usage record + its correction
+  -- type, so downstream can keep ORIGINAL/RETRACTION/RESTATEMENT as distinct rows
+  -- (retraction quantities are negative and net out when SILVER/GOLD SUM cost).
+  u.record_id AS x_RecordId,
+  u.record_type AS x_RecordType
 FROM
   usage_with_pricing u;

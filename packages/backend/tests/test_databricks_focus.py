@@ -1,6 +1,59 @@
+from dataclasses import dataclass
+
 from auralake.focus.enums import ComputeClass, ServiceCategory
 from auralake.ingest.connectors._focus_map import map_focus_row
-from auralake.ingest.connectors.databricks import compute_class_for_sku
+from auralake.ingest.connectors.databricks import (
+    _warehouse_sort_key,
+    compute_class_for_sku,
+)
+
+
+@dataclass
+class _FakeWarehouse:
+    id: str
+    name: str | None = None
+    cluster_size: str | None = None
+    enable_serverless_compute: bool | None = None
+
+
+def _pick(*warehouses: _FakeWarehouse) -> str:
+    return min(warehouses, key=_warehouse_sort_key).id
+
+
+def test_warehouse_autopick_prefers_smallest_size() -> None:
+    chosen = _pick(
+        _FakeWarehouse(id="lg", cluster_size="Large"),
+        _FakeWarehouse(id="sm", cluster_size="Small"),
+        _FakeWarehouse(id="md", cluster_size="Medium"),
+        _FakeWarehouse(id="xs", cluster_size="2X-Small"),
+    )
+    assert chosen == "xs"
+
+
+def test_warehouse_autopick_serverless_breaks_size_tie() -> None:
+    # Same size → serverless wins (no idle infra cost).
+    chosen = _pick(
+        _FakeWarehouse(id="classic", cluster_size="Small", enable_serverless_compute=False),
+        _FakeWarehouse(id="serverless", cluster_size="Small", enable_serverless_compute=True),
+    )
+    assert chosen == "serverless"
+
+
+def test_warehouse_autopick_unknown_size_sorts_last() -> None:
+    chosen = _pick(
+        _FakeWarehouse(id="unknown", cluster_size=None),
+        _FakeWarehouse(id="big", cluster_size="4X-Large"),
+    )
+    assert chosen == "big"
+
+
+def test_warehouse_autopick_name_is_final_tiebreak() -> None:
+    # Identical size + serverless → deterministic by name.
+    chosen = _pick(
+        _FakeWarehouse(id="b", name="b-wh", cluster_size="Small", enable_serverless_compute=True),
+        _FakeWarehouse(id="a", name="a-wh", cluster_size="Small", enable_serverless_compute=True),
+    )
+    assert chosen == "a"
 
 
 def test_compute_class_from_sku() -> None:

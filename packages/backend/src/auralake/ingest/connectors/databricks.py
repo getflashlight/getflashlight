@@ -14,12 +14,15 @@ system.lakeflow.pipelines.
 
 from __future__ import annotations
 
+import json
 import time
+import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.sql import Disposition, Format
 
 from auralake.core.exceptions import ConnectorError
 from auralake.core.logging import get_logger
@@ -33,6 +36,41 @@ logger = get_logger(__name__)
 
 _QUERY_PATH = Path(__file__).parent / "sql" / "databricks_focus_1_3.sql"
 _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELED", "CLOSED"}
+
+# SQL-warehouse cluster sizes, smallest → largest. Auto-pick prefers the smallest
+# (cheapest) warehouse; an unknown/blank size sorts last so it's only a fallback.
+_WAREHOUSE_SIZE_ORDER = (
+    "2X-Small",
+    "X-Small",
+    "Small",
+    "Medium",
+    "Large",
+    "X-Large",
+    "2X-Large",
+    "3X-Large",
+    "4X-Large",
+)
+
+
+def _warehouse_size_rank(size: str | None) -> int:
+    """Rank a cluster size for cheapest-first ordering; unknowns sort last."""
+    if size in _WAREHOUSE_SIZE_ORDER:
+        return _WAREHOUSE_SIZE_ORDER.index(size)
+    return len(_WAREHOUSE_SIZE_ORDER)
+
+
+def _warehouse_sort_key(wh: Any) -> tuple[int, int, str]:
+    """Cheapest-first key: smallest size, then serverless on a tie, then name.
+
+    Serverless wins ties because it has no idle infra cost; the name is a final
+    tiebreak so the pick is deterministic across runs.
+    """
+    return (
+        _warehouse_size_rank(wh.cluster_size),
+        0 if wh.enable_serverless_compute else 1,
+        wh.name or "",
+    )
+
 
 # Public list/rack rates — always present. The connector falls back to this for the
 # account-prices join when no negotiated table is available (effective cost = list).
@@ -108,6 +146,10 @@ class DatabricksConnector(Connector):
                     "x_compute_class": compute_class_for_sku(record.sku_id),
                     "x_focus_version": "1.3",
                     "x_effective_is_list": effective_is_list,
+                    # Passthrough identity from the vendored query (see _focus_map drops
+                    # unknown columns, so read them off the raw row here).
+                    "x_record_id": row.get("x_RecordId"),
+                    "x_record_type": row.get("x_RecordType"),
                 }
             )
 
@@ -177,16 +219,22 @@ class DatabricksConnector(Connector):
             )
             return self._resolved_warehouse_id
 
-        for wh in self._client.warehouses.list():
-            if wh.id:
-                self._resolved_warehouse_id = wh.id
-                logger.info(
-                    "databricks_warehouse_autoselected",
-                    warehouse_id=wh.id,
-                    warehouse_name=wh.name,
-                )
-                return wh.id
-        raise ConnectorError(self.name, "No SQL warehouse available")
+        warehouses = [wh for wh in self._client.warehouses.list() if wh.id]
+        if not warehouses:
+            raise ConnectorError(self.name, "No SQL warehouse available")
+
+        chosen = min(warehouses, key=_warehouse_sort_key)
+        warehouse_id = chosen.id
+        assert warehouse_id is not None  # filtered above; for the type checker
+        self._resolved_warehouse_id = warehouse_id
+        logger.info(
+            "databricks_warehouse_autoselected",
+            warehouse_id=warehouse_id,
+            warehouse_name=chosen.name,
+            cluster_size=chosen.cluster_size,
+            serverless=bool(chosen.enable_serverless_compute),
+        )
+        return warehouse_id
 
     def _execute(self, sql: str) -> list[dict[str, Any]]:
         exec_api = self._client.statement_execution
@@ -194,7 +242,13 @@ class DatabricksConnector(Connector):
         logger.debug("databricks_statement_submit", warehouse_id=warehouse_id, sql_chars=len(sql))
         try:
             resp = exec_api.execute_statement(
-                warehouse_id=warehouse_id, statement=sql, wait_timeout="50s"
+                warehouse_id=warehouse_id,
+                statement=sql,
+                wait_timeout="50s",
+                # Account-wide usage easily exceeds the 25 MiB INLINE cap, so stage
+                # results to presigned external links and download the chunks ourselves.
+                disposition=Disposition.EXTERNAL_LINKS,
+                format=Format.JSON_ARRAY,
             )
             resp = self._await_completion(resp)
             manifest = resp.manifest
@@ -205,8 +259,12 @@ class DatabricksConnector(Connector):
 
             rows: list[dict[str, Any]] = []
             chunk = resp.result
-            while chunk and chunk.data_array:
-                rows.extend(dict(zip(cols, r, strict=False)) for r in chunk.data_array)
+            while chunk:
+                for link in chunk.external_links or []:
+                    rows.extend(
+                        dict(zip(cols, r, strict=False))
+                        for r in self._download_chunk(link.external_link)
+                    )
                 if chunk.next_chunk_index is None:
                     break
                 chunk = exec_api.get_statement_result_chunk_n(
@@ -220,6 +278,20 @@ class DatabricksConnector(Connector):
             raise
         except Exception as exc:  # noqa: BLE001
             raise ConnectorError(self.name, f"SQL failed: {exc}") from exc
+
+    @staticmethod
+    def _download_chunk(url: str | None) -> list[list[Any]]:
+        """Fetch one EXTERNAL_LINKS result chunk and parse it.
+
+        The link is a presigned cloud-storage URL — fetch it WITHOUT auth headers
+        (a forwarded token can break the signature). JSON_ARRAY format returns a
+        JSON array of row-arrays.
+        """
+        if not url:
+            return []
+        with urllib.request.urlopen(url) as fh:  # noqa: S310 (presigned https URL)
+            payload = fh.read()
+        return json.loads(payload) if payload else []
 
     def _await_completion(self, resp: Any) -> Any:
         """Poll until the statement reaches a terminal state."""

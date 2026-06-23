@@ -112,3 +112,5 @@ class RawFocusRecord(SQLModel, table=True):
     x_focus_version: str = "1.1"
     x_source_connector: str = "unknown"
     x_effective_is_list: bool = False
+    x_record_id: str | None = None
+    x_record_type: str | None = None

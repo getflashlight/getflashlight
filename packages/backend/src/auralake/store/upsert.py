@@ -1,34 +1,25 @@
-"""Idempotent bulk upsert of canonical FOCUS records into the BRONZE table.
+"""BRONZE writes: partition-replace per (connector, charge-period window).
 
-Re-ingesting a restated billing export must *correct* existing rows, not
-duplicate them. We rely on the UNIQUE(dedupe_key) constraint and Postgres
-``ON CONFLICT DO UPDATE`` to overwrite the mutable fields (costs, tags, run id)
-of a previously-seen charge line.
+Cloud billing is restated data — Databricks appends corrections, AWS CUR re-delivers
+whole months. So ingest is authoritative for the window it pulls: ``delete_window``
+purges the connector's existing rows in that charge-period range, then
+``insert_focus_records`` bulk-inserts the fresh pull. Re-running the same window is
+therefore idempotent AND self-purging (bad/orphaned rows can't survive). Caller must
+run both in one transaction (savepoint) so a failed insert never leaves a hole.
 """
 
 from __future__ import annotations
 
-from sqlalchemy.dialects.postgresql import insert
-from sqlmodel import Session
+from datetime import UTC, date, datetime, time, timedelta
 
+from sqlalchemy import delete, insert
+from sqlmodel import Session, col
+
+from auralake.core.logging import get_logger
 from auralake.focus.model import FocusRecord
 from auralake.store.models import RawFocusRecord
 
-# Fields refreshed when a charge line is re-seen (a restatement).
-_MUTABLE_FIELDS = (
-    "ingest_run_id",
-    "billed_cost",
-    "effective_cost",
-    "list_cost",
-    "contracted_cost",
-    "consumed_quantity",
-    "consumed_unit",
-    "charge_description",
-    "tags",
-    "x_compute_class",
-    "x_focus_version",
-    "x_effective_is_list",
-)
+logger = get_logger(__name__)
 
 
 def _to_row(record: FocusRecord, ingest_run_id: int) -> dict[str, object]:
@@ -66,40 +57,83 @@ def _to_row(record: FocusRecord, ingest_run_id: int) -> dict[str, object]:
         "x_focus_version": record.x_focus_version,
         "x_source_connector": record.x_source_connector,
         "x_effective_is_list": record.x_effective_is_list,
+        "x_record_id": record.x_record_id,
+        "x_record_type": record.x_record_type,
     }
 
 
 def collapse_duplicates(records: list[FocusRecord]) -> list[FocusRecord]:
-    """Collapse records sharing a ``dedupe_key`` (last wins).
+    """Collapse records sharing a ``dedupe_key`` (last wins) — a within-batch guard.
 
-    A single ``INSERT ... ON CONFLICT DO UPDATE`` cannot touch the same conflicting
-    row twice, so an export with internal duplicates must be de-duplicated first or
-    Postgres raises a CardinalityViolation.
+    After a window delete the insert is conflict-free, but a single pull must still not
+    contain the same physical row twice (the UNIQUE(dedupe_key) constraint would
+    reject it). The key identifies a physical source row — for Databricks it includes
+    record_id + record_type, so ORIGINAL/RETRACTION/RESTATEMENT do NOT collapse; their
+    costs net later via SUM in SILVER/GOLD (retraction is negative). A genuine collision
+    here means the identical row appeared twice in one pull, so last-wins loses nothing.
     """
     by_key: dict[str, FocusRecord] = {}
     for record in records:
         by_key[record.dedupe_key()] = record
+
+    if len(by_key) != len(records):
+        logger.info(
+            "collapsed_duplicate_rows",
+            input_rows=len(records),
+            output_rows=len(by_key),
+            dropped=len(records) - len(by_key),
+        )
     return list(by_key.values())
 
 
-def upsert_focus_records(
+def delete_window(session: Session, connector_name: str, start: date, end: date) -> int:
+    """Delete a connector's rows whose charge period falls in [start, end] (inclusive).
+
+    Makes the upcoming insert authoritative for the window: anything the source no
+    longer reports (or earlier bad data) is purged. ``end`` is inclusive, so we delete
+    up to the exclusive start of the day after ``end``.
+    """
+    lo = datetime.combine(start, time.min, tzinfo=UTC)
+    hi = datetime.combine(end + timedelta(days=1), time.min, tzinfo=UTC)
+    stmt = delete(RawFocusRecord).where(
+        col(RawFocusRecord.x_source_connector) == connector_name,
+        col(RawFocusRecord.charge_period_start) >= lo,
+        col(RawFocusRecord.charge_period_start) < hi,
+    )
+    # Log the effective SQL so the destructive step is auditable in the run log.
+    logger.info(
+        "window_delete_sql",
+        sql=(
+            "DELETE FROM raw.focus_record WHERE "
+            f"x_source_connector = '{connector_name}' "
+            f"AND charge_period_start >= '{lo.isoformat()}' "
+            f"AND charge_period_start < '{hi.isoformat()}'"
+        ),
+    )
+    result = session.execute(stmt)
+    deleted = int(getattr(result, "rowcount", 0) or 0)
+    logger.info("window_deleted", connector=connector_name, rows=deleted, start=str(start),
+                end=str(end))
+    return deleted
+
+
+def insert_focus_records(
     session: Session,
     records: list[FocusRecord],
     ingest_run_id: int,
     batch_size: int = 1000,
 ) -> int:
-    """Upsert *records* into ``raw.focus_record``. Returns rows written."""
+    """Bulk-insert *records* into ``raw.focus_record``. Returns rows written.
+
+    Assumes the target window was already cleared via ``delete_window`` in the same
+    transaction, so a plain INSERT is conflict-free.
+    """
     deduped = collapse_duplicates(records)
 
     written = 0
     for start in range(0, len(deduped), batch_size):
         batch = deduped[start : start + batch_size]
         rows = [_to_row(r, ingest_run_id) for r in batch]
-        stmt = insert(RawFocusRecord).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["dedupe_key"],
-            set_={f: getattr(stmt.excluded, f) for f in _MUTABLE_FIELDS},
-        )
-        session.execute(stmt)
+        session.execute(insert(RawFocusRecord).values(rows))
         written += len(rows)
     return written
