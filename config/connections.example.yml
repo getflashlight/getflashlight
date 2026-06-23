@@ -21,12 +21,17 @@ connectors:
     access_key_env: AWS_ACCESS_KEY_ID
     secret_key_env: AWS_SECRET_ACCESS_KEY
 
-  # Databricks DBU usage from system tables (mapped to FOCUS).
+  # Databricks DBU usage. Runs the vendored Databricks→FOCUS 1.3 query on a SQL
+  # warehouse (see data/README + the SQL header for provenance/attribution).
+  # Needs UC access to system.billing.*, system.compute.*, system.lakeflow.pipelines,
+  # system.access.workspaces_latest.
   - type: databricks
     enabled: true
     host: https://dbc-xxxxxxxx.cloud.databricks.com
     token_env: DATABRICKS_TOKEN
     sql_warehouse_id: null   # null → auto-pick a warehouse
+    # Use system.billing.account_prices only if you're in the Account Prices Preview.
+    account_prices_table: system.billing.list_prices
 
   # AWS infra via Cost Explorer — only needed if you do NOT have a native FOCUS
   # export. Attributes EC2/EBS/S3 to clusters via the cluster tag. Disabled by default.

@@ -32,6 +32,7 @@ from auralake.ingest.connectors import (
 from auralake.store.engine import session_scope
 from auralake.store.models import IngestRun
 from auralake.store.upsert import upsert_focus_records
+from auralake.transform.runner import apply_views
 
 logger = get_logger(__name__)
 
@@ -92,6 +93,9 @@ def run() -> None:
     parser.add_argument("--start", type=date.fromisoformat, default=None)
     parser.add_argument("--end", type=date.fromisoformat, default=None)
     parser.add_argument("--connections", default=None, help="Path to connections.yml")
+    parser.add_argument(
+        "--no-transform", action="store_true", help="Skip refreshing SILVER/GOLD views"
+    )
     args = parser.parse_args()
 
     setup_logging()
@@ -108,6 +112,11 @@ def run() -> None:
     for config in configs:
         connector = build_connector(config)
         total += run_connector(connector, window)
+
+    # Refresh SILVER/GOLD so the data is immediately queryable (the bundled flow).
+    if not args.no_transform:
+        apply_views()
+        logger.info("transform_done")
     logger.info("ingest_complete", connectors=len(configs), rows=total)
 
 

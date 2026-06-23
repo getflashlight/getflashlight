@@ -1,9 +1,15 @@
-# Local default — all sources disabled so `/ingest` runs the transform path
-# without needing real cloud credentials. Enable + fill in to pull real billing.
+# Local default. The focus_file connector loads the official FOCUS sample
+# (see data/README.md to fetch it). Enable real sources by filling them in.
 connectors:
+  - type: focus_file
+    enabled: true
+    path: /data/focus_sample.csv
+    respect_window: false
+
   - type: aws_focus
     enabled: false
     s3_bucket: ""
+
   - type: databricks
     enabled: false
     host: ""

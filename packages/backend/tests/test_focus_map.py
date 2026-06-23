@@ -46,7 +46,8 @@ def test_space_separated_timestamp_parsed() -> None:
 
 
 def test_credit_and_unknown_category_fallbacks() -> None:
-    assert map_focus_row(_row(ChargeCategory="Credit"), "f").charge_category == ChargeCategory.CREDIT
+    credit = map_focus_row(_row(ChargeCategory="Credit"), "f")
+    assert credit is not None and credit.charge_category == ChargeCategory.CREDIT
     # FOCUS 1.0 'Identity' isn't in our enum → OTHER, but cost is unaffected.
     rec = map_focus_row(_row(ServiceCategory="Identity"), "f")
     assert rec is not None and rec.service_category == ServiceCategory.OTHER

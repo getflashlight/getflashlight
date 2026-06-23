@@ -42,8 +42,12 @@ docker compose up -d                                   # full stack
   vocab (`enums.py`). Every connector maps its source into a `FocusRecord`; this
   is the one contract between ingestion and storage.
 - **`ingest/`** — `Connector` ABC (`base.py`), YAML config (`config.py`), the
-  `runner.py` orchestrator, and `connectors/` (aws_focus, databricks, aws_infra,
-  plus stubs for bigquery/snowflake/redshift).
+  `runner.py` orchestrator, and `connectors/` (aws_focus, focus_file, databricks,
+  aws_infra, plus stubs for bigquery/snowflake/redshift). FOCUS-shaped sources share
+  `connectors/_focus_map.py`. The **databricks** connector runs the vendored
+  Databricks→FOCUS 1.3 query (`connectors/sql/databricks_focus_1_3.sql`, from
+  `databricks-solutions/cloud-infra-costs`) on a warehouse and maps its output —
+  don't reintroduce hand-rolled DBU math. Re-pull that file upstream to update it.
 - **`store/`** — SQLModel BRONZE tables (`models.py`: `raw.focus_record`,
   `meta.ingest_run`), engine, idempotent `upsert.py`, and read-only `query.py`.
 - **`transform/`** — `sql/` holds the SILVER/GOLD views (the metrics contract);

@@ -67,6 +67,19 @@ def _to_row(record: FocusRecord, ingest_run_id: int) -> dict[str, object]:
     }
 
 
+def collapse_duplicates(records: list[FocusRecord]) -> list[FocusRecord]:
+    """Collapse records sharing a ``dedupe_key`` (last wins).
+
+    A single ``INSERT ... ON CONFLICT DO UPDATE`` cannot touch the same conflicting
+    row twice, so an export with internal duplicates must be de-duplicated first or
+    Postgres raises a CardinalityViolation.
+    """
+    by_key: dict[str, FocusRecord] = {}
+    for record in records:
+        by_key[record.dedupe_key()] = record
+    return list(by_key.values())
+
+
 def upsert_focus_records(
     session: Session,
     records: list[FocusRecord],
@@ -74,9 +87,11 @@ def upsert_focus_records(
     batch_size: int = 1000,
 ) -> int:
     """Upsert *records* into ``raw.focus_record``. Returns rows written."""
+    deduped = collapse_duplicates(records)
+
     written = 0
-    for start in range(0, len(records), batch_size):
-        batch = records[start : start + batch_size]
+    for start in range(0, len(deduped), batch_size):
+        batch = deduped[start : start + batch_size]
         rows = [_to_row(r, ingest_run_id) for r in batch]
         stmt = insert(RawFocusRecord).values(rows)
         stmt = stmt.on_conflict_do_update(
