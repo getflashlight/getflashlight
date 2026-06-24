@@ -85,8 +85,16 @@ def aws_create_export(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print the request without creating the export"
     ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Use resolved values without prompting; skip confirmation"
+    ),
 ) -> None:
-    """Create the AWS FOCUS 1.2 Data Export this platform consumes."""
+    """Create the AWS FOCUS 1.2 Data Export this platform consumes.
+
+    Walks you through each input (bucket, prefix, region) with the resolved value as
+    the default — press Enter to keep it, or type a new one — then confirms before
+    provisioning. ``--yes`` takes the resolved values as-is.
+    """
     from botocore.exceptions import BotoCoreError, ClientError
 
     from auralake.ingest.aws_export_setup import (
@@ -95,17 +103,21 @@ def aws_create_export(
         save_state,
     )
 
-    # Resolve the values lacking a static default: flag → connections.yml →
-    # remembered → prompt. (Plain `prompt=True` can't see those fallbacks.)
+    # Resolve the values lacking a static default: flag → connections.yml → remembered.
     bucket, prefix, s3_region, _ = resolved_targets(bucket, prefix, s3_region, connections)
-    bucket = bucket or typer.prompt("Destination S3 bucket")
-    if prefix is None:
+    if not yes:
+        # Interactive flow: prompt for each field with the resolved value as the
+        # editable default (no default → the field is required).
+        bucket = typer.prompt("Destination S3 bucket", default=bucket or None)
         prefix = typer.prompt(
-            "S3 export-root prefix (the folder with data/ and metadata/)", default=""
+            "S3 export-root prefix (the folder with data/ and metadata/)",
+            default=prefix if prefix is not None else "",
         )
-    s3_region = s3_region or typer.prompt("Bucket region", default="us-east-1")
+        s3_region = typer.prompt("Bucket region", default=s3_region or "us-east-1")
     save_state(bucket=bucket, prefix=prefix, region=s3_region)
 
+    # Confirm after the summary prints (default Yes); --yes skips, --dry-run never asks.
+    confirm = None if yes else (lambda: typer.confirm("\nCreate this export?", default=True))
     try:
         perform_create_export(
             apply=not dry_run,
@@ -118,6 +130,7 @@ def aws_create_export(
             overwrite=overwrite,
             query_statement=query_statement,
             connections=connections,
+            confirm=confirm,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -127,7 +140,7 @@ def aws_create_export(
         if "bucket permission" in str(exc).lower() or "AccessDenied" in str(exc):
             from auralake.ingest.aws_export_setup import bucket_policy_hint
 
-            typer.echo(bucket_policy_hint(bucket, connections), err=True)
+            typer.echo(bucket_policy_hint(bucket or "", connections), err=True)
         raise typer.Exit(code=1) from exc
 
 

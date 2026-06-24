@@ -109,6 +109,14 @@ def load_aws_focus_defaults(path: str | None) -> dict[str, Any]:
     return {}
 
 
+def _print_create_summary(name: str, request: dict[str, Any]) -> None:
+    """Print what CreateExport will provision."""
+    new = _destination_fields(request)
+    print(f"Will create export: {name}")
+    for field in ("bucket", "prefix", "region", "granularity", "overwrite"):
+        print(f"  {field:11} {new[field] or '—'}")
+
+
 def perform_create_export(
     *,
     apply: bool,
@@ -121,11 +129,15 @@ def perform_create_export(
     overwrite: str,
     query_statement: str | None,
     connections: str | None,
+    confirm: Callable[[], bool] | None = None,
 ) -> None:
     """Build (and optionally create) the FOCUS export. Backs ``auralake aws create-export``.
 
     Applies by default — calls CreateExport. Pass ``apply=False`` (CLI ``--dry-run``)
-    to just print the request. Raises ``ValueError`` if no bucket can be resolved.
+    to just print the request. Prints a summary and warns if an export of the same
+    name already exists (creating another delivers duplicate data). ``confirm``, when
+    given, is called right before mutating; returning False aborts. Raises
+    ``ValueError`` if no bucket can be resolved.
     """
     defaults = load_aws_focus_defaults(connections)
     bucket = bucket or defaults.get("s3_bucket")
@@ -154,11 +166,32 @@ def perform_create_export(
         )
         return
 
+    from botocore.exceptions import BotoCoreError, ClientError
+
     client = _bcm_client(defaults)
+    _print_create_summary(name, request)
+
+    # Warn before silently provisioning a duplicate (same name → duplicate delivery).
+    # Best-effort: if we can't list exports, skip the check rather than block.
+    try:
+        existing = _find_export_by_name(client, name)
+    except (ClientError, BotoCoreError):
+        existing = None
+    if existing:
+        print(
+            f"\n⚠ An export named {name!r} already exists:\n  {existing}\n"
+            "AWS keys exports by name, so re-creating REPLACES it (and resets its ARN).\n"
+            "To modify it in place instead, abort and run: auralake aws update-export"
+        )
+
+    if confirm is not None and not confirm():
+        print("Aborted.")
+        return
+
     resp = client.create_export(Export=request)
     arn = resp.get("ExportArn")
     logger.info("aws_export_created", arn=arn, bucket=bucket, prefix=prefix)
-    print(f"Created export: {arn}")
+    print(f"\nCreated export: {arn}")
     print("First data delivery can take up to 24 hours. Then run: auralake ingest")
 
 

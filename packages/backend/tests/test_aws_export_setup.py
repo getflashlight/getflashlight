@@ -118,11 +118,16 @@ class _FakeBcmClient:
     ) -> None:
         self._exports = exports
         self._current = current or {}
+        self.created: dict[str, object] | None = None
         self.updated: dict[str, object] | None = None
         self.deleted: str | None = None
 
     def list_exports(self, **_: object) -> dict[str, object]:
         return {"Exports": self._exports}
+
+    def create_export(self, *, Export: dict[str, object]) -> dict[str, str]:  # noqa: N803 - boto3 API kwargs
+        self.created = {"export": Export}
+        return {"ExportArn": "arn:created"}
 
     def get_export(self, *, ExportArn: str) -> dict[str, object]:  # noqa: N803 - boto3 API kwargs
         return {"Export": self._current}
@@ -147,6 +152,33 @@ def test_find_export_by_name() -> None:
     )
     assert _find_export_by_name(client, "auralake-focus") == "arn:focus"
     assert _find_export_by_name(client, "missing") is None
+
+
+def test_perform_create_export_warns_on_duplicate_name(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    import auralake.ingest.aws_export_setup as mod
+
+    # An export with this name already exists → creating another should warn.
+    client = _FakeBcmClient([{"ExportName": "auralake-focus", "ExportArn": "arn:existing"}])
+    monkeypatch.setattr(mod, "_bcm_client", lambda _defaults: client)
+
+    mod.perform_create_export(
+        apply=True,
+        name="auralake-focus",
+        description="d",
+        bucket="b",
+        prefix="p",
+        s3_region="us-east-1",
+        time_granularity="DAILY",
+        overwrite="OVERWRITE_REPORT",
+        query_statement=None,
+        connections="/nonexistent.yml",
+        confirm=lambda: False,  # decline at the warning → no create
+    )
+    out = capsys.readouterr().out
+    assert "already exists" in out
+    assert "arn:existing" in out
+    assert "Aborted" in out
+    assert client.created is None  # nothing provisioned
 
 
 def test_current_export_destination_reads_live_values(monkeypatch) -> None:  # type: ignore[no-untyped-def]

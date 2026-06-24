@@ -53,13 +53,13 @@ def test_target_is_remembered_across_aws_commands(tmp_path) -> None:  # type: ig
     # First run records bucket/prefix/region…
     first = runner.invoke(
         app,
-        ["aws", "create-export", "--dry-run", "--bucket", "remembered-bkt",
+        ["aws", "create-export", "--dry-run", "--yes", "--bucket", "remembered-bkt",
          "--prefix", "focus/export", "--s3-region", "us-west-2", "--connections", str(missing)],
     )
     assert first.exit_code == 0
-    # …so a second run with no flags or input reuses them (no prompts).
+    # …so a second run with no flags or input reuses them (--yes skips the prompts).
     second = runner.invoke(
-        app, ["aws", "create-export", "--dry-run", "--connections", str(missing)], input=""
+        app, ["aws", "create-export", "--dry-run", "--yes", "--connections", str(missing)], input=""
     )
     assert second.exit_code == 0
     assert "remembered-bkt" in second.output
@@ -70,7 +70,7 @@ def test_aws_create_export_dry_run_emits_request(tmp_path) -> None:  # type: ign
     missing = tmp_path / "none.yml"  # forces empty defaults, bucket from flag
     result = runner.invoke(
         app,
-        ["aws", "create-export", "--dry-run", "--bucket", "b", "--prefix", "p",
+        ["aws", "create-export", "--dry-run", "--yes", "--bucket", "b", "--prefix", "p",
          "--s3-region", "us-west-1", "--connections", str(missing)],
     )
     assert result.exit_code == 0
