@@ -41,8 +41,9 @@ logger = get_logger(__name__)
 
 # Partition-level manifest: ``metadata/BILLING_PERIOD=YYYY-MM/<...>Manifest.json``.
 # The trailing ``[^/]*`` excludes the per-execution copies that "create new" mode
-# nests one level deeper under ``<timestamp>-<execution-id>/``.
-_MANIFEST_RE = re.compile(r"metadata/BILLING_PERIOD=(\d{4}-\d{2})/[^/]*Manifest\.json$")
+# nests one level deeper under ``<timestamp>-<execution-id>/``. Case-insensitive:
+# AWS delivers the partition key lowercased (``billing_period=``).
+_MANIFEST_RE = re.compile(r"metadata/billing_period=(\d{4}-\d{2})/[^/]*Manifest\.json$", re.I)
 
 
 class AwsFocusConnector(Connector):

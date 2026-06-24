@@ -4,9 +4,9 @@ Auralake *consumes* a FOCUS export from S3; it does not create one. This command
 wraps the ``bcm-data-exports:CreateExport`` API so customers can provision that
 export reproducibly instead of click-ops in the console.
 
-It is **dry-run by default** — CreateExport provisions a billing resource that
-refreshes daily, so you must pass ``--apply`` to actually create it. Bucket /
-prefix / region default from your ``connections.yml`` aws_focus block.
+It **applies by default** — CreateExport provisions a billing resource that
+refreshes daily. Pass ``--dry-run`` to print the request without creating it.
+Bucket / prefix / region default from your ``connections.yml`` aws_focus block.
 
 Prerequisite (one-time, not done here): the destination bucket policy must grant
 ``bcm-data-exports.amazonaws.com`` ``s3:PutObject`` — see the AWS Data Exports
@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +103,8 @@ def load_aws_focus_defaults(path: str | None) -> dict[str, Any]:
     raw = yaml.safe_load(cfg_path.read_text()) or {}
     for entry in raw.get("connectors", []):
         if isinstance(entry, dict) and entry.get("type") == "aws_focus":
+            if isinstance(entry.get("s3_prefix"), str):
+                entry["s3_prefix"] = entry["s3_prefix"].rstrip("/")
             return entry
     return {}
 
@@ -121,12 +124,12 @@ def perform_create_export(
 ) -> None:
     """Build (and optionally create) the FOCUS export. Backs ``auralake aws create-export``.
 
-    Dry-run by default — prints the request. Pass ``apply=True`` to call CreateExport.
-    Raises ``ValueError`` if no bucket can be resolved.
+    Applies by default — calls CreateExport. Pass ``apply=False`` (CLI ``--dry-run``)
+    to just print the request. Raises ``ValueError`` if no bucket can be resolved.
     """
     defaults = load_aws_focus_defaults(connections)
     bucket = bucket or defaults.get("s3_bucket")
-    prefix = prefix if prefix is not None else defaults.get("s3_prefix", "")
+    prefix = (prefix if prefix is not None else defaults.get("s3_prefix", "")).rstrip("/")
     s3_region = s3_region or defaults.get("region", "us-east-1")
     if not bucket:
         raise ValueError("no S3 bucket: pass --bucket or set s3_bucket in connections.yml")
@@ -144,24 +147,188 @@ def perform_create_export(
 
     if not apply:
         print(json.dumps({"Export": request}, indent=2))
-        print("\nDRY RUN — no export created. Re-run with --apply to create it.")
+        print("\nDRY RUN — no export created. Re-run without --dry-run to create it.")
         print(
             "Prerequisite: the destination bucket policy must grant "
             "bcm-data-exports.amazonaws.com the s3:PutObject action."
         )
         return
 
-    client = boto3.client(
-        "bcm-data-exports",
-        region_name=_API_REGION,
-        aws_access_key_id=env(defaults.get("access_key_env", "AWS_ACCESS_KEY_ID")),
-        aws_secret_access_key=env(defaults.get("secret_key_env", "AWS_SECRET_ACCESS_KEY")),
-    )
+    client = _bcm_client(defaults)
     resp = client.create_export(Export=request)
     arn = resp.get("ExportArn")
     logger.info("aws_export_created", arn=arn, bucket=bucket, prefix=prefix)
     print(f"Created export: {arn}")
     print("First data delivery can take up to 24 hours. Then run: auralake ingest")
+
+
+def _bcm_client(defaults: dict[str, Any]) -> Any:
+    return boto3.client(
+        "bcm-data-exports",
+        region_name=_API_REGION,
+        aws_access_key_id=env(defaults.get("access_key_env", "AWS_ACCESS_KEY_ID")),
+        aws_secret_access_key=env(defaults.get("secret_key_env", "AWS_SECRET_ACCESS_KEY")),
+    )
+
+
+def _find_export_by_name(client: Any, name: str) -> str | None:
+    """Return the ARN of the export named ``name`` (first match), or None."""
+    token: str | None = None
+    while True:
+        resp = client.list_exports(**({"NextToken": token} if token else {}))
+        for ref in resp.get("Exports", []):
+            if ref.get("ExportName") == name and ref.get("ExportArn"):
+                return str(ref["ExportArn"])
+        token = resp.get("NextToken")
+        if not token:
+            return None
+
+
+def _destination_fields(export: dict[str, Any]) -> dict[str, str]:
+    """Flatten the destination + query knobs UpdateExport actually changes."""
+    s3 = export.get("DestinationConfigurations", {}).get("S3Destination", {})
+    out = s3.get("S3OutputConfigurations", {})
+    tables = export.get("DataQuery", {}).get("TableConfigurations", {})
+    table = next(iter(tables), "")
+    return {
+        "bucket": s3.get("S3Bucket", ""),
+        "prefix": s3.get("S3Prefix", ""),
+        "region": s3.get("S3Region", ""),
+        "granularity": tables.get(table, {}).get("TIME_GRANULARITY", ""),
+        "overwrite": out.get("Overwrite", ""),
+        "query": export.get("DataQuery", {}).get("QueryStatement", ""),
+    }
+
+
+def current_export_destination(name: str, connections: str | None) -> dict[str, str] | None:
+    """The live export's current bucket/prefix/region/etc., or None if it doesn't exist.
+
+    This is the right source of defaults for ``update-export`` — you're editing what
+    AWS actually has deployed, not a remembered local guess. May raise ClientError /
+    BotoCoreError if the AWS lookup fails (callers fall back to config/state).
+    """
+    defaults = load_aws_focus_defaults(connections)
+    client = _bcm_client(defaults)
+    arn = _find_export_by_name(client, name)
+    if not arn:
+        return None
+    export = client.get_export(ExportArn=arn).get("Export", {})
+    return _destination_fields(export)
+
+
+def _print_update_plan(current: dict[str, Any], request: dict[str, Any]) -> bool:
+    """Print a before→after summary; return True if the destination bucket changes."""
+    cur = _destination_fields(current)
+    new = _destination_fields(request)
+    print("Update plan:")
+    for field in ("bucket", "prefix", "region", "granularity", "overwrite", "query"):
+        old_v, new_v = cur[field], new[field]
+        if old_v == new_v:
+            print(f"     {field:11} {old_v or '—'}  (unchanged)")
+        else:
+            print(f"  →  {field:11} {old_v or '—'}  ⇒  {new_v or '—'}")
+    return cur["bucket"] != new["bucket"]
+
+
+def perform_update_export(
+    *,
+    apply: bool,
+    name: str,
+    description: str,
+    bucket: str | None,
+    prefix: str | None,
+    s3_region: str | None,
+    time_granularity: str,
+    overwrite: str,
+    query_statement: str | None,
+    connections: str | None,
+    confirm: Callable[[], bool] | None = None,
+) -> None:
+    """Update an existing FOCUS export in place (e.g. to fix its S3 prefix).
+
+    Finds the export by ``name``, rebuilds its **whole** definition from the
+    resolved bucket/prefix/region/granularity/overwrite/query, prints a
+    before→after plan, and calls UpdateExport. If the destination bucket changes,
+    it surfaces the bucket-policy step the new bucket needs. Applies by default —
+    pass ``apply=False`` (CLI ``--dry-run``) to just print the plan. ``confirm``,
+    when given, is called right before mutating; returning False aborts.
+
+    Raises ``ValueError`` if no bucket resolves or the named export doesn't exist.
+    """
+    defaults = load_aws_focus_defaults(connections)
+    bucket = bucket or defaults.get("s3_bucket")
+    prefix = (prefix if prefix is not None else defaults.get("s3_prefix", "")).rstrip("/")
+    s3_region = s3_region or defaults.get("region", "us-east-1")
+    if not bucket:
+        raise ValueError("no S3 bucket: pass --bucket or set s3_bucket in connections.yml")
+
+    request = build_export_request(
+        name=name,
+        description=description,
+        s3_bucket=bucket,
+        s3_prefix=prefix or "",
+        s3_region=s3_region,
+        query_statement=query_statement or default_query_statement(),
+        time_granularity=time_granularity,
+        overwrite=overwrite,
+    )
+
+    client = _bcm_client(defaults)
+    arn = _find_export_by_name(client, name)
+    if not arn:
+        raise ValueError(f"no export named {name!r} found — create it first with create-export")
+
+    current = client.get_export(ExportArn=arn).get("Export", {})
+    print(f"Export: {name}\n  {arn}\n")
+    bucket_changed = _print_update_plan(current, request)
+    if bucket_changed:
+        print(
+            f"\nThe new bucket {bucket!r} must grant AWS Data Exports s3:PutObject before\n"
+            f"the next refresh can deliver. Apply it with:\n"
+            f"  auralake aws bucket-policy --bucket {bucket}"
+        )
+
+    if not apply:
+        print(f"\nDRY RUN — no change made. Re-run without --dry-run to update {arn}.")
+        return
+
+    if confirm is not None and not confirm():
+        print("Aborted.")
+        return
+
+    client.update_export(ExportArn=arn, Export=request)
+    logger.info("aws_export_updated", arn=arn, bucket=bucket, prefix=prefix)
+    print(f"\nUpdated export: {arn}")
+    print(
+        "The next refresh delivers to the new destination; already-delivered "
+        "objects stay at the old path until you remove them."
+    )
+
+
+def perform_delete_export(
+    *, apply: bool, name: str, connections: str | None
+) -> None:
+    """Delete the FOCUS export named ``name``.
+
+    Deletes by default — pass ``apply=False`` (CLI ``--dry-run``) to just show
+    what would be deleted. Raises ``ValueError`` if the named export doesn't
+    exist. Deleting the export does NOT remove the parquet already delivered to S3.
+    """
+    defaults = load_aws_focus_defaults(connections)
+    client = _bcm_client(defaults)
+    arn = _find_export_by_name(client, name)
+    if not arn:
+        raise ValueError(f"no export named {name!r} found")
+
+    if not apply:
+        print(f"Would delete export {name!r}: {arn}")
+        print("\nDRY RUN — nothing deleted. Re-run without --dry-run to delete it.")
+        return
+
+    client.delete_export(ExportArn=arn)
+    logger.info("aws_export_deleted", arn=arn, name=name)
+    print(f"Deleted export: {arn}")
+    print("Parquet already delivered to S3 is untouched — remove it separately if needed.")
 
 
 # ── S3 bucket policy (the CreateExport prerequisite) ─────────────────────────
@@ -213,8 +380,8 @@ def bucket_policy_hint(bucket: str, connections: str | None) -> str:
     policy = json.dumps(bucket_policy_document(bucket, account_id), indent=2)
     return (
         f"\nThe bucket '{bucket}' is not authorized for AWS Data Exports yet.\n"
-        f"Apply this bucket policy, then retry with --apply:\n\n{policy}\n\n"
-        f"Or let Auralake do it:  auralake aws bucket-policy --bucket {bucket} --apply"
+        f"Apply this bucket policy, then retry:\n\n{policy}\n\n"
+        f"Or let Auralake do it:  auralake aws bucket-policy --bucket {bucket}"
     )
 
 
@@ -223,7 +390,7 @@ def print_bucket_policy(bucket: str, connections: str | None) -> None:
     print(json.dumps(bucket_policy_document(bucket, account_id), indent=2))
     print(
         f"\nApply with:\n  aws s3api put-bucket-policy --bucket {bucket} "
-        f"--policy file://policy.json\nor: auralake aws bucket-policy --bucket {bucket} --apply"
+        f"--policy file://policy.json\nor: auralake aws bucket-policy --bucket {bucket}"
     )
 
 
@@ -296,12 +463,15 @@ def resolved_targets(
     state = load_state()
     rb = bucket or defaults.get("s3_bucket") or state.get("bucket")
     rp = prefix if prefix is not None else (defaults.get("s3_prefix") or state.get("prefix"))
+    if isinstance(rp, str):
+        rp = rp.rstrip("/")
     rr = region or defaults.get("region") or state.get("region")
     return rb, rp, rr, defaults
 
 
 # ── describe-export: how much FOCUS data has actually landed in S3 ───────────
-_DATA_PARQUET_RE = re.compile(r"data/BILLING_PERIOD=(\d{4}-\d{2})/.*\.parquet$")
+# Case-insensitive: AWS delivers the partition key lowercased (``billing_period=``).
+_DATA_PARQUET_RE = re.compile(r"data/billing_period=(\d{4}-\d{2})/.*\.parquet$", re.I)
 
 
 def _human_bytes(n: int) -> str:
@@ -440,7 +610,3 @@ def _describe_s3_delivery(
     for period in ordered:
         chunks = periods[period]
         print(f"    {period}  {_human_bytes(sum(chunks))} / {len(chunks)} files")
-    print(
-        "\nCounts cover all services (the export is account-wide); your include_services "
-        "allow-list narrows what ingest loads into BRONZE."
-    )

@@ -4,6 +4,8 @@
     auralake ingest             pull billing → BRONZE, then refresh SILVER/GOLD
     auralake transform          rebuild SILVER views + GOLD matviews
     auralake aws create-export  provision the AWS FOCUS Data Export to consume
+    auralake aws update-export  update that export in place (e.g. fix its S3 prefix)
+    auralake aws delete-export  remove that export (S3 data is left untouched)
 
 End users don't use this CLI — they read Grafana dashboards (which query Postgres
 directly) and talk to the MCP server. This is the deployment/ops surface.
@@ -69,10 +71,10 @@ def transform(
 
 @aws_app.command("create-export")
 def aws_create_export(
-    bucket: str | None = typer.Option(None, help="Destination S3 bucket (flag → config → prompt)"),
-    prefix: str | None = typer.Option(None, help="Destination S3 prefix (flag → config → prompt)"),
+    bucket: str | None = typer.Option(None, help="Destination S3 bucket"),
+    prefix: str | None = typer.Option(None, help="Destination S3 prefix"),
     s3_region: str | None = typer.Option(
-        None, "--s3-region", help="Bucket region (config → prompt)"
+        None, "--s3-region", help="Bucket region"
     ),
     name: str = typer.Option("auralake-focus", help="Export name"),
     description: str = typer.Option("FOCUS 1.2 export consumed by Auralake"),
@@ -80,7 +82,9 @@ def aws_create_export(
     overwrite: str = typer.Option("OVERWRITE_REPORT", help="OVERWRITE_REPORT | CREATE_NEW_REPORT"),
     query_statement: str | None = typer.Option(None, help="Override the FOCUS column projection"),
     connections: str | None = typer.Option(None, help="connections.yml for bucket/prefix defaults"),
-    apply: bool = typer.Option(False, help="Actually create the export (default: dry-run)"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the request without creating the export"
+    ),
 ) -> None:
     """Create the AWS FOCUS 1.2 Data Export this platform consumes."""
     from botocore.exceptions import BotoCoreError, ClientError
@@ -104,7 +108,7 @@ def aws_create_export(
 
     try:
         perform_create_export(
-            apply=apply,
+            apply=not dry_run,
             name=name,
             description=description,
             bucket=bucket,
@@ -129,12 +133,14 @@ def aws_create_export(
 
 @aws_app.command("bucket-policy")
 def aws_bucket_policy(
-    bucket: str | None = typer.Option(None, help="S3 bucket (flag → config → prompt)"),
+    bucket: str | None = typer.Option(None, help="S3 bucket"),
     region: str | None = typer.Option(None, help="Bucket region (default: config)"),
     connections: str | None = typer.Option(None, help="connections.yml for defaults"),
-    apply: bool = typer.Option(False, help="Merge-apply to the bucket (default: print only)"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the policy without applying it to the bucket"
+    ),
 ) -> None:
-    """Print or --apply the S3 bucket policy AWS Data Exports needs to write the export."""
+    """Merge-apply the S3 bucket policy AWS Data Exports needs (--dry-run to just print it)."""
     from botocore.exceptions import BotoCoreError, ClientError
 
     from auralake.ingest.aws_export_setup import (
@@ -147,7 +153,7 @@ def aws_bucket_policy(
     bucket, _, region, _ = resolved_targets(bucket, None, region, connections)
     bucket = bucket or typer.prompt("S3 bucket")
     save_state(bucket=bucket, region=region)
-    if not apply:
+    if dry_run:
         print_bucket_policy(bucket=bucket, connections=connections)
         return
     try:
@@ -160,8 +166,8 @@ def aws_bucket_policy(
 
 @aws_app.command("describe-export")
 def aws_describe_export(
-    bucket: str | None = typer.Option(None, help="S3 bucket (flag → config → remembered → prompt)"),
-    prefix: str | None = typer.Option(None, help="Export-root prefix (flag → config → remembered)"),
+    bucket: str | None = typer.Option(None, help="S3 bucket"),
+    prefix: str | None = typer.Option(None, help="Export-root prefix"),
     region: str | None = typer.Option(None, "--s3-region", help="Bucket region"),
     connections: str | None = typer.Option(None, help="connections.yml for defaults"),
 ) -> None:
@@ -179,6 +185,117 @@ def aws_describe_export(
         describe_export(bucket=bucket, prefix=prefix, region=region, connections=connections)
     except (ClientError, BotoCoreError) as exc:
         typer.secho(f"describe-export failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@aws_app.command("update-export")
+def aws_update_export(
+    bucket: str | None = typer.Option(None, help="Destination S3 bucket"),
+    prefix: str | None = typer.Option(None, help="Destination S3 prefix"),
+    s3_region: str | None = typer.Option(
+        None, "--s3-region", help="Bucket region"
+    ),
+    name: str = typer.Option("auralake-focus", help="Name of the existing export to update"),
+    description: str = typer.Option("FOCUS 1.2 export consumed by Auralake"),
+    time_granularity: str = typer.Option("DAILY", help="HOURLY | DAILY | MONTHLY"),
+    overwrite: str = typer.Option("OVERWRITE_REPORT", help="OVERWRITE_REPORT | CREATE_NEW_REPORT"),
+    query_statement: str | None = typer.Option(None, help="Override the FOCUS column projection"),
+    connections: str | None = typer.Option(None, help="connections.yml for bucket/prefix defaults"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the plan without updating the export"
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Use resolved values without prompting; skip confirmation"
+    ),
+) -> None:
+    """Update the AWS FOCUS Data Export in place (e.g. fix its S3 prefix after editing config).
+
+    Walks you through each input (bucket, prefix, region) with the current value as
+    the default — press Enter to keep it, or type a new one. Then prints a before→after
+    plan of every field UpdateExport changes, flags the bucket-policy step if the bucket
+    moves, and confirms before applying. ``--yes`` takes the resolved values as-is.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from auralake.ingest.aws_export_setup import (
+        current_export_destination,
+        perform_update_export,
+        resolved_targets,
+        save_state,
+    )
+
+    # Defaults come from the LIVE export (what AWS actually has), then fall back to
+    # flags/config/state. We're editing a deployed resource, so its current values
+    # are the truth — not a remembered local guess.
+    try:
+        live = current_export_destination(name, connections)
+    except (ClientError, BotoCoreError):
+        live = None  # can't reach AWS — fall back to config/state below
+    rb, rp, rr, _ = resolved_targets(bucket, prefix, s3_region, connections)
+    bucket = bucket or (live or {}).get("bucket") or rb
+    prefix = prefix if prefix is not None else ((live or {}).get("prefix") or rp)
+    s3_region = s3_region or (live or {}).get("region") or rr
+
+    if not yes:
+        # Interactive flow: prompt for each field with the current value as the
+        # editable default (no default → the field is required).
+        bucket = typer.prompt("Destination S3 bucket", default=bucket or None)
+        prefix = typer.prompt(
+            "S3 export-root prefix (the folder with data/ and metadata/)",
+            default=prefix if prefix is not None else "",
+        )
+        s3_region = typer.prompt("Bucket region", default=s3_region or "us-east-1")
+    save_state(bucket=bucket, prefix=prefix, region=s3_region)
+
+    # Confirm after the plan prints (default Yes); --yes skips, --dry-run never asks.
+    confirm = None if yes else (lambda: typer.confirm("\nApply this update?", default=True))
+    try:
+        perform_update_export(
+            apply=not dry_run,
+            name=name,
+            description=description,
+            bucket=bucket,
+            prefix=prefix,
+            s3_region=s3_region,
+            time_granularity=time_granularity,
+            overwrite=overwrite,
+            query_statement=query_statement,
+            connections=connections,
+            confirm=confirm,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except (ClientError, BotoCoreError) as exc:
+        typer.secho(f"UpdateExport failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@aws_app.command("delete-export")
+def aws_delete_export(
+    name: str = typer.Option("auralake-focus", help="Name of the export to delete"),
+    connections: str | None = typer.Option(None, help="connections.yml for AWS credentials"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be deleted without deleting it"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
+) -> None:
+    """Delete the AWS FOCUS Data Export. Parquet already in S3 is left untouched."""
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    from auralake.ingest.aws_export_setup import perform_delete_export
+
+    # Destructive and applies by default — require explicit confirmation (default No)
+    # unless --dry-run (which deletes nothing) or --yes (an intentional bypass).
+    if not dry_run and not yes and not typer.confirm(f"Delete the export {name!r}?"):
+        typer.echo("Aborted.")
+        raise typer.Exit(code=1)
+
+    try:
+        perform_delete_export(apply=not dry_run, name=name, connections=connections)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except (ClientError, BotoCoreError) as exc:
+        typer.secho(f"DeleteExport failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
 

@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from auralake.core.exceptions import ConfigError
 from auralake.core.settings import get_settings
@@ -30,6 +30,14 @@ class AwsFocusConfig(BaseModel):
     # data-platform deployment narrows here instead. Empty list = ingest every
     # service (the full account).
     include_services: list[str] = Field(default_factory=list)
+
+    @field_validator("s3_prefix")
+    @classmethod
+    def _strip_trailing_slash(cls, v: str) -> str:
+        # AWS Data Exports inserts its own ``/`` separator before the export name,
+        # so a trailing slash here yields a ``focus_data//export-name`` double
+        # slash in the delivered keys. Normalize any accidental trailing slash(es).
+        return v.rstrip("/")
 
 
 class FocusFileConfig(BaseModel):
