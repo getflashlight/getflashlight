@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import streamlit as st
 
+from auralake.dashboard.theme import inject_css
 from auralake.dashboard.views import aws_focus, billing_overview, tco_overview
 
 st.set_page_config(page_title="Auralake", page_icon="💧", layout="wide")
+inject_css()
 
 navigation = st.navigation(
     [
