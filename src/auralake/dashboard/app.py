@@ -14,9 +14,15 @@ st.set_page_config(page_title="Auralake", page_icon="💧", layout="wide")
 
 navigation = st.navigation(
     [
-        st.Page(billing_overview.render, title="Billing overview", icon="💵", default=True),
-        st.Page(tco_overview.render, title="TCO overview", icon="🧮"),
-        st.Page(aws_focus.render, title="AWS FOCUS", icon="☁️"),
+        st.Page(
+            billing_overview.render,
+            title="Billing overview",
+            icon="💵",
+            url_path="billing-overview",
+            default=True,
+        ),
+        st.Page(tco_overview.render, title="TCO overview", icon="🧮", url_path="tco-overview"),
+        st.Page(aws_focus.render, title="AWS FOCUS", icon="☁️", url_path="aws-focus"),
     ]
 )
 navigation.run()
