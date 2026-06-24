@@ -18,13 +18,10 @@ dir), queried by a throwaway in-memory **DuckDB** in each process.
 (Auralake was previously a Databricks cost-optimization tool; that code was
 removed in the FOCUS pivot. Don't reintroduce analyzers/recommendations.)
 
-## Monorepo
+## Project layout
 
-uv workspace (virtual root `pyproject.toml`), one package:
-
-```
-packages/backend/  → auralake-backend (the platform + the unified `auralake` CLI)
-```
+Single package, src layout — `pyproject.toml` at the repo root, code under
+`src/auralake/`, tests under `tests/`. No workspace, no nesting.
 
 The single `auralake` console script is the operator surface. `ingest` is the sole
 **writer**; `mcp serve` and `dashboard serve` are independent **read-only**
@@ -37,16 +34,17 @@ per-file rename. See `src/auralake/cli.py`.
 
 ```bash
 uv sync
-uv run --project packages/backend auralake init            # scaffold ~/.auralake + sample
-uv run --project packages/backend auralake ingest          # pull billing → BRONZE, rebuild GOLD
-uv run --project packages/backend auralake transform       # rebuild GOLD from BRONZE (no re-pull)
-uv run --project packages/backend auralake mcp serve       # MCP server :8002 (agents)
-uv run --project packages/backend auralake dashboard serve # Streamlit dashboard :8501 (humans)
-uv run --project packages/backend auralake aws create-export  # create the AWS FOCUS export
-uv run ruff check packages/ && uv run mypy packages/backend && uv run pytest
+uv run auralake init             # scaffold ~/.auralake + sample
+uv run auralake sample           # download the FinOps FOCUS sample + seed it
+uv run auralake ingest           # pull billing → BRONZE, rebuild GOLD
+uv run auralake transform        # rebuild GOLD from BRONZE (no re-pull)
+uv run auralake mcp serve        # MCP server :8002 (agents)
+uv run auralake dashboard serve  # Streamlit dashboard :8501 (humans)
+uv run auralake aws create-export  # create the AWS FOCUS export
+uv run ruff check src tests && uv run mypy src tests && uv run pytest
 ```
 
-## Architecture (`packages/backend/src/auralake/`)
+## Architecture (`src/auralake/`)
 
 - **`focus/`** — the canonical internal FOCUS record (`model.py`) and controlled
   vocab (`enums.py`). Every connector maps its source into a `FocusRecord`; this

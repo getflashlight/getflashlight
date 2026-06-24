@@ -1,4 +1,5 @@
 import pytest
+
 from auralake.core.exceptions import ConfigError
 from auralake.ingest.config import (
     AwsFocusConfig,

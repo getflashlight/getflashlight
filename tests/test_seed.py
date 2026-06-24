@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 
 import pytest
+
 from auralake.core.settings import get_settings
 
 # One clean row + one with NULL sentinels and an out-of-vocab ServiceCategory.

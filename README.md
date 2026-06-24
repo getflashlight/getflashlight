@@ -76,7 +76,7 @@ explicit **unattributed** bucket rather than hidden.
 
 The `databricks` connector does **not** hand-roll the billing math. It runs the
 authoritative **Databricks System Tables → FOCUS 1.3** query, vendored verbatim at
-[`packages/backend/src/auralake/ingest/connectors/sql/databricks_focus_1_3.sql`](packages/backend/src/auralake/ingest/connectors/sql/databricks_focus_1_3.sql)
+[`src/auralake/ingest/connectors/sql/databricks_focus_1_3.sql`](src/auralake/ingest/connectors/sql/databricks_focus_1_3.sql)
 from the Databricks solution accelerator
 [`databricks-solutions/cloud-infra-costs`](https://github.com/databricks-solutions/cloud-infra-costs/blob/main/focus/focus_query.sql).
 The connector executes it on a SQL warehouse, then feeds the FOCUS-columned output
@@ -103,15 +103,15 @@ carry it, but the TCO double-count guard needs it.
 
 ```bash
 uv sync
-uv run ruff check packages/
-uv run mypy packages/backend
+uv run ruff check src tests
+uv run mypy src tests
 uv run pytest
 ```
 
 ## Layout
 
 ```
-packages/backend/src/auralake/
+src/auralake/
   focus/      canonical FOCUS model + enums
   ingest/     connectors (aws_focus, databricks, aws_infra) + runner
   lake/       the Parquet layer: paths, schema, bronze writes, DuckDB, publish

@@ -12,6 +12,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
+
 from auralake.core.settings import get_settings
 from auralake.focus.enums import (
     ChargeCategory,

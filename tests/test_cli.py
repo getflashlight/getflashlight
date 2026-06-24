@@ -1,8 +1,9 @@
 """The unified `auralake` CLI exposes only the operator surface (MCP-only)."""
 
 import pytest
-from auralake.cli import app
 from typer.testing import CliRunner
+
+from auralake.cli import app
 
 runner = CliRunner()
 

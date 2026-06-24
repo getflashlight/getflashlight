@@ -1,4 +1,5 @@
 import pytest
+
 from auralake.gold.reader import QueryError, run_select
 
 

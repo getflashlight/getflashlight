@@ -1,10 +1,9 @@
 # Sample data
 
-`auralake init` copies a bundled copy of this FOCUS sample into
-`~/.auralake/data/` and enables a `focus_file` connector for it, so a fresh
-install has data out of the box. To use your own files, drop FOCUS CSV/Parquet
-anywhere and point a `focus_file` connector at the path in
-`~/.auralake/config/connections.yml`.
+`auralake sample` downloads this FOCUS sample on demand and seeds it — the
+zero-config way to get demo data (nothing is bundled in the wheel). To use your
+own files, drop FOCUS CSV/Parquet anywhere and point a `focus_file` connector at
+the path in `~/.auralake/config/connections.yml`.
 
 ## Fetch the official FinOps FOCUS sample dataset
 
