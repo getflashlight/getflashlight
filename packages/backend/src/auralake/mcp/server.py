@@ -83,8 +83,9 @@ def run_sql(sql: str, limit: int = 200) -> dict[str, Any]:
 def serve_mcp() -> None:
     """Run the MCP server. Backs the ``auralake serve`` command.
 
-    Applies pending migrations first (gated by AURALAKE_AUTO_MIGRATE) since this is
-    now the primary long-running service — there is no separate migrate step.
+    Migrations are applied by the dedicated ``migrate`` step, not here. Set
+    ``AURALAKE_AUTO_MIGRATE=true`` to opt into self-applying on boot (off by
+    default) — useful when running ``serve`` standalone without that step.
     """
     from auralake.core.settings import get_settings
 

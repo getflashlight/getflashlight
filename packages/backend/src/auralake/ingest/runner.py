@@ -99,15 +99,10 @@ def run_ingest(
 ) -> int:
     """Pull all enabled connectors for the window, then refresh views. Returns rows.
 
-    Backs the ``auralake ingest`` subcommand.
+    Backs the ``auralake ingest`` subcommand. The schema must already be migrated
+    (by the compose ``migrate`` service, or ``python -m auralake.store.migrate``);
+    ingest does not self-migrate.
     """
-    # Self-apply schema so an on-demand ingest works without a separate migrate
-    # step (no-op if already current; gated by AURALAKE_AUTO_MIGRATE).
-    if get_settings().auto_migrate:
-        from auralake.store.migrate import upgrade_to_head
-
-        upgrade_to_head()
-
     end = end or date.today()
     start = start or (end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
     window = IngestWindow(start=start, end=end)

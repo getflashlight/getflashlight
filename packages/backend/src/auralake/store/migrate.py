@@ -1,9 +1,14 @@
-"""Alembic migrations, applied automatically on service startup.
+"""Alembic migrations.
 
-``upgrade_to_head()`` runs at the start of ``auralake serve`` and ``auralake
-ingest`` when ``AURALAKE_AUTO_MIGRATE`` is true (the default). There is no separate
-migrate command or init-container — the schema self-applies. Idempotent: running
-against an already-current database is a no-op.
+Migrations are applied by running this module directly — ``python -m
+auralake.store.migrate`` — which the docker-compose stack does once via a
+dedicated one-shot ``migrate`` service (see the ``__main__`` block below). It is
+not a CLI subcommand. Idempotent: running against an already-current database is
+a no-op.
+
+``ingest`` never self-migrates. ``serve`` self-applies only when
+``AURALAKE_AUTO_MIGRATE`` is true (off by default) — an opt-in for running it
+standalone without the migrate step.
 """
 
 from __future__ import annotations
@@ -61,3 +66,12 @@ def upgrade_to_head(wait: bool = True) -> None:
     logger.info("migrate_start")
     command.upgrade(_alembic_config(), "head")
     logger.info("migrate_done")
+
+
+if __name__ == "__main__":
+    # Entrypoint for the compose `migrate` init service. Configures logging (which
+    # the CLI's callback would otherwise do) so migrate_start/done are observable.
+    from auralake.core.logging import setup_logging
+
+    setup_logging()
+    upgrade_to_head()

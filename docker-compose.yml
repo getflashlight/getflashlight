@@ -1,11 +1,12 @@
 # Auralake — batteries-included FOCUS TCO stack.
-#   db → mcp → grafana   (Grafana reads Postgres directly; agents use MCP)
+#   db → migrate → mcp → grafana   (Grafana reads Postgres directly; agents use MCP)
 # Ingest is on-demand (see the `ingest` profile / README), not a daemon.
 
 x-backend-env: &backend-env
   AURALAKE_DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER:-auralake}:${POSTGRES_PASSWORD:-auralake}@db:5432/${POSTGRES_DB:-auralake}"
-  # Migrations self-apply on `auralake serve` / `auralake ingest` startup.
-  AURALAKE_AUTO_MIGRATE: "true"
+  # Migrations run once via the one-shot `migrate` service below; nothing else
+  # self-migrates (AURALAKE_AUTO_MIGRATE defaults to false). Set it "true" here to
+  # let `serve` self-apply on boot instead of relying on the migrate service.
   AURALAKE_CONNECTIONS_PATH: "/config/connections.yml"
   DATABRICKS_TOKEN: "${DATABRICKS_TOKEN:-}"
   AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID:-}"
@@ -28,6 +29,19 @@ services:
       timeout: 3s
       retries: 10
 
+  # One-shot schema migration. Runs once after the DB is healthy, then exits;
+  # mcp/ingest wait for it to finish rather than each self-migrating on startup.
+  migrate:
+    build:
+      context: .
+      dockerfile: packages/backend/Dockerfile
+    environment: *backend-env
+    command: ["python", "-m", "auralake.store.migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
   mcp:
     build:
       context: .
@@ -42,6 +56,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   # On-demand ingest: `docker compose --profile ingest run --rm ingest`
   ingest:
@@ -56,6 +72,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     profiles: ["ingest"]
 
   grafana:

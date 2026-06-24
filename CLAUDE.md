@@ -25,14 +25,18 @@ packages/backend/  → auralake-backend (the platform + the unified `auralake` C
 The single `auralake` console script is the operator surface: `serve` (the MCP
 server), `ingest`, `transform`, and `aws create-export`. End users don't use the
 CLI — they read Grafana dashboards (Postgres direct) and talk to MCP. There is no
-REST API and no migrate command: migrations self-apply on `serve`/`ingest` startup
-(gated by `AURALAKE_AUTO_MIGRATE`). See `src/auralake/cli.py`.
+REST API and no migrate CLI subcommand. Migrations are applied by a dedicated step
+— `python -m auralake.store.migrate` — which the docker-compose stack runs once via
+a one-shot `migrate` service that `mcp`/`ingest` wait on. `ingest` never self-
+migrates; `serve` self-applies only when `AURALAKE_AUTO_MIGRATE=true` (off by
+default), an opt-in for running it standalone. See `src/auralake/cli.py`.
 
 ## Commands
 
 ```bash
 uv sync
-uv run --project packages/backend auralake serve          # MCP server :8002 (auto-migrates)
+uv run --project packages/backend python -m auralake.store.migrate  # apply schema (run once)
+uv run --project packages/backend auralake serve          # MCP server :8002
 uv run --project packages/backend auralake ingest         # pull billing → BRONZE
 uv run --project packages/backend auralake transform      # (re)build SILVER/GOLD views
 uv run --project packages/backend auralake aws create-export  # create the AWS FOCUS export

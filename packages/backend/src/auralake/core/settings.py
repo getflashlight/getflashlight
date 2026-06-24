@@ -20,9 +20,10 @@ class Settings(BaseSettings):
     api_key: str | None = None
     base_currency: str = "USD"
     connections_path: str = "connections.yml"
-    # Apply Alembic migrations automatically on `serve`/`ingest` startup.
-    # Idempotent; set false to manage schema out of band.
-    auto_migrate: bool = True
+    # Off by default: migrations are applied by the dedicated `migrate` step
+    # (the compose init service, or `python -m auralake.store.migrate` locally),
+    # not on app startup. Set true to let `serve` self-apply on boot instead.
+    auto_migrate: bool = False
 
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8002
