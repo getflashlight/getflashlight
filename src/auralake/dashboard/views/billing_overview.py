@@ -1,9 +1,10 @@
 """Billing overview — headline spend, savings, and where the money goes.
 
 Layout mirrors the original Grafana ``billing_overview`` board (recovered from
-git history): KPI stats, a list-vs-effective trend, a by-service donut + top-SKU
-bar + team-tag table composition row, a daily provider trend, and an SKU
-month-over-month table — all over the same GOLD views.
+git history): a KPI stat row, then everything on one dense scroll — a monthly
+provider trend beside a list-vs-effective line, a by-service donut beside a
+top-SKU bar, a team-tag table, a daily provider trend, and an SKU
+month-over-month heatmap — all over the same GOLD views.
 """
 
 from __future__ import annotations
@@ -15,12 +16,13 @@ import streamlit as st
 from auralake.dashboard.data import gold_df, has_data
 from auralake.dashboard.theme import (
     PALETTE,
+    compact_money,
+    heatmap_table,
     kpi_cards,
     month_filter,
     plotly,
     shadcn_table,
     style_fig,
-    tabs,
 )
 
 
@@ -38,9 +40,23 @@ def render() -> None:
 
     months = bill["charge_month"].astype(str).tolist()
     month = month_filter(months, key="billing_month") or max(months)
-    sel = bill[bill["charge_month"].astype(str) == month]
 
-    earlier = sorted(m for m in set(months) if m < month)
+    _kpis(bill, month)
+    st.divider()
+    _trend_row(bill)
+    st.write("")
+    _composition_row()
+    st.write("")
+    _daily_trend()
+    st.write("")
+    _sku_movement(month)
+
+
+def _kpis(bill: pd.DataFrame, month: str) -> None:
+    sel = bill[bill["charge_month"].astype(str) == month]
+    months = set(bill["charge_month"].astype(str))
+
+    earlier = sorted(m for m in months if m < month)
     delta = ""
     if earlier:
         prev = bill[bill["charge_month"].astype(str) == earlier[-1]]["net_cost"].sum()
@@ -52,26 +68,16 @@ def render() -> None:
     savings_sub = f"{savings / list_cost:.0%} off list" if list_cost else ""
     kpi_cards(
         [
-            (f"Net cost · {month}", f"${sel['net_cost'].sum():,.0f}", delta),
-            ("List cost", f"${list_cost:,.0f}", "before discounts"),
-            ("Savings", f"${savings:,.0f}", savings_sub),
+            (f"Net cost · {month}", compact_money(sel["net_cost"].sum()), delta),
+            ("List cost", compact_money(list_cost), "before discounts"),
+            ("Savings", compact_money(savings), savings_sub),
             ("Providers", str(sel["provider_name"].nunique()), "billing sources"),
         ],
         key="billing",
     )
 
-    st.write("")
-    active = tabs(["Spend trend", "Composition", "SKU movement"], key="billing_tabs")
 
-    if active == "Spend trend":
-        _spend_trend(bill)
-    elif active == "Composition":
-        _composition()
-    elif active == "SKU movement":
-        _sku_movement(month)
-
-
-def _spend_trend(bill: pd.DataFrame) -> None:
+def _trend_row(bill: pd.DataFrame) -> None:
     bar = bill.copy()
     bar["month"] = pd.to_datetime(bar["charge_month"]).dt.strftime("%Y-%m")
     left, right = st.columns(2)
@@ -112,27 +118,8 @@ def _spend_trend(bill: pd.DataFrame) -> None:
             )
             plotly(style_fig(fig), title="List vs effective cost", key="billing_savings")
 
-    daily = gold_df(
-        "SELECT charge_day, provider_name, net_cost FROM gold.spend_trend_daily "
-        "ORDER BY charge_day"
-    )
-    if not daily.empty:
-        plotly(
-            style_fig(
-                px.line(
-                    daily,
-                    x="charge_day",
-                    y="net_cost",
-                    color="provider_name",
-                    labels={"charge_day": "", "net_cost": "Net cost", "provider_name": ""},
-                )
-            ),
-            title="Daily spend trend by provider",
-            key="billing_daily",
-        )
 
-
-def _composition() -> None:
+def _composition_row() -> None:
     left, right = st.columns(2)
     with left:
         services = gold_df(
@@ -181,17 +168,38 @@ def _composition() -> None:
         "SELECT tag_value AS team, SUM(net_cost) AS net_cost FROM gold.spend_by_tag_month "
         "WHERE tag_key = 'team' GROUP BY tag_value ORDER BY net_cost DESC LIMIT 15"
     )
-    if tags.empty:
-        st.caption("No `team` tag found on this data.")
-    else:
+    if not tags.empty:
         st.markdown("##### Spend by team tag (all time)")
         shadcn_table(
             tags, key="billing_tags", money_cols=["net_cost"], rename={"net_cost": "Net cost"}
         )
 
 
+def _daily_trend() -> None:
+    daily = gold_df(
+        "SELECT charge_day, provider_name, net_cost FROM gold.spend_trend_daily "
+        "ORDER BY charge_day"
+    )
+    if daily.empty:
+        return
+    plotly(
+        style_fig(
+            px.line(
+                daily,
+                x="charge_day",
+                y="net_cost",
+                color="provider_name",
+                labels={"charge_day": "", "net_cost": "Net cost", "provider_name": ""},
+            )
+        ),
+        title="Daily spend trend by provider",
+        key="billing_daily",
+    )
+
+
 def _sku_movement(month: str) -> None:
-    st.caption(f"Month-over-month change · {month}")
+    st.markdown("##### SKU month-over-month")
+    st.caption(f"Top SKUs by spend · {month} vs prior month")
     mom = gold_df(
         "SELECT sku_id, net_cost, prev_cost, cost_delta, cost_pct_change "
         f"FROM gold.sku_month_over_month WHERE charge_month = '{month}' "
@@ -200,11 +208,10 @@ def _sku_movement(month: str) -> None:
     if mom.empty:
         st.info("No SKU movement for this month.")
         return
-    shadcn_table(
+    heatmap_table(
         mom,
-        key="billing_mom",
+        heat_col="cost_pct_change",
         money_cols=["net_cost", "prev_cost", "cost_delta"],
-        pct_cols=["cost_pct_change"],
         rename={
             "sku_id": "SKU",
             "net_cost": "This month",

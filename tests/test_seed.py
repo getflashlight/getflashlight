@@ -59,6 +59,54 @@ def test_seed_maps_and_builds_gold(lake_home, tmp_path) -> None:  # type: ignore
     assert ("team", "data") in tags
 
 
+def test_sample_cleanup_removes_all_data(lake_home, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from auralake.lake import paths, runlog, seed
+    from auralake.sample import SAMPLE_CONNECTOR, cleanup
+
+    paths.ensure_layout()
+
+    # Seed the sample's three artifacts: BRONZE partitions, a cached CSV, a run log.
+    csv_path = tmp_path / "src.csv"
+    csv_path.write_text(_CSV)
+    seed.seed_from_csv(csv_path, connector=SAMPLE_CONNECTOR, ingest_run_id="run1")
+
+    data_dir = paths.home() / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    cached = data_dir / "focus_sample.csv"
+    cached.write_text(_CSV)
+
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    runlog.record_run(
+        run_id="run1",
+        connector=SAMPLE_CONNECTOR,
+        status="success",
+        rows=2,
+        started_at=now,
+        finished_at=now,
+    )
+
+    bronze_part = paths.bronze_dir() / f"x_source_connector={SAMPLE_CONNECTOR}"
+    run_file = paths.runs_dir() / f"run1-{SAMPLE_CONNECTOR}.parquet"
+    assert bronze_part.exists()
+    assert cached.exists()
+    assert run_file.exists()
+
+    cleanup()
+
+    assert not bronze_part.exists()
+    assert not cached.exists()
+    assert not run_file.exists()
+    # GOLD is rebuilt and the sample's spend is gone.
+    from auralake.gold.reader import query_view
+
+    assert query_view("gold.monthly_bill") == []
+
+    # Idempotent: a second cleanup with nothing to remove is a no-op, not an error.
+    cleanup()
+
+
 def test_seed_rejects_mixed_currency(lake_home, tmp_path) -> None:  # type: ignore[no-untyped-def]
     from auralake.core.exceptions import FocusValidationError
     from auralake.lake import seed

@@ -12,6 +12,10 @@ class Settings(BaseSettings):
 
     All credentials for source connectors live in connection config files /
     env, never here — this is only the platform's own plumbing.
+
+    Values come from ``os.environ`` (``AURALAKE_*``). The CLI calls
+    ``dotenv.load_dotenv()`` at startup so a ``.env`` in the working directory also
+    feeds these — shell env still wins (``load_dotenv`` does not override).
     """
 
     model_config = SettingsConfigDict(env_prefix="AURALAKE_", extra="ignore")

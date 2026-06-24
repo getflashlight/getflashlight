@@ -4,15 +4,21 @@ For each enabled connector: stream FOCUS records, validate currency, and
 partition-replace them into the BRONZE Parquet lake. A failing connector is
 isolated — its run is logged failed and the others still proceed. After all
 connectors land, GOLD is rebuilt from BRONZE so the data is immediately queryable.
+
+Isolation does *not* mean a failure is swallowed: if any connector failed, the run
+rebuilds GOLD from whatever did land, then raises :class:`IngestError` so the CLI
+reports the failed connectors and exits non-zero (a green exit must mean every
+connector succeeded).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
 from pydantic import BaseModel
 
-from auralake.core.exceptions import FocusValidationError
+from auralake.core.exceptions import FocusValidationError, IngestError
 from auralake.core.logging import get_logger
 from auralake.core.settings import get_settings
 from auralake.ingest.base import Connector, IngestWindow
@@ -44,6 +50,16 @@ _REGISTRY: dict[type[BaseModel], type[Connector]] = {
 DEFAULT_LOOKBACK_DAYS = 35
 
 
+@dataclass
+class ConnectorOutcome:
+    """Result of running one connector: rows written, plus failure detail if any."""
+
+    name: str
+    rows: int
+    ok: bool
+    detail: str | None = None
+
+
 def build_connector(config: BaseModel) -> Connector:
     cls = _REGISTRY.get(type(config))
     if cls is None:
@@ -51,11 +67,12 @@ def build_connector(config: BaseModel) -> Connector:
     return cls(config)  # type: ignore[call-arg]
 
 
-def run_connector(connector: Connector, window: IngestWindow) -> int:
-    """Run one connector end-to-end. Returns rows written.
+def run_connector(connector: Connector, window: IngestWindow) -> ConnectorOutcome:
+    """Run one connector end-to-end.
 
-    Failures are isolated and logged to the run log; they return 0 rather than
-    aborting the whole ingest.
+    Failures are isolated and logged to the run log; the outcome is marked
+    ``ok=False`` rather than aborting the whole ingest, so the orchestrator can
+    keep going and still report the failure.
     """
     base_currency = get_settings().base_currency
     run_id = bronze.new_run_id()
@@ -82,8 +99,9 @@ def run_connector(connector: Connector, window: IngestWindow) -> int:
             finished_at=datetime.now(UTC),
         )
         logger.info("ingest_ok", connector=connector.name, rows=written)
-        return written
+        return ConnectorOutcome(name=connector.name, rows=written, ok=True)
     except Exception as exc:  # noqa: BLE001 - isolate one connector's failure
+        detail = str(exc)[:1000]
         runlog.record_run(
             run_id=run_id,
             connector=connector.name,
@@ -91,10 +109,10 @@ def run_connector(connector: Connector, window: IngestWindow) -> int:
             rows=0,
             started_at=started_at,
             finished_at=datetime.now(UTC),
-            detail=str(exc)[:1000],
+            detail=detail,
         )
         logger.error("ingest_failed", connector=connector.name, error=str(exc))
-        return 0
+        return ConnectorOutcome(name=connector.name, rows=0, ok=False, detail=detail)
 
 
 def run_ingest(
@@ -113,14 +131,25 @@ def run_ingest(
         logger.warning("ingest_no_connectors")
         return 0
 
-    total = 0
-    for config in configs:
-        connector = build_connector(config)
-        total += run_connector(connector, window)
+    outcomes = [run_connector(build_connector(config), window) for config in configs]
+    total = sum(o.rows for o in outcomes)
+    failed = [o.name for o in outcomes if not o.ok]
 
-    # Rebuild SILVER/GOLD from BRONZE so the data is immediately queryable.
+    # Rebuild SILVER/GOLD from whatever landed so the data is immediately queryable
+    # — even on partial failure, the connectors that succeeded are still useful.
     if not no_transform:
         published = build_gold()
         logger.info("transform_done", gold_views=published)
-    logger.info("ingest_complete", connectors=len(configs), rows=total)
+    logger.info(
+        "ingest_complete",
+        connectors=len(configs),
+        succeeded=len(configs) - len(failed),
+        failed=len(failed),
+        rows=total,
+    )
+
+    # Isolated per-connector, but the run as a whole failed — surface it so the CLI
+    # exits non-zero. GOLD has already been rebuilt above, so the partial data lands.
+    if failed:
+        raise IngestError(failed)
     return total

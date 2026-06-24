@@ -79,6 +79,20 @@ def section_title(text: str) -> None:
     st.markdown(f"##### {text}")
 
 
+def compact_money(v: float) -> str:
+    """Format a dollar amount compactly for KPI cards — ``$20K`` / ``$1.2M`` / ``$950``.
+
+    Trailing ``.0`` is trimmed so round magnitudes read clean (``$20K`` not
+    ``$20.0K``); below 1,000 it falls back to a plain ``$``-grouped integer.
+    """
+    a = abs(v)
+    for cutoff, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if a >= cutoff:
+            scaled = f"{v / cutoff:.1f}".rstrip("0").rstrip(".")
+            return f"${scaled}{suffix}"
+    return f"${v:,.0f}"
+
+
 def plotly(fig: go.Figure, *, title: str | None = None, key: str | None = None) -> None:
     """Render a styled figure (optional title above it), modebar hidden, stretched."""
     if title:
@@ -146,6 +160,75 @@ def shadcn_table(
     if rename:
         disp = disp.rename(columns=rename)
     ui.table(data=disp, key=key, maxHeight=max_height)
+
+
+def _heat_color(val: float, cap: float) -> str:
+    """Diverging cell background for a signed % — red for increases, green for drops.
+
+    ``cap`` is the magnitude (in %) that saturates the shade; values past it clamp.
+    Returns a CSS ``background-color`` declaration (empty for NaN).
+    """
+    if pd.isna(val):
+        return ""
+    frac = max(-1.0, min(1.0, val / cap)) if cap else 0.0
+    r, g, b = (214, 84, 72) if frac >= 0 else (74, 159, 100)
+    alpha = 0.10 + 0.55 * abs(frac)
+    return f"background-color: rgba({r}, {g}, {b}, {alpha:.2f})"
+
+
+_HEAT_TABLE_CSS = """
+<style>
+table.auralake-heat { width: 100%; border-collapse: collapse;
+  font-family: Inter, system-ui, sans-serif; font-size: 13px; }
+table.auralake-heat th { text-align: right; padding: 8px 12px; background: #f8fafc;
+  color: #64748b; font-weight: 600; border-bottom: 2px solid #e2e8f0; }
+table.auralake-heat td { text-align: right; padding: 7px 12px; color: #1B2A36;
+  border-bottom: 1px solid #eef2f6; }
+table.auralake-heat th:first-child, table.auralake-heat td:first-child { text-align: left; }
+</style>
+"""
+
+
+def heatmap_table(
+    df: pd.DataFrame,
+    *,
+    heat_col: str,
+    money_cols: Sequence[str] = (),
+    heat_cap: float = 50.0,
+    rename: dict[str, str] | None = None,
+) -> None:
+    """Render a DataFrame as an HTML heatmap table (Grafana-style MoM coloring).
+
+    Unlike :func:`shadcn_table`, ``heat_col`` cells get a red (increase) / green
+    (decrease) background scaled by magnitude (capped at ``heat_cap`` %). It renders
+    via the pandas Styler's own HTML (``st.markdown(..., unsafe_allow_html=True)``),
+    not ``st.dataframe`` — ``st.dataframe`` honors a Styler's cell *colors* but draws
+    the numeric grid itself, dropping ``.format`` and showing ``NaN`` as ``None``; the
+    Styler HTML keeps both the colors and the ``$``/``±%``/``—`` formatting, and being
+    inline (not a shadcn iframe) its styles apply on the page. Top-N tables only.
+    """
+    disp = df.copy()
+    if rename:
+        disp = disp.rename(columns=rename)
+
+    def _name(col: str) -> str:
+        return rename.get(col, col) if rename else col
+
+    money = [_name(c) for c in money_cols if _name(c) in disp.columns]
+    heat = _name(heat_col)
+    fmt: dict[str, object] = {c: (lambda v: f"${v:,.0f}" if pd.notna(v) else "—") for c in money}
+    if heat in disp.columns:
+        fmt[heat] = lambda v: f"{v:+.1f}%" if pd.notna(v) else "—"
+
+    styler = (
+        disp.style.format(fmt, na_rep="—")
+        .hide(axis="index")
+        .set_table_attributes('class="auralake-heat"')
+    )
+    if heat in disp.columns:
+        styler = styler.map(lambda v: _heat_color(v, heat_cap), subset=[heat])
+
+    st.markdown(_HEAT_TABLE_CSS + styler.to_html(), unsafe_allow_html=True)
 
 
 def inject_css() -> None:

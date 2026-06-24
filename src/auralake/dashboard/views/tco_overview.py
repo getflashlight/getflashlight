@@ -2,8 +2,9 @@
 unattributed bucket. The product's headline view.
 
 Layout mirrors the original Grafana ``tco_overview`` board (recovered from git
-history): TCO stats, a by-service-category donut, the monthly DBU/infra
-breakdown, a daily provider trend, and the per-cluster TCO tables.
+history): TCO stats, then one dense scroll — the monthly DBU/infra breakdown
+beside a by-service-category donut, a daily provider trend, and the per-cluster
+Databricks + EKS TCO tables.
 """
 
 from __future__ import annotations
@@ -15,12 +16,12 @@ import streamlit as st
 from auralake.dashboard.data import gold_df, has_data
 from auralake.dashboard.theme import (
     PALETTE,
+    compact_money,
     kpi_cards,
     month_filter,
     plotly,
     shadcn_table,
     style_fig,
-    tabs,
 )
 
 # Stable component → label/colour mapping so the stacked bars read the same every month.
@@ -58,23 +59,20 @@ def render() -> None:
     coverage = f"{(1 - row['unattributed_infra_cost'] / total):.0%} attributed" if total else ""
     kpi_cards(
         [
-            (f"Total TCO · {month}", f"${total:,.0f}", "DBU + infra"),
-            ("DBU cost", f"${row['dbu_cost']:,.0f}", "Databricks compute"),
-            ("Unattributed AWS", f"${row['unattributed_infra_cost']:,.0f}", "not yet mapped"),
+            (f"Total TCO · {month}", compact_money(total), "DBU + infra"),
+            ("DBU cost", compact_money(row["dbu_cost"]), "Databricks compute"),
+            ("Unattributed AWS", compact_money(row["unattributed_infra_cost"]), "not yet mapped"),
             ("Attribution coverage", coverage or "—", "of total TCO"),
         ],
         key="tco",
     )
 
+    st.divider()
+    _breakdown(summary)
     st.write("")
-    active = tabs(["Breakdown", "Databricks clusters", "EKS clusters"], key="tco_tabs")
-
-    if active == "Breakdown":
-        _breakdown(summary)
-    elif active == "Databricks clusters":
-        _databricks_clusters(month)
-    elif active == "EKS clusters":
-        _eks_clusters(month)
+    _databricks_clusters(month)
+    st.write("")
+    _eks_clusters(month)
 
 
 def _breakdown(summary: pd.DataFrame) -> None:
@@ -145,7 +143,8 @@ def _breakdown(summary: pd.DataFrame) -> None:
 
 
 def _databricks_clusters(month: str) -> None:
-    st.caption(f"Latest charge month · {month}")
+    st.markdown("##### Databricks clusters")
+    st.caption(f"Per-cluster DBU + attributed infra · {month}")
     clusters = gold_df(
         "SELECT cluster_id, compute_class, tco_basis, dbu_cost, infra_cost, tco_cost, "
         f"infra_pct_of_tco FROM gold.tco_by_cluster_month WHERE charge_month = '{month}' "
@@ -172,7 +171,8 @@ def _databricks_clusters(month: str) -> None:
 
 
 def _eks_clusters(month: str) -> None:
-    st.caption(f"Latest charge month · {month}")
+    st.markdown("##### EKS clusters")
+    st.caption(f"Per-cluster control plane + node TCO · {month}")
     eks = gold_df(
         "SELECT cluster_name, control_plane_cost, node_ec2_cost, node_ebs_cost, "
         f"eks_tco, nodes_attributed FROM gold.tco_eks_by_cluster_month "

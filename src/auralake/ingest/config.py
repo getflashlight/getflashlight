@@ -82,8 +82,15 @@ class ConnectionsFile(BaseModel):
 
 
 def env(name: str) -> str | None:
-    """Read an environment variable (helper for connectors)."""
-    return os.environ.get(name)
+    """Read an environment variable (helper for connectors).
+
+    A present-but-empty value — ``AWS_ACCESS_KEY_ID=`` in a ``.env`` reads back as
+    ``""`` — is treated as *unset* (returns ``None``), so connectors fall back to
+    their default credential chain (instance role, ``~/.aws/credentials``, …)
+    instead of sending an explicit empty credential that AWS rejects as a malformed
+    authorization header.
+    """
+    return os.environ.get(name) or None
 
 
 def load_connections(path: str | None = None) -> list[BaseModel]:

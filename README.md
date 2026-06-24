@@ -13,10 +13,17 @@ Persistence is Parquet under `AURALAKE_HOME`, queried by an in-memory **DuckDB**
 
 > v1 visualizes current spend. It does not (yet) recommend optimizations.
 
+**Cross-platform.** The lake home defaults to the OS user-data dir
+(`platformdirs`) — `~/Library/Application Support/auralake` on macOS,
+`%LOCALAPPDATA%\auralake\auralake` on Windows, `~/.local/share/auralake` on Linux
+— or set `AURALAKE_HOME` to override. Secrets load from a `.env` in the working
+directory (or real shell env, which wins). Windows is supported: the atomic GOLD
+publish retries the per-file rename to ride out a reader's brief open handle.
+
 ## Architecture
 
 ```
-sources ──▶ auralake ingest ──▶ Parquet lake (~/.auralake) ──▶ readers
+sources ──▶ auralake ingest ──▶ Parquet lake (AURALAKE_HOME) ──▶ readers
  AWS FOCUS export    (writer)     bronze/  partitioned, source of truth   auralake mcp serve
  Databricks tables                gold/    *.parquet ◀── the only surface  auralake dashboard serve
  AWS Cost Explorer                         consumers read                 (each: own in-mem DuckDB)
@@ -46,7 +53,7 @@ with real data — it loads the CSV straight into Parquet via a vectorized DuckD
 projection (no per-row Python). For your own sources instead:
 
 ```bash
-auralake init                 # scaffold ~/.auralake + a connections.yml
+auralake init                 # scaffold the lake home + a connections.yml
 auralake ingest               # pull configured connectors → BRONZE, rebuild GOLD
 ```
 

@@ -1,8 +1,9 @@
 """AWS FOCUS — AWS spend trend, service/SKU breakdown, and tags.
 
 Layout mirrors the original Grafana ``aws_focus`` board (recovered from git
-history): AWS stats, a daily trend + service-category donut, top-service and
-top-SKU tables, the monthly bill bar, and a tag table.
+history): AWS stats, then one dense scroll — a daily trend beside a
+service-category donut, the monthly bill bar, top-service and top-SKU tables,
+and a tag table.
 """
 
 from __future__ import annotations
@@ -14,12 +15,12 @@ import streamlit as st
 from auralake.dashboard.data import gold_df, has_data
 from auralake.dashboard.theme import (
     PALETTE,
+    compact_money,
     kpi_cards,
     month_filter,
     plotly,
     shadcn_table,
     style_fig,
-    tabs,
 )
 
 
@@ -47,23 +48,20 @@ def render() -> None:
 
     kpi_cards(
         [
-            (f"AWS net · {month}", f"${sel['net_cost'].sum():,.0f}", "selected month"),
-            ("AWS net · all time", f"${bill['net_cost'].sum():,.0f}", f"{len(months)} months"),
-            ("AWS savings · all time", f"${bill['savings'].sum():,.0f}", "vs list"),
+            (f"AWS net · {month}", compact_money(sel["net_cost"].sum()), "selected month"),
+            ("AWS net · all time", compact_money(bill["net_cost"].sum()), f"{len(months)} months"),
+            ("AWS savings · all time", compact_money(bill["savings"].sum()), "vs list"),
             ("AWS services", str(int(n_services)), "distinct services"),
         ],
         key="aws",
     )
 
+    st.divider()
+    _trend(bill)
     st.write("")
-    active = tabs(["Trend", "Services & SKUs", "Tags"], key="aws_tabs")
-
-    if active == "Trend":
-        _trend(bill)
-    elif active == "Services & SKUs":
-        _services_skus(month)
-    elif active == "Tags":
-        _tags(month)
+    _services_skus(month)
+    st.write("")
+    _tags(month)
 
 
 def _trend(bill: pd.DataFrame) -> None:
@@ -166,7 +164,8 @@ def _services_skus(month: str) -> None:
 
 
 def _tags(month: str) -> None:
-    st.caption(f"AWS spend by tag · {month}")
+    st.markdown("##### Spend by tag")
+    st.caption(f"Top AWS tags by net cost · {month}")
     tags = gold_df(
         "SELECT tag_key, tag_value, SUM(net_cost) AS net_cost FROM gold.spend_by_tag_month "
         f"WHERE provider_name = 'AWS' AND charge_month = '{month}' "

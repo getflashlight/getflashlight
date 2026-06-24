@@ -34,7 +34,7 @@ per-file rename. See `src/auralake/cli.py`.
 
 ```bash
 uv sync
-uv run auralake init             # scaffold ~/.auralake + sample
+uv run auralake init             # scaffold the lake home + connections.yml
 uv run auralake sample           # download the FinOps FOCUS sample + seed it
 uv run auralake ingest           # pull billing → BRONZE, rebuild GOLD
 uv run auralake transform        # rebuild GOLD from BRONZE (no re-pull)

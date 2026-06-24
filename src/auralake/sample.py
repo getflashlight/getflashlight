@@ -46,6 +46,41 @@ def _download(url: str, dest: Path, *, force: bool) -> None:
     logger.info("sample_downloaded", path=str(dest))
 
 
+def cleanup() -> None:
+    """Remove everything the sample seeded, then rebuild GOLD.
+
+    Tears down the four things :func:`load_sample` creates — the ``focus_sample``
+    BRONZE partitions, the cached download CSV(s), the sample run-log entries — and
+    refreshes GOLD so the dashboard reflects the removal. Idempotent: a no-op if the
+    sample was never seeded. Other connectors' data is untouched (purge is scoped to
+    the isolated ``focus_sample`` connector)."""
+    paths.ensure_layout()
+
+    bronze.purge_connector(SAMPLE_CONNECTOR)
+
+    data_dir = paths.home() / "data"
+    removed_files = 0
+    if data_dir.exists():
+        for csv in data_dir.glob("focus_sample*.csv"):
+            csv.unlink()
+            removed_files += 1
+            logger.info("sample_csv_removed", path=str(csv))
+
+    removed_runs = 0
+    if paths.runs_dir().exists():
+        for run in paths.runs_dir().glob(f"*-{SAMPLE_CONNECTOR}.parquet"):
+            run.unlink()
+            removed_runs += 1
+            logger.info("sample_run_removed", path=str(run))
+
+    published = build_gold()
+
+    typer.echo(
+        f"Cleaned up sample data ({removed_files} CSV(s), {removed_runs} run log entry/entries) "
+        f"→ rebuilt {published} GOLD views."
+    )
+
+
 def load_sample(rows: int = 1000, url: str | None = None, force: bool = False) -> None:
     """Download the FOCUS sample (``rows`` = 1000 or 10000, or an explicit ``url``)
     and seed BRONZE + GOLD."""

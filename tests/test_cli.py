@@ -111,3 +111,38 @@ def test_aws_delete_export_aborts_when_not_confirmed(tmp_path) -> None:  # type:
     )
     assert result.exit_code != 0
     assert "Aborted" in result.output
+
+
+def test_cleanup_removes_all_lake_data(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("AURALAKE_HOME", str(tmp_path / "home"))
+    from auralake.lake import paths
+
+    paths.ensure_layout()
+    (paths.bronze_dir() / "x_source_connector=demo").mkdir(parents=True)
+    (paths.gold_dir() / "spend.parquet").write_text("data")
+    (paths.runs_dir() / "run-demo.parquet").write_text("data")
+
+    # --yes skips the confirm; data dirs are recreated empty afterward.
+    result = runner.invoke(app, ["cleanup", "--yes"])
+    assert result.exit_code == 0
+    assert not any(paths.bronze_dir().iterdir())
+    assert not any(paths.gold_dir().iterdir())
+    assert not any(paths.runs_dir().iterdir())
+    # Re-running is an idempotent no-op.
+    again = runner.invoke(app, ["cleanup", "--yes"])
+    assert again.exit_code == 0
+    assert "Nothing to clean" in again.output
+
+
+def test_cleanup_aborts_without_confirmation(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("AURALAKE_HOME", str(tmp_path / "home"))
+    from auralake.lake import paths
+
+    paths.ensure_layout()
+    (paths.gold_dir() / "spend.parquet").write_text("data")
+
+    result = runner.invoke(app, ["cleanup"], input="\n")
+    assert result.exit_code != 0
+    assert "Aborted" in result.output
+    # Nothing was removed.
+    assert (paths.gold_dir() / "spend.parquet").exists()

@@ -1,9 +1,11 @@
 """Unified ``auralake`` command — the one operator interface.
 
-    auralake init               scaffold ~/.auralake (config + bundled sample data)
+    auralake init               scaffold the lake home (config skeleton + connections.yml)
     auralake sample             download the FinOps FOCUS sample dataset and seed it
+    auralake sample --clean     remove all seeded sample data, then rebuild GOLD
     auralake ingest             pull billing → BRONZE Parquet, then rebuild GOLD
     auralake transform          rebuild GOLD Parquet from BRONZE
+    auralake cleanup            remove ALL lake data (BRONZE/GOLD Parquet + run log)
     auralake mcp serve          MCP server for agents (reads GOLD read-only)
     auralake dashboard serve    Streamlit dashboard for humans (reads GOLD read-only)
     auralake aws create-export  provision the AWS FOCUS Data Export to consume
@@ -21,6 +23,7 @@ Heavy imports (boto3, the MCP/Streamlit stacks) are deferred into each command s
 from datetime import date
 
 import typer
+from dotenv import load_dotenv
 
 from auralake.core.logging import setup_logging
 
@@ -39,6 +42,11 @@ app.add_typer(dashboard_app, name="grafana", hidden=True)  # familiar alias
 
 @app.callback()
 def _main() -> None:
+    # Load .env from the CWD into os.environ before anything reads settings, so both
+    # AURALAKE_* platform settings and connector *_env credentials (DATABRICKS_TOKEN,
+    # AWS_*) resolve from it. override=False → real shell env always wins over the
+    # file. The dashboard subprocess inherits this populated environment.
+    load_dotenv()
     setup_logging()
 
 
@@ -46,7 +54,8 @@ def _main() -> None:
 def init(
     force: bool = typer.Option(False, "--force", help="Overwrite existing config/sample"),
 ) -> None:
-    """Scaffold ~/.auralake with config and bundled sample data. Run once."""
+    """Scaffold the lake home (AURALAKE_HOME, else the platform user-data dir) with a
+    starter connections.yml. Run once. (Use ``sample`` to seed demo data.)"""
     from auralake.scaffold import scaffold
 
     scaffold(force=force)
@@ -57,10 +66,20 @@ def sample(
     rows: int = typer.Option(1000, help="Sample size: 1000 or 10000"),
     url: str | None = typer.Option(None, help="Override the FOCUS sample CSV URL"),
     force: bool = typer.Option(False, "--force", help="Re-download even if cached"),
+    clean: bool = typer.Option(
+        False, "--clean", help="Remove all seeded sample data instead of seeding"
+    ),
 ) -> None:
-    """Download the FinOps FOCUS sample dataset and seed it for the dashboard."""
-    from auralake.sample import load_sample
+    """Download the FinOps FOCUS sample dataset and seed it for the dashboard.
 
+    With ``--clean``, removes everything the sample seeded (BRONZE partitions, cached
+    CSVs, run-log entries) and rebuilds GOLD — other connectors are left untouched.
+    """
+    from auralake.sample import cleanup, load_sample
+
+    if clean:
+        cleanup()
+        return
     load_sample(rows=rows, url=url, force=force)
 
 
@@ -88,14 +107,26 @@ def ingest(
     no_transform: bool = typer.Option(False, "--no-transform", help="Skip SILVER/GOLD refresh"),
 ) -> None:
     """Pull billing from all enabled connectors into BRONZE, then refresh views."""
+    from auralake.core.exceptions import IngestError
     from auralake.ingest.runner import run_ingest
 
-    run_ingest(
-        start=date.fromisoformat(start) if start else None,
-        end=date.fromisoformat(end) if end else None,
-        connections=connections,
-        no_transform=no_transform,
-    )
+    try:
+        run_ingest(
+            start=date.fromisoformat(start) if start else None,
+            end=date.fromisoformat(end) if end else None,
+            connections=connections,
+            no_transform=no_transform,
+        )
+    except IngestError as exc:
+        # Some connectors failed (the rest still ingested and GOLD was rebuilt).
+        # Report which, and exit non-zero so scripts/CI see the failure.
+        typer.secho(
+            f"Ingest finished with failures: {', '.join(exc.failed)} "
+            f"(see the logs above; other connectors and GOLD were updated).",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
 
 
 @app.command()
@@ -104,6 +135,43 @@ def transform() -> None:
     from auralake.transform.runner import build_gold
 
     build_gold()
+
+
+@app.command()
+def cleanup(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be removed without removing it"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt"),
+) -> None:
+    """Remove ALL lake data — every BRONZE/GOLD Parquet and the run log.
+
+    Wipes everything the writers produce under ``AURALAKE_HOME``, leaving only
+    ``config/``. Destructive and irreversible; re-seed with ``sample`` or ``ingest``.
+    To remove only the seeded sample, use ``sample --clean`` instead.
+    """
+    from auralake.lake import cleanup as lake_cleanup
+
+    targets = lake_cleanup.cleanup_targets()
+    if not targets:
+        typer.echo("Nothing to clean — no lake data found.")
+        return
+
+    typer.echo("The following lake data will be removed:")
+    for path in targets:
+        typer.echo(f"  {path}")
+
+    if dry_run:
+        typer.echo("\nDry run — nothing removed.")
+        return
+
+    # Destructive and applies by default — require explicit confirmation (default No).
+    if not yes and not typer.confirm("\nRemove all lake data?"):
+        typer.echo("Aborted.")
+        raise typer.Exit(code=1)
+
+    removed = lake_cleanup.purge_all()
+    typer.echo(f"Removed all lake data ({', '.join(removed)}).")
 
 
 @aws_app.command("create-export")
