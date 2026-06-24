@@ -1,6 +1,7 @@
 """Unified ``auralake`` command — the one operator interface.
 
     auralake init               scaffold ~/.auralake (config + bundled sample data)
+    auralake sample             download the FinOps FOCUS sample dataset and seed it
     auralake ingest             pull billing → BRONZE Parquet, then rebuild GOLD
     auralake transform          rebuild GOLD Parquet from BRONZE
     auralake mcp serve          MCP server for agents (reads GOLD read-only)
@@ -49,6 +50,18 @@ def init(
     from auralake.scaffold import scaffold
 
     scaffold(force=force)
+
+
+@app.command()
+def sample(
+    rows: int = typer.Option(1000, help="Sample size: 1000 or 10000"),
+    url: str | None = typer.Option(None, help="Override the FOCUS sample CSV URL"),
+    force: bool = typer.Option(False, "--force", help="Re-download even if cached"),
+) -> None:
+    """Download the FinOps FOCUS sample dataset and seed it for the dashboard."""
+    from auralake.sample import load_sample
+
+    load_sample(rows=rows, url=url, force=force)
 
 
 @mcp_app.command("serve")

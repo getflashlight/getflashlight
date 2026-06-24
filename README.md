@@ -37,9 +37,17 @@ Parquet, publish by atomic per-file rename" — no locks, no server.
 
 ```bash
 pip install auralake          # or: uv sync (from this repo)
-auralake init                 # scaffold ~/.auralake + bundled FOCUS sample
-auralake ingest               # load billing → BRONZE, rebuild GOLD
+auralake sample               # download the FinOps FOCUS sample + seed it (no config)
 auralake dashboard serve      # dashboard → http://127.0.0.1:8501
+```
+
+`auralake sample [--rows 1000|10000]` is the zero-config way to see the dashboard
+with real data — it loads the CSV straight into Parquet via a vectorized DuckDB
+projection (no per-row Python). For your own sources instead:
+
+```bash
+auralake init                 # scaffold ~/.auralake + a connections.yml
+auralake ingest               # pull configured connectors → BRONZE, rebuild GOLD
 ```
 
 * Dashboard: `http://127.0.0.1:8501` (Streamlit; consumer surface for humans)

@@ -78,7 +78,13 @@ def _purge_window(connector: str, window: IngestWindow) -> None:
             logger.info("bronze_partition_purged", connector=connector, charge_month=month)
 
 
-def _copy_options() -> str:
+def copy_options() -> str:
+    """DuckDB ``COPY`` options for a partitioned, zstd BRONZE write.
+
+    Shared by the row-based connector path (:func:`write_window`) and the
+    vectorized file path (:mod:`auralake.lake.seed`), so the partition layout and
+    compression settings can never drift between them.
+    """
     settings = get_settings()
     opts = [
         "FORMAT parquet",
@@ -89,6 +95,14 @@ def _copy_options() -> str:
     if settings.parquet_compression == "zstd":
         opts.insert(3, f"COMPRESSION_LEVEL {settings.parquet_compression_level}")
     return ", ".join(opts)
+
+
+def purge_connector(connector: str) -> None:
+    """Remove all of a connector's BRONZE partitions (full replace for that source)."""
+    connector_dir = paths.bronze_dir() / f"x_source_connector={connector}"
+    if connector_dir.exists():
+        shutil.rmtree(connector_dir)
+        logger.info("bronze_connector_purged", connector=connector)
 
 
 def write_window(
@@ -115,7 +129,7 @@ def write_window(
     try:
         con.register("_rows", table)
         con.execute(
-            f"COPY _rows TO '{paths.bronze_dir()}' ({_copy_options()})"  # noqa: S608
+            f"COPY _rows TO '{paths.bronze_dir()}' ({copy_options()})"  # noqa: S608
         )
     finally:
         con.close()
