@@ -1,11 +1,10 @@
--- GOLD: the metrics contract. Grafana and the MCP server read ONLY these views,
--- never raw/silver — so dashboards and agents always return identical numbers.
+-- GOLD: the metrics contract. The dashboard and the MCP server read ONLY these
+-- views, never raw/silver — so charts and agents always return identical numbers.
 --
--- These are MATERIALIZED views: the ingest pipeline refreshes them after BRONZE is
--- updated (REFRESH MATERIALIZED VIEW CONCURRENTLY), so dashboards read precomputed
--- data without recomputing joins on every query. Each has a UNIQUE index so the
--- concurrent refresh works. Created WITH DATA on first run; `auralake transform
--- --rebuild` drops + recreates them when a definition here changes.
+-- These are plain DuckDB VIEWS. The transform runner materializes each to a zstd
+-- Parquet file (COPY) after BRONZE is rebuilt; that COPY *is* the refresh. No
+-- matviews, no REFRESH, no indexes — at single-user scale a full rebuild is
+-- sub-second.
 --
 -- Cost rules carried from SILVER: the single canonical metric is `cost`
 -- (= EffectiveCost), which already nets Databricks corrections (RETRACTION rows have
@@ -13,7 +12,7 @@
 -- `net_cost` = credits applied; `gross_cost` = usage/purchase only.
 
 -- ── "What is my monthly bill?" — headline spend per provider per month ──────────
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.monthly_bill AS
+CREATE OR REPLACE VIEW gold.monthly_bill AS
 SELECT
     provider_name,
     charge_month,
@@ -27,12 +26,9 @@ SELECT
 FROM silver.focus_normalized
 GROUP BY provider_name, charge_month;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_monthly_bill
-    ON gold.monthly_bill (provider_name, charge_month);
-
 
 -- ── "Where is the money going?" — by service / product ──────────────────────────
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.spend_by_service_month AS
+CREATE OR REPLACE VIEW gold.spend_by_service_month AS
 SELECT
     provider_name,
     service_category,
@@ -47,12 +43,9 @@ SELECT
 FROM silver.focus_normalized
 GROUP BY provider_name, service_category, service_name, charge_month;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_spend_by_service_month
-    ON gold.spend_by_service_month (provider_name, service_category, service_name, charge_month);
-
 
 -- ── "Where is the money going?" — by SKU (with consumed quantity, e.g. DBUs) ─────
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.spend_by_sku_month AS
+CREATE OR REPLACE VIEW gold.spend_by_sku_month AS
 SELECT
     provider_name,
     service_name,
@@ -66,12 +59,9 @@ SELECT
 FROM silver.focus_normalized
 GROUP BY provider_name, service_name, coalesce(sku_id, '(unknown)'), charge_month;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_spend_by_sku_month
-    ON gold.spend_by_sku_month (provider_name, service_name, sku_id, charge_month);
-
 
 -- ── "Where is the money going?" — by workspace / sub-account ─────────────────────
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.spend_by_workspace_month AS
+CREATE OR REPLACE VIEW gold.spend_by_workspace_month AS
 SELECT
     provider_name,
     coalesce(sub_account_id, '(none)')                   AS sub_account_id,
@@ -82,31 +72,26 @@ SELECT
 FROM silver.focus_normalized
 GROUP BY provider_name, coalesce(sub_account_id, '(none)'), charge_month;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_spend_by_workspace_month
-    ON gold.spend_by_workspace_month (provider_name, sub_account_id, charge_month);
-
 
 -- ── "Where is the money going?" — by tag (cost allocation: team/env/etc.) ────────
--- Explodes the Tags map; rows with no tags don't appear here (they're covered by the
--- service/sku views). One row per (tag_key, tag_value) so any allocation tag works.
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.spend_by_tag_month AS
+-- Explodes the Tags JSON; rows with no tags don't appear here (they're covered by
+-- the service/sku views). One row per (tag_key, tag_value) so any allocation tag
+-- works. json_keys + json_extract_string is DuckDB's stand-in for jsonb_each_text.
+CREATE OR REPLACE VIEW gold.spend_by_tag_month AS
 SELECT
-    t.key                                                AS tag_key,
-    t.value                                              AS tag_value,
-    provider_name,
-    charge_month,
-    sum(cost)                                            AS net_cost,
-    bool_or(is_partial_period)                           AS is_partial_period
+    t.tag_key                                            AS tag_key,
+    json_extract_string(f.tags, '$."' || t.tag_key || '"') AS tag_value,
+    f.provider_name,
+    f.charge_month,
+    sum(f.cost)                                          AS net_cost,
+    bool_or(f.is_partial_period)                         AS is_partial_period
 FROM silver.focus_normalized f
-CROSS JOIN LATERAL jsonb_each_text(f.tags) AS t(key, value)
-GROUP BY t.key, t.value, provider_name, charge_month;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_spend_by_tag_month
-    ON gold.spend_by_tag_month (tag_key, tag_value, provider_name, charge_month);
+CROSS JOIN unnest(json_keys(f.tags)) AS t(tag_key)
+GROUP BY tag_key, tag_value, f.provider_name, f.charge_month;
 
 
 -- ── "Am I realizing my negotiated discount?" — list vs effective ─────────────────
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.savings_summary_month AS
+CREATE OR REPLACE VIEW gold.savings_summary_month AS
 SELECT
     provider_name,
     charge_month,
@@ -121,12 +106,9 @@ SELECT
 FROM silver.focus_normalized
 GROUP BY provider_name, charge_month;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_savings_summary_month
-    ON gold.savings_summary_month (provider_name, charge_month);
-
 
 -- ── Daily spend trend per provider — drives the time-series panels ───────────────
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.spend_trend_daily AS
+CREATE OR REPLACE VIEW gold.spend_trend_daily AS
 SELECT
     charge_day,
     provider_name,
@@ -136,12 +118,9 @@ SELECT
 FROM silver.focus_normalized
 GROUP BY charge_day, provider_name;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_spend_trend_daily
-    ON gold.spend_trend_daily (charge_day, provider_name);
-
 
 -- ── TCO per Databricks cluster per month (DBU + attributed AWS infra) ────────────
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.tco_by_cluster_month AS
+CREATE OR REPLACE VIEW gold.tco_by_cluster_month AS
 SELECT
     charge_month,
     coalesce(sub_account_id, '(none)')                   AS sub_account_id,
@@ -156,9 +135,6 @@ SELECT
     is_partial_period
 FROM silver.tco_resource_month;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_tco_by_cluster_month
-    ON gold.tco_by_cluster_month (charge_month, sub_account_id, cluster_id);
-
 
 -- ── EKS TCO per cluster per month (control plane + AWS-attributed node EC2/EBS) ──
 -- Node spend is keyed on AWS-generated tags (aws:eks:cluster-name /
@@ -166,7 +142,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_tco_by_cluster_month
 -- nodes_attributed = false with control_plane_cost > 0 flags clusters whose node
 -- tags were not activated as cost-allocation tags upstream (under-attribution
 -- surfaced, not hidden).
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.tco_eks_by_cluster_month AS
+CREATE OR REPLACE VIEW gold.tco_eks_by_cluster_month AS
 SELECT
     charge_month,
     coalesce(cluster_name, '(unresolved)')               AS cluster_name,
@@ -179,12 +155,9 @@ SELECT
     is_partial_period
 FROM silver.tco_eks_resource_month;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_tco_eks_by_cluster_month
-    ON gold.tco_eks_by_cluster_month (charge_month, cluster_name);
-
 
 -- ── Monthly TCO rollup: total DBU vs infra vs the unattributed AWS bucket ────────
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.tco_summary_month AS
+CREATE OR REPLACE VIEW gold.tco_summary_month AS
 WITH attributed AS (
     SELECT charge_month,
            sum(dbu_cost)   AS dbu_cost,
@@ -210,9 +183,6 @@ SELECT
 FROM attributed a
 FULL OUTER JOIN unattributed u ON u.charge_month = a.charge_month;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_tco_summary_month
-    ON gold.tco_summary_month (charge_month);
-
 
 -- ── "What changed month-over-month, and why?" — per-SKU cost variance ────────────
 -- Decomposes each SKU's cost change into VOLUME vs RATE so you can tell "more jobs
@@ -221,7 +191,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_tco_summary_month
 --   volume_effect = Δquantity × prior unit rate          (consumption changed)
 --   rate_effect   = cost_delta − volume_effect           (price/mix changed)
 -- These two always sum to cost_delta. Rolled up to pure SKU (matches invoice lines).
-CREATE MATERIALIZED VIEW IF NOT EXISTS gold.sku_month_over_month AS
+CREATE OR REPLACE VIEW gold.sku_month_over_month AS
 WITH base AS (
     SELECT
         provider_name,
@@ -251,7 +221,7 @@ SELECT
     prev_cost,
     net_cost - prev_cost                                                    AS cost_delta,
     CASE WHEN prev_cost > 0
-         THEN round((100 * (net_cost - prev_cost) / prev_cost)::numeric, 1) END AS cost_pct_change,
+         THEN round(100 * (net_cost - prev_cost) / prev_cost, 1) END        AS cost_pct_change,
     consumed_quantity - prev_qty                                            AS qty_delta,
     CASE WHEN prev_qty > 0
          THEN (consumed_quantity - prev_qty) * (prev_cost / prev_qty) END   AS volume_effect,
@@ -262,6 +232,3 @@ SELECT
                      ELSE 0 END
     END                                                                     AS rate_effect
 FROM lagged;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_gold_sku_month_over_month
-    ON gold.sku_month_over_month (provider_name, sku_id, charge_month);

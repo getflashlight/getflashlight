@@ -1,28 +1,26 @@
-"""Apply SILVER views + GOLD materialized views, then refresh GOLD.
+"""Build GOLD Parquet from BRONZE — the "transform" / refresh step.
 
-Subcommand: ``auralake transform [--rebuild]``. The ingest pipeline calls
-``apply_views()`` right after upserting BRONZE, so GOLD is always current without a
-separate step.
+Backs ``auralake transform`` and the tail of ``auralake ingest``. One in-memory
+DuckDB reads the BRONZE Parquet as ``raw.focus_record``, applies the SILVER and
+GOLD view SQL (``sql/*.sql``), then materializes each GOLD view to a zstd Parquet
+file via ``COPY``. The files are written to a staging dir and swapped into ``gold/``
+atomically per file (:func:`auralake.lake.publish.atomic_publish`).
 
-- SILVER are plain views (``CREATE OR REPLACE``) — cheap, recomputed on read.
-- GOLD are materialized views, refreshed with ``REFRESH MATERIALIZED VIEW
-  CONCURRENTLY`` so dashboards read precomputed data with no read downtime.
-
-``CREATE MATERIALIZED VIEW IF NOT EXISTS`` won't alter an existing matview, so when a
-definition in ``sql/`` changes, run ``--rebuild`` to drop + recreate. The normal path
-also drops any leftover *plain* GOLD views, which auto-heals the one-time migration
-from the previous (view-based) GOLD layer.
+SILVER is never persisted — it lives only as views inside this connection. GOLD
+matviews + ``REFRESH … CONCURRENTLY`` are gone: a full rebuild via ``COPY`` is the
+refresh, and at single-user data scale it's sub-second.
 """
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
-from sqlalchemy import text
-from sqlalchemy.engine import Connection
-
 from auralake.core.logging import get_logger
-from auralake.store.engine import get_engine
+from auralake.core.settings import get_settings
+from auralake.lake import duck, paths
+from auralake.lake.publish import atomic_publish
+from auralake.transform.catalog import CATALOG
 
 logger = get_logger(__name__)
 
@@ -30,11 +28,11 @@ SQL_DIR = Path(__file__).parent / "sql"
 
 
 def _statements(sql_text: str) -> list[str]:
-    """Split a SQL file into individual statements (semicolon-terminated).
+    """Split a SQL file into individual ``;``-terminated statements.
 
-    Line comments are stripped first, because a ``;`` inside a ``--`` comment must
-    not be treated as a statement terminator. (Our SQL has no string literals or
-    dollar-quoted bodies containing ``--`` or ``;``, so this is sufficient.)
+    Line comments are stripped first so a ``;`` inside a ``--`` comment isn't
+    treated as a terminator. Our SQL has no string literals containing ``--`` or
+    ``;``, so this is sufficient.
     """
     decommented = []
     for line in sql_text.splitlines():
@@ -44,59 +42,46 @@ def _statements(sql_text: str) -> list[str]:
     return [stmt.strip() for stmt in cleaned.split(";") if stmt.strip()]
 
 
-def _gold_matviews(conn: Connection) -> list[str]:
-    rows = conn.execute(
-        text("SELECT matviewname FROM pg_matviews WHERE schemaname = 'gold' ORDER BY matviewname")
-    )
-    return [r[0] for r in rows]
+def _gold_copy_options() -> str:
+    settings = get_settings()
+    opts = ["FORMAT parquet", f"COMPRESSION '{settings.parquet_compression}'"]
+    if settings.parquet_compression == "zstd":
+        opts.append(f"COMPRESSION_LEVEL {settings.parquet_compression_level}")
+    return ", ".join(opts)
 
 
-def _drop_stale_gold_views(conn: Connection) -> None:
-    """Drop any leftover plain views in GOLD (it's materialized-only now)."""
-    rows = conn.execute(text("SELECT viewname FROM pg_views WHERE schemaname = 'gold'"))
-    for (name,) in rows.fetchall():
-        conn.execute(text(f'DROP VIEW IF EXISTS gold."{name}" CASCADE'))
-        logger.info("gold_stale_view_dropped", view=name)
+def build_gold() -> int:
+    """Rebuild SILVER (in-memory) and GOLD (Parquet) from BRONZE. Returns views published."""
+    con = duck.connect()
+    try:
+        con.execute("CREATE SCHEMA IF NOT EXISTS silver")
+        con.execute("CREATE SCHEMA IF NOT EXISTS gold")
+        duck.register_bronze(con)  # creates schema raw + raw.focus_record
 
-
-def _apply_sql_files() -> None:
-    files = sorted(SQL_DIR.glob("*.sql"))
-    with get_engine().begin() as conn:
-        _drop_stale_gold_views(conn)
-        for path in files:
+        for path in sorted(SQL_DIR.glob("*.sql")):
             for stmt in _statements(path.read_text()):
-                conn.execute(text(stmt))
+                con.execute(stmt)
             logger.info("sql_applied", file=path.name)
 
+        staging = paths.gold_staging_dir()
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+        options = _gold_copy_options()
+        for view in CATALOG:
+            short = view.name.removeprefix("gold.")
+            target = staging / f"{short}.parquet"
+            con.execute(
+                f'COPY (SELECT * FROM gold."{short}") TO \'{target}\' ({options})'  # noqa: S608
+            )
+    finally:
+        con.close()
 
-def _refresh_gold() -> int:
-    """REFRESH MATERIALIZED VIEW CONCURRENTLY each GOLD matview (cannot run in a txn)."""
-    refreshed = 0
-    with get_engine().connect() as base:
-        conn = base.execution_options(isolation_level="AUTOCOMMIT")
-        for name in _gold_matviews(conn):
-            conn.execute(text(f'REFRESH MATERIALIZED VIEW CONCURRENTLY gold."{name}"'))
-            refreshed += 1
-            logger.info("gold_refreshed", view=name)
-    return refreshed
-
-
-def _drop_gold_matviews() -> None:
-    with get_engine().begin() as conn:
-        for name in _gold_matviews(conn):
-            conn.execute(text(f'DROP MATERIALIZED VIEW IF EXISTS gold."{name}" CASCADE'))
-            logger.info("gold_matview_dropped", view=name)
+    published = atomic_publish(paths.gold_staging_dir(), paths.gold_dir())
+    logger.info("gold_built", views=published)
+    return published
 
 
 def apply_views(rebuild: bool = False) -> int:
-    """Apply view definitions and refresh GOLD. Returns count of refreshed matviews.
-
-    ``rebuild`` drops existing GOLD matviews first, so changed definitions in ``sql/``
-    take effect (``CREATE ... IF NOT EXISTS`` alone would skip them).
-    """
-    if rebuild:
-        _drop_gold_matviews()
-    _apply_sql_files()
-    return _refresh_gold()
-
-
+    """Back-compat alias for :func:`build_gold`. Every build is a full rebuild now,
+    so ``rebuild`` is a no-op."""
+    return build_gold()

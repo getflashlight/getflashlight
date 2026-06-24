@@ -22,7 +22,7 @@ def _record(**overrides: object) -> FocusRecord:
         resource_id="cluster-123",
     )
     base.update(overrides)
-    return FocusRecord(**base)  # type: ignore[arg-type]
+    return FocusRecord(**base)
 
 
 def test_dedupe_key_is_stable() -> None:

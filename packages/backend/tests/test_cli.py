@@ -17,7 +17,7 @@ def _isolated_state(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-d
 def test_root_help_lists_operator_commands() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for token in ("serve", "ingest", "transform", "aws"):
+    for token in ("init", "ingest", "transform", "mcp", "dashboard", "aws"):
         assert token in result.output
 
 

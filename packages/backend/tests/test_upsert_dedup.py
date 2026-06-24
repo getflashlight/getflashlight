@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from auralake.focus.enums import ChargeCategory, ProviderName, ServiceCategory
 from auralake.focus.model import FocusRecord
-from auralake.store.upsert import collapse_duplicates
+from auralake.lake.bronze import collapse_duplicates
 
 
 def _rec(resource_id: str, cost: str) -> FocusRecord:

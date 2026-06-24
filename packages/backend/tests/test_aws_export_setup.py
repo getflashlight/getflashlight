@@ -1,6 +1,8 @@
 """The create-export CLI builds a valid bcm-data-exports:CreateExport payload for
 a FOCUS 1.2 export aligned with what the connector ingests."""
 
+from collections.abc import Mapping
+
 from auralake.ingest.aws_export_setup import (
     FOCUS_TABLE,
     bucket_policy_document,
@@ -114,7 +116,7 @@ class _FakeBcmClient:
     """Minimal stand-in for the bcm-data-exports client used by update/delete."""
 
     def __init__(
-        self, exports: list[dict[str, str]], current: dict[str, object] | None = None
+        self, exports: list[dict[str, str]], current: Mapping[str, object] | None = None
     ) -> None:
         self._exports = exports
         self._current = current or {}

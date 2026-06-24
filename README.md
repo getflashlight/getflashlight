@@ -3,45 +3,48 @@
 **FOCUS-based, multi-cloud Total Cost of Ownership (TCO) spend visualization.**
 
 Auralake ingests cloud billing in the [FinOps FOCUS](https://focus.finops.org/focus-specification/)
-format, standardizes it into a layered data model, and serves preconfigured
-**Grafana** dashboards plus an **MCP server** for agents. It answers one question
+format, standardizes it into a layered data model, and serves a bundled
+**Streamlit** dashboard plus an **MCP server** for agents. It answers one question
 well: *what are we actually spending* — including the often-hidden TCO of a
 Databricks workload (DBU cost **plus** the AWS infra it provisions).
+
+It installs with `pip install auralake` — **no Docker, no database server**.
+Persistence is Parquet under `AURALAKE_HOME`, queried by an in-memory **DuckDB**.
 
 > v1 visualizes current spend. It does not (yet) recommend optimizations.
 
 ## Architecture
 
 ```
-sources ──▶ ingest (FOCUS connectors) ──▶ Postgres ──▶ Grafana
- AWS FOCUS export                          raw  (BRONZE)    └▶ MCP server
- Databricks system tables                  silver (views)
- AWS Cost Explorer (fallback)              gold (views) ◀── the only surface
-                                                            consumers read
+sources ──▶ auralake ingest ──▶ Parquet lake (~/.auralake) ──▶ readers
+ AWS FOCUS export    (writer)     bronze/  partitioned, source of truth   auralake mcp serve
+ Databricks tables                gold/    *.parquet ◀── the only surface  auralake dashboard serve
+ AWS Cost Explorer                         consumers read                 (each: own in-mem DuckDB)
 ```
 
-* **BRONZE** `raw.focus_record` — canonical FOCUS landing table (idempotent upsert).
-* **SILVER** `silver.*` — cleaned view + the Databricks↔AWS **TCO join** with the
-  double-count guard (classic compute adds infra; serverless does not).
-* **GOLD** `gold.*` — the metrics contract Grafana and MCP both read, so a chart
-  and an agent never disagree.
+Three independent processes: `ingest` is the sole writer; `mcp serve` and
+`dashboard serve` are read-only. Concurrency is "many readers over immutable
+Parquet, publish by atomic per-file rename" — no locks, no server.
 
-The store is pluggable (Postgres is the bundled default; the SQL layer ports to
-DuckDB / BigQuery / Redshift / Databricks).
+* **BRONZE** `bronze/` — canonical FOCUS records, Hive-partitioned by connector +
+  charge month; partition-replace makes re-ingest idempotent and self-purging.
+* **SILVER** (in-memory only) — cleaned view + the Databricks↔AWS **TCO join** with
+  the double-count guard (classic compute adds infra; serverless does not).
+* **GOLD** `gold/*.parquet` — the metrics contract the dashboard and MCP both read,
+  so a chart and an agent never disagree. Built by `transform` via DuckDB `COPY`.
 
 ## Quick start
 
 ```bash
-cp .env.example .env
-cp config/connections.example.yml config/connections.yml   # edit sources
-docker compose up -d                                        # db, mcp, grafana
-docker compose --profile ingest run --rm ingest            # pull billing data
-open http://localhost:3000                                  # Grafana → Auralake → TCO Overview
+pip install auralake          # or: uv sync (from this repo)
+auralake init                 # scaffold ~/.auralake + bundled FOCUS sample
+auralake ingest               # load billing → BRONZE, rebuild GOLD
+auralake dashboard serve      # dashboard → http://127.0.0.1:8501
 ```
 
-* Grafana: `http://localhost:3000` (consumer surface for humans; reads Postgres)
-* MCP: `http://localhost:8002` (streamable-http; consumer surface for agents)
-* CLI: `uv run --project packages/backend auralake serve | ingest | transform | aws create-export`
+* Dashboard: `http://127.0.0.1:8501` (Streamlit; consumer surface for humans)
+* MCP: `http://localhost:8002` (`auralake mcp serve`; streamable-http, for agents)
+* CLI: `auralake init | ingest | transform | mcp serve | dashboard serve | aws create-export`
 
 ## FOCUS handling (why the numbers are trustworthy)
 
@@ -103,12 +106,14 @@ uv run pytest
 packages/backend/src/auralake/
   focus/      canonical FOCUS model + enums
   ingest/     connectors (aws_focus, databricks, aws_infra) + runner
-  transform/  SILVER/GOLD SQL + runner + metric catalog
-  store/      engine, BRONZE models, idempotent upsert, read-only query
+  lake/       the Parquet layer: paths, schema, bronze writes, DuckDB, publish
+  transform/  SILVER/GOLD SQL + runner (builds gold/*.parquet) + metric catalog
+  gold/       reader.py — the shared GOLD read surface (MCP + dashboard)
   mcp/        MCP server over the GOLD views (the agent consumer surface)
-  cli.py      the unified `auralake` command (serve / ingest / transform / aws)
-deploy/grafana/ provisioned datasource + TCO dashboard
+  dashboard/  Streamlit app over the GOLD views (the human consumer surface)
+  cli.py      the unified `auralake` command (init / ingest / transform / mcp / dashboard / aws)
 ```
 
-`auralake serve` runs the MCP server; Grafana reads Postgres GOLD directly. There
-is no REST API. Migrations self-apply on startup.
+`auralake mcp serve` and `auralake dashboard serve` are independent read-only
+processes over `gold/*.parquet`. There is no REST API, no database, and no
+migrations — Parquet is self-describing and `FocusRecord` is the schema.

@@ -1,5 +1,5 @@
 import pytest
-from auralake.store.query import QueryError, run_select
+from auralake.gold.reader import QueryError, run_select
 
 
 @pytest.mark.parametrize(

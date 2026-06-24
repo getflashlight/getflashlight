@@ -28,8 +28,10 @@ def _row(**over: object) -> dict[str, object]:
 
 def test_open_provider_name_preserved() -> None:
     # Microsoft/Oracle aren't in our enum constants — must pass through as strings.
-    assert map_focus_row(_row(), "focus_file").provider_name == "Microsoft"
-    assert map_focus_row(_row(ProviderName="Oracle"), "focus_file").provider_name == "Oracle"
+    microsoft = map_focus_row(_row(), "focus_file")
+    oracle = map_focus_row(_row(ProviderName="Oracle"), "focus_file")
+    assert microsoft is not None and microsoft.provider_name == "Microsoft"
+    assert oracle is not None and oracle.provider_name == "Oracle"
 
 
 def test_null_tokens_become_none() -> None:

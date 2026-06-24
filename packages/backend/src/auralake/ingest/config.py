@@ -14,7 +14,7 @@ import yaml
 from pydantic import BaseModel, Field, field_validator
 
 from auralake.core.exceptions import ConfigError
-from auralake.core.settings import get_settings
+from auralake.lake import paths
 
 
 class AwsFocusConfig(BaseModel):
@@ -87,10 +87,15 @@ def env(name: str) -> str | None:
 
 
 def load_connections(path: str | None = None) -> list[BaseModel]:
-    """Parse the connections YAML into typed, enabled connector configs."""
-    cfg_path = Path(path or get_settings().connections_path)
+    """Parse the connections YAML into typed, enabled connector configs.
+
+    Defaults to ``<home>/config/connections.yml`` (what ``auralake init`` writes).
+    """
+    cfg_path = Path(path) if path else paths.connections_path()
     if not cfg_path.exists():
-        raise ConfigError(f"Connections file not found: {cfg_path}")
+        raise ConfigError(
+            f"Connections file not found: {cfg_path}. Run `auralake init` first."
+        )
 
     raw = yaml.safe_load(cfg_path.read_text()) or {}
     entries = raw.get("connectors", [])

@@ -16,3 +16,10 @@ python_version = "3.11"
 plugins = ["pydantic.mypy"]
 strict = true
 ignore_missing_imports = true
+
+# numpy's bundled stubs use 3.12+ `type` statements that break parsing under our
+# 3.11 target; don't follow them (pandas re-exports numpy, so this covers it too).
+[[tool.mypy.overrides]]
+module = ["numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true

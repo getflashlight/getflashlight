@@ -6,10 +6,14 @@ Guidance for Claude Code when working in this repository.
 
 Auralake is a **FOCUS-based, multi-cloud TCO spend-visualization** platform. It
 ingests cloud billing in the FinOps FOCUS format, standardizes it into a layered
-data model (BRONZE → SILVER → GOLD), and serves preconfigured Grafana dashboards
+data model (BRONZE → SILVER → GOLD), and serves a bundled Streamlit dashboard
 and an MCP server. It visualizes **current spend** — its headline is **Total Cost
 of Ownership** (e.g. Databricks DBU cost + the underlying AWS infra). It does
 **not** produce optimization recommendations in v1.
+
+It ships as a single `pip install auralake` — **no Docker, no database server**.
+Persistent state is Parquet under `AURALAKE_HOME` (default: the platform user-data
+dir), queried by a throwaway in-memory **DuckDB** in each process.
 
 (Auralake was previously a Databricks cost-optimization tool; that code was
 removed in the FOCUS pivot. Don't reintroduce analyzers/recommendations.)
@@ -22,26 +26,24 @@ uv workspace (virtual root `pyproject.toml`), one package:
 packages/backend/  → auralake-backend (the platform + the unified `auralake` CLI)
 ```
 
-The single `auralake` console script is the operator surface: `serve` (the MCP
-server), `ingest`, `transform`, and `aws create-export`. End users don't use the
-CLI — they read Grafana dashboards (Postgres direct) and talk to MCP. There is no
-REST API and no migrate CLI subcommand. Migrations are applied by a dedicated step
-— `python -m auralake.store.migrate` — which the docker-compose stack runs once via
-a one-shot `migrate` service that `mcp`/`ingest` wait on. `ingest` never self-
-migrates; `serve` self-applies only when `AURALAKE_AUTO_MIGRATE=true` (off by
-default), an opt-in for running it standalone. See `src/auralake/cli.py`.
+The single `auralake` console script is the operator surface. `ingest` is the sole
+**writer**; `mcp serve` and `dashboard serve` are independent **read-only**
+processes. There is no REST API, no database, and no migrations (Parquet is
+self-describing; the `FocusRecord` Pydantic model is the schema). The three
+processes never contend: many readers over immutable Parquet, publish by atomic
+per-file rename. See `src/auralake/cli.py`.
 
 ## Commands
 
 ```bash
 uv sync
-uv run --project packages/backend python -m auralake.store.migrate  # apply schema (run once)
-uv run --project packages/backend auralake serve          # MCP server :8002
-uv run --project packages/backend auralake ingest         # pull billing → BRONZE
-uv run --project packages/backend auralake transform      # (re)build SILVER/GOLD views
+uv run --project packages/backend auralake init            # scaffold ~/.auralake + sample
+uv run --project packages/backend auralake ingest          # pull billing → BRONZE, rebuild GOLD
+uv run --project packages/backend auralake transform       # rebuild GOLD from BRONZE (no re-pull)
+uv run --project packages/backend auralake mcp serve       # MCP server :8002 (agents)
+uv run --project packages/backend auralake dashboard serve # Streamlit dashboard :8501 (humans)
 uv run --project packages/backend auralake aws create-export  # create the AWS FOCUS export
 uv run ruff check packages/ && uv run mypy packages/backend && uv run pytest
-docker compose up -d                                   # full stack
 ```
 
 ## Architecture (`packages/backend/src/auralake/`)
@@ -56,17 +58,27 @@ docker compose up -d                                   # full stack
   Databricks→FOCUS 1.3 query (`connectors/sql/databricks_focus_1_3.sql`, from
   `databricks-solutions/cloud-infra-costs`) on a warehouse and maps its output —
   don't reintroduce hand-rolled DBU math. Re-pull that file upstream to update it.
-- **`store/`** — SQLModel BRONZE tables (`models.py`: `raw.focus_record`,
-  `meta.ingest_run`), engine, idempotent `upsert.py`, and read-only `query.py`.
-- **`transform/`** — `sql/` holds the SILVER/GOLD views (the metrics contract);
-  `runner.py` applies them; `catalog.py` describes the GOLD views for consumers.
-- **`mcp/`** — FastMCP server (`auralake serve`) exposing the GOLD views to agents;
-  the only programmatic consumer surface. Grafana reads Postgres GOLD directly.
+- **`lake/`** — the Parquet persistence layer. `paths.py` (on-disk layout under
+  `AURALAKE_HOME`), `schema.py` (the BRONZE Arrow schema + row builder, replacing the
+  old SQLModel table; `tags` is a JSON string), `bronze.py` (partition-replace
+  writes), `duck.py` (in-memory DuckDB + `register_bronze`/`register_gold`),
+  `publish.py` (atomic per-file GOLD swap), `runlog.py` (`meta/runs/` run log).
+  Writes are zstd (`AURALAKE_PARQUET_COMPRESSION*`).
+- **`transform/`** — `sql/` holds the SILVER/GOLD views (the metrics contract, in
+  DuckDB SQL); `runner.py` (`build_gold`) reads BRONZE Parquet, applies the views
+  in-memory, and materializes each GOLD view to a zstd Parquet file via `COPY` (the
+  refresh — no matviews). `catalog.py` describes the GOLD views for consumers.
+- **`gold/`** — `reader.py`, the one read surface shared by MCP and the dashboard:
+  cached in-memory DuckDB over `gold/*.parquet`, with the ad-hoc-SELECT guard rails.
+- **`mcp/`** — FastMCP server (`auralake mcp serve`) exposing the GOLD views to
+  agents. **`dashboard/`** — the Streamlit app (`auralake dashboard serve`), pages in
+  `views/`, reading GOLD via `gold/reader.py`. Both are read-only consumers of GOLD.
 
 ## Key invariants (do not violate)
 
-- **GOLD is the only consumer surface.** Grafana and MCP read `gold.*`, never raw/
-  silver — so charts and agents always agree.
+- **GOLD is the only consumer surface.** The Streamlit dashboard and MCP read the
+  published `gold/*.parquet` (registered as `gold.*`), never raw/silver — so charts
+  and agents always agree.
 - **One cost metric per aggregation.** Canonical is `EffectiveCost` (mapped to
   `cost` in SILVER). Never sum across FOCUS cost columns.
 - **Charge-period grain only** when aggregating; never the billing period.
@@ -74,12 +86,13 @@ docker compose up -d                                   # full stack
   attributed AWS infra; serverless = DBU only. The `x_compute_class` stamped by the
   Databricks connector drives this.
 - **Partition-replace ingest**: each run is authoritative for the (connector,
-  charge-period window) it pulls — `delete_window` purges that range, then a plain
-  insert loads the fresh pull, atomically in one savepoint. Re-running is idempotent
-  and self-purging (bad/orphaned rows can't survive). `dedupe_key` (incl.
-  `record_id`/`record_type`) is now only a within-batch uniqueness guard, not an
-  upsert key. Databricks corrections (RETRACTION/RESTATEMENT) land as distinct rows
-  and net via `SUM` downstream.
+  charge-period window) it pulls — `lake.bronze.write_window` removes that
+  connector's `x_source_connector=…/charge_month=…/` partition dirs across the
+  window, then writes the fresh pull. Re-running is idempotent and self-purging (a
+  month the source no longer reports loses its partition; bad/orphaned rows can't
+  survive). `dedupe_key` (incl. `record_id`/`record_type`) is only a within-batch
+  uniqueness guard. Databricks corrections (RETRACTION/RESTATEMENT) land as distinct
+  rows and net via `SUM` downstream.
 - **Single currency**: ingest asserts `billing_currency == AURALAKE_BASE_CURRENCY`.
 - **Attribution honesty**: unattributed AWS spend is surfaced, never silently dropped.
 

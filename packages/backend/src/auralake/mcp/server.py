@@ -1,6 +1,6 @@
 """Auralake MCP server — lets agents discover and query FOCUS/TCO metrics.
 
-Exposes the same GOLD views the Grafana dashboards use, so an agent and a chart
+Exposes the same GOLD views the Streamlit dashboard uses, so an agent and a chart
 never disagree. All tools are read-only and scoped to the published views.
 
 Tools:
@@ -17,8 +17,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from auralake.core.settings import get_settings
-from auralake.store.engine import init_engine
-from auralake.store.query import QueryError, query_view, run_select
+from auralake.gold.reader import QueryError, query_view, run_select
 from auralake.transform.catalog import CATALOG, CATALOG_BY_NAME
 
 _settings = get_settings()
@@ -81,19 +80,12 @@ def run_sql(sql: str, limit: int = 200) -> dict[str, Any]:
 
 
 def serve_mcp() -> None:
-    """Run the MCP server. Backs the ``auralake serve`` command.
+    """Run the MCP server. Backs ``auralake mcp serve``.
 
-    Migrations are applied by the dedicated ``migrate`` step, not here. Set
-    ``AURALAKE_AUTO_MIGRATE=true`` to opt into self-applying on boot (off by
-    default) — useful when running ``serve`` standalone without that step.
+    Reads the published GOLD Parquet read-only — no database, no migrations. If
+    GOLD hasn't been built yet (no ``auralake ingest`` run), the metric views are
+    simply empty.
     """
-    from auralake.core.settings import get_settings
-
-    if get_settings().auto_migrate:
-        from auralake.store.migrate import upgrade_to_head
-
-        upgrade_to_head()
-    init_engine()
     mcp.run(transport="streamable-http")
 
 

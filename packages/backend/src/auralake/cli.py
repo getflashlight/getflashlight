@@ -1,16 +1,19 @@
 """Unified ``auralake`` command — the one operator interface.
 
-    auralake serve              run the MCP server (the consumer surface for agents)
-    auralake ingest             pull billing → BRONZE, then refresh SILVER/GOLD
-    auralake transform          rebuild SILVER views + GOLD matviews
+    auralake init               scaffold ~/.auralake (config + bundled sample data)
+    auralake ingest             pull billing → BRONZE Parquet, then rebuild GOLD
+    auralake transform          rebuild GOLD Parquet from BRONZE
+    auralake mcp serve          MCP server for agents (reads GOLD read-only)
+    auralake dashboard serve    Streamlit dashboard for humans (reads GOLD read-only)
     auralake aws create-export  provision the AWS FOCUS Data Export to consume
     auralake aws update-export  update that export in place (e.g. fix its S3 prefix)
     auralake aws delete-export  remove that export (S3 data is left untouched)
 
-End users don't use this CLI — they read Grafana dashboards (which query Postgres
-directly) and talk to the MCP server. This is the deployment/ops surface.
+There is no database and no Docker: persistent state is Parquet under
+``AURALAKE_HOME``. ``ingest`` is the sole writer; ``mcp serve`` and ``dashboard
+serve`` are independent read-only processes.
 
-Heavy imports (boto3, psycopg, the MCP stack) are deferred into each command so
+Heavy imports (boto3, the MCP/Streamlit stacks) are deferred into each command so
 ``auralake --help`` stays fast and doesn't import the world.
 """
 
@@ -25,7 +28,12 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 aws_app = typer.Typer(help="AWS Data Exports setup", no_args_is_help=True)
+mcp_app = typer.Typer(help="MCP server for agents", no_args_is_help=True)
+dashboard_app = typer.Typer(help="Streamlit dashboard for humans", no_args_is_help=True)
 app.add_typer(aws_app, name="aws")
+app.add_typer(mcp_app, name="mcp")
+app.add_typer(dashboard_app, name="dashboard")
+app.add_typer(dashboard_app, name="grafana", hidden=True)  # familiar alias
 
 
 @app.callback()
@@ -34,11 +42,29 @@ def _main() -> None:
 
 
 @app.command()
-def serve() -> None:
-    """Run the Auralake MCP server (migrations auto-apply on startup)."""
+def init(
+    force: bool = typer.Option(False, "--force", help="Overwrite existing config/sample"),
+) -> None:
+    """Scaffold ~/.auralake with config and bundled sample data. Run once."""
+    from auralake.scaffold import scaffold
+
+    scaffold(force=force)
+
+
+@mcp_app.command("serve")
+def mcp_serve() -> None:
+    """Run the MCP server for agents (reads the GOLD Parquet read-only)."""
     from auralake.mcp.server import serve_mcp
 
     serve_mcp()
+
+
+@dashboard_app.command("serve")
+def dashboard_serve() -> None:
+    """Run the Streamlit dashboard for humans (reads the GOLD Parquet read-only)."""
+    from auralake.dashboard.launch import serve_dashboard
+
+    serve_dashboard()
 
 
 @app.command()
@@ -60,13 +86,11 @@ def ingest(
 
 
 @app.command()
-def transform(
-    rebuild: bool = typer.Option(False, help="Drop + recreate GOLD matviews to apply changes"),
-) -> None:
-    """(Re)build SILVER views and GOLD materialized views."""
-    from auralake.transform.runner import apply_views
+def transform() -> None:
+    """Rebuild GOLD Parquet from the current BRONZE (no re-pull needed)."""
+    from auralake.transform.runner import build_gold
 
-    apply_views(rebuild=rebuild)
+    build_gold()
 
 
 @aws_app.command("create-export")

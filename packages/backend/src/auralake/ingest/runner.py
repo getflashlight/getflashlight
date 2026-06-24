@@ -1,8 +1,9 @@
 """Ingest orchestration. Subcommand: ``auralake ingest [--start --end]``.
 
-For each enabled connector: open an IngestRun, stream FOCUS records, upsert them
-idempotently, and close the run with a status. A failing connector is isolated —
-its run is marked failed and the others still proceed.
+For each enabled connector: stream FOCUS records, validate currency, and
+partition-replace them into the BRONZE Parquet lake. A failing connector is
+isolated — its run is logged failed and the others still proceed. After all
+connectors land, GOLD is rebuilt from BRONZE so the data is immediately queryable.
 """
 
 from __future__ import annotations
@@ -28,10 +29,8 @@ from auralake.ingest.connectors import (
     DatabricksConnector,
     FocusFileConnector,
 )
-from auralake.store.engine import session_scope
-from auralake.store.models import IngestRun
-from auralake.store.upsert import delete_window, insert_focus_records
-from auralake.transform.runner import apply_views
+from auralake.lake import bronze, runlog
+from auralake.transform.runner import build_gold
 
 logger = get_logger(__name__)
 
@@ -53,42 +52,49 @@ def build_connector(config: BaseModel) -> Connector:
 
 
 def run_connector(connector: Connector, window: IngestWindow) -> int:
-    """Run one connector end-to-end. Returns rows written."""
+    """Run one connector end-to-end. Returns rows written.
+
+    Failures are isolated and logged to the run log; they return 0 rather than
+    aborting the whole ingest.
+    """
     base_currency = get_settings().base_currency
-    with session_scope() as session:
-        run = IngestRun(connector=connector.name, started_at=datetime.now(UTC))
-        session.add(run)
-        session.flush()  # assign run.id
-        run_id = run.id
-        assert run_id is not None
+    run_id = bronze.new_run_id()
+    started_at = datetime.now(UTC)
+    try:
+        records = []
+        for record in connector.fetch(window):
+            if record.billing_currency != base_currency:
+                raise FocusValidationError(
+                    f"{connector.name}: currency {record.billing_currency} "
+                    f"!= base {base_currency}; mixed-currency sums are unsafe"
+                )
+            records.append(record)
 
-        try:
-            records = []
-            for record in connector.fetch(window):
-                if record.billing_currency != base_currency:
-                    raise FocusValidationError(
-                        f"{connector.name}: currency {record.billing_currency} "
-                        f"!= base {base_currency}; mixed-currency sums are unsafe"
-                    )
-                records.append(record)
-
-            # Partition-replace, atomically: clear the window then insert the fresh
-            # pull in one savepoint, so a failed insert can't leave the window emptied.
-            with session.begin_nested():
-                delete_window(session, connector.name, window.start, window.end)
-                written = insert_focus_records(session, records, run_id)
-            run.status = "success"
-            run.rows_ingested = written
-            run.finished_at = datetime.now(UTC)
-            logger.info("ingest_ok", connector=connector.name, rows=written)
-            return written
-        except Exception as exc:  # noqa: BLE001
-            run.status = "failed"
-            run.detail = str(exc)[:1000]
-            run.finished_at = datetime.now(UTC)
-            session.add(run)
-            logger.error("ingest_failed", connector=connector.name, error=str(exc))
-            return 0
+        written = bronze.write_window(
+            connector.name, window, records, ingest_run_id=run_id
+        )
+        runlog.record_run(
+            run_id=run_id,
+            connector=connector.name,
+            status="success",
+            rows=written,
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+        )
+        logger.info("ingest_ok", connector=connector.name, rows=written)
+        return written
+    except Exception as exc:  # noqa: BLE001 - isolate one connector's failure
+        runlog.record_run(
+            run_id=run_id,
+            connector=connector.name,
+            status="failed",
+            rows=0,
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+            detail=str(exc)[:1000],
+        )
+        logger.error("ingest_failed", connector=connector.name, error=str(exc))
+        return 0
 
 
 def run_ingest(
@@ -97,12 +103,7 @@ def run_ingest(
     connections: str | None = None,
     no_transform: bool = False,
 ) -> int:
-    """Pull all enabled connectors for the window, then refresh views. Returns rows.
-
-    Backs the ``auralake ingest`` subcommand. The schema must already be migrated
-    (by the compose ``migrate`` service, or ``python -m auralake.store.migrate``);
-    ingest does not self-migrate.
-    """
+    """Pull all enabled connectors for the window, then rebuild GOLD. Returns rows."""
     end = end or date.today()
     start = start or (end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
     window = IngestWindow(start=start, end=end)
@@ -117,9 +118,9 @@ def run_ingest(
         connector = build_connector(config)
         total += run_connector(connector, window)
 
-    # Refresh SILVER/GOLD so the data is immediately queryable (the bundled flow).
+    # Rebuild SILVER/GOLD from BRONZE so the data is immediately queryable.
     if not no_transform:
-        apply_views()
-        logger.info("transform_done")
+        published = build_gold()
+        logger.info("transform_done", gold_views=published)
     logger.info("ingest_complete", connectors=len(configs), rows=total)
     return total

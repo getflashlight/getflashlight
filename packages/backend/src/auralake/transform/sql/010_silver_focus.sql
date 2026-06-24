@@ -10,7 +10,6 @@
 
 CREATE OR REPLACE VIEW silver.focus_normalized AS
 SELECT
-    f.id,
     f.provider_name,
     f.billing_account_id,
     f.sub_account_id,

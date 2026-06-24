@@ -1,7 +1,10 @@
 # Sample data
 
-Drop FOCUS files here (mounted into the containers at `/data`) and point a
-`focus_file` connector at them in `config/connections.yml`.
+`auralake init` copies a bundled copy of this FOCUS sample into
+`~/.auralake/data/` and enables a `focus_file` connector for it, so a fresh
+install has data out of the box. To use your own files, drop FOCUS CSV/Parquet
+anywhere and point a `focus_file` connector at the path in
+`~/.auralake/config/connections.yml`.
 
 ## Fetch the official FinOps FOCUS sample dataset
 
@@ -12,11 +15,11 @@ curl -sL -o data/focus_sample.csv \
 # A 10,000-row version (focus_sample_10000.csv) is in the same folder.
 ```
 
-Then enable the `focus_file` connector in `config/connections.yml` and run:
+Then point a `focus_file` connector at it in `~/.auralake/config/connections.yml`
+and run:
 
 ```bash
-docker compose --profile ingest run --rm ingest   # ingest + build views
-# or, against a local server:  auralake ingest
+auralake ingest   # load → BRONZE, rebuild GOLD
 ```
 
 Source: https://github.com/FinOps-Open-Cost-and-Usage-Spec/FOCUS-Sample-Data

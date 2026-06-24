@@ -20,8 +20,8 @@ CREATE OR REPLACE VIEW silver.tco_eks_resource_month AS
 WITH control_plane AS (
     SELECT
         coalesce(
-            tags ->> 'aws:eks:cluster-name',
-            substring(resource_id from 'cluster/(.+)$')
+            json_extract_string(tags, '$."aws:eks:cluster-name"'),
+            nullif(regexp_extract(resource_id, 'cluster/(.+)$', 1), '')
         )                                    AS cluster_name,
         charge_month,
         sum(cost)                            AS control_plane_cost,
@@ -38,12 +38,12 @@ node_rows AS (
         f.cost,
         f.is_partial_period,
         coalesce(
-            f.tags ->> 'aws:eks:cluster-name',
-            f.tags ->> 'eks:cluster-name',
-            (SELECT substring(k from 'kubernetes\.io/cluster/(.+)$')
-               FROM jsonb_object_keys(f.tags) AS k
+            json_extract_string(f.tags, '$."aws:eks:cluster-name"'),
+            json_extract_string(f.tags, '$."eks:cluster-name"'),
+            (SELECT nullif(regexp_extract(k, 'kubernetes\.io/cluster/(.+)$', 1), '')
+               FROM unnest(json_keys(f.tags)) AS t(k)
               WHERE k LIKE 'kubernetes.io/cluster/%'
-                AND f.tags ->> k = 'owned'
+                AND json_extract_string(f.tags, '$."' || k || '"') = 'owned'
               LIMIT 1)
         )                                    AS cluster_name
     FROM silver.focus_normalized f

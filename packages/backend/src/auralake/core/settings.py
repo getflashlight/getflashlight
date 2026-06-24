@@ -16,17 +16,25 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="AURALAKE_", extra="ignore")
 
-    database_url: str = "postgresql+psycopg://auralake:auralake@localhost:5432/auralake"
+    # Root of the on-disk Parquet lake. None → the platform user-data dir
+    # (see auralake.lake.paths.home). All three processes resolve the same files
+    # from here, so ingest (writer) and the MCP/dashboard readers always agree.
+    home: str | None = None
     api_key: str | None = None
     base_currency: str = "USD"
+    # Connector config. Relative/unset resolves under <home>/config/connections.yml.
     connections_path: str = "connections.yml"
-    # Off by default: migrations are applied by the dedicated `migrate` step
-    # (the compose init service, or `python -m auralake.store.migrate` locally),
-    # not on app startup. Set true to let `serve` self-apply on boot instead.
-    auto_migrate: bool = False
+
+    # Parquet write codec, applied to every COPY (BRONZE partitions + GOLD files).
+    # zstd beats the snappy default on ratio at negligible read cost; DuckDB reads
+    # it transparently, so only the writers care.
+    parquet_compression: str = "zstd"
+    parquet_compression_level: int = 3  # zstd 1–22; 3 is the ratio/speed sweet spot
 
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8002
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = 8501
 
 
 @lru_cache

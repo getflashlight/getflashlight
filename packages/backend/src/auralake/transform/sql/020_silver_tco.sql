@@ -29,14 +29,13 @@ WITH databricks_cost AS (
 ),
 aws_attributed AS (
     SELECT
-        tags ->> 'ClusterId'                 AS cluster_id,
+        json_extract_string(tags, '$.ClusterId')   AS cluster_id,
         charge_month,
-        sum(cost)                            AS infra_cost
+        sum(cost)                                   AS infra_cost
     FROM silver.focus_normalized
     WHERE provider_name = 'AWS'
-      AND tags ? 'ClusterId'
-      AND coalesce(tags ->> 'ClusterId', '') <> ''
-    GROUP BY tags ->> 'ClusterId', charge_month
+      AND coalesce(json_extract_string(tags, '$.ClusterId'), '') <> ''
+    GROUP BY json_extract_string(tags, '$.ClusterId'), charge_month
 )
 SELECT
     d.sub_account_id,
@@ -69,5 +68,5 @@ SELECT
     bool_or(is_partial_period)               AS is_partial_period
 FROM silver.focus_normalized
 WHERE provider_name = 'AWS'
-  AND (NOT (tags ? 'ClusterId') OR coalesce(tags ->> 'ClusterId', '') = '')
+  AND coalesce(json_extract_string(tags, '$.ClusterId'), '') = ''
 GROUP BY charge_month, service_category, service_name;
