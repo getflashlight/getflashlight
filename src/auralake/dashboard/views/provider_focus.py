@@ -1,13 +1,15 @@
 """Per-provider FOCUS spend — one page per provider, rendered from its GOLD group.
 
-Generalizes the original AWS board: each provider's GOLD lives in its own group
-schema (``aws.*``, ``databricks.*``, …), so the page reads ``<group>.<view>`` with
-no ``provider_name`` filter (the files are already provider-scoped). ``render`` is
-bound per provider in ``app.py``; widget keys are namespaced by group so two
-provider pages don't collide in session state.
+Each provider's GOLD lives in its own group schema (``aws.*``, ``databricks.*``, …),
+so the page reads ``<group>.<view>`` with no ``provider_name`` filter. A single
+sidebar **from→to date range** drives every panel below it. ``render`` is bound per
+provider in ``app.py``; widget keys are namespaced by group so two provider pages
+don't collide in session state.
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 import pandas as pd
 import plotly.express as px
@@ -17,169 +19,243 @@ from auralake.dashboard.data import gold_df, has_data
 from auralake.dashboard.theme import (
     PALETTE,
     compact_money,
+    date_range,
+    heatmap_table,
+    html_table,
     kpi_cards,
-    month_filter,
     plotly,
-    shadcn_table,
     style_fig,
 )
+
+
+def _d(value: object) -> date:
+    """Coerce a DuckDB/pandas date-ish scalar to a plain ``date``."""
+    ts = pd.Timestamp(value)
+    return date(ts.year, ts.month, ts.day)
 
 
 def render(group: str, label: str) -> None:
     """Render the FOCUS spend page for one provider group (``group`` schema, ``label`` UI)."""
     st.title(f"{label} FOCUS spend")
-    st.caption(f"{label} net cost over time and the SKUs driving it, in the FOCUS format.")
+    st.caption(f"{label} net cost over the chosen window and the SKUs driving it.")
     if not has_data():
         st.info("No data yet — run `auralake ingest` to load billing.")
         return
 
-    bill = gold_df(f'SELECT * FROM "{group}".monthly_bill ORDER BY charge_month')
-    if bill.empty:
+    bounds = gold_df(
+        f'SELECT min(charge_day) AS lo, max(charge_day) AS hi FROM "{group}".spend_trend_daily'
+    )
+    if bounds.empty or pd.isna(bounds["lo"].iloc[0]):
         st.info(f"No {label} rows found. Enable a {label} connector in connections.yml.")
         return
 
-    months = bill["charge_month"].astype(str).tolist()
-    month = month_filter(months, key=f"{group}_month") or max(months)
-    sel = bill[bill["charge_month"].astype(str) == month]
-    n_services = gold_df(
-        f'SELECT count(DISTINCT service_name) AS n FROM "{group}".spend_by_service_month'
-    )["n"].iloc[0]
+    lo, hi = _d(bounds["lo"].iloc[0]), _d(bounds["hi"].iloc[0])
+    # Default the window to open on the first month with material spend, so a one-day
+    # sliver at the very start (e.g. a Dec 31 charge) doesn't anchor the range there —
+    # the user can still drag back to `lo`.
+    first = gold_df(
+        f'SELECT min(charge_month) AS m FROM "{group}".monthly_bill WHERE abs(net_cost) >= 1'
+    )
+    default_lo = _d(first["m"].iloc[0]) if not first.empty and pd.notna(first["m"].iloc[0]) else lo
+    start, end = date_range(lo, hi, key=f"{group}_range", default_lo=default_lo)
+    sm = start.replace(day=1)  # month-grain views key on the first of the month
 
+    _kpis(group, label, start, end, sm)
+    st.divider()
+    _trend(group, label, start, end)
+    _spend_pivot(group, end, sm)
+    _savings(group, label, end, sm)
+    _sku_mom(group, end)
+    _tags(group, label, end, sm)
+
+
+def _kpis(group: str, label: str, start: date, end: date, sm: date) -> None:
+    agg = gold_df(
+        "SELECT coalesce(sum(net_cost),0) AS net, coalesce(sum(list_cost),0) AS lst, "
+        f'coalesce(sum(savings),0) AS sav FROM "{group}".monthly_bill '
+        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}'"
+    ).iloc[0]
+    net, lst, sav = float(agg["net"]), float(agg["lst"]), float(agg["sav"])
+    disc = f"{100 * sav / lst:.1f}%" if lst else "—"
+    span = f"{start:%b %d} → {end:%b %d}"
     kpi_cards(
         [
-            (f"{label} net · {month}", compact_money(sel["net_cost"].sum()), "selected month"),
-            (
-                f"{label} net · all time",
-                compact_money(bill["net_cost"].sum()),
-                f"{len(months)} months",
-            ),
-            (f"{label} savings · all time", compact_money(bill["savings"].sum()), "vs list"),
-            (f"{label} services", str(int(n_services)), "distinct services"),
+            (f"{label} net", compact_money(net), span),
+            (f"{label} list", compact_money(lst), "before discounts"),
+            (f"{label} savings", compact_money(sav), "vs list"),
+            ("Realized discount", disc, "off list"),
         ],
         key=group,
     )
 
-    st.divider()
-    _trend(group, label, bill)
-    st.write("")
-    _services_skus(group, label, month)
-    st.write("")
-    _tags(group, label, month)
+
+def _trend(group: str, label: str, start: date, end: date) -> None:
+    trend = gold_df(
+        f'SELECT charge_day, net_cost FROM "{group}".spend_trend_daily '
+        f"WHERE charge_day >= '{start}' AND charge_day <= '{end}' ORDER BY charge_day"
+    )
+    if trend.empty:
+        st.info(f"No daily {label} rows in range.")
+        return
+    fig = px.area(trend, x="charge_day", y="net_cost", labels={"charge_day": "", "net_cost": ""})
+    fig.update_traces(line_color=PALETTE[1], fillcolor="rgba(46,134,171,0.18)")
+    plotly(style_fig(fig), title=f"Daily {label} spend", key=f"{group}_trend")
 
 
-def _trend(group: str, label: str, bill: pd.DataFrame) -> None:
-    left, right = st.columns([2, 1])
-    with left:
-        trend = gold_df(
-            f'SELECT charge_day, net_cost FROM "{group}".spend_trend_daily ORDER BY charge_day'
-        )
-        if trend.empty:
-            st.info(f"No daily {label} rows.")
-        else:
-            fig = px.area(
-                trend,
-                x="charge_day",
-                y="net_cost",
-                labels={"charge_day": "", "net_cost": "Net cost"},
-            )
-            fig.update_traces(line_color="#2E86AB", fillcolor="rgba(46,134,171,0.18)")
-            plotly(style_fig(fig), title=f"Daily {label} spend", key=f"{group}_trend")
-    with right:
-        cats = gold_df(
-            'SELECT service_category, SUM(net_cost) AS net_cost '
-            f'FROM "{group}".spend_by_service_month '
-            "GROUP BY service_category ORDER BY net_cost DESC"
-        )
-        if cats.empty:
-            st.info("No category rows.")
-        else:
-            fig = px.pie(
-                cats,
-                names="service_category",
-                values="net_cost",
-                hole=0.55,
-                color_discrete_sequence=PALETTE,
-            )
-            fig.update_traces(textposition="inside", textinfo="percent")
-            plotly(
-                style_fig(fig, currency_axis=None),
-                title="By service category",
-                key=f"{group}_pie",
-            )
+def _spend_pivot(group: str, end: date, sm: date) -> None:
+    """Top cost drivers as a <dim> × month spend matrix with reconciling row/col totals.
 
-    bar = bill.copy()
-    bar["month"] = pd.to_datetime(bar["charge_month"]).dt.strftime("%Y-%m")
-    fig = px.bar(bar, x="month", y="net_cost", labels={"month": "", "net_cost": "Net cost"})
-    fig.update_traces(marker_color=PALETTE[1])
-    plotly(style_fig(fig), title=f"Monthly {label} bill (net)", key=f"{group}_monthly")
+    Pivots on SKU for Databricks (its service names — JOBS, SQL — are too coarse; the
+    SKU id carries the real detail) and on service for everyone else (where names like
+    'Amazon EC2' are meaningful).
+    """
+    if group == "databricks":
+        dim, view, label = "sku_id", "spend_by_sku_month", "SKU"
+    else:
+        dim, view, label = "service_name", "spend_by_service_month", "Service"
 
+    st.markdown(f"##### {label}s × month — spend")
+    df = gold_df(
+        f"SELECT {dim} AS k, charge_month, sum(net_cost) AS net_cost "
+        f'FROM "{group}".{view} '
+        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
+        f"GROUP BY {dim}, charge_month"
+    )
+    if df.empty:
+        st.info(f"No {label.lower()} rows in range.")
+        return
 
-def _services_skus(group: str, label: str, month: str) -> None:
-    left, right = st.columns(2)
-    with left:
-        st.markdown(f"##### Top {label} services")
-        st.caption(month)
-        services = gold_df(
-            "SELECT service_name, service_category, SUM(net_cost) AS net_cost "
-            f'FROM "{group}".spend_by_service_month '
-            f"WHERE charge_month = '{month}' GROUP BY service_name, service_category "
-            "ORDER BY net_cost DESC LIMIT 20"
-        )
-        if services.empty:
-            st.info("No service rows for this month.")
-        else:
-            shadcn_table(
-                services,
-                key=f"{group}_services",
-                money_cols=["net_cost"],
-                rename={
-                    "service_name": "Service",
-                    "service_category": "Category",
-                    "net_cost": "Net cost",
-                },
-            )
-    with right:
-        st.markdown(f"##### Top {label} SKUs")
-        st.caption(month)
-        skus = gold_df(
-            "SELECT service_name, sku_id, SUM(net_cost) AS net_cost, "
-            "SUM(consumed_quantity) AS quantity, max(consumed_unit) AS unit "
-            f'FROM "{group}".spend_by_sku_month '
-            f"WHERE charge_month = '{month}' GROUP BY service_name, sku_id "
-            "ORDER BY net_cost DESC LIMIT 20"
-        )
-        if skus.empty:
-            st.info("No SKU rows for this month.")
-        else:
-            shadcn_table(
-                skus,
-                key=f"{group}_skus",
-                money_cols=["net_cost"],
-                num_cols=["quantity"],
-                rename={
-                    "service_name": "Service",
-                    "sku_id": "SKU",
-                    "net_cost": "Net cost",
-                    "quantity": "Quantity",
-                    "unit": "Unit",
-                },
-            )
+    current = pd.Timestamp(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
+    pivot = df.pivot_table(
+        index="k", columns="charge_month", values="net_cost", aggfunc="sum", fill_value=0.0
+    )
+    # Drop the uniform ENTERPRISE_ prefix Databricks puts on every SKU id.
+    pivot.index = pivot.index.str.replace("ENTERPRISE_", "", regex=False)
+    pivot = pivot.reindex(sorted(pivot.columns), axis=1)  # chronological months
+    pivot["Total"] = pivot.sum(axis=1)
+    pivot = pivot.sort_values("Total", ascending=False)
+    pivot.loc["Total"] = pivot.sum(axis=0)  # column totals reconcile with the row totals
+
+    def _col(c: object) -> str:
+        if c == "Total":
+            return "Total"
+        ts = pd.Timestamp(c)
+        return f"{ts:%b %Y}" + (" (partial)" if ts == current else "")
+
+    pivot.columns = [_col(c) for c in pivot.columns]
+    out = pivot.reset_index().rename(columns={"k": label})
+    for col in out.columns:
+        if col != label:
+            out[col] = out[col].map(lambda v: "" if not v else compact_money(v))
+    html_table(out)
 
 
-def _tags(group: str, label: str, month: str) -> None:
+def _savings(group: str, label: str, end: date, sm: date) -> None:
+    sv = gold_df(
+        "SELECT charge_month, effective_cost, savings, list_cost, savings_pct "
+        f'FROM "{group}".savings_summary_month '
+        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' AND list_cost >= 1 "
+        "ORDER BY charge_month"
+    )
+    if sv.empty:
+        return
+    latest = sv.iloc[-1]
+    st.markdown("##### Bill: list vs effective")
+    st.caption(f"Effective + savings = list. Latest month · {latest['savings_pct']:.1f}% off list.")
+    melt = sv.copy()
+    melt["month"] = pd.to_datetime(melt["charge_month"]).dt.strftime("%Y-%m")
+    melt = melt.melt(
+        id_vars="month",
+        value_vars=["effective_cost", "savings"],
+        var_name="component",
+        value_name="cost",
+    )
+    melt["component"] = melt["component"].map(
+        {"effective_cost": "Effective (paid)", "savings": "Savings (discount)"}
+    )
+    fig = px.bar(
+        melt,
+        x="month",
+        y="cost",
+        color="component",
+        barmode="stack",  # stacked, so the full bar height = list cost (Grafana-style)
+        color_discrete_map={"Effective (paid)": PALETTE[1], "Savings (discount)": PALETTE[4]},
+        category_orders={"component": ["Effective (paid)", "Savings (discount)"]},
+        labels={"month": "", "cost": "", "component": ""},
+    )
+    plotly(style_fig(fig), key=f"{group}_savings")
+
+
+def _sku_mom(group: str, end: date) -> None:
+    st.markdown("##### SKU month-over-month")
+    # Compare the latest COMPLETE month (exclude the current, still-accruing month) so
+    # we never pit a partial month against a full one. Honour the selected range's end.
+    current = pd.Timestamp(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
+    months = gold_df(
+        f'SELECT DISTINCT charge_month FROM "{group}".sku_month_over_month '
+        f"WHERE charge_month <= '{end}' AND charge_month < '{current.date()}' "
+        "ORDER BY charge_month DESC LIMIT 1"
+    )
+    if months.empty:
+        st.caption("Not enough complete months in range to compare.")
+        st.info("Need at least one full (non-current) month of data.")
+        return
+    cmp_month = pd.Timestamp(months.iloc[0]["charge_month"])
+    prior = cmp_month - pd.DateOffset(months=1)
+    st.caption(f"Top SKUs by net cost · {cmp_month:%b %Y} vs {prior:%b %Y}")
+    mom = gold_df(
+        "SELECT sku_id, net_cost, cost_delta, cost_pct_change "
+        f'FROM "{group}".sku_month_over_month WHERE charge_month = \'{cmp_month.date()}\' '
+        "ORDER BY net_cost DESC LIMIT 20"
+    )
+    if mom.empty:
+        st.info("No SKU movement rows for the latest complete month.")
+        return
+    heatmap_table(
+        mom,
+        heat_col="cost_pct_change",
+        money_cols=["net_cost", "cost_delta"],
+        rename={
+            "sku_id": "SKU",
+            "net_cost": "Net cost",
+            "cost_delta": "Δ vs prior",
+            "cost_pct_change": "MoM %",
+        },
+    )
+
+
+def _tags(group: str, label: str, end: date, sm: date) -> None:
+    keys = gold_df(
+        f'SELECT tag_key, sum(net_cost) AS net FROM "{group}".spend_by_tag_month '
+        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
+        "GROUP BY tag_key ORDER BY net DESC"
+    )
+    if keys.empty:
+        st.markdown("##### Spend by tag")
+        st.info("No tagged spend in range.")
+        return
+
     st.markdown("##### Spend by tag")
-    st.caption(f"Top {label} tags by net cost · {month}")
+    options = keys["tag_key"].tolist()
+    default = "team" if "team" in options else options[0]
+    sel = st.selectbox(
+        "Tag key",
+        options=options,
+        index=options.index(default),
+        key=f"{group}_tagkey",
+        label_visibility="collapsed",
+    )
+    st.caption(f"{label} spend broken down by the `{sel}` tag")
     tags = gold_df(
-        f'SELECT tag_key, tag_value, SUM(net_cost) AS net_cost FROM "{group}".spend_by_tag_month '
-        f"WHERE charge_month = '{month}' "
-        "GROUP BY tag_key, tag_value ORDER BY net_cost DESC LIMIT 20"
+        f"SELECT tag_value, sum(net_cost) AS net_cost FROM \"{group}\".spend_by_tag_month "
+        f"WHERE tag_key = '{sel}' AND charge_month >= '{sm}' AND charge_month <= '{end}' "
+        "GROUP BY tag_value ORDER BY net_cost DESC LIMIT 20"
     )
     if tags.empty:
-        st.info("No tag rows for this month.")
+        st.info("No values for this tag in range.")
         return
-    shadcn_table(
+    html_table(
         tags,
-        key=f"{group}_tags",
         money_cols=["net_cost"],
-        rename={"tag_key": "Tag", "tag_value": "Value", "net_cost": "Net cost"},
+        rename={"tag_value": sel, "net_cost": "Net cost"},
     )

@@ -15,10 +15,10 @@ import streamlit as st
 from auralake.dashboard.data import gold_df, has_data
 from auralake.dashboard.theme import (
     compact_money,
+    html_table,
     kpi_cards,
     month_filter,
     plotly,
-    shadcn_table,
     style_fig,
 )
 
@@ -113,9 +113,8 @@ def _databricks_clusters(month: str) -> None:
     if clusters.empty:
         st.info("No Databricks cluster rows for this month.")
         return
-    shadcn_table(
+    html_table(
         clusters,
-        key="tco_clusters",
         money_cols=["dbu_cost", "infra_cost", "tco_cost"],
         pct_cols=["infra_pct_of_tco"],
         rename={
@@ -141,9 +140,8 @@ def _eks_clusters(month: str) -> None:
     if eks.empty:
         st.info("No EKS cluster rows for this month.")
         return
-    shadcn_table(
+    html_table(
         eks,
-        key="tco_eks",
         money_cols=["control_plane_cost", "node_ec2_cost", "node_ebs_cost", "eks_tco"],
         int_cols=["nodes_attributed"],
         rename={
