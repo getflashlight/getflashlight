@@ -1,10 +1,9 @@
 """TCO overview — Databricks DBU + attributed AWS infra, plus the honest
 unattributed bucket. The product's headline view.
 
-Layout mirrors the original Grafana ``tco_overview`` board (recovered from git
-history): TCO stats, then one dense scroll — the monthly DBU/infra breakdown
-beside a by-service-category donut, a daily provider trend, and the per-cluster
-Databricks + EKS TCO tables.
+Reads the cross-provider ``shared.*`` TCO group only — per-provider spend lives on
+each provider's own page. Layout: TCO stats, the monthly DBU/infra breakdown, then
+the per-cluster Databricks + EKS TCO tables.
 """
 
 from __future__ import annotations
@@ -15,7 +14,6 @@ import streamlit as st
 
 from auralake.dashboard.data import gold_df, has_data
 from auralake.dashboard.theme import (
-    PALETTE,
     compact_money,
     kpi_cards,
     month_filter,
@@ -46,7 +44,7 @@ def render() -> None:
         st.info("No data yet — run `auralake ingest` to load billing.")
         return
 
-    summary = gold_df("SELECT * FROM gold.tco_summary_month ORDER BY charge_month")
+    summary = gold_df("SELECT * FROM shared.tco_summary_month ORDER BY charge_month")
     if summary.empty:
         st.info("No TCO rows — needs Databricks + AWS data to attribute.")
         return
@@ -76,70 +74,32 @@ def render() -> None:
 
 
 def _breakdown(summary: pd.DataFrame) -> None:
-    left, right = st.columns(2)
-    with left:
-        melted = summary.melt(
-            id_vars="charge_month",
-            value_vars=list(_COMPONENT_LABELS),
-            var_name="component",
-            value_name="cost",
-        )
-        melted["component"] = melted["component"].map(_COMPONENT_LABELS)
-        melted["month"] = pd.to_datetime(melted["charge_month"]).dt.strftime("%Y-%m")
-        plotly(
-            style_fig(
-                px.bar(
-                    melted,
-                    x="month",
-                    y="cost",
-                    color="component",
-                    color_discrete_map=_COMPONENT_COLORS,
-                    category_orders={"component": list(_COMPONENT_COLORS)},
-                    labels={"month": "", "cost": "Cost", "component": ""},
-                )
-            ),
-            title="Monthly TCO — DBU vs attributed vs unattributed",
-            key="tco_breakdown",
-        )
-    with right:
-        cats = gold_df(
-            "SELECT service_category, SUM(net_cost) AS net_cost FROM gold.spend_by_service_month "
-            "GROUP BY service_category ORDER BY net_cost DESC"
-        )
-        if cats.empty:
-            st.info("No service-category rows.")
-        else:
-            fig = px.pie(
-                cats,
-                names="service_category",
-                values="net_cost",
-                hole=0.55,
-                color_discrete_sequence=PALETTE,
-            )
-            fig.update_traces(textposition="inside", textinfo="percent")
-            plotly(
-                style_fig(fig, currency_axis=None),
-                title="Spend by service category (all time)",
-                key="tco_pie",
-            )
-
-    daily = gold_df(
-        "SELECT charge_day, provider_name, net_cost FROM gold.spend_trend_daily ORDER BY charge_day"
+    # The monthly DBU vs attributed vs unattributed stack, straight from the shared
+    # TCO summary. Per-provider spend lives on each provider's own page now, so this
+    # page stays focused on the cross-provider TCO numbers.
+    melted = summary.melt(
+        id_vars="charge_month",
+        value_vars=list(_COMPONENT_LABELS),
+        var_name="component",
+        value_name="cost",
     )
-    if not daily.empty:
-        plotly(
-            style_fig(
-                px.line(
-                    daily,
-                    x="charge_day",
-                    y="net_cost",
-                    color="provider_name",
-                    labels={"charge_day": "", "net_cost": "Net cost", "provider_name": ""},
-                )
-            ),
-            title="Daily spend trend by provider",
-            key="tco_daily",
-        )
+    melted["component"] = melted["component"].map(_COMPONENT_LABELS)
+    melted["month"] = pd.to_datetime(melted["charge_month"]).dt.strftime("%Y-%m")
+    plotly(
+        style_fig(
+            px.bar(
+                melted,
+                x="month",
+                y="cost",
+                color="component",
+                color_discrete_map=_COMPONENT_COLORS,
+                category_orders={"component": list(_COMPONENT_COLORS)},
+                labels={"month": "", "cost": "Cost", "component": ""},
+            )
+        ),
+        title="Monthly TCO — DBU vs attributed vs unattributed",
+        key="tco_breakdown",
+    )
 
 
 def _databricks_clusters(month: str) -> None:
@@ -147,7 +107,7 @@ def _databricks_clusters(month: str) -> None:
     st.caption(f"Per-cluster DBU + attributed infra · {month}")
     clusters = gold_df(
         "SELECT cluster_id, compute_class, tco_basis, dbu_cost, infra_cost, tco_cost, "
-        f"infra_pct_of_tco FROM gold.tco_by_cluster_month WHERE charge_month = '{month}' "
+        f"infra_pct_of_tco FROM shared.tco_by_cluster_month WHERE charge_month = '{month}' "
         "ORDER BY tco_cost DESC"
     )
     if clusters.empty:
@@ -175,7 +135,7 @@ def _eks_clusters(month: str) -> None:
     st.caption(f"Per-cluster control plane + node TCO · {month}")
     eks = gold_df(
         "SELECT cluster_name, control_plane_cost, node_ec2_cost, node_ebs_cost, "
-        f"eks_tco, nodes_attributed FROM gold.tco_eks_by_cluster_month "
+        f"eks_tco, nodes_attributed FROM shared.tco_eks_by_cluster_month "
         f"WHERE charge_month = '{month}' ORDER BY eks_tco DESC"
     )
     if eks.empty:

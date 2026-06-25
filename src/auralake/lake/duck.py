@@ -6,8 +6,9 @@ throwaway in-memory DuckDB, then registers the lake relations it needs:
 * :func:`register_bronze` exposes ``raw.focus_record`` over the partitioned BRONZE
   Parquet (with a typed empty fallback before the first ingest), for the transform
   to build SILVER/GOLD from.
-* :func:`register_gold` exposes ``gold.<view>`` over each published GOLD Parquet,
-  for the read surface (MCP, dashboard) to query.
+* :func:`register_gold` exposes ``<group>.<view>`` over each published GOLD Parquet
+  (a schema per provider group, plus ``shared``), for the read surface (MCP,
+  dashboard) to query.
 
 DuckDB is just the compute engine here — it owns no files on disk, so any number
 of these connections can run concurrently against the same immutable Parquet.
@@ -51,15 +52,20 @@ def register_bronze(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def register_gold(con: duckdb.DuckDBPyConnection) -> None:
-    """Expose each published GOLD Parquet as a ``gold.<view>`` view.
+    """Expose published GOLD Parquet as ``<group>.<view>`` views, one schema per group.
 
-    Only files that exist are registered; before the first transform the schema is
-    simply empty and queries against a missing view surface as 'unknown view'.
+    GOLD is laid out ``gold/<group>/<view>.parquet`` (a group per provider, plus
+    ``shared`` for TCO); each group dir becomes a DuckDB schema. Only files that
+    exist are registered; before the first transform there are no group dirs, so
+    queries against a missing view surface as 'unknown view'.
     """
-    con.execute("CREATE SCHEMA IF NOT EXISTS gold")
-    for parquet in sorted(paths.gold_dir().glob("*.parquet")):
-        view = parquet.stem
-        path = str(parquet).replace("'", "''")
-        con.execute(
-            f"CREATE OR REPLACE VIEW gold.\"{view}\" AS SELECT * FROM read_parquet('{path}')"
-        )
+    for group_dir in sorted(p for p in paths.gold_dir().glob("*") if p.is_dir()):
+        group = group_dir.name
+        con.execute(f'CREATE SCHEMA IF NOT EXISTS "{group}"')
+        for parquet in sorted(group_dir.glob("*.parquet")):
+            view = parquet.stem
+            path = str(parquet).replace("'", "''")
+            con.execute(
+                f'CREATE OR REPLACE VIEW "{group}"."{view}" '
+                f"AS SELECT * FROM read_parquet('{path}')"
+            )

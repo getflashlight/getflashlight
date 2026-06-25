@@ -1,6 +1,6 @@
 """Dashboard data access — GOLD Parquet → pandas, cached on the GOLD file set.
 
-Queries run through a throwaway in-memory DuckDB with ``gold.<view>`` registered
+Queries run through a throwaway in-memory DuckDB with ``<group>.<view>`` registered
 (:func:`auralake.lake.duck.register_gold`). Results are cached by Streamlit keyed
 on the SQL plus a signature of the GOLD files' mtimes, so a new ``auralake
 ingest`` publish transparently invalidates the cache.
@@ -15,16 +15,19 @@ from auralake.lake import duck, paths
 
 
 def _signature() -> tuple[tuple[str, int], ...]:
+    # Keyed on the path relative to gold/ so two groups' same-named files don't collide.
+    gold = paths.gold_dir()
     return tuple(
         sorted(
-            (p.name, p.stat().st_mtime_ns) for p in paths.gold_dir().glob("*.parquet")
+            (p.relative_to(gold).as_posix(), p.stat().st_mtime_ns)
+            for p in gold.glob("*/*.parquet")
         )
     )
 
 
 def has_data() -> bool:
     """True once at least one GOLD view has been published."""
-    return any(paths.gold_dir().glob("*.parquet"))
+    return any(paths.gold_dir().glob("*/*.parquet"))
 
 
 @st.cache_data(show_spinner=False)

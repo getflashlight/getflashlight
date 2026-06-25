@@ -2,9 +2,11 @@
 
 Backs ``auralake transform`` and the tail of ``auralake ingest``. One in-memory
 DuckDB reads the BRONZE Parquet as ``raw.focus_record``, applies the SILVER and
-GOLD view SQL (``sql/*.sql``), then materializes each GOLD view to a zstd Parquet
-file via ``COPY``. The files are written to a staging dir and swapped into ``gold/``
-atomically per file (:func:`auralake.lake.publish.atomic_publish`).
+GOLD view SQL (``sql/*.sql``), then materializes GOLD **per provider**: each
+provider-scoped view is sliced by ``provider_name`` into
+``gold/<group>/<view>.parquet`` and the cross-provider TCO views into
+``gold/shared/``. The files are written to a staging tree and swapped into
+``gold/`` atomically per file (:func:`auralake.lake.publish.atomic_publish`).
 
 SILVER is never persisted — it lives only as views inside this connection. GOLD
 matviews + ``REFRESH … CONCURRENTLY`` are gone: a full rebuild via ``COPY`` is the
@@ -16,11 +18,18 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import duckdb
+
 from auralake.core.logging import get_logger
 from auralake.core.settings import get_settings
 from auralake.lake import duck, paths
 from auralake.lake.publish import atomic_publish
-from auralake.transform.catalog import CATALOG
+from auralake.transform.catalog import (
+    PROVIDER_BASE_VIEWS,
+    SHARED_BASE_VIEWS,
+    SHARED_GROUP,
+    provider_group,
+)
 
 logger = get_logger(__name__)
 
@@ -50,8 +59,33 @@ def _gold_copy_options() -> str:
     return ", ".join(opts)
 
 
+def _sql_quote(value: str) -> str:
+    """Escape a string for inlining as a single-quoted SQL literal."""
+    return value.replace("'", "''")
+
+
+def _discover_providers(con: duckdb.DuckDBPyConnection) -> list[str]:
+    """Distinct, non-empty ``provider_name`` values present in SILVER.
+
+    The set of provider groups GOLD fans out into is data-driven — whatever
+    providers actually appear — so a new provider needs no code change.
+    """
+    rows = con.execute(
+        "SELECT DISTINCT provider_name FROM silver.focus_normalized "
+        "WHERE provider_name IS NOT NULL AND provider_name <> '' "
+        "ORDER BY provider_name"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def build_gold() -> int:
-    """Rebuild SILVER (in-memory) and GOLD (Parquet) from BRONZE. Returns views published."""
+    """Rebuild SILVER (in-memory) and GOLD (Parquet) from BRONZE. Returns files published.
+
+    GOLD is materialized per provider: each provider-scoped view is sliced by
+    ``provider_name`` into ``gold/<group>/<view>.parquet`` (one group per provider),
+    and the cross-provider TCO views go into ``gold/shared/``. The in-memory
+    ``gold.<view>`` SQL is the shared source for the per-provider COPY slices.
+    """
     con = duck.connect()
     try:
         con.execute("CREATE SCHEMA IF NOT EXISTS silver")
@@ -65,19 +99,37 @@ def build_gold() -> int:
 
         staging = paths.gold_staging_dir()
         shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir(parents=True, exist_ok=True)
         options = _gold_copy_options()
-        for view in CATALOG:
-            short = view.name.removeprefix("gold.")
-            target = staging / f"{short}.parquet"
+        published = 0
+
+        # Per-provider groups: slice each provider-scoped view by provider_name.
+        for provider in _discover_providers(con):
+            group = provider_group(provider)
+            group_dir = staging / group
+            group_dir.mkdir(parents=True, exist_ok=True)
+            for spec in PROVIDER_BASE_VIEWS:
+                target = group_dir / f"{spec.view}.parquet"
+                con.execute(
+                    f'COPY (SELECT * FROM gold."{spec.view}" '  # noqa: S608
+                    f"WHERE provider_name = '{_sql_quote(provider)}') "
+                    f"TO '{target}' ({options})"
+                )
+                published += 1
+
+        # Shared/TCO group: cross-provider, unfiltered.
+        shared_dir = staging / SHARED_GROUP
+        shared_dir.mkdir(parents=True, exist_ok=True)
+        for spec in SHARED_BASE_VIEWS:
+            target = shared_dir / f"{spec.view}.parquet"
             con.execute(
-                f'COPY (SELECT * FROM gold."{short}") TO \'{target}\' ({options})'  # noqa: S608
+                f'COPY (SELECT * FROM gold."{spec.view}") TO \'{target}\' ({options})'  # noqa: S608
             )
+            published += 1
     finally:
         con.close()
 
-    published = atomic_publish(paths.gold_staging_dir(), paths.gold_dir())
-    logger.info("gold_built", views=published)
+    atomic_publish(paths.gold_staging_dir(), paths.gold_dir())
+    logger.info("gold_built", files=published)
     return published
 
 

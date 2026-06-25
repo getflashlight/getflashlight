@@ -46,16 +46,20 @@ def test_seed_maps_and_builds_gold(lake_home, tmp_path) -> None:  # type: ignore
 
     build_gold()
 
-    bill = {r["provider_name"] for r in query_view("gold.monthly_bill")}
-    assert {"AWS", "Microsoft"} <= bill
+    # Each provider gets its own GOLD group, discovered from the data (note "Microsoft"
+    # isn't even in the ProviderName enum — discovery is data-driven, not enum-driven).
+    from auralake.transform.catalog import discover_provider_groups
+
+    assert set(discover_provider_groups()) == {"aws", "microsoft"}
+    assert {r["provider_name"] for r in query_view("aws.monthly_bill")} == {"AWS"}
+    assert {r["provider_name"] for r in query_view("microsoft.monthly_bill")} == {"Microsoft"}
 
     # Out-of-vocab ServiceCategory ("Bogus") coerces to "Other", mirroring _coerce.
-    services = query_view("gold.spend_by_service_month")
-    microsoft = [r for r in services if r["provider_name"] == "Microsoft"]
-    assert microsoft and microsoft[0]["service_category"] == "Other"
+    services = query_view("microsoft.spend_by_service_month")
+    assert services and services[0]["service_category"] == "Other"
 
-    # Tags JSON exploded set-based.
-    tags = {(r["tag_key"], r["tag_value"]) for r in query_view("gold.spend_by_tag_month")}
+    # Tags JSON exploded set-based (the team tag is on the AWS row).
+    tags = {(r["tag_key"], r["tag_value"]) for r in query_view("aws.spend_by_tag_month")}
     assert ("team", "data") in tags
 
 
@@ -98,10 +102,11 @@ def test_sample_cleanup_removes_all_data(lake_home, tmp_path) -> None:  # type: 
     assert not bronze_part.exists()
     assert not cached.exists()
     assert not run_file.exists()
-    # GOLD is rebuilt and the sample's spend is gone.
-    from auralake.gold.reader import query_view
+    # GOLD is rebuilt from now-empty BRONZE, so no provider groups remain (the
+    # sample's spend is gone); only the empty shared/ TCO group is left.
+    from auralake.transform.catalog import discover_provider_groups
 
-    assert query_view("gold.monthly_bill") == []
+    assert discover_provider_groups() == []
 
     # Idempotent: a second cleanup with nothing to remove is a no-op, not an error.
     cleanup()

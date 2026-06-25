@@ -13,6 +13,8 @@ from auralake.gold.reader import QueryError, run_select
         "SELECT * FROM raw.focus_record",
         "SELECT * FROM meta.ingest_run",
         "INSERT INTO gold.x VALUES (1)",
+        # The old flat `gold.` schema is gone — reject it with a clear pointer.
+        "SELECT * FROM gold.monthly_bill",
     ],
 )
 def test_run_select_rejects_unsafe(sql: str) -> None:

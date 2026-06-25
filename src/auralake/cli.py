@@ -118,11 +118,11 @@ def ingest(
             no_transform=no_transform,
         )
     except IngestError as exc:
-        # Some connectors failed (the rest still ingested and GOLD was rebuilt).
+        # Fail-fast: a connector failed, so the run aborted before rebuilding GOLD.
         # Report which, and exit non-zero so scripts/CI see the failure.
         typer.secho(
-            f"Ingest finished with failures: {', '.join(exc.failed)} "
-            f"(see the logs above; other connectors and GOLD were updated).",
+            f"Ingest aborted — connector failed: {', '.join(exc.failed)} "
+            f"(see the logs above; GOLD was not rebuilt).",
             fg=typer.colors.RED,
             err=True,
         )

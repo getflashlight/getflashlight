@@ -1,10 +1,12 @@
 """Atomic GOLD publish.
 
-A transform builds the new GOLD into a staging directory, then this swaps each
-file into place with :func:`os.replace` — atomic per file on POSIX and Windows —
-so a reader mid-query never sees a half-written ``<view>.parquet``. Cross-file
-atomicity isn't needed: dashboards tolerate one view updating a beat before
-another, and the next read reconciles.
+A transform builds the new GOLD into a staging tree (``<group>/<view>.parquet``,
+one group per provider plus ``shared``), then this swaps each file into place with
+:func:`os.replace` — atomic per file on POSIX and Windows — so a reader mid-query
+never sees a half-written ``<view>.parquet``. Cross-file atomicity isn't needed:
+dashboards tolerate one view updating a beat before another, and the next read
+reconciles. Group dirs present in ``gold/`` but absent from staging (a provider that
+dropped out of the data) are pruned so the published set always matches the data.
 
 Readers query GOLD via DuckDB's lazy ``read_parquet`` (see
 :func:`auralake.lake.duck.register_gold`), so the file handle is held only for a
@@ -45,17 +47,30 @@ def _replace_with_retry(src: Path, dst: Path) -> None:
 
 
 def atomic_publish(staging: Path, target: Path) -> int:
-    """Move every ``*.parquet`` from *staging* onto *target*, atomically per file.
+    """Move every ``<group>/*.parquet`` from *staging* onto *target*, atomically per file.
 
-    Returns the number of files published. The staging directory is removed
-    afterwards. Files in *target* with no staged counterpart are left untouched
-    (the catalog rebuilds every view each run, so they're always replaced).
+    Returns the number of files published. Each file is swapped into
+    ``target/<group>/<view>.parquet`` (the group dir is created on first publish).
+    Group dirs in *target* with no staged counterpart are pruned, so a provider that
+    dropped out of the data loses its GOLD. The staging tree is removed afterwards.
     """
     target.mkdir(parents=True, exist_ok=True)
+    staged_groups: set[str] = set()
     published = 0
-    for parquet in sorted(staging.glob("*.parquet")):
-        _replace_with_retry(parquet, target / parquet.name)
+    for parquet in sorted(staging.glob("*/*.parquet")):
+        rel = parquet.relative_to(staging)  # e.g. aws/monthly_bill.parquet
+        staged_groups.add(rel.parts[0])
+        dest = target / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _replace_with_retry(parquet, dest)
         published += 1
-        logger.info("gold_published", view=parquet.stem)
+        logger.info("gold_published", group=rel.parts[0], view=parquet.stem)
+
+    # Prune group dirs that are no longer produced (provider gone from the data).
+    for group_dir in target.iterdir():
+        if group_dir.is_dir() and group_dir.name not in staged_groups:
+            shutil.rmtree(group_dir, ignore_errors=True)
+            logger.info("gold_group_pruned", group=group_dir.name)
+
     shutil.rmtree(staging, ignore_errors=True)
     return published

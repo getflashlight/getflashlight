@@ -64,10 +64,13 @@ uv run ruff check src tests && uv run mypy src tests && uv run pytest
   Writes are zstd (`AURALAKE_PARQUET_COMPRESSION*`).
 - **`transform/`** — `sql/` holds the SILVER/GOLD views (the metrics contract, in
   DuckDB SQL); `runner.py` (`build_gold`) reads BRONZE Parquet, applies the views
-  in-memory, and materializes each GOLD view to a zstd Parquet file via `COPY` (the
-  refresh — no matviews). `catalog.py` describes the GOLD views for consumers.
+  in-memory, then materializes GOLD **per provider** — slicing each provider-scoped
+  view by `provider_name` into `gold/<group>/<view>.parquet` via `COPY`, and the TCO
+  views into `gold/shared/` (the refresh — no matviews). `catalog.py` is the
+  group-aware, data-driven description of the GOLD views for consumers.
 - **`gold/`** — `reader.py`, the one read surface shared by MCP and the dashboard:
-  cached in-memory DuckDB over `gold/*.parquet`, with the ad-hoc-SELECT guard rails.
+  cached in-memory DuckDB over `gold/<group>/*.parquet`, with the ad-hoc-SELECT guard
+  rails.
 - **`mcp/`** — FastMCP server (`auralake mcp serve`) exposing the GOLD views to
   agents. **`dashboard/`** — the Streamlit app (`auralake dashboard serve`), pages in
   `views/`, reading GOLD via `gold/reader.py`. Both are read-only consumers of GOLD.
@@ -75,8 +78,16 @@ uv run ruff check src tests && uv run mypy src tests && uv run pytest
 ## Key invariants (do not violate)
 
 - **GOLD is the only consumer surface.** The Streamlit dashboard and MCP read the
-  published `gold/*.parquet` (registered as `gold.*`), never raw/silver — so charts
-  and agents always agree.
+  published `gold/<group>/*.parquet`, never raw/silver — so charts and agents always
+  agree.
+- **GOLD is split per provider.** Each distinct `provider_name` present in the data
+  gets its own group — a `gold/<group>/` dir registered as the DuckDB schema
+  `<group>.<view>` (e.g. `aws.monthly_bill`, `databricks.monthly_bill`) — plus a
+  fixed `shared` group for the cross-provider TCO views (`shared.tco_*`). Groups are
+  **data-driven** (discovered from `provider_name`, not a hard-coded list), and
+  `build_gold` fans the in-memory `gold.<view>` SQL out per provider at COPY time;
+  publish prunes a group whose provider dropped out of the data. Each provider gets
+  its own dashboard page; TCO is its own page. See `transform/catalog.py`.
 - **One cost metric per aggregation.** Canonical is `EffectiveCost` (mapped to
   `cost` in SILVER). Never sum across FOCUS cost columns.
 - **Charge-period grain only** when aggregating; never the billing period.

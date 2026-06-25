@@ -1,7 +1,8 @@
 """Read-only queries over the published GOLD Parquet.
 
 Shared by the MCP server and the dashboard. A single cached in-memory DuckDB
-registers ``gold.<view>`` over each ``gold/*.parquet`` (see
+registers ``<group>.<view>`` over each ``gold/<group>/<view>.parquet`` — a schema
+per provider group, plus ``shared`` for TCO (see
 :func:`auralake.lake.duck.register_gold`); the connection is rebuilt whenever a
 publish changes the GOLD files, so reads are always fresh. Only GOLD is
 registered, so raw/silver are simply not reachable.
@@ -19,7 +20,7 @@ import duckdb
 
 from auralake.core.exceptions import AuraLakeError
 from auralake.lake import duck, paths
-from auralake.transform.catalog import CATALOG_BY_NAME
+from auralake.transform.catalog import current_catalog_by_name, discover_provider_groups
 
 MAX_LIMIT = 10_000
 
@@ -33,10 +34,17 @@ class QueryError(AuraLakeError):
 
 
 def _gold_signature() -> tuple[tuple[str, int], ...]:
-    """Identity of the current GOLD files — rebuild the connection when it changes."""
+    """Identity of the current GOLD files — rebuild the connection when it changes.
+
+    Keyed on the path relative to ``gold/`` so two groups' identically-named files
+    (e.g. ``aws/monthly_bill.parquet`` and ``databricks/monthly_bill.parquet``)
+    don't collide in the signature.
+    """
+    gold = paths.gold_dir()
     return tuple(
         sorted(
-            (p.name, p.stat().st_mtime_ns) for p in paths.gold_dir().glob("*.parquet")
+            (p.relative_to(gold).as_posix(), p.stat().st_mtime_ns)
+            for p in gold.glob("*/*.parquet")
         )
     )
 
@@ -79,7 +87,7 @@ def query_view(
     descending: bool = False,
 ) -> list[dict[str, Any]]:
     """Return rows from a catalogued GOLD view. Only known views are allowed."""
-    view = CATALOG_BY_NAME.get(view_name)
+    view = current_catalog_by_name().get(view_name)
     if view is None:
         raise QueryError(f"Unknown metric view: {view_name}")
 
@@ -105,9 +113,12 @@ def run_select(sql: str, limit: int = 1000) -> list[dict[str, Any]]:
     forbidden = ("insert", "update", "delete", "drop", "alter", "create", "grant", "truncate")
     if any(re.search(rf"\b{kw}\b", lowered) for kw in forbidden):
         raise QueryError("Mutating keywords are not permitted")
-    # Only GOLD is registered; reject explicit raw/silver/meta references for a clear error.
-    for schema in re.findall(r"\b(raw|silver|meta)\.", lowered):
-        raise QueryError(f"Schema {schema!r} is not queryable; use gold.* views")
+    # Only the published GOLD groups are registered; reject raw/silver/meta (and the
+    # old flat `gold.` schema) with a clear pointer to the per-provider schemas.
+    for schema in re.findall(r"\b(raw|silver|meta|gold)\.", lowered):
+        groups = discover_provider_groups() or ["<provider>"]
+        hint = ", ".join(f"{g}.*" for g in [*groups, "shared"])
+        raise QueryError(f"Schema {schema!r} is not queryable; use the metric schemas ({hint})")
 
     limit = max(1, min(limit, MAX_LIMIT))
     wrapped = f"SELECT * FROM ({cleaned}) AS _q LIMIT {limit}"  # noqa: S608 - validated above

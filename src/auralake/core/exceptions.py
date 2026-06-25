@@ -24,11 +24,11 @@ class FocusValidationError(AuraLakeError):
 
 
 class IngestError(AuraLakeError):
-    """Raised when one or more connectors failed during an ingest run.
+    """Raised when a connector fails during an ingest run.
 
-    Per-connector failures are isolated (the others still ingest and GOLD still
-    rebuilds), but the run as a whole is not a success — this carries the failed
-    connector names so the CLI can report them and exit non-zero.
+    Ingest is fail-fast: the first failure aborts the run before the remaining
+    connectors run and before GOLD is rebuilt. Carries the failed connector
+    name(s) so the CLI can report them and exit non-zero.
     """
 
     def __init__(self, failed: list[str]) -> None:

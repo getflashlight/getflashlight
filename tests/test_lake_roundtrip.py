@@ -97,10 +97,21 @@ def test_transform_builds_gold_with_tco(lake_home) -> None:  # type: ignore[no-u
     published = build_gold()
     assert published > 0
 
-    bill = query_view("gold.monthly_bill")
-    assert bill, "monthly_bill should have rows"
+    # GOLD is split per provider on disk: gold/<group>/<view>.parquet, + shared/ TCO.
+    from auralake.lake import paths
 
-    tco = query_view("gold.tco_summary_month")
+    gold = paths.gold_dir()
+    assert (gold / "aws" / "monthly_bill.parquet").exists()
+    assert (gold / "databricks" / "monthly_bill.parquet").exists()
+    assert (gold / "shared" / "tco_summary_month.parquet").exists()
+
+    # Per-provider files are pre-sliced: every row carries that provider.
+    aws_bill = query_view("aws.monthly_bill")
+    assert aws_bill, "aws.monthly_bill should have rows"
+    assert {r["provider_name"] for r in aws_bill} == {"AWS"}
+    assert {r["provider_name"] for r in query_view("databricks.monthly_bill")} == {"Databricks"}
+
+    tco = query_view("shared.tco_summary_month")
     assert tco, "tco_summary_month should have rows"
     row = tco[0]
     assert row["dbu_cost"] == pytest.approx(40.0)
@@ -120,7 +131,7 @@ def test_tag_explosion(lake_home) -> None:  # type: ignore[no-untyped-def]
     bronze.write_window("t", _WINDOW, records, ingest_run_id="r1")
     build_gold()
 
-    rows = query_view("gold.spend_by_tag_month")
+    rows = query_view("aws.spend_by_tag_month")
     pairs = {(r["tag_key"], r["tag_value"]) for r in rows}
     assert ("team", "data") in pairs
     assert ("env", "prod") in pairs
