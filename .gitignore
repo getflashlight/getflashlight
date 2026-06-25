@@ -1,22 +1,33 @@
+# Python bytecode / build artifacts
 __pycache__/
 *.py[cod]
 *$py.class
-*.egg-info/
-dist/
-build/
-.eggs/
 *.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments (uv manages .venv)
 .venv/
 venv/
-.env
-*.db
-*.sqlite3
+
+# Tool caches
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
-htmlcov/
 .coverage
+htmlcov/
+
+# local operator config (commit the *.example.* templates instead)
+.env
+config/connections.yml
+
+# Lake data — billing Parquet must never be committed
+*.parquet
+
+# Logs
 *.log
-uv.lock
-node_modules/
-.next/
+
+# OS cruft
+.DS_Store
