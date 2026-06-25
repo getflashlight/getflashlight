@@ -88,6 +88,37 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
         measures=("net_cost", "gross_cost", "consumed_quantity"),
     ),
     ViewSpec(
+        view="resource_month",
+        title="Spend by resource / month",
+        description="Finest consumer grain: net spend and consumed quantity per (SKU, resource, "
+        "resource_type, workspace, region), by month — drives the SKU→resource drill-down "
+        "(e.g. which SQL warehouse moved). consumed_quantity is the billable usage unit "
+        "(e.g. DBUs), not an operation/query count.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=(
+            "provider_name",
+            "service_name",
+            "sku_id",
+            "resource_type",
+            "resource_id",
+            "resource_name",
+            "sub_account_id",
+            "region_id",
+            "charge_month",
+        ),
+        measures=("net_cost", "consumed_quantity"),
+    ),
+    ViewSpec(
+        view="spend_by_sku_tag_month",
+        title="Spend by SKU × tag / month",
+        description="Net spend per (SKU, cost-allocation tag key/value), by month — attributes a "
+        "SKU's spend to a project/team tag. Untagged spend is absent; reconcile against "
+        "spend_by_sku_month for the unattributed remainder.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=("provider_name", "sku_id", "tag_key", "tag_value", "charge_month"),
+        measures=("net_cost",),
+    ),
+    ViewSpec(
         view="spend_by_workspace_month",
         title="Spend by workspace / month",
         description="Net/gross spend per workspace (sub-account), by month.",

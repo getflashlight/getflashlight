@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from datetime import date
+from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -96,11 +97,32 @@ def compact_money(v: float) -> str:
     return f"${v:,.0f}"
 
 
-def plotly(fig: go.Figure, *, title: str | None = None, key: str | None = None) -> None:
-    """Render a styled figure (optional title above it), modebar hidden, stretched."""
+def plotly(
+    fig: go.Figure,
+    *,
+    title: str | None = None,
+    key: str | None = None,
+    on_select: bool = False,
+) -> Any:
+    """Render a styled figure (optional title above it), modebar hidden, stretched.
+
+    With ``on_select`` the chart becomes click-selectable (point selection) and the
+    Streamlit selection event is returned so the caller can drive a drill-down;
+    otherwise nothing is returned. ``on_select`` requires ``key``.
+    """
     if title:
         section_title(title)
+    if on_select:
+        return st.plotly_chart(
+            fig,
+            width="stretch",
+            config={"displayModeBar": False},
+            key=key,
+            on_select="rerun",
+            selection_mode="points",
+        )
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False}, key=key)
+    return None
 
 
 # ---------------------------------------------------------------------------

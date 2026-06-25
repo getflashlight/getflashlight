@@ -60,6 +60,53 @@ FROM silver.focus_normalized
 GROUP BY provider_name, service_name, coalesce(sku_id, '(unknown)'), charge_month;
 
 
+-- ── "Where exactly inside a SKU did the money land?" — resource-grain drill ──────
+-- The finest consumer-facing grain: one row per (SKU, resource, resource_type,
+-- workspace, region, month). Drives the dashboard drill-down from a SKU into the
+-- individual resources moving its cost — e.g. a specific SQL warehouse. Carries
+-- consumed_quantity so a mover can be read as *more usage* vs *higher rate*.
+-- NOTE: consumed_quantity is the billable usage unit (DBUs for Databricks), NOT an
+-- operation/query count — this billing data carries no operation counts.
+CREATE OR REPLACE VIEW gold.resource_month AS
+SELECT
+    provider_name,
+    service_name,
+    coalesce(sku_id, '(unknown)')                        AS sku_id,
+    coalesce(resource_type, '(none)')                    AS resource_type,
+    coalesce(resource_id, '(none)')                      AS resource_id,
+    coalesce(resource_name, resource_id, '(unattributed)') AS resource_name,
+    coalesce(sub_account_id, '(none)')                   AS sub_account_id,
+    coalesce(region_id, '(none)')                        AS region_id,
+    charge_month,
+    sum(cost)                                            AS net_cost,
+    sum(consumed_quantity)                               AS consumed_quantity,
+    max(consumed_unit)                                   AS consumed_unit,
+    bool_or(is_partial_period)                           AS is_partial_period
+FROM silver.focus_normalized
+GROUP BY provider_name, service_name, coalesce(sku_id, '(unknown)'),
+         coalesce(resource_type, '(none)'), coalesce(resource_id, '(none)'),
+         coalesce(resource_name, resource_id, '(unattributed)'),
+         coalesce(sub_account_id, '(none)'), coalesce(region_id, '(none)'), charge_month;
+
+
+-- ── "Which project/team does a SKU's spend belong to?" — SKU × tag drill ─────────
+-- Crosses SKU with each cost-allocation tag so a SKU's movement can be attributed to
+-- a project/team. Untagged spend is absent here by construction (rows with no tags
+-- produce no tag row); the dashboard reconciles against spend_by_sku_month to surface
+-- the unattributed remainder (attribution honesty — never silently dropped).
+CREATE OR REPLACE VIEW gold.spend_by_sku_tag_month AS
+SELECT
+    f.provider_name,
+    coalesce(f.sku_id, '(unknown)')                      AS sku_id,
+    t.tag_key                                            AS tag_key,
+    json_extract_string(f.tags, '$."' || t.tag_key || '"') AS tag_value,
+    f.charge_month,
+    sum(f.cost)                                          AS net_cost
+FROM silver.focus_normalized f
+CROSS JOIN unnest(json_keys(f.tags)) AS t(tag_key)
+GROUP BY f.provider_name, coalesce(f.sku_id, '(unknown)'), t.tag_key, tag_value, f.charge_month;
+
+
 -- ── "Where is the money going?" — by workspace / sub-account ─────────────────────
 CREATE OR REPLACE VIEW gold.spend_by_workspace_month AS
 SELECT
