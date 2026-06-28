@@ -1,9 +1,8 @@
 """Streamlit entry script — run via ``auralake dashboard serve`` (see launch.py).
 
-Navigation is built at runtime: one page per published provider group (AWS,
-Databricks, …) rendered by :mod:`auralake.dashboard.views.provider_focus`, plus a
-TCO page for the cross-provider ``shared`` group. The provider set is discovered
-from what's on disk, so a newly-ingested provider appears as its own page with no
+Navigation is built at runtime: a Home overview, the cross-provider TCO page,
+then one page per published provider group (AWS, Databricks, …). The provider set
+is discovered from what's on disk, so a newly-ingested provider appears with no
 code change.
 """
 
@@ -13,42 +12,65 @@ from functools import partial
 
 import streamlit as st
 
-from auralake.dashboard.data import gold_df, has_data
+from auralake.dashboard.context import init_global_range
+from auralake.dashboard.data import NO_DATA_MSG, gold_last_updated, has_data, provider_label
 from auralake.dashboard.theme import inject_css
-from auralake.dashboard.views import provider_focus, tco_overview
+from auralake.dashboard.views import home_overview, provider_focus, tco_overview
 from auralake.transform.catalog import discover_provider_groups
 
 st.set_page_config(page_title="Auralake", page_icon="💧", layout="wide")
 inject_css()
 
-
-def _provider_label(group: str) -> str:
-    """Human label for a group — the provider_name in its data, else the titled slug."""
-    try:
-        df = gold_df(f'SELECT provider_name FROM "{group}".monthly_bill LIMIT 1')
-        if not df.empty and df["provider_name"].iloc[0]:
-            return str(df["provider_name"].iloc[0])
-    except Exception:  # noqa: BLE001 - fall back to a readable slug on any query issue
-        pass
-    return group.replace("_", " ").title()
-
-
 if not has_data():
     st.title("Auralake")
-    st.info("No data yet — run `auralake sample` or `auralake ingest`, then refresh.")
+    st.info(NO_DATA_MSG)
 else:
-    # One page per published provider group, then the cross-provider TCO page.
-    pages = [
+    st.sidebar.markdown("### Time range")
+    global_rng = init_global_range()
+    updated = gold_last_updated()
+    if updated:
+        st.sidebar.markdown(
+            f'<p class="aura-sidebar-meta">Data updated · {updated:%Y-%m-%d %H:%M} UTC</p>',
+            unsafe_allow_html=True,
+        )
+    if global_rng:
+        start, end = global_rng
+        st.sidebar.markdown(
+            f'<p class="aura-sidebar-meta">Viewing · {start:%b %d, %Y} → {end:%b %d, %Y}</p>',
+            unsafe_allow_html=True,
+        )
+
+    groups = discover_provider_groups()
+    provider_pages = [
         st.Page(
-            partial(provider_focus.render, group, _provider_label(group)),
-            title=_provider_label(group),
+            partial(provider_focus.render, group, provider_label(group)),
+            title=f"{provider_label(group)} spend",
             icon="☁️",
             url_path=group,
-            default=(i == 0),
         )
-        for i, group in enumerate(discover_provider_groups())
+        for group in groups
     ]
-    pages.append(
-        st.Page(tco_overview.render, title="TCO overview", icon="🧮", url_path="tco-overview")
+    provider_by_group = dict(zip(groups, provider_pages, strict=True))
+    tco_page = st.Page(
+        tco_overview.render,
+        title="Total cost (Databricks + AWS)",
+        icon="🧮",
+        url_path="tco-overview",
     )
+    pages = {
+        "Overview": [
+            st.Page(
+                partial(
+                    home_overview.render,
+                    tco_page=tco_page,
+                    provider_pages=provider_by_group,
+                ),
+                title="Home",
+                icon="🏠",
+                default=True,
+            ),
+            tco_page,
+        ],
+        "By provider": provider_pages,
+    }
     st.navigation(pages).run()

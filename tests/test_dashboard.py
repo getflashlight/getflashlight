@@ -63,4 +63,4 @@ def test_provider_page_renders_when_data_starts_midmonth(lake_home) -> None:  # 
 
     at = AppTest.from_file(app.__file__, default_timeout=30).run()
     assert not at.exception, f"dashboard raised: {at.exception}"
-    assert any("AWS" in t.value for t in at.title)
+    assert any("Cloud spend" in t.value for t in at.title)

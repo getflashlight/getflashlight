@@ -37,7 +37,6 @@ dashboard_app = typer.Typer(help="Streamlit dashboard for humans", no_args_is_he
 app.add_typer(aws_app, name="aws")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(dashboard_app, name="dashboard")
-app.add_typer(dashboard_app, name="grafana", hidden=True)  # familiar alias
 
 
 @app.callback()

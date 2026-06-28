@@ -33,25 +33,9 @@ class QueryError(AuraLakeError):
     """Raised when a query is rejected (unknown view, unsafe SQL, etc.)."""
 
 
-def _gold_signature() -> tuple[tuple[str, int], ...]:
-    """Identity of the current GOLD files — rebuild the connection when it changes.
-
-    Keyed on the path relative to ``gold/`` so two groups' identically-named files
-    (e.g. ``aws/monthly_bill.parquet`` and ``databricks/monthly_bill.parquet``)
-    don't collide in the signature.
-    """
-    gold = paths.gold_dir()
-    return tuple(
-        sorted(
-            (p.relative_to(gold).as_posix(), p.stat().st_mtime_ns)
-            for p in gold.glob("*/*.parquet")
-        )
-    )
-
-
 def _connection() -> duckdb.DuckDBPyConnection:
     global _conn, _signature
-    sig = _gold_signature()
+    sig = paths.gold_signature()
     if _conn is None or sig != _signature:
         if _conn is not None:
             _conn.close()

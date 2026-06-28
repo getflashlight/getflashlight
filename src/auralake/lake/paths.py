@@ -39,6 +39,22 @@ def gold_dir() -> Path:
     return home() / "gold"
 
 
+def gold_signature() -> tuple[tuple[str, int], ...]:
+    """Identity of the current GOLD files (relpath + mtime) — changes on every publish.
+
+    Keyed on the path relative to ``gold/`` so two groups' identically-named files
+    (e.g. ``aws/monthly_bill.parquet`` / ``databricks/monthly_bill.parquet``) don't
+    collide. Readers rebuild their cached connection when this changes.
+    """
+    gold = gold_dir()
+    return tuple(
+        sorted(
+            (p.relative_to(gold).as_posix(), p.stat().st_mtime_ns)
+            for p in gold.glob("*/*.parquet")
+        )
+    )
+
+
 def gold_staging_dir() -> Path:
     """Transient dir a transform builds GOLD into before the atomic publish swap."""
     return home() / "gold.staging"

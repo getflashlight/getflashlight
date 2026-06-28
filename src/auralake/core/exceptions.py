@@ -34,7 +34,3 @@ class IngestError(AuraLakeError):
     def __init__(self, failed: list[str]) -> None:
         self.failed = failed
         super().__init__(f"ingest failed for: {', '.join(failed)}")
-
-
-class DatabaseError(AuraLakeError):
-    """Raised for database connection or query failures."""

@@ -239,10 +239,6 @@ def build_catalog(provider_groups: Iterable[str]) -> tuple[GoldView, ...]:
     return tuple(views)
 
 
-def catalog_by_name(catalog: Iterable[GoldView]) -> dict[str, GoldView]:
-    return {v.name: v for v in catalog}
-
-
 def discover_provider_groups() -> list[str]:
     """The provider groups actually published under ``gold/`` (excludes ``shared``)."""
     gold = paths.gold_dir()
@@ -259,4 +255,4 @@ def current_catalog() -> tuple[GoldView, ...]:
 
 
 def current_catalog_by_name() -> dict[str, GoldView]:
-    return catalog_by_name(current_catalog())
+    return {v.name: v for v in current_catalog()}

@@ -6,7 +6,6 @@ from auralake.transform.catalog import (
     PROVIDER_BASE_VIEWS,
     SHARED_BASE_VIEWS,
     build_catalog,
-    catalog_by_name,
     provider_group,
 )
 
@@ -40,7 +39,7 @@ def test_name_property_and_relpath() -> None:
 
 def test_catalog_by_name_keys_unique() -> None:
     cat = build_catalog(["aws", "databricks", "microsoft"])
-    by_name = catalog_by_name(cat)
+    by_name = {v.name: v for v in cat}
     assert len(by_name) == len(cat)  # no collisions across groups
 
 

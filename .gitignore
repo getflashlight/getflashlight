@@ -31,3 +31,4 @@ config/connections.yml
 
 # OS cruft
 .DS_Store
+.cursor/mcp.json

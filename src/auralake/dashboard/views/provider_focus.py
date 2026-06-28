@@ -16,23 +16,27 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from auralake.dashboard.data import gold_df, has_data
+from auralake.dashboard.context import global_range, range_has_partial_month
+from auralake.dashboard.data import NO_DATA_MSG, gold_df, has_data
+from auralake.dashboard.data import to_date as _d
+from auralake.dashboard.summary import _service_movers, driver_dim, provider_spend_summary
 from auralake.dashboard.theme import (
-    PALETTE,
+    SEMANTIC,
     compact_money,
-    date_range,
+    delta_variant,
+    filterable_table,
     heatmap_table,
     html_table,
     kpi_cards,
+    panel,
     plotly,
+    provider_color,
+    rgba_hex,
+    section_caption,
+    section_subtitle,
+    section_title,
     style_fig,
 )
-
-
-def _d(value: object) -> date:
-    """Coerce a DuckDB/pandas date-ish scalar to a plain ``date``."""
-    ts = pd.Timestamp(value)
-    return date(ts.year, ts.month, ts.day)
 
 
 def _q(value: str) -> str:
@@ -42,42 +46,52 @@ def _q(value: str) -> str:
 
 def render(group: str, label: str) -> None:
     """Render the FOCUS spend page for one provider group (``group`` schema, ``label`` UI)."""
-    st.title(f"{label} FOCUS spend")
-    st.caption(f"{label} net cost over the chosen window and the SKUs driving it.")
+    st.title(f"{label} spend")
     if not has_data():
-        st.info("No data yet — run `auralake ingest` to load billing.")
+        st.info(NO_DATA_MSG)
         return
 
     bounds = gold_df(
         f'SELECT min(charge_day) AS lo, max(charge_day) AS hi FROM "{group}".spend_trend_daily'
     )
     if bounds.empty or pd.isna(bounds["lo"].iloc[0]):
-        st.info(f"No {label} rows found. Enable a {label} connector in connections.yml.")
+        st.info(f"No {label} billing data found. Your admin may need to enable the connection.")
         return
 
     lo, hi = _d(bounds["lo"].iloc[0]), _d(bounds["hi"].iloc[0])
-    # Default the window to open on the first month with material spend, so a one-day
-    # sliver at the very start (e.g. a Dec 31 charge) doesn't anchor the range there —
-    # the user can still drag back to `lo`.
-    first = gold_df(
-        f'SELECT min(charge_month) AS m FROM "{group}".monthly_bill WHERE abs(net_cost) >= 1'
+    start, end = global_range()
+    start, end = max(start, lo), min(end, hi)
+    sm = start.replace(day=1)
+    accent = provider_color(label=label, group=group)
+    partial = range_has_partial_month(end)
+    cap = f"{label} net cost over the chosen window and what's driving it."
+    if partial:
+        cap += " Partial month — current month is still accruing."
+    st.caption(cap)
+
+    _kpis(group, label, start, end, sm, accent=accent, partial=partial)
+    st.markdown(provider_spend_summary(group, label, start, end, partial=partial))
+
+    tab_trend, tab_breakdown, tab_tags = st.tabs(
+        ["Trend & changes", "Breakdown", "Tags"],
     )
-    default_lo = _d(first["m"].iloc[0]) if not first.empty and pd.notna(first["m"].iloc[0]) else lo
-    start, end = date_range(lo, hi, key=f"{group}_range", default_lo=default_lo)
-    sm = start.replace(day=1)  # month-grain views key on the first of the month
+    with tab_trend:
+        with panel(tone="teal", flush=True):
+            _trend(group, label, start, end, accent=accent)
+            _monthly_drill(group, label, end, sm, accent=accent)
+    with tab_breakdown:
+        with panel(tone="default", flush=True):
+            _spend_pivot(group, end, sm)
+            _savings(group, label, end, sm)
+            _driver_mom(group, end)
+    with tab_tags:
+        with panel(tone="default", flush=True):
+            _tags(group, label, end, sm)
 
-    _kpis(group, label, start, end, sm)
-    st.divider()
-    _trend(group, label, start, end)
-    if group == "databricks":  # prototype: click-to-drill, Databricks only for now
-        _monthly_drill(group, label, end, sm)
-    _spend_pivot(group, end, sm)
-    _savings(group, label, end, sm)
-    _sku_mom(group, end)
-    _tags(group, label, end, sm)
 
-
-def _kpis(group: str, label: str, start: date, end: date, sm: date) -> None:
+def _kpis(
+    group: str, label: str, start: date, end: date, sm: date, *, accent: str, partial: bool
+) -> None:
     agg = gold_df(
         "SELECT coalesce(sum(net_cost),0) AS net, coalesce(sum(list_cost),0) AS lst, "
         f'coalesce(sum(savings),0) AS sav FROM "{group}".monthly_bill '
@@ -85,19 +99,21 @@ def _kpis(group: str, label: str, start: date, end: date, sm: date) -> None:
     ).iloc[0]
     net, lst, sav = float(agg["net"]), float(agg["lst"]), float(agg["sav"])
     disc = f"{100 * sav / lst:.1f}%" if lst else "—"
-    span = f"{start:%b %d} → {end:%b %d}"
+    span = f"{start:%b %d} → {end:%b %d}" + (" · partial" if partial else "")
     kpi_cards(
         [
-            (f"{label} net", compact_money(net), span),
-            (f"{label} list", compact_money(lst), "before discounts"),
-            (f"{label} savings", compact_money(sav), "vs list"),
-            ("Realized discount", disc, "off list"),
+            (f"{label} net", compact_money(net), span, "default"),
+            (f"{label} list", compact_money(lst), "before discounts", "paid"),
+            (f"{label} savings", compact_money(sav), "vs list", "savings"),
+            ("Realized discount", disc, "off list", "savings"),
         ],
         key=group,
+        accent=accent,
+        partial=partial,
     )
 
 
-def _trend(group: str, label: str, start: date, end: date) -> None:
+def _trend(group: str, label: str, start: date, end: date, *, accent: str) -> None:
     trend = gold_df(
         f'SELECT charge_day, net_cost FROM "{group}".spend_trend_daily '
         f"WHERE charge_day >= '{start}' AND charge_day <= '{end}' ORDER BY charge_day"
@@ -106,8 +122,9 @@ def _trend(group: str, label: str, start: date, end: date) -> None:
         st.info(f"No daily {label} rows in range.")
         return
     fig = px.area(trend, x="charge_day", y="net_cost", labels={"charge_day": "", "net_cost": ""})
-    fig.update_traces(line_color=PALETTE[1], fillcolor="rgba(46,134,171,0.18)")
-    plotly(style_fig(fig), title=f"Daily {label} spend", key=f"{group}_trend")
+    fig.update_traces(line_color=accent, fillcolor=rgba_hex(accent, 0.18))
+    section_title("Daily spend", flush=True)
+    plotly(style_fig(fig, has_legend=False), key=f"{group}_trend")
 
 
 def _selected_month(event: Any) -> str | None:
@@ -119,14 +136,9 @@ def _selected_month(event: Any) -> str | None:
     return str(points[-1]["x"]) if points else None
 
 
-def _monthly_drill(group: str, label: str, end: date, sm: date) -> None:
-    """Clickable monthly-spend bars → per-SKU breakdown of *why* a month moved.
-
-    Click a bar and the panel below decomposes that month's change vs the prior month
-    into volume (more usage) vs rate (price/mix) using ``sku_month_over_month`` — the
-    one view that already carries that split, which is why this prototypes on
-    Databricks (its SKU grain makes the breakdown meaningful).
-    """
+def _monthly_drill(group: str, label: str, end: date, sm: date, *, accent: str) -> None:
+    """Clickable monthly bars → per-SKU or per-service breakdown of *why* a month moved."""
+    id_col, id_label, _ = driver_dim(group)
     bills = gold_df(
         f'SELECT charge_month, net_cost FROM "{group}".monthly_bill '
         f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' ORDER BY charge_month"
@@ -135,19 +147,31 @@ def _monthly_drill(group: str, label: str, end: date, sm: date) -> None:
         return
     bills["month"] = pd.to_datetime(bills["charge_month"]).dt.strftime("%Y-%m")
     fig = px.bar(bills, x="month", y="net_cost", labels={"month": "", "net_cost": ""})
-    fig.update_traces(marker_color=PALETTE[1])
+    fig.update_traces(marker_color=accent)
+    section_title("Monthly net cost — click a bar to drill in")
+    section_caption(f"Tip: select a month to see which {id_label.lower()}s drove its change.")
     event = plotly(
-        style_fig(fig),
-        title=f"Monthly {label} net cost — click a bar to drill in",
+        style_fig(fig, has_legend=False),
         key=f"{group}_monthly_drill",
         on_select=True,
     )
 
     picked = _selected_month(event)
     if picked is None:
-        st.caption("Tip: click a month above to see which SKUs drove its change.")
         return
     _drilldown(group, picked)
+
+
+def _drill_movers(group: str, month: date, prior: date) -> pd.DataFrame:
+    id_col, _, _ = driver_dim(group)
+    if group == "databricks":
+        return gold_df(
+            f"SELECT {id_col}, net_cost, cost_delta, volume_effect, rate_effect, cost_pct_change "
+            f'FROM "{group}".sku_month_over_month WHERE charge_month = \'{month}\' '
+            "AND cost_delta IS NOT NULL ORDER BY abs(cost_delta) DESC LIMIT 15"
+        )
+    svc = _service_movers(group, month, prior).head(15)
+    return svc.rename(columns={"k": id_col})
 
 
 def _drilldown(group: str, month_label: str) -> None:
@@ -167,10 +191,9 @@ def _drilldown(group: str, month_label: str) -> None:
         return
 
     net, delta, vol, rate = (float(agg[k]) for k in ("net", "delta", "vol", "rate"))
-    st.divider()
-    st.markdown(f"##### Why did {m:%b %Y} change?")
     sign = "↑" if delta >= 0 else "↓"
-    st.caption(
+    section_subtitle(f"Why did {m:%b %Y} change?")
+    section_caption(
         f"Net cost {compact_money(net)} · {sign} {compact_money(abs(delta))} vs {prior:%b %Y}. "
         "Volume = usage changed; Rate = price/mix changed (the two sum to the change)."
     )
@@ -179,38 +202,70 @@ def _drilldown(group: str, month_label: str) -> None:
 
     kpi_cards(
         [
-            (f"{m:%b %Y} net", compact_money(net), "after credits"),
-            ("Change vs prior", _signed(delta), f"vs {prior:%b}"),
-            ("Volume effect", _signed(vol), "usage"),
-            ("Rate effect", _signed(rate), "price / mix"),
+            (f"{m:%b %Y} net", compact_money(net), "after credits", "default"),
+            ("Change vs prior", _signed(delta), f"vs {prior:%b}", delta_variant(delta)),
+            ("Volume effect", _signed(vol), "usage", "volume"),
+            ("Rate effect", _signed(rate), "price / mix", "rate"),
         ],
         key=f"{group}_drill",
     )
 
-    movers = gold_df(
-        "SELECT sku_id, net_cost, cost_delta, volume_effect, rate_effect, cost_pct_change "
-        f'FROM "{group}".sku_month_over_month WHERE charge_month = \'{m.date()}\' '
-        "AND cost_delta IS NOT NULL ORDER BY abs(cost_delta) DESC LIMIT 15"
+    effects = pd.DataFrame(
+        [{"component": "Volume", "effect": vol}, {"component": "Rate", "effect": rate}]
     )
+    fig = px.bar(
+        effects,
+        x="component",
+        y="effect",
+        color="component",
+        color_discrete_map={"Volume": SEMANTIC["volume"], "Rate": SEMANTIC["rate"]},
+        labels={"component": "", "effect": ""},
+    )
+    fig.update_layout(showlegend=False)
+    plotly(
+        style_fig(fig, has_legend=False),
+        title=f"What drove the change · {m:%b %Y}",
+        key=f"{group}_drill_effects",
+    )
+
+    movers = _drill_movers(group, m.date(), prior.date())
     if movers.empty:
         return
-    disp = movers.copy()  # keep movers["sku_id"] raw — it's the query key for the SKU drill
-    disp["sku_id"] = disp["sku_id"].str.replace("ENTERPRISE_", "", regex=False)
-    st.markdown("###### Top movers — SKUs driving the change")
-    heatmap_table(
-        disp,
-        heat_col="cost_pct_change",
-        money_cols=["net_cost", "cost_delta", "volume_effect", "rate_effect"],
-        rename={
-            "sku_id": "SKU",
-            "net_cost": "Net cost",
-            "cost_delta": "Δ vs prior",
-            "volume_effect": "Volume Δ",
-            "rate_effect": "Rate Δ",
-            "cost_pct_change": "MoM %",
-        },
-    )
-    _sku_detail(group, m, prior, movers["sku_id"].tolist())
+    id_col, id_label, _ = driver_dim(group)
+    disp = movers.copy()
+    if group == "databricks":
+        disp[id_col] = disp[id_col].str.replace("ENTERPRISE_", "", regex=False)
+        section_subtitle(f"Top movers — {id_label}s driving the change")
+        heatmap_table(
+            disp,
+            heat_col="cost_pct_change",
+            money_cols=["net_cost", "cost_delta", "volume_effect", "rate_effect"],
+            rename={
+                id_col: id_label,
+                "net_cost": "Net cost",
+                "cost_delta": "Δ vs prior",
+                "volume_effect": "Volume Δ",
+                "rate_effect": "Rate Δ",
+                "cost_pct_change": "MoM %",
+            },
+        )
+    else:
+        section_subtitle(f"Top movers — {id_label}s driving the change")
+        filterable_table(
+            disp[[id_col, "net_cost", "cost_delta", "cost_pct_change"]],
+            filter_col=id_col,
+            file_name=f"{group}_movers.csv",
+            key=f"{group}_drill_movers",
+            money_cols=["net_cost", "cost_delta"],
+            pct_cols=["cost_pct_change"],
+            rename={
+                id_col: id_label,
+                "net_cost": "Net cost",
+                "cost_delta": "Δ vs prior",
+                "cost_pct_change": "MoM %",
+            },
+        )
+    _driver_detail(group, m, prior, movers[id_col].tolist())
 
 
 def _cur_prev(m: pd.Timestamp, prior: pd.Timestamp, col: str = "net_cost", sfx: str = "") -> str:
@@ -221,37 +276,46 @@ def _cur_prev(m: pd.Timestamp, prior: pd.Timestamp, col: str = "net_cost", sfx: 
     )
 
 
-def _sku_detail(group: str, m: pd.Timestamp, prior: pd.Timestamp, skus: list[str]) -> None:
-    """Drill one moved SKU into *where* it moved (resource/workspace) and *who* owns it (tag).
-
-    Answers the follow-ups a SKU-level delta can't: which exact resource (e.g. a SQL
-    warehouse) and workspace drove it, how much more it was *used*, and whether the
-    change lands on a project/team tag — with the unattributed remainder surfaced.
-    """
-    if not skus:
+def _driver_detail(group: str, m: pd.Timestamp, prior: pd.Timestamp, drivers: list[str]) -> None:
+    """Drill a moved SKU or service into resources (and tags for SKU grain)."""
+    if not drivers:
         return
-    st.markdown("###### Drill into a SKU — where exactly did it move?")
-    raw = st.selectbox(
-        "SKU", options=skus, format_func=lambda s: s.replace("ENTERPRISE_", ""),
-        key=f"{group}_drill_sku", label_visibility="collapsed",
-    )
-    sku, sku_label = _q(raw), raw.replace("ENTERPRISE_", "")
-    months = f"charge_month IN ('{m.date()}','{prior.date()}')"
-
-    _resource_breakdown(group, sku, sku_label, m, prior, months)
-    _tag_breakdown(group, sku, m, prior, months)
+    id_col, id_label, _ = driver_dim(group)
+    section_subtitle(f"Drill into a {id_label} — where exactly did it move?")
+    if group == "databricks":
+        raw = st.selectbox(
+            id_label, options=drivers, format_func=lambda s: s.replace("ENTERPRISE_", ""),
+            key=f"{group}_drill_driver", label_visibility="collapsed",
+        )
+        key_val, label = _q(raw), raw.replace("ENTERPRISE_", "")
+        months = f"charge_month IN ('{m.date()}','{prior.date()}')"
+        _resource_breakdown(group, "sku_id", key_val, label, m, prior, months)
+        _tag_breakdown(group, key_val, m, prior, months)
+    else:
+        service = st.selectbox(
+            id_label, options=drivers, key=f"{group}_drill_driver", label_visibility="collapsed",
+        )
+        months = f"charge_month IN ('{m.date()}','{prior.date()}')"
+        _resource_breakdown(group, "service_name", _q(service), service, m, prior, months)
+        section_caption("Team/project tags are on the Tags tab — they span all services.")
 
 
 def _resource_breakdown(
-    group: str, sku: str, sku_label: str, m: pd.Timestamp, prior: pd.Timestamp, months: str
+    group: str,
+    filter_col: str,
+    key_val: str,
+    label: str,
+    m: pd.Timestamp,
+    prior: pd.Timestamp,
+    months: str,
 ) -> None:
-    """Per-resource (warehouse/job/cluster) + workspace movement for the chosen SKU."""
+    """Per-resource movement for the chosen SKU or service."""
     res = gold_df(
         "SELECT resource_name, resource_type, sub_account_id, "
         f"{_cur_prev(m, prior)}, {_cur_prev(m, prior, 'consumed_quantity', '_q')}, "
         "max(consumed_unit) AS unit "
         f'FROM "{group}".resource_month '
-        f"WHERE sku_id='{sku}' AND {months} "
+        f"WHERE {filter_col}='{key_val}' AND {months} "
         "GROUP BY resource_name, resource_type, sub_account_id"
     )
     if res.empty:
@@ -261,14 +325,19 @@ def _resource_breakdown(
     res["pct"] = res.apply(lambda r: 100 * r["delta"] / r["prev"] if r["prev"] else None, axis=1)
     res = res.loc[res["delta"].abs().sort_values(ascending=False).index].head(12)
     unit = next(iter(res["unit"].dropna()), "units")
+    cols = ["resource_name", "resource_type", "sub_account_id", "cur", "delta", "qty_delta", "pct"]
     st.caption(
-        f"Resources moving **{sku_label}** · {prior:%b}→{m:%b}. "
+        f"Resources moving **{label}** · {prior:%b}→{m:%b}. "
         f"Usage Δ is in {unit} (this billing data carries no query/operation counts)."
     )
-    cols = ["resource_name", "resource_type", "sub_account_id", "cur", "delta", "qty_delta", "pct"]
-    html_table(
+    filterable_table(
         res[cols],
-        money_cols=["cur", "delta"], num_cols=["qty_delta"], pct_cols=["pct"],
+        filter_col="resource_name",
+        file_name=f"{group}_resources.csv",
+        key=f"{group}_drill_res",
+        money_cols=["cur", "delta"],
+        num_cols=["qty_delta"],
+        pct_cols=["pct"],
         rename={
             "resource_name": "Resource", "resource_type": "Type", "sub_account_id": "Workspace",
             "cur": f"{m:%b} net", "delta": "Δ vs prior", "qty_delta": f"Usage Δ ({unit})",
@@ -333,7 +402,7 @@ def _spend_pivot(group: str, end: date, sm: date) -> None:
     else:
         dim, view, label = "service_name", "spend_by_service_month", "Service"
 
-    st.markdown(f"##### {label}s × month — spend")
+    section_title(f"{label}s × month — spend")
     df = gold_df(
         f"SELECT {dim} AS k, charge_month, sum(net_cost) AS net_cost "
         f'FROM "{group}".{view} '
@@ -362,11 +431,17 @@ def _spend_pivot(group: str, end: date, sm: date) -> None:
         return f"{ts:%b %Y}" + (" (partial)" if ts == current else "")
 
     pivot.columns = [_col(c) for c in pivot.columns]
-    out = pivot.reset_index().rename(columns={"k": label})
-    for col in out.columns:
-        if col != label:
-            out[col] = out[col].map(lambda v: "" if not v else compact_money(v))
-    html_table(out)
+    out = pivot.reset_index()
+    money_cols = [c for c in out.columns if c != "k"]
+    filterable_table(
+        out,
+        filter_col="k",
+        file_name=f"{group}_spend_pivot.csv",
+        key=f"{group}_pivot",
+        money_cols=money_cols,
+        rename={"k": label},
+        compact=True,
+    )
 
 
 def _savings(group: str, label: str, end: date, sm: date) -> None:
@@ -379,8 +454,10 @@ def _savings(group: str, label: str, end: date, sm: date) -> None:
     if sv.empty:
         return
     latest = sv.iloc[-1]
-    st.markdown("##### Bill: list vs effective")
-    st.caption(f"Effective + savings = list. Latest month · {latest['savings_pct']:.1f}% off list.")
+    section_title("Bill: list vs effective")
+    section_caption(
+        f"Effective + savings = list. Latest month · {latest['savings_pct']:.1f}% off list."
+    )
     melt = sv.copy()
     melt["month"] = pd.to_datetime(melt["charge_month"]).dt.strftime("%Y-%m")
     melt = melt.melt(
@@ -398,15 +475,19 @@ def _savings(group: str, label: str, end: date, sm: date) -> None:
         y="cost",
         color="component",
         barmode="stack",  # stacked, so the full bar height = list cost (Grafana-style)
-        color_discrete_map={"Effective (paid)": PALETTE[1], "Savings (discount)": PALETTE[4]},
+        color_discrete_map={
+            "Effective (paid)": SEMANTIC["paid"],
+            "Savings (discount)": SEMANTIC["savings"],
+        },
         category_orders={"component": ["Effective (paid)", "Savings (discount)"]},
         labels={"month": "", "cost": "", "component": ""},
     )
-    plotly(style_fig(fig), key=f"{group}_savings")
+    plotly(style_fig(fig, has_legend=True), key=f"{group}_savings")
 
 
-def _sku_mom(group: str, end: date) -> None:
-    st.markdown("##### SKU month-over-month")
+def _driver_mom(group: str, end: date) -> None:
+    id_col, id_label, _ = driver_dim(group)
+    section_title(f"{id_label} month-over-month")
     # Compare the latest COMPLETE month (exclude the current, still-accruing month) so
     # we never pit a partial month against a full one. Honour the selected range's end.
     current = pd.Timestamp(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
@@ -421,21 +502,41 @@ def _sku_mom(group: str, end: date) -> None:
         return
     cmp_month = pd.Timestamp(months.iloc[0]["charge_month"])
     prior = cmp_month - pd.DateOffset(months=1)
-    st.caption(f"Top SKUs by net cost · {cmp_month:%b %Y} vs {prior:%b %Y}")
-    mom = gold_df(
-        "SELECT sku_id, net_cost, cost_delta, cost_pct_change "
-        f'FROM "{group}".sku_month_over_month WHERE charge_month = \'{cmp_month.date()}\' '
-        "ORDER BY net_cost DESC LIMIT 20"
-    )
-    if mom.empty:
-        st.info("No SKU movement rows for the latest complete month.")
+    section_caption(f"Top {id_label.lower()}s by net cost · {cmp_month:%b %Y} vs {prior:%b %Y}")
+    if group == "databricks":
+        mom = gold_df(
+            f"SELECT {id_col}, net_cost, cost_delta, cost_pct_change "
+            f'FROM "{group}".sku_month_over_month WHERE charge_month = \'{cmp_month.date()}\' '
+            "ORDER BY net_cost DESC LIMIT 20"
+        )
+        if mom.empty:
+            st.info(f"No {id_label.lower()} movement rows for the latest complete month.")
+            return
+        heatmap_table(
+            mom,
+            heat_col="cost_pct_change",
+            money_cols=["net_cost", "cost_delta"],
+            rename={
+                id_col: id_label,
+                "net_cost": "Net cost",
+                "cost_delta": "Δ vs prior",
+                "cost_pct_change": "MoM %",
+            },
+        )
         return
-    heatmap_table(
-        mom,
-        heat_col="cost_pct_change",
+    svc = _service_movers(group, cmp_month.date(), prior.date()).head(20)
+    if svc.empty:
+        st.info(f"No {id_label.lower()} movement rows for the latest complete month.")
+        return
+    filterable_table(
+        svc.rename(columns={"k": id_col}),
+        filter_col=id_col,
+        file_name=f"{group}_mom.csv",
+        key=f"{group}_mom",
         money_cols=["net_cost", "cost_delta"],
+        pct_cols=["cost_pct_change"],
         rename={
-            "sku_id": "SKU",
+            id_col: id_label,
             "net_cost": "Net cost",
             "cost_delta": "Δ vs prior",
             "cost_pct_change": "MoM %",
@@ -450,11 +551,11 @@ def _tags(group: str, label: str, end: date, sm: date) -> None:
         "GROUP BY tag_key ORDER BY net DESC"
     )
     if keys.empty:
-        st.markdown("##### Spend by tag")
+        section_title("Spend by tag")
         st.info("No tagged spend in range.")
         return
 
-    st.markdown("##### Spend by tag")
+    section_title("Spend by tag")
     options = keys["tag_key"].tolist()
     default = "team" if "team" in options else options[0]
     sel = st.selectbox(
@@ -464,7 +565,7 @@ def _tags(group: str, label: str, end: date, sm: date) -> None:
         key=f"{group}_tagkey",
         label_visibility="collapsed",
     )
-    st.caption(f"{label} spend broken down by the `{sel}` tag")
+    section_caption(f"{label} spend broken down by the `{sel}` tag")
     tags = gold_df(
         f"SELECT tag_value, sum(net_cost) AS net_cost FROM \"{group}\".spend_by_tag_month "
         f"WHERE tag_key = '{sel}' AND charge_month >= '{sm}' AND charge_month <= '{end}' "
@@ -473,8 +574,11 @@ def _tags(group: str, label: str, end: date, sm: date) -> None:
     if tags.empty:
         st.info("No values for this tag in range.")
         return
-    html_table(
+    filterable_table(
         tags,
+        filter_col="tag_value",
+        file_name=f"{group}_tags.csv",
+        key=f"{group}_tags",
         money_cols=["net_cost"],
         rename={"tag_value": sel, "net_cost": "Net cost"},
     )

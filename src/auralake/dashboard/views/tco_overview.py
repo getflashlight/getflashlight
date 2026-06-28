@@ -1,9 +1,5 @@
 """TCO overview — Databricks DBU + attributed AWS infra, plus the honest
 unattributed bucket. The product's headline view.
-
-Reads the cross-provider ``shared.*`` TCO group only — per-provider spend lives on
-each provider's own page. Layout: TCO stats, the monthly DBU/infra breakdown, then
-the per-cluster Databricks + EKS TCO tables.
 """
 
 from __future__ import annotations
@@ -12,17 +8,20 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from auralake.dashboard.data import gold_df, has_data
+from auralake.dashboard.context import global_range, tco_charge_month
+from auralake.dashboard.data import NO_DATA_MSG, gold_df, has_data
 from auralake.dashboard.theme import (
     compact_money,
-    html_table,
+    filterable_table,
     kpi_cards,
-    month_filter,
+    panel,
     plotly,
+    provider_color,
+    section_caption,
+    section_title,
     style_fig,
 )
 
-# Stable component → label/colour mapping so the stacked bars read the same every month.
 _COMPONENT_LABELS = {
     "dbu_cost": "DBU cost",
     "attributed_infra_cost": "Attributed infra",
@@ -34,6 +33,13 @@ _COMPONENT_COLORS = {
     "Unattributed AWS": "#C28B4B",
 }
 
+_TCO_FOOTNOTE = (
+    "**How we calculate TCO:** Classic Databricks compute = DBU cost + the AWS EC2/EBS "
+    "we can tie to a cluster. Serverless and SQL warehouses = DBU only (no separate infra "
+    "line in this view). Unattributed AWS is spend we see in billing but cannot yet map to "
+    "a Databricks cluster — it is shown honestly, never hidden."
+)
+
 
 def render() -> None:
     st.title("Total Cost of Ownership")
@@ -41,42 +47,64 @@ def render() -> None:
         "Databricks DBU + the underlying AWS infra it runs on — plus what we can't yet attribute."
     )
     if not has_data():
-        st.info("No data yet — run `auralake ingest` to load billing.")
+        st.info(NO_DATA_MSG)
         return
 
     summary = gold_df("SELECT * FROM shared.tco_summary_month ORDER BY charge_month")
     if summary.empty:
-        st.info("No TCO rows — needs Databricks + AWS data to attribute.")
+        st.info(
+            "No total-cost view yet — this page needs both Databricks and AWS billing "
+            "so we can attribute infrastructure spend."
+        )
         return
 
-    months = summary["charge_month"].astype(str).tolist()
-    month = month_filter(months, key="tco_month") or max(months)
-    row = summary[summary["charge_month"].astype(str) == month].iloc[0]
+    _, end = global_range()
+    month_key = tco_charge_month(end)
+    available = summary["charge_month"].astype(str).tolist()
+    if month_key not in available:
+        month_key = max(available)
+    row = summary[summary["charge_month"].astype(str) == month_key].iloc[0]
+    month_label = pd.Timestamp(month_key).strftime("%b %Y")
 
     total = row["total_cost"]
     coverage = f"{(1 - row['unattributed_infra_cost'] / total):.0%} attributed" if total else ""
+    section_caption(
+        f"Showing **{month_label}** (from sidebar date range ending {end:%b %d, %Y})."
+    )
     kpi_cards(
         [
-            (f"Total TCO · {month}", compact_money(total), "DBU + infra"),
-            ("DBU cost", compact_money(row["dbu_cost"]), "Databricks compute"),
-            ("Unattributed AWS", compact_money(row["unattributed_infra_cost"]), "not yet mapped"),
-            ("Attribution coverage", coverage or "—", "of total TCO"),
+            (f"Total TCO · {month_label}", compact_money(total), "DBU + infra", "default"),
+            (
+                "DBU cost",
+                compact_money(row["dbu_cost"]),
+                "Databricks compute",
+                provider_color(group="databricks"),
+            ),
+            (
+                "Unattributed AWS",
+                compact_money(row["unattributed_infra_cost"]),
+                "not yet mapped",
+                "unattributed",
+            ),
+            ("Attribution coverage", coverage or "—", "of total TCO", "default"),
         ],
         key="tco",
+        accent=provider_color(group="databricks"),
     )
+    with st.expander("How is TCO calculated?"):
+        st.markdown(_TCO_FOOTNOTE)
 
-    st.divider()
-    _breakdown(summary)
-    st.write("")
-    _databricks_clusters(month)
-    st.write("")
-    _eks_clusters(month)
+    with panel(tone="teal", flush=True):
+        _breakdown(summary)
+    with panel(tone="default"):
+        tab_db, tab_eks = st.tabs(["Databricks clusters", "EKS clusters"])
+        with tab_db:
+            _databricks_clusters(month_key)
+        with tab_eks:
+            _eks_clusters(month_key)
 
 
 def _breakdown(summary: pd.DataFrame) -> None:
-    # The monthly DBU vs attributed vs unattributed stack, straight from the shared
-    # TCO summary. Per-provider spend lives on each provider's own page now, so this
-    # page stays focused on the cross-provider TCO numbers.
     melted = summary.melt(
         id_vars="charge_month",
         value_vars=list(_COMPONENT_LABELS),
@@ -95,16 +123,18 @@ def _breakdown(summary: pd.DataFrame) -> None:
                 color_discrete_map=_COMPONENT_COLORS,
                 category_orders={"component": list(_COMPONENT_COLORS)},
                 labels={"month": "", "cost": "Cost", "component": ""},
-            )
+            ),
+            has_legend=True,
         ),
         title="Monthly TCO — DBU vs attributed vs unattributed",
+        title_flush=True,
         key="tco_breakdown",
     )
 
 
 def _databricks_clusters(month: str) -> None:
-    st.markdown("##### Databricks clusters")
-    st.caption(f"Per-cluster DBU + attributed infra · {month}")
+    section_title("Databricks clusters", flush=True)
+    section_caption(f"Per-cluster DBU + attributed infra · {month}")
     clusters = gold_df(
         "SELECT cluster_id, compute_class, tco_basis, dbu_cost, infra_cost, tco_cost, "
         f"infra_pct_of_tco FROM shared.tco_by_cluster_month WHERE charge_month = '{month}' "
@@ -113,8 +143,11 @@ def _databricks_clusters(month: str) -> None:
     if clusters.empty:
         st.info("No Databricks cluster rows for this month.")
         return
-    html_table(
+    filterable_table(
         clusters,
+        filter_col="cluster_id",
+        file_name="databricks_clusters.csv",
+        key="tco_db_clusters",
         money_cols=["dbu_cost", "infra_cost", "tco_cost"],
         pct_cols=["infra_pct_of_tco"],
         rename={
@@ -130,8 +163,8 @@ def _databricks_clusters(month: str) -> None:
 
 
 def _eks_clusters(month: str) -> None:
-    st.markdown("##### EKS clusters")
-    st.caption(f"Per-cluster control plane + node TCO · {month}")
+    section_title("EKS clusters", flush=True)
+    section_caption(f"Per-cluster control plane + node TCO · {month}")
     eks = gold_df(
         "SELECT cluster_name, control_plane_cost, node_ec2_cost, node_ebs_cost, "
         f"eks_tco, nodes_attributed FROM shared.tco_eks_by_cluster_month "
@@ -140,8 +173,11 @@ def _eks_clusters(month: str) -> None:
     if eks.empty:
         st.info("No EKS cluster rows for this month.")
         return
-    html_table(
+    filterable_table(
         eks,
+        filter_col="cluster_name",
+        file_name="eks_clusters.csv",
+        key="tco_eks_clusters",
         money_cols=["control_plane_cost", "node_ec2_cost", "node_ebs_cost", "eks_tco"],
         int_cols=["nodes_attributed"],
         rename={
