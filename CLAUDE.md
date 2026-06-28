@@ -8,15 +8,21 @@ Auralake is a **FOCUS-based, multi-cloud TCO spend-visualization** platform. It
 ingests cloud billing in the FinOps FOCUS format, standardizes it into a layered
 data model (BRONZE → SILVER → GOLD), and serves a bundled Streamlit dashboard
 and an MCP server. It visualizes **current spend** — its headline is **Total Cost
-of Ownership** (e.g. Databricks DBU cost + the underlying AWS infra). It does
-**not** produce optimization recommendations in v1.
+of Ownership** (e.g. Databricks DBU cost + the underlying AWS infra).
 
 It ships as a single `pip install auralake` — **no Docker, no database server**.
 Persistent state is Parquet under `AURALAKE_HOME` (default: the platform user-data
 dir), queried by a throwaway in-memory **DuckDB** in each process.
 
-(Auralake was previously a Databricks cost-optimization tool; that code was
-removed in the FOCUS pivot. Don't reintroduce analyzers/recommendations.)
+A second capability, **efficiency / waste** (the `metrics` plane → `efficiency`
+GOLD group), surfaces **recoverable spend** — the billed-but-not-used gap (idle,
+underutilized, wrong-compute-placement). This is *measurement of recoverable
+dollars*, **not** automated remediation: still no analyzers that act, no
+rightsizing recommendations engine. See `docs/design/efficiency-waste.md`.
+
+(Auralake was previously a Databricks cost-optimization tool; that code was removed
+in the FOCUS pivot. The efficiency view measures waste — it does not reintroduce the
+old recommendation/remediation analyzers.)
 
 ## Project layout
 
@@ -82,12 +88,23 @@ uv run ruff check src tests && uv run mypy src tests && uv run pytest
   agree.
 - **GOLD is split per provider.** Each distinct `provider_name` present in the data
   gets its own group — a `gold/<group>/` dir registered as the DuckDB schema
-  `<group>.<view>` (e.g. `aws.monthly_bill`, `databricks.monthly_bill`) — plus a
-  fixed `shared` group for the cross-provider TCO views (`shared.tco_*`). Groups are
+  `<group>.<view>` (e.g. `aws.monthly_bill`, `databricks.monthly_bill`) — plus two
+  fixed groups: `shared` for the cross-provider TCO views (`shared.tco_*`) and
+  `efficiency` for the waste views (`efficiency.waste_record`). Provider groups are
   **data-driven** (discovered from `provider_name`, not a hard-coded list), and
   `build_gold` fans the in-memory `gold.<view>` SQL out per provider at COPY time;
   publish prunes a group whose provider dropped out of the data. Each provider gets
-  its own dashboard page; TCO is its own page. See `transform/catalog.py`.
+  its own dashboard page; TCO and efficiency are their own pages. See
+  `transform/catalog.py`.
+- **The efficiency/waste plane is a second medallion**, parallel to FOCUS and
+  separate because utilization telemetry doesn't fit `FocusRecord`. `EfficiencyRecord`
+  (`efficiency/model.py`) is its one standardized contract — connectors emit it via
+  `Connector.fetch_efficiency` (best-effort: a failed pull warns and skips, never
+  blocks the cost ingest). It lands in the `metrics/` Parquet root
+  (`lake.metrics.write_efficiency`, partition-replace by `provider_name`/`charge_month`),
+  is registered as `metrics.efficiency_record`, and `050_gold_waste.sql` classifies it
+  into `efficiency.waste_record` (waste_category + recoverable_cost). New compute
+  classes / platforms add **rows** (a connector emitting `EfficiencyRecord`), not views.
 - **One cost metric per aggregation.** Canonical is `EffectiveCost` (mapped to
   `cost` in SILVER). Never sum across FOCUS cost columns.
 - **Charge-period grain only** when aggregating; never the billing period.
@@ -104,6 +121,11 @@ uv run ruff check src tests && uv run mypy src tests && uv run pytest
   rows and net via `SUM` downstream.
 - **Single currency**: ingest asserts `billing_currency == AURALAKE_BASE_CURRENCY`.
 - **Attribution honesty**: unattributed AWS spend is surfaced, never silently dropped.
+- **Waste honesty** (`050_gold_waste.sql`): `underutilized` is only emitted when
+  `utilization_pct` is non-NULL, so it's **never** claimed for shared compute
+  (interactive/SQL warehouse) where per-entity utilization doesn't exist; `placement`
+  and `photon_no_gain` are `candidate` confidence; report failed-run/idle-window cost,
+  never an auto-termination "saving". Waste `billed_cost` reconciles to the FOCUS bill.
 
 ## Code style
 

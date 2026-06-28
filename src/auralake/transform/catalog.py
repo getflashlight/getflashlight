@@ -25,6 +25,11 @@ from auralake.lake import paths
 # compute it provisions) — the one place GOLD is intentionally not per-provider.
 SHARED_GROUP = "shared"
 
+# The fixed group holding the efficiency/waste views. Like SHARED, not per-provider:
+# `waste_record` already carries provider_name as a column, so one group spans every
+# platform. Fed by the metrics plane (metrics.efficiency_record), not BRONZE.
+EFFICIENCY_GROUP = "efficiency"
+
 
 @dataclass(frozen=True)
 class ViewSpec:
@@ -209,6 +214,43 @@ SHARED_BASE_VIEWS: tuple[ViewSpec, ...] = (
 )
 
 
+# Efficiency/waste: the standardized waste record + its KPI rollup, materialized once
+# into the `efficiency` group (provider_name is a column, not a group).
+EFFICIENCY_BASE_VIEWS: tuple[ViewSpec, ...] = (
+    ViewSpec(
+        view="waste_record",
+        title="Waste record",
+        description="One row per (entity, month, waste_category): the classified, "
+        "standardized waste record across platforms. recoverable_cost is the estimated "
+        "recoverable spend; lens splits WASTE (tune it) from OPPORTUNITY (move it). "
+        "confidence is high vs candidate. underutilized is never emitted for shared compute.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=(
+            "provider_name",
+            "charge_month",
+            "entity_type",
+            "entity_id",
+            "entity_name",
+            "owner_user",
+            "owner_project",
+            "waste_category",
+            "lens",
+            "confidence",
+        ),
+        measures=("billed_cost", "recoverable_cost"),
+    ),
+    ViewSpec(
+        view="waste_summary_month",
+        title="Waste summary",
+        description="Recoverable spend per month × waste_category × lens × confidence — "
+        "drives the KPI bar (total WASTE $ vs OPPORTUNITY $).",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=("charge_month", "waste_category", "lens", "confidence"),
+        measures=("recoverable_cost", "billed_cost", "entity_count"),
+    ),
+)
+
+
 def provider_group(provider_name: str) -> str:
     """Slug a ``provider_name`` into a filesystem/DuckDB-safe group id.
 
@@ -231,22 +273,22 @@ def _view(group: str, spec: ViewSpec) -> GoldView:
 
 
 def build_catalog(provider_groups: Iterable[str]) -> tuple[GoldView, ...]:
-    """Expand the base specs over the given provider groups + the shared TCO group."""
+    """Expand the base specs over the given provider groups + the fixed shared/efficiency groups."""
     views: list[GoldView] = []
     for group in provider_groups:
         views.extend(_view(group, spec) for spec in PROVIDER_BASE_VIEWS)
     views.extend(_view(SHARED_GROUP, spec) for spec in SHARED_BASE_VIEWS)
+    views.extend(_view(EFFICIENCY_GROUP, spec) for spec in EFFICIENCY_BASE_VIEWS)
     return tuple(views)
 
 
 def discover_provider_groups() -> list[str]:
-    """The provider groups actually published under ``gold/`` (excludes ``shared``)."""
+    """The provider groups published under ``gold/`` (excludes the fixed shared/efficiency)."""
     gold = paths.gold_dir()
     if not gold.exists():
         return []
-    return sorted(
-        p.name for p in gold.iterdir() if p.is_dir() and p.name != SHARED_GROUP
-    )
+    fixed = {SHARED_GROUP, EFFICIENCY_GROUP}
+    return sorted(p.name for p in gold.iterdir() if p.is_dir() and p.name not in fixed)
 
 
 def current_catalog() -> tuple[GoldView, ...]:

@@ -25,6 +25,8 @@ from auralake.core.settings import get_settings
 from auralake.lake import duck, paths
 from auralake.lake.publish import atomic_publish
 from auralake.transform.catalog import (
+    EFFICIENCY_BASE_VIEWS,
+    EFFICIENCY_GROUP,
     PROVIDER_BASE_VIEWS,
     SHARED_BASE_VIEWS,
     SHARED_GROUP,
@@ -91,6 +93,7 @@ def build_gold() -> int:
         con.execute("CREATE SCHEMA IF NOT EXISTS silver")
         con.execute("CREATE SCHEMA IF NOT EXISTS gold")
         duck.register_bronze(con)  # creates schema raw + raw.focus_record
+        duck.register_metrics(con)  # creates schema metrics + metrics.efficiency_record
 
         for path in sorted(SQL_DIR.glob("*.sql")):
             for stmt in _statements(path.read_text()):
@@ -116,15 +119,20 @@ def build_gold() -> int:
                 )
                 published += 1
 
-        # Shared/TCO group: cross-provider, unfiltered.
-        shared_dir = staging / SHARED_GROUP
-        shared_dir.mkdir(parents=True, exist_ok=True)
-        for spec in SHARED_BASE_VIEWS:
-            target = shared_dir / f"{spec.view}.parquet"
-            con.execute(
-                f'COPY (SELECT * FROM gold."{spec.view}") TO \'{target}\' ({options})'  # noqa: S608
-            )
-            published += 1
+        # Fixed cross-provider groups: TCO (shared) + efficiency/waste, unfiltered.
+        fixed_groups = (
+            (SHARED_GROUP, SHARED_BASE_VIEWS),
+            (EFFICIENCY_GROUP, EFFICIENCY_BASE_VIEWS),
+        )
+        for group, specs in fixed_groups:
+            group_dir = staging / group
+            group_dir.mkdir(parents=True, exist_ok=True)
+            for spec in specs:
+                target = group_dir / f"{spec.view}.parquet"
+                con.execute(
+                    f'COPY (SELECT * FROM gold."{spec.view}") TO \'{target}\' ({options})'  # noqa: S608
+                )
+                published += 1
     finally:
         con.close()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from auralake.transform.catalog import (
+    EFFICIENCY_BASE_VIEWS,
     PROVIDER_BASE_VIEWS,
     SHARED_BASE_VIEWS,
     build_catalog,
@@ -19,13 +20,16 @@ def test_provider_group_slugs() -> None:
 
 def test_build_catalog_expands_per_group() -> None:
     cat = build_catalog(["aws", "databricks"])
-    # 8 provider-scoped views per provider + 3 shared.
-    assert len(cat) == len(PROVIDER_BASE_VIEWS) * 2 + len(SHARED_BASE_VIEWS)
+    # provider-scoped views per provider + the fixed shared + efficiency groups.
+    assert len(cat) == (
+        len(PROVIDER_BASE_VIEWS) * 2 + len(SHARED_BASE_VIEWS) + len(EFFICIENCY_BASE_VIEWS)
+    )
 
     names = {v.name for v in cat}
     assert "aws.monthly_bill" in names
     assert "databricks.monthly_bill" in names
     assert "shared.tco_summary_month" in names
+    assert "efficiency.waste_record" in names
     # No flat `gold.` names remain.
     assert not any(n.startswith("gold.") for n in names)
 
@@ -43,6 +47,9 @@ def test_catalog_by_name_keys_unique() -> None:
     assert len(by_name) == len(cat)  # no collisions across groups
 
 
-def test_empty_provider_set_still_has_shared() -> None:
+def test_empty_provider_set_still_has_fixed_groups() -> None:
     cat = build_catalog([])
-    assert {v.name for v in cat} == {f"shared.{s.view}" for s in SHARED_BASE_VIEWS}
+    expected = {f"shared.{s.view}" for s in SHARED_BASE_VIEWS} | {
+        f"efficiency.{s.view}" for s in EFFICIENCY_BASE_VIEWS
+    }
+    assert {v.name for v in cat} == expected

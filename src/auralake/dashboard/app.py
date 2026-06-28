@@ -15,7 +15,12 @@ import streamlit as st
 from auralake.dashboard.context import init_global_range
 from auralake.dashboard.data import NO_DATA_MSG, gold_last_updated, has_data, provider_label
 from auralake.dashboard.theme import inject_css
-from auralake.dashboard.views import home_overview, provider_focus, tco_overview
+from auralake.dashboard.views import (
+    efficiency_waste,
+    home_overview,
+    provider_focus,
+    tco_overview,
+)
 from auralake.transform.catalog import discover_provider_groups
 
 st.set_page_config(page_title="Auralake", page_icon="💧", layout="wide")
@@ -57,6 +62,12 @@ else:
         icon="🧮",
         url_path="tco-overview",
     )
+    waste_page = st.Page(
+        efficiency_waste.render,
+        title="Efficiency & waste",
+        icon="♻️",
+        url_path="efficiency-waste",
+    )
     pages = {
         "Overview": [
             st.Page(
@@ -70,6 +81,7 @@ else:
                 default=True,
             ),
             tco_page,
+            waste_page,
         ],
         "By provider": provider_pages,
     }

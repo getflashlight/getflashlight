@@ -34,6 +34,16 @@ def bronze_dir() -> Path:
     return home() / "bronze"
 
 
+def metrics_dir() -> Path:
+    """Efficiency-telemetry root, Hive-partitioned ``provider_name=…/charge_month=…/``.
+
+    The waste-plane sibling of :func:`bronze_dir` — holds the aggregated
+    ``EfficiencyRecord`` rows the GOLD waste view classifies. Separate from BRONZE
+    because efficiency telemetry does not fit ``FocusRecord``.
+    """
+    return home() / "metrics"
+
+
 def gold_dir() -> Path:
     """GOLD root — one ``<view>.parquet`` per catalogued metric (consumer surface)."""
     return home() / "gold"
@@ -71,5 +81,5 @@ def runs_dir() -> Path:
 
 def ensure_layout() -> None:
     """Create the lake directory skeleton (idempotent)."""
-    for path in (config_dir(), bronze_dir(), gold_dir(), runs_dir()):
+    for path in (config_dir(), bronze_dir(), metrics_dir(), gold_dir(), runs_dir()):
         path.mkdir(parents=True, exist_ok=True)

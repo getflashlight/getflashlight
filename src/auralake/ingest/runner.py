@@ -33,7 +33,7 @@ from auralake.ingest.connectors import (
     DatabricksConnector,
     FocusFileConnector,
 )
-from auralake.lake import bronze, runlog
+from auralake.lake import bronze, metrics, runlog
 from auralake.transform.runner import build_gold
 
 logger = get_logger(__name__)
@@ -146,9 +146,35 @@ def run_ingest(
             raise IngestError([outcome.name])
         total += outcome.rows
 
+    # Best-effort efficiency/waste pull (secondary to cost): each connector that exposes
+    # utilization telemetry writes aggregated EfficiencyRecords to the metrics plane. A
+    # failure here warns and skips — it must NOT block the canonical cost pipeline.
+    _run_efficiency(window, configs)
+
     # Every connector succeeded — rebuild SILVER/GOLD so the data is queryable.
     if not no_transform:
         published = build_gold()
         logger.info("transform_done", gold_views=published)
     logger.info("ingest_complete", connectors=len(configs), rows=total)
     return total
+
+
+def _run_efficiency(window: IngestWindow, configs: list[BaseModel]) -> int:
+    """Pull + write efficiency records for every connector that exposes them. Best-effort.
+
+    Returns rows written. Per-connector failures are logged and skipped so the waste
+    view simply goes stale rather than aborting the cost ingest.
+    """
+    written = 0
+    for config in configs:
+        connector = build_connector(config)
+        name = getattr(connector, "name", type(connector).__name__)
+        try:
+            records = list(connector.fetch_efficiency(window))
+        except Exception as exc:  # noqa: BLE001 - secondary signal; never block ingest
+            logger.warning("efficiency_pull_failed", connector=name, error=str(exc))
+            continue
+        if records:
+            written += metrics.write_efficiency(window, records)
+            logger.info("efficiency_written", connector=name, rows=len(records))
+    return written

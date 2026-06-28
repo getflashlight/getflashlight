@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date
 
+from auralake.efficiency.model import EfficiencyRecord
 from auralake.focus.model import FocusRecord
 
 
@@ -34,3 +35,13 @@ class Connector(ABC):
         inventing new ones.
         """
         raise NotImplementedError
+
+    def fetch_efficiency(self, window: IngestWindow) -> Iterator[EfficiencyRecord]:
+        """Yield aggregated efficiency records for the window (default: none).
+
+        Optional, non-abstract: a source without utilization/activity telemetry emits
+        no waste rows. Connectors that have it (e.g. Databricks system tables) override
+        this to power the efficiency/waste GOLD view. Best-effort — a failure here must
+        not abort the canonical cost ingest (the runner warns and skips).
+        """
+        return iter(())

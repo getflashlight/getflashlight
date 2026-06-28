@@ -18,6 +18,7 @@ import json
 import time
 import urllib.request
 from collections.abc import Iterator
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -26,15 +27,18 @@ from databricks.sdk.service.sql import Disposition, Format
 
 from auralake.core.exceptions import ConnectorError
 from auralake.core.logging import get_logger
+from auralake.efficiency.model import EfficiencyRecord, EntityType
 from auralake.focus.enums import ComputeClass
 from auralake.focus.model import FocusRecord
 from auralake.ingest.base import Connector, IngestWindow
 from auralake.ingest.config import DatabricksConfig, env
+from auralake.ingest.connectors._coerce import to_decimal
 from auralake.ingest.connectors._focus_map import map_focus_row
 
 logger = get_logger(__name__)
 
 _QUERY_PATH = Path(__file__).parent / "sql" / "databricks_focus_1_3.sql"
+_EFFICIENCY_QUERY_PATH = Path(__file__).parent / "sql" / "databricks_efficiency.sql"
 _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELED", "CLOSED"}
 
 # SQL-warehouse cluster sizes, smallest → largest. Auto-pick prefers the smallest
@@ -103,6 +107,21 @@ def _statement_error(resp: Any) -> tuple[str, str]:
 def compute_class_for_sku(sku: str | None) -> ComputeClass:
     """Classic vs serverless from the SKU name (drives the TCO double-count guard)."""
     return ComputeClass.SERVERLESS if sku and "SERVERLESS" in sku.upper() else ComputeClass.CLASSIC
+
+
+def _opt_float(value: object) -> float | None:
+    """Parse an optional numeric (warehouse values arrive as strings/None)."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_int(value: object) -> int | None:
+    f = _opt_float(value)
+    return None if f is None else int(f)
 
 
 class DatabricksConnector(Connector):
@@ -207,6 +226,66 @@ class DatabricksConnector(Connector):
         # Bound the scan to the ingest window (final FROM aliases the CTE as `u`).
         sql = sql.rstrip().rstrip(";")
         return f"{sql}\nWHERE u.usage_date BETWEEN '{window.start}' AND '{window.end}'"
+
+    def fetch_efficiency(self, window: IngestWindow) -> Iterator[EfficiencyRecord]:
+        """Yield aggregated EfficiencyRecord rows (entity × month) for the window.
+
+        Runs the vendored efficiency aggregation (``sql/databricks_efficiency.sql``) on
+        the warehouse — billing.usage ⋈ list_prices for $, node_timeline for utilization,
+        job_run_timeline for run/failure counts — and maps each row. Reuses the same
+        warehouse + account-prices resolution as the FOCUS pull, so rates match.
+        """
+        sql = self._render_efficiency_query(window)
+        fetched = mapped = 0
+        for row in self._execute(sql):
+            fetched += 1
+            record = self._to_efficiency(row)
+            if record is not None:
+                mapped += 1
+                yield record
+        logger.info("databricks_efficiency_done", rows_fetched=fetched, rows_mapped=mapped)
+
+    def _render_efficiency_query(self, window: IngestWindow) -> str:
+        sql = _EFFICIENCY_QUERY_PATH.read_text()
+        sql = sql.replace(":account_prices", f"'{self._resolve_account_prices()}'")
+        return (
+            sql.replace(":start_date", f"'{window.start}'")
+            .replace(":end_date", f"'{window.end}'")
+        )
+
+    @staticmethod
+    def _to_efficiency(row: dict[str, Any]) -> EfficiencyRecord | None:
+        """Map one aggregation row → EfficiencyRecord (values arrive as strings/None)."""
+        entity_id = row.get("entity_id")
+        charge_month = row.get("charge_month")
+        if not entity_id or not charge_month:
+            return None
+        try:
+            entity_type = EntityType(str(row.get("entity_type")))
+        except ValueError:
+            return None  # unknown compute class — skip rather than invent
+        cause = {
+            "run_count": _opt_int(row.get("run_count")),
+            "pct_runs_underutilized": _opt_float(row.get("pct_runs_underutilized")),
+            "failed_cost": _opt_float(row.get("failed_cost")),
+            "photon": str(row.get("photon")).lower() in ("true", "1"),
+        }
+        return EfficiencyRecord(
+            provider_name="Databricks",
+            charge_month=date.fromisoformat(str(charge_month)[:10]),
+            entity_type=entity_type,
+            entity_id=str(entity_id),
+            entity_name=row.get("entity_name"),
+            owner_user=row.get("owner_user"),
+            owner_project=row.get("owner_project"),
+            billed_cost=to_decimal(row.get("billed_cost")),
+            native_quantity=_opt_float(row.get("native_quantity")),
+            native_unit="DBU",
+            utilization_pct=_opt_float(row.get("utilization_pct")),
+            activity_count=_opt_int(row.get("activity_count")),
+            cause_detail={k: v for k, v in cause.items() if v is not None},
+            x_source_connector="databricks",
+        )
 
     def _warehouse_id(self) -> str:
         if self._resolved_warehouse_id is not None:

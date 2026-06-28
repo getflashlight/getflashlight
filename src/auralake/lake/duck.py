@@ -19,6 +19,7 @@ from __future__ import annotations
 import duckdb
 
 from auralake.lake import paths
+from auralake.lake.metrics_schema import empty_table as empty_metrics_table
 from auralake.lake.schema import empty_table
 
 
@@ -48,6 +49,29 @@ def register_bronze(con: duckdb.DuckDBPyConnection) -> None:
         con.register("_bronze_empty", empty_table())
         con.execute(
             "CREATE OR REPLACE VIEW raw.focus_record AS SELECT * FROM _bronze_empty"
+        )
+
+
+def register_metrics(con: duckdb.DuckDBPyConnection) -> None:
+    """Expose ``metrics.efficiency_record`` over the partitioned metrics Parquet.
+
+    The waste-plane sibling of :func:`register_bronze`: reads with
+    ``hive_partitioning`` so ``provider_name`` and ``charge_month`` come back as
+    columns, with the same typed-empty fallback before the first efficiency pull so
+    the GOLD waste SQL resolves either way.
+    """
+    con.execute("CREATE SCHEMA IF NOT EXISTS metrics")
+    files = list(paths.metrics_dir().glob("**/*.parquet"))
+    if files:
+        glob = str(paths.metrics_dir() / "**" / "*.parquet").replace("'", "''")
+        con.execute(
+            f"CREATE OR REPLACE VIEW metrics.efficiency_record AS SELECT * FROM "
+            f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
+        )
+    else:
+        con.register("_metrics_empty", empty_metrics_table())
+        con.execute(
+            "CREATE OR REPLACE VIEW metrics.efficiency_record AS SELECT * FROM _metrics_empty"
         )
 
 
