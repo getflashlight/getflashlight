@@ -121,11 +121,16 @@ uv run ruff check src tests && uv run mypy src tests && uv run pytest
   rows and net via `SUM` downstream.
 - **Single currency**: ingest asserts `billing_currency == AURALAKE_BASE_CURRENCY`.
 - **Attribution honesty**: unattributed AWS spend is surfaced, never silently dropped.
-- **Waste honesty** (`050_gold_waste.sql`): `underutilized` is only emitted when
-  `utilization_pct` is non-NULL, so it's **never** claimed for shared compute
-  (interactive/SQL warehouse) where per-entity utilization doesn't exist; `placement`
-  and `photon_no_gain` are `candidate` confidence; report failed-run/idle-window cost,
-  never an auto-termination "saving". Waste `billed_cost` reconciles to the FOCUS bill.
+- **Waste honesty** (`050_gold_waste.sql`): `underutilized` requires entity-level
+  `utilization_pct` (jobs and all-purpose **clusters** — the cluster is the entity, so
+  cluster CPU is honest); SQL warehouses have no per-entity utilization (NULL) so are
+  never flagged underutilized. `placement` is **all-purpose only** (you can't move a SQL
+  warehouse to jobs compute). `idle` fires only on a **measured** zero activity, never on
+  NULL (= unmeasured). `placement`/`photon_no_gain` are `candidate` confidence. WASTE and
+  OPPORTUNITY are separate lenses (a cluster can be both — different remedies); never sum
+  them into one headline. Waste `billed_cost` reconciles to the FOCUS bill. The Databricks
+  efficiency query (`connectors/sql/databricks_efficiency.sql`) is validated against a live
+  warehouse; entity grain is job_id / all-purpose cluster_id / warehouse_id × month.
 
 ## Code style
 

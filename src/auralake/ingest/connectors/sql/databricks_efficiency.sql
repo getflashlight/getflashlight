@@ -6,13 +6,14 @@
 --
 -- Substituted by the connector: :account_prices (price table), :start_date, :end_date.
 --
--- !!! VALIDATE AGAINST A LIVE WAREHOUSE before relying on the numbers. The system-table
--- column names below (pricing.default, identity_metadata.run_as, job_run_timeline
--- .result_state, node_timeline.cpu_*) follow current Databricks docs but vary by region/
--- release; adjust as needed. Utilization here is the cluster's monthly avg attributed to
--- the workload — the precise version overlaps node_timeline with each run window
--- (cause_detail.pct_runs_underutilized), a later enrichment. ponytail: cluster-month avg
--- is the tractable approximation; upgrade to per-run overlap when the signal needs it.
+-- VALIDATED against a live warehouse 2026-06-28: all columns/struct fields below confirmed
+-- (pricing.default, usage_metadata.*, identity_metadata.run_as, job_run_timeline.result_state,
+-- node_timeline.cpu_*), and billing_origin_product values include JOBS / ALL_PURPOSE / SQL /
+-- MODEL_SERVING. Re-validate if pointed at a different account/region/release.
+-- Utilization here is the cluster's monthly avg attributed to the workload — the precise
+-- version overlaps node_timeline with each run window (cause_detail.pct_runs_underutilized),
+-- a later enrichment. ponytail: cluster-month avg is the tractable approximation; upgrade to
+-- per-run overlap when the signal needs it.
 
 WITH prices AS (
   SELECT
@@ -51,7 +52,7 @@ util AS (
     AVG(cpu_user_percent + cpu_system_percent)               AS avg_cpu,
     AVG(mem_used_percent)                                    AS avg_mem
   FROM system.compute.node_timeline
-  WHERE start_time >= :start_date
+  WHERE start_time >= :start_date AND start_time < :end_date + INTERVAL 1 DAY
   GROUP BY cluster_id, date_trunc('MONTH', start_time)
 ),
 runs AS (
@@ -62,7 +63,7 @@ runs AS (
     SUM(CASE WHEN result_state IN ('ERROR','FAILED','TIMED_OUT') THEN 1 ELSE 0 END)
                                                            AS failed_runs
   FROM system.lakeflow.job_run_timeline
-  WHERE period_start_time >= :start_date
+  WHERE period_start_time >= :start_date AND period_start_time < :end_date + INTERVAL 1 DAY
   GROUP BY job_id, date_trunc('MONTH', period_start_time)
 )
 -- JOBS / DLT — per-job utilization (cluster avg), run count, failed-run cost
@@ -88,18 +89,21 @@ LEFT JOIN runs r  ON r.job_id      = u.job_id     AND r.charge_month  = u.charge
 WHERE u.product = 'JOBS' AND u.job_id IS NOT NULL
 GROUP BY u.job_id, u.run_as, u.charge_month
 UNION ALL
--- ALL-PURPOSE (interactive) — shared: cost-attributable, cluster-avg utilization
+-- ALL-PURPOSE (interactive) — grain is the CLUSTER (the actionable unit). Cluster-level
+-- utilization is honest at this grain (it describes the cluster, not a user). owner_user
+-- is the heaviest user, a best-effort hint. Catches underutilized/idle all-purpose
+-- clusters (a top waste vector) AND is a placement candidate downstream.
 SELECT
   CAST(u.cluster_id AS STRING), 'interactive', CAST(u.cluster_id AS STRING),
-  u.run_as, MAX(u.project), CAST(u.charge_month AS DATE),
+  max_by(u.run_as, u.cost), max_by(u.project, u.cost), CAST(u.charge_month AS DATE),
   SUM(u.cost), SUM(u.usage_quantity),
   LEAST(100, AVG(GREATEST(ut.avg_cpu, ut.avg_mem))),
   CAST(NULL AS BIGINT), CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE),
   CAST(NULL AS DOUBLE), BOOL_OR(u.photon)
 FROM usage u
 LEFT JOIN util ut ON ut.cluster_id = u.cluster_id AND ut.charge_month = u.charge_month
-WHERE UPPER(u.sku_name) LIKE '%ALL_PURPOSE%' AND u.cluster_id IS NOT NULL
-GROUP BY u.cluster_id, u.run_as, u.charge_month
+WHERE u.product = 'ALL_PURPOSE' AND u.cluster_id IS NOT NULL
+GROUP BY u.cluster_id, u.charge_month
 UNION ALL
 -- SQL WAREHOUSE — shared: cost-attributable; no per-entity utilization (NULL)
 SELECT

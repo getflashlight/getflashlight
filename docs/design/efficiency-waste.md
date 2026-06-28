@@ -5,8 +5,10 @@
 > Adds an **efficiency-waste** capability alongside the existing FOCUS/TCO product.
 > Built: the `EfficiencyRecord` contract, the `metrics/` plane, `Connector.fetch_efficiency`
 > (Databricks), `050_gold_waste.sql` classification, the `efficiency` GOLD group, and the
-> dashboard page. Open: live-validate `databricks_efficiency.sql` against a warehouse;
-> Phase 1b Model Serving. See **Build order**.
+> dashboard page. **Validated end-to-end against a live warehouse (2026-06-28):** column
+> names, joins, and classification confirmed on real data; interactive moved to cluster
+> grain and `placement` restricted to all-purpose as a result. Open: Phase 1b Model
+> Serving. See **Build order**.
 
 ## The one decision this design turns on
 
@@ -137,18 +139,20 @@ Output splits into two categories:
 
 | Compute class | Detect via | Telemetry grain *available* | **Action grain (GOLD)** | Lens |
 |---|---|---|---|---|
-| Jobs / DLT | `billing_origin_product IN (JOBS, DLT)` | per **job_run** (node util ∩ run window) | **`job_id` × month** (run_count, avg util; drill → run) | shadow waste: underutil, failed/retry |
-| All-purpose | `sku LIKE '%ALL_PURPOSE%'` | cluster-level only | **`run_as` / `project` × month** | attribution + move-to-jobs opportunity |
-| SQL warehouse | `billing_origin_product = SQL` | warehouse + `query.history` | **`user` / `warehouse` × month** | attribution + idle/oversize warehouse |
+| Jobs / DLT | `billing_origin_product = JOBS` | per **job_run** (node util ∩ run window) | **`job_id` × month** (run_count, avg util; drill → run) | shadow waste: underutil, failed/retry |
+| All-purpose | `billing_origin_product = ALL_PURPOSE` | cluster-level | **`cluster_id` × month** (cluster util; owner = heaviest user) | underutilized/idle cluster + move-to-jobs opportunity |
+| SQL warehouse | `billing_origin_product = SQL` | warehouse + `query.history` (later) | **`warehouse_id` × month** | attribution; idle/oversize (later) — no per-entity util |
 | **Model Serving** | `billing_origin_product = MODEL_SERVING` | endpoint request-rate vs provisioned (serving system tables — *verify names*) | **`endpoint` × month** | idle provisioned endpoint / no scale-to-zero |
 | **Photon** (cross-cutting) | `photon = true` on any of the above | inherits the host workload's grain | the host workload | premium $ on no-gain workloads (**candidate**; real A/B needs with/without) |
 
-**Honest limitation that forces the split:** `node_timeline` is per node (cluster).
-Shared clusters & SQL warehouses serve many users → **per-user CPU% does not exist**,
-but `billing.usage.run_as` means **per-user *cost* does**. So jobs get a real
-*utilization* waste number; interactive/SQL get a *cost-attribution + placement* number,
-never a per-user utilization claim (that would be a lie). Model Serving waste is
-*idle-provisioned*, not utilization-based.
+**Honest limitation that forces the grain:** `node_timeline` is per node, keyed by
+`cluster_id` — so **cluster** utilization is honest, but **per-user** CPU% on a shared
+cluster is not. Hence the entity is the **cluster** for all-purpose (cluster util →
+underutilized/idle is honest; `owner_user` is a best-effort heaviest-user hint), and the
+**job** for jobs. SQL warehouses expose no per-entity utilization (`utilization_pct` =
+NULL) → never flagged underutilized; their waste is idle/oversize (a later signal from
+query activity). Model Serving waste is *idle-provisioned*, not utilization-based.
+*(Validated against a live warehouse 2026-06-28 — see Build order.)*
 
 ### The one standardized schema — `EfficiencyRecord` (the FOCUS-analog for waste)
 
@@ -266,8 +270,10 @@ total recoverable_cost per category, drives the KPI bar.
 
 **Honesty rules baked in:** failed-run cost is reported, never auto-termination "savings"
 (research refutation); `photon_no_gain` and `placement` are `candidate` confidence;
-`underutilized` requires non-NULL `utilization_pct`, so it is **never** emitted for shared
-compute (where per-user/entity utilization doesn't exist).
+`underutilized` requires non-NULL `utilization_pct` (jobs + all-purpose clusters; SQL
+warehouses are NULL → never flagged); `placement` is all-purpose only; `idle` fires only on
+a **measured** zero activity, never on NULL; WASTE and OPPORTUNITY are separate lenses and
+are never summed into one headline.
 
 ---
 

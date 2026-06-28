@@ -60,14 +60,17 @@ def render() -> None:
     waste_total = month_rows.loc[month_rows["lens"] == "WASTE", "recoverable_cost"].sum()
     opp_total = month_rows.loc[month_rows["lens"] == "OPPORTUNITY", "recoverable_cost"].sum()
     high_total = month_rows.loc[month_rows["confidence"] == "high", "recoverable_cost"].sum()
+    n_entities = month_rows["entity_id"].nunique()
 
+    # WASTE and OPPORTUNITY are separate lenses (a cluster can be both — different
+    # remedies), so they are shown separately, never summed into one headline.
     section_caption(f"Showing **{month_label}** — the latest month with telemetry.")
     kpi_cards(
         [
-            ("Total recoverable", compact_money(waste_total + opp_total), month_label, "default"),
             ("Waste (tune it)", compact_money(waste_total), "idle · underused", "unattributed"),
             ("Opportunity (move)", compact_money(opp_total), "→ jobs compute", "default"),
-            ("High confidence", compact_money(high_total), "vs candidate", "default"),
+            ("High confidence", compact_money(high_total), "of waste", "default"),
+            ("Entities flagged", f"{n_entities:,}", month_label, "default"),
         ],
         key="waste",
     )

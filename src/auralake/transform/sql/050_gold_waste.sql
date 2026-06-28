@@ -7,11 +7,12 @@
 -- string 'YYYY-MM'; normalize to a date here so it matches the rest of GOLD.
 --
 -- HONESTY (carried from the FOCUS plane):
---   * underutilized requires a non-NULL utilization_pct → NEVER emitted for shared
---     compute (interactive/sql_warehouse), where per-entity CPU% does not exist.
---   * placement and photon_no_gain are 'candidate' confidence (real confirmation needs
---     job-context / an A/B run); idle and failed are 'high'.
---   * we report failed-run and idle-window cost — never an auto-termination "saving".
+--   * underutilized requires a non-NULL utilization_pct (jobs + all-purpose CLUSTERS,
+--     where cluster CPU is honest); SQL warehouses are NULL → never flagged.
+--   * placement is all-purpose only (can't move a SQL warehouse to jobs compute).
+--   * idle fires only on a MEASURED zero activity, never on NULL (= unmeasured).
+--   * placement and photon_no_gain are 'candidate' confidence; idle and failed are 'high'.
+--   * we report failed-run and idle cost — never an auto-termination "saving".
 
 -- ── Recoverable-fraction knobs (tune as rates move) ────────────────────────────────
 -- ponytail: hard-coded heuristics; promote to a list_prices-derived join if the rate
@@ -39,7 +40,8 @@ WITH e AS (
                                                            AS photon
     FROM metrics.efficiency_record
 )
--- underutilized (measurable utilization only)
+-- underutilized (entity-level utilization only: jobs + all-purpose clusters; SQL
+-- warehouses have NULL util and are excluded)
 SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
        owner_user, owner_project, billed_cost,
        'underutilized'                                     AS waste_category,
@@ -50,19 +52,24 @@ SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
 FROM e
 WHERE utilization_pct IS NOT NULL AND utilization_pct <= 20
 UNION ALL
--- idle (billed but zero activity)
+-- idle (billed but a MEASURED zero activity). NULL = unmeasured, never idle — an idle
+-- cluster with low CPU is caught by 'underutilized' instead. Only fires once a connector
+-- supplies a real activity count (jobs: run_count).
 SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
        owner_user, owner_project, billed_cost,
        'idle', 'WASTE', round(billed_cost, 2), 'high'
 FROM e
-WHERE coalesce(activity_count, 0) = 0 AND billed_cost > 0
+WHERE activity_count = 0 AND billed_cost > 0
 UNION ALL
--- placement: real work on interactive/SQL that could run on jobs compute → OPPORTUNITY
+-- placement: all-purpose spend that could run on (cheaper) jobs compute → OPPORTUNITY.
+-- All-purpose only — you can't move a SQL warehouse to jobs compute. (WASTE and
+-- OPPORTUNITY are separate lenses, so a cluster can be both underutilized AND a
+-- placement candidate — different remedies; don't sum across lenses in a headline.)
 SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
        owner_user, owner_project, billed_cost,
        'placement', 'OPPORTUNITY', round(billed_cost * 0.70, 2), 'candidate'
 FROM e
-WHERE entity_type IN ('interactive', 'sql_warehouse') AND coalesce(activity_count, 0) > 0
+WHERE entity_type = 'interactive'
 UNION ALL
 -- failed / retried run spend
 SELECT provider_name, charge_month, entity_type, entity_id, entity_name,

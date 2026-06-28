@@ -57,8 +57,12 @@ def test_waste_classification(lake_home) -> None:  # type: ignore[no-untyped-def
              cause_detail={"pct_runs_underutilized": 0.9}),
         # idle: billed but zero activity → full cost recoverable
         _rec("job-idle", EntityType.JOB, "50", activity_count=0),
-        # placement: interactive with real activity → OPPORTUNITY, 70% of cost
+        # placement: any all-purpose spend → OPPORTUNITY, 70% of cost (no activity gate)
         _rec("cl-interactive", EntityType.INTERACTIVE, "200", activity_count=10),
+        # underutilized interactive CLUSTER: cluster-level util is honest at cluster grain
+        _rec("cl-under", EntityType.INTERACTIVE, "120", utilization_pct=15.0),
+        # SQL warehouse: shared, no per-entity util → no underutilized AND no placement
+        _rec("wh-1", EntityType.SQL_WAREHOUSE, "300"),
         # failed runs: util healthy, but failed_cost present
         _rec("job-failed", EntityType.JOB, "80", utilization_pct=50.0, activity_count=3,
              cause_detail={"failed_cost": 20.0}),
@@ -81,11 +85,17 @@ def test_waste_classification(lake_home) -> None:  # type: ignore[no-untyped-def
     # idle: full billed cost
     assert idx[("job-idle", "idle")]["recoverable_cost"] == pytest.approx(50.0)
 
-    # placement: 70% of cost, opportunity lens, candidate
+    # placement: 70% of cost, opportunity lens, candidate (all-purpose, no activity gate)
     placement = idx[("cl-interactive", "placement")]
     assert placement["recoverable_cost"] == pytest.approx(140.0)
     assert placement["lens"] == "OPPORTUNITY"
     assert placement["confidence"] == "candidate"
+
+    # interactive CLUSTER with cluster-level util → underutilized is honest at cluster grain
+    under_cl = idx[("cl-under", "underutilized")]
+    assert under_cl["recoverable_cost"] == pytest.approx(120 * 0.85)
+    # it is ALSO a placement candidate (different lens, different remedy)
+    assert ("cl-under", "placement") in idx
 
     # failed: the failed_cost from cause_detail
     assert idx[("job-failed", "failed")]["recoverable_cost"] == pytest.approx(20.0)
@@ -99,8 +109,11 @@ def test_waste_classification(lake_home) -> None:  # type: ignore[no-untyped-def
 
     # honesty: a healthy job emits no underutilized row
     assert ("job-failed", "underutilized") not in idx
-    # shared compute never gets an underutilized row (no per-entity utilization)
+    # no utilization data (NULL) → no underutilized row (cl-interactive has util=None)
     assert ("cl-interactive", "underutilized") not in idx
+    # SQL warehouse: no per-entity util → never underutilized, and never a placement
+    # candidate (you can't move a warehouse to jobs compute)
+    assert not any(k[0] == "wh-1" for k in idx)
 
 
 def test_summary_rolls_up(lake_home) -> None:  # type: ignore[no-untyped-def]
