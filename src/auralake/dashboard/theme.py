@@ -337,19 +337,27 @@ def filterable_table(
     num_cols: Sequence[str] = (),
     rename: dict[str, str] | None = None,
     compact: bool = False,
+    max_rows: int | None = None,
 ) -> None:
-    """Searchable table with CSV export — filter applies to ``filter_col`` before formatting."""
+    """Searchable table with CSV export — filter applies to ``filter_col`` before formatting.
+
+    ``max_rows`` caps the *displayed* rows (the long tail is noise once sorted by value);
+    the CSV export always carries the full filtered set, and a note reports what was hidden.
+    A ``filter_col`` absent from ``df`` (e.g. dropped because it was constant) just skips
+    the search box.
+    """
     raw = df.copy()
     show_chrome = not compact or len(raw) > 10
     if show_chrome:
-        label = (rename or {}).get(filter_col, filter_col)
-        q = st.text_input(
-            f"Filter {label}",
-            key=f"{key}_filter",
-            placeholder=f"Search {label}…",
-        )
-        if q:
-            raw = raw[raw[filter_col].astype(str).str.contains(q, case=False, na=False)]
+        if filter_col in raw.columns:
+            label = (rename or {}).get(filter_col, filter_col)
+            q = st.text_input(
+                f"Filter {label}",
+                key=f"{key}_filter",
+                placeholder=f"Search {label}…",
+            )
+            if q:
+                raw = raw[raw[filter_col].astype(str).str.contains(q, case=False, na=False)]
         btn_col, _ = st.columns([1, 3])
         with btn_col:
             st.download_button(
@@ -359,8 +367,11 @@ def filterable_table(
                 mime="text/csv",
                 key=f"{key}_csv",
             )
+    shown = raw if max_rows is None else raw.head(max_rows)
+    if max_rows is not None and len(raw) > max_rows:
+        st.caption(f"Showing top {max_rows} of {len(raw):,} — download the CSV for the full list.")
     html_table(
-        raw,
+        shown,
         money_cols=money_cols,
         pct_cols=pct_cols,
         int_cols=int_cols,

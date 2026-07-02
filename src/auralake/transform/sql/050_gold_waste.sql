@@ -46,6 +46,7 @@ SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
        owner_user, owner_project, billed_cost,
        'underutilized'                                     AS waste_category,
        'WASTE'                                             AS lens,
+       'util ' || round(utilization_pct)::INT || '%'       AS detail,
        round(billed_cost * (1 - utilization_pct / 100.0), 2) AS recoverable_cost,
        CASE WHEN coalesce(pct_runs_underutilized, 0) >= 0.8 THEN 'high'
             ELSE 'candidate' END                           AS confidence
@@ -57,7 +58,7 @@ UNION ALL
 -- supplies a real activity count (jobs: run_count).
 SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
        owner_user, owner_project, billed_cost,
-       'idle', 'WASTE', round(billed_cost, 2), 'high'
+       'idle', 'WASTE', 'no measured activity', round(billed_cost, 2), 'high'
 FROM e
 WHERE activity_count = 0 AND billed_cost > 0
 UNION ALL
@@ -67,21 +68,23 @@ UNION ALL
 -- placement candidate — different remedies; don't sum across lenses in a headline.)
 SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
        owner_user, owner_project, billed_cost,
-       'placement', 'OPPORTUNITY', round(billed_cost * 0.70, 2), 'candidate'
+       'placement', 'OPPORTUNITY', '→ jobs compute', round(billed_cost * 0.70, 2), 'candidate'
 FROM e
 WHERE entity_type = 'interactive'
 UNION ALL
 -- failed / retried run spend
 SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
        owner_user, owner_project, billed_cost,
-       'failed', 'WASTE', round(failed_cost, 2), 'high'
+       'failed', 'WASTE', 'failed/retried runs', round(failed_cost, 2), 'high'
 FROM e
 WHERE coalesce(failed_cost, 0) > 0
 UNION ALL
 -- photon on a no-gain (low-util) workload (candidate; real A/B needs with/without)
 SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
        owner_user, owner_project, billed_cost,
-       'photon_no_gain', 'WASTE', round(billed_cost * (1 - 1 / 2.9), 2), 'candidate'
+       'photon_no_gain', 'WASTE',
+       'photon, util ' || round(utilization_pct)::INT || '%',
+       round(billed_cost * (1 - 1 / 2.9), 2), 'candidate'
 FROM e
 WHERE photon AND utilization_pct IS NOT NULL AND utilization_pct <= 20;
 

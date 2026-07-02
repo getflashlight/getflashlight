@@ -75,42 +75,77 @@ def render() -> None:
         key="waste",
     )
 
+    # Split by lens — WASTE and OPPORTUNITY are different remedies and share billed_cost
+    # for the same entity, so a single flat list invites double-counting.
+    _lens_table(month_rows, "WASTE", "Waste — tune or right-size it", "waste")
+    _lens_table(month_rows, "OPPORTUNITY", "Opportunity — move it to cheaper compute", "opp")
+
+
+# Displayed in order; descriptor columns that are constant across a lens table collapse
+# into the caption instead of repeating on every row (e.g. placement is always
+# interactive · candidate · → jobs compute).
+_COLS = [
+    "entity_name",
+    "entity_type",
+    "provider_name",
+    "owner_user",
+    "waste_category",
+    "confidence",
+    "detail",
+    "billed_cost",
+    "recoverable_cost",
+]
+_CONSTANT_CANDIDATES = [
+    "entity_type",
+    "provider_name",
+    "waste_category",
+    "confidence",
+    "detail",
+]
+_RENAME = {
+    "entity_name": "Entity",
+    "entity_type": "Type",
+    "provider_name": "Provider",
+    "owner_user": "Owner",
+    "waste_category": "Cause",
+    "confidence": "Confidence",
+    "detail": "Detail",
+    "billed_cost": "Billed",
+    "recoverable_cost": "Recoverable",
+}
+_MIN_RECOVERABLE = 1.0  # sub-dollar rows are noise (and round to "$0" in the table)
+_MAX_ROWS = 40
+
+
+def _lens_table(month_rows: pd.DataFrame, lens: str, title: str, key: str) -> None:
+    # Impact-first: rank by recoverable $. Confidence is a column + its own KPI; making it
+    # the primary sort buried the big-$ candidate rows under a long tail of tiny high-conf
+    # ones. Drop sub-dollar rows — they only add noise and display as "$0".
+    rows = month_rows[
+        (month_rows["lens"] == lens) & (month_rows["recoverable_cost"] >= _MIN_RECOVERABLE)
+    ].sort_values("recoverable_cost", ascending=False)
+    if rows.empty:
+        return
+
+    # Collapse columns that are constant across this table into one context line.
+    constants = [
+        c for c in _CONSTANT_CANDIDATES if c in rows and rows[c].nunique(dropna=False) == 1
+    ]
+    context = " · ".join(str(rows[c].iloc[0]) for c in constants)
+    cols = [c for c in _COLS if c not in constants]
+
     with panel(tone="default"):
-        section_title("Recoverable spend by entity", flush=True)
+        section_title(title, flush=True)
         section_caption(
-            "Ranked by recoverable $. Filter by category (the cause), owner, or provider. "
+            f"Ranked by recoverable $. {('All ' + context + '. ') if context else ''}"
             "underutilized is never shown for shared compute (no per-entity utilization)."
         )
-        table = month_rows[
-            [
-                "entity_name",
-                "entity_type",
-                "provider_name",
-                "owner_user",
-                "owner_project",
-                "waste_category",
-                "lens",
-                "confidence",
-                "billed_cost",
-                "recoverable_cost",
-            ]
-        ]
         filterable_table(
-            table,
+            rows[cols],
             filter_col="waste_category",
-            file_name="waste_record.csv",
-            key="waste_leaderboard",
+            file_name=f"waste_{key}.csv",
+            key=f"waste_{key}",
             money_cols=["billed_cost", "recoverable_cost"],
-            rename={
-                "entity_name": "Entity",
-                "entity_type": "Type",
-                "provider_name": "Provider",
-                "owner_user": "Owner",
-                "owner_project": "Project",
-                "waste_category": "Cause",
-                "lens": "Lens",
-                "confidence": "Confidence",
-                "billed_cost": "Billed",
-                "recoverable_cost": "Recoverable",
-            },
+            rename=_RENAME,
+            max_rows=_MAX_ROWS,
         )
