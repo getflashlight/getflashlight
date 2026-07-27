@@ -6,6 +6,13 @@
 
 <p align="center"><em>Finds what's burning money in the dark.</em></p>
 
+<p align="center">
+  <a href="https://github.com/ychaparala/getflashlight/actions/workflows/ci.yml"><img src="https://github.com/ychaparala/getflashlight/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://pypi.org/project/getflashlight/"><img src="https://img.shields.io/pypi/v/getflashlight" alt="PyPI"></a>
+  <a href="https://pypi.org/project/getflashlight/"><img src="https://img.shields.io/pypi/pyversions/getflashlight" alt="Python versions"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/ychaparala/getflashlight" alt="License"></a>
+</p>
+
 **FOCUS-based, multi-cloud Total Cost of Ownership (TCO) spend visualization.**
 
 Flashlight ingests cloud billing in the [FinOps FOCUS](https://focus.finops.org/focus-specification/)
