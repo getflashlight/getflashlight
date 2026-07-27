@@ -84,7 +84,7 @@ def test_ingest_parquet(lake_home, tmp_path) -> None:  # type: ignore[no-untyped
         }
     )
     path = tmp_path / "focus.parquet"
-    pq.write_table(table, path)  # type: ignore[no-untyped-call]
+    pq.write_table(table, path)
     connector = FocusFileConnector(FocusFileConfig(path=str(path)))
 
     written = connector.ingest(_WINDOW, run_id="r1")
