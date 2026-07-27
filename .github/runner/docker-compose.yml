@@ -1,0 +1,17 @@
+# Run the self-hosted runner:  docker compose up -d --build
+# Provide GITHUB_PAT (recommended) or RUNNER_TOKEN via a .env file next to this.
+services:
+  runner:
+    build: .
+    image: flashlight-gha-runner
+    environment:
+      GITHUB_URL: ${GITHUB_URL:-https://github.com/ychaparala/flashlight}
+      # Provide ONE of the two below:
+      GITHUB_PAT: ${GITHUB_PAT:-}        # PAT (repo admin) → mints tokens automatically (recommended)
+      RUNNER_TOKEN: ${RUNNER_TOKEN:-}    # or a short-lived registration token from repo Settings
+      RUNNER_NAME: ${RUNNER_NAME:-flashlight-docker}
+      RUNNER_LABELS: ${RUNNER_LABELS:-self-hosted,docker,linux,x64}
+      RUNNER_EPHEMERAL: ${RUNNER_EPHEMERAL:-false}
+    restart: unless-stopped
+    # Scale to N parallel runners:  docker compose up -d --build --scale runner=3
+    # (don't set a fixed container_name when scaling)

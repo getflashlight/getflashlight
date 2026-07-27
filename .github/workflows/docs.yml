@@ -1,0 +1,21 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths: [docs/**, mkdocs.yml, src/flashlight/cli.py, .github/workflows/docs.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, flashlight]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --group docs
+      # CLI reference is generated at build time, never committed
+      - run: uv run typer flashlight.cli utils docs --name flashlight --output docs/cli.md
+      - run: uv run --group docs mkdocs gh-deploy --force

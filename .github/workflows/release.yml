@@ -1,0 +1,58 @@
+name: Release
+
+# CD: on a version tag, run the gate, build the wheel + sdist, and publish them
+# to a GitHub Release. Tag and pyproject version must match.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # create the release + upload assets
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: [self-hosted, linux, flashlight]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv + Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install (locked)
+        run: uv sync --locked
+
+      - name: Check tag matches pyproject version
+        run: |
+          VERSION=$(uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "pyproject=$VERSION tag=$TAG"
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "::error::Tag '$TAG' does not match pyproject version '$VERSION'"
+            exit 1
+          fi
+
+      - name: Gate (lint, type-check, test)
+        run: |
+          uv run ruff check src tests
+          uv run mypy src tests
+          uv run pytest
+
+      - name: Build wheel + sdist
+        run: uv build
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

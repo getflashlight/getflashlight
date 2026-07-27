@@ -1,0 +1,91 @@
+# Flashlight connector configuration. Copy to config/connections.yml and edit.
+# Credentials are NOT stored here — they're read from the environment variables
+# named by the *_env fields (set them in .env / your shell / secrets manager).
+
+connectors:
+  # Local FOCUS file (CSV or Parquet) — easiest way to load sample data or any
+  # vendor's FOCUS export with no cloud credentials. See data/README.md to fetch
+  # the official FinOps FOCUS sample dataset.
+  - type: focus_file
+    enabled: false
+    path: /data/focus_sample.csv
+    respect_window: false   # ingest all rows regardless of the run's date window
+
+  # AWS native FOCUS export (preferred). Point at the S3 location of your
+  # AWS Data Exports FOCUS 1.0 dataset. Includes Redshift, S3, EC2/EBS lines.
+  - type: aws_focus
+    enabled: true
+    s3_bucket: my-cur-exports
+    s3_prefix: focus/flashlight/data
+    region: us-east-1
+    access_key_env: AWS_ACCESS_KEY_ID
+    secret_key_env: AWS_SECRET_ACCESS_KEY
+
+  # Databricks DBU usage. Runs the vendored Databricks→FOCUS 1.3 query on a SQL
+  # warehouse (see data/README + the SQL header for provenance/attribution).
+  # Needs UC access to system.billing.*, system.compute.*, system.lakeflow.pipelines,
+  # system.access.workspaces_latest.
+  - type: databricks
+    enabled: true
+    host: https://dbc-xxxxxxxx.cloud.databricks.com
+    token_env: DATABRICKS_TOKEN
+    sql_warehouse_id: null   # null → auto-pick a warehouse
+
+  # AWS infra via Cost Explorer — only needed if you do NOT have a native FOCUS
+  # export. Attributes EC2/EBS/S3 to clusters via the cluster tag. Disabled by default.
+  - type: aws_infra
+    enabled: false
+    region: us-east-1
+    cluster_tag_key: ClusterId
+    tag_filters:
+      Vendor: Databricks
+
+  # Redshift efficiency/waste telemetry only — no cost pull (Redshift cost already
+  # flows through aws_focus above, which should ideally be enabled too; this
+  # connector's fetch() is a deliberate no-op). Its $ breakdown reads aws_focus's
+  # already-ingested BRONZE rows for the same window instead of a second API call —
+  # if aws_focus isn't enabled yet, or hasn't ingested this window, the cluster's $
+  # figures are just absent/zero; every other signal (query patterns, per-user
+  # activity, WLM health, table inventory/usage) still runs fully regardless, since
+  # none of that needs cost data. Runs read-only queries against Redshift system
+  # tables (STL_*/SVL_*/SVCS_*) via the Data API (IAM-based, no persistent DB
+  # credentials). Set exactly one of cluster_identifier / workgroup_name.
+  - type: redshift
+    enabled: false
+    region: us-east-1
+    cluster_identifier: my-redshift-cluster
+    # workgroup_name: my-serverless-workgroup   # alternative to cluster_identifier
+    database: dev
+    # Named AWS profile (~/.aws/credentials or ~/.aws/config, incl. SSO profiles) —
+    # takes priority over access_key_env/secret_key_env below when set. Convenient
+    # for local/dev use against a real account:
+    # aws_profile: my-sso-profile
+    access_key_env: AWS_ACCESS_KEY_ID
+    secret_key_env: AWS_SECRET_ACCESS_KEY
+    #
+    # Redshift cluster's own endpoint — optional. Auto-discovered via AWS
+    # describe_clusters if unset; set these to skip that AWS API call entirely
+    # (e.g. you don't want to grant even read-only Describe* permissions):
+    # db_host: my-cluster.abc123.us-east-1.redshift.amazonaws.com
+    # db_port: 5439
+    #
+    # ── SQL query auth — pick ONE (default: none of these, the Data API) ──
+    #
+    # Option A: the cluster is reachable directly (public, or same network/VPC) and
+    # you have a native Redshift DB account/password — no tunnel, no IAM needed:
+    # db_user: flashlight_ro
+    # db_password_env: REDSHIFT_DB_PASSWORD   # env var holding the password
+    #
+    # Option B: the cluster is locked down in a private VPC and needs an SSH jump
+    # host to reach at all (needs: pip install "getflashlight[redshift-bastion]").
+    # The bastion_* fields describe the SSH jump host itself, NOT the Redshift
+    # cluster — kept as a distinct, flattened set of fields (no nested block, no
+    # name collisions with db_* above) for exactly that reason. Default auth over
+    # the tunnel is a short-lived IAM credential (needs redshift:GetClusterCredentials
+    # for db_user) — or set db_password_env (same field as Option A) for a native DB
+    # account/password over the tunnel instead of IAM:
+    # db_user: flashlight_ro
+    # bastion_host: bastion.example.com
+    # bastion_user: ec2-user
+    # bastion_private_key_path: /path/to/bastion-key.pem
+    # db_password_env: REDSHIFT_DB_PASSWORD   # optional, see above

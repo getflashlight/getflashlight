@@ -1,0 +1,75 @@
+[project]
+# PyPI name is getflashlight (flashlight is squatted); import + CLI stay `flashlight`
+name = "getflashlight"
+version = "0.2.0"
+description = "FOCUS-based multi-cloud TCO spend-visualization platform"
+requires-python = ">=3.12"
+dependencies = [
+    # Connector SDKs are imported eagerly by ingest, so they're required for now.
+    # Making them optional extras needs lazy connector imports (follow-up).
+    "boto3>=1.43.36",
+    "databricks-sdk>=0.119.0",
+    "duckdb>=1.5.4",
+    "httpx>=0.28.1",
+    "mcp>=1.28.0",
+    "nicegui>=3.14.0",
+    "pandas>=3.0.3",
+    "platformdirs>=4.10.0",
+    "plotly>=6.8.0",
+    "pyarrow>=24.0.0",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.2",
+    "python-dotenv>=1.0.1",
+    "pyyaml>=6.0.3",
+    "structlog>=26.1.0",
+    "typer>=0.26.7",
+]
+
+[project.optional-dependencies]
+# Only needed for RedshiftConfig.bastion_host/db_password_env (a direct SQL
+# connection, tunneled or not, for clusters not reachable via the Data API) —
+# lazily imported so the default `pip install getflashlight` doesn't pull these
+# in for everyone.
+redshift-bastion = [
+    "sshtunnel>=0.4.0",
+    "redshift-connector>=2.1.6",
+]
+
+[project.scripts]
+flashlight = "flashlight.cli:app"
+fl = "flashlight.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flashlight"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+    "pre-commit>=4.6.1",
+    "pytest>=9.1.1",
+    "ruff>=0.15.19",
+]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocs-llmstxt>=0.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+strict = true
+ignore_missing_imports = true

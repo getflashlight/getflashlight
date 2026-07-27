@@ -1,0 +1,79 @@
+site_name: Flashlight
+site_description: FOCUS-based, multi-cloud TCO spend visualization. Finds what's burning money in the dark.
+site_url: https://getflashlight.app/
+repo_url: https://github.com/ychaparala/getflashlight
+repo_name: ychaparala/getflashlight
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  font:
+    text: Inter
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
+      accent: green
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: green
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences
+  - tables
+  - toc:
+      title: On this page
+
+extra_css:
+  - stylesheets/extra.css
+
+plugins:
+  - search
+  - llmstxt:
+      markdown_description: >
+        FOCUS-based, multi-cloud TCO spend visualization. Ingests cloud billing
+        in the FinOps FOCUS format, standardizes it into a BRONZE/SILVER/GOLD
+        Parquet lake, and serves a bundled dashboard plus an MCP server for
+        agents. Installs with `pip install getflashlight` — no Docker, no
+        database server.
+      sections:
+        Docs:
+          - index.md: Overview — what Flashlight is and why the numbers are trustworthy
+          - quickstart.md: Sample data to a running dashboard in two commands
+          - architecture.md: The BRONZE → SILVER → GOLD lake and its invariants
+          - connectors.md: AWS, Databricks, FOCUS files, and the mapping SQL
+          - cli.md: Every `flashlight` command
+        Design:
+          - design/efficiency-waste.md: The efficiency/waste GOLD group and its rules
+
+nav:
+  - Home: index.md
+  - Quick start: quickstart.md
+  - Architecture: architecture.md
+  - Connectors: connectors.md
+  - CLI reference: cli.md
+  - Design:
+      - Efficiency / waste: design/efficiency-waste.md
+
+exclude_docs: |
+  research/
