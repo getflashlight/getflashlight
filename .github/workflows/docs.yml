@@ -11,10 +11,15 @@ permissions:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, linux, flashlight]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
       - run: uv sync --group docs
       # CLI reference is generated at build time, never committed
       - run: uv run typer flashlight.cli utils docs --name flashlight --output docs/cli.md
