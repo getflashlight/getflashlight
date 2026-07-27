@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write  # create the release + upload assets
+  id-token: write  # PyPI trusted publishing (OIDC)
 
 concurrency:
   group: release-${{ github.ref }}
@@ -18,7 +19,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: [self-hosted, linux, flashlight]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +50,11 @@ jobs:
 
       - name: Build wheel + sdist
         run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
