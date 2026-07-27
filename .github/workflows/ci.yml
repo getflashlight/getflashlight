@@ -12,11 +12,11 @@ concurrency:
 jobs:
   test:
     name: gate (py${{ matrix.python-version }})
-    runs-on: [self-hosted, linux, flashlight]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
