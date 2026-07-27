@@ -3,7 +3,17 @@
 name = "getflashlight"
 version = "0.1.0"
 description = "FOCUS-based multi-cloud TCO spend-visualization platform"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Yuga Chaparala", email = "ychaparala@gmail.com" }]
 requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
 dependencies = [
     # Connector SDKs are imported eagerly by ingest, so they're required for now.
     # Making them optional extras needs lazy connector imports (follow-up).
@@ -38,6 +48,11 @@ redshift-bastion = [
 [project.scripts]
 flashlight = "flashlight.cli:app"
 fl = "flashlight.cli:app"
+
+[project.urls]
+Homepage = "https://getflashlight.app/"
+Repository = "https://github.com/ychaparala/getflashlight"
+Issues = "https://github.com/ychaparala/getflashlight/issues"
 
 [build-system]
 requires = ["hatchling"]
