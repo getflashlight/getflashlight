@@ -45,7 +45,7 @@ def _connector(monkeypatch, tmp_path, files: list[str], **config_kw: object):  #
 
 def _write_parquet(path, rows: list[dict[str, object]]) -> str:  # type: ignore[no-untyped-def]
     table = pa.Table.from_pylist(rows)
-    pq.write_table(table, path)  # type: ignore[no-untyped-call]
+    pq.write_table(table, path)
     return str(path)
 
 
