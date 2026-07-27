@@ -1,0 +1,25 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you expected instead, too.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Command(s) run, connector/config involved, and any relevant log output.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: getflashlight version
+      description: Output of `pip show getflashlight`.
+    validations:
+      required: true
