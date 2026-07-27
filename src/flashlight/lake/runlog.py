@@ -60,8 +60,6 @@ def record_run(
             ],
             schema=RUN_SCHEMA,
         )
-        pq.write_table(  # type: ignore[no-untyped-call]
-            table, paths.runs_dir() / f"{run_id}-{connector}.parquet"
-        )
+        pq.write_table(table, paths.runs_dir() / f"{run_id}-{connector}.parquet")
     except Exception as exc:  # noqa: BLE001 - observability must not break ingest
         logger.warning("runlog_write_failed", connector=connector, error=str(exc))
