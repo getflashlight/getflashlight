@@ -12,7 +12,7 @@ concurrency:
 jobs:
   test:
     name: gate (py${{ matrix.python-version }})
-    runs-on: [self-hosted, linux, flashlight]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:

@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: [self-hosted, linux, flashlight]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
