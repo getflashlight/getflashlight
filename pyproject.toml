@@ -1,7 +1,7 @@
 [project]
 # PyPI name is getflashlight (flashlight is squatted); import + CLI stay `flashlight`
 name = "getflashlight"
-version = "0.1.0"
+version = "0.2.0"
 description = "FOCUS-based multi-cloud TCO spend-visualization platform"
 readme = "README.md"
 license = "Apache-2.0"
