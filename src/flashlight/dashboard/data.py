@@ -52,6 +52,16 @@ def gold_df(sql: str) -> pd.DataFrame:
         con.close()
 
 
+def telemetry_df(sql: str) -> pd.DataFrame:
+    """Run *sql* over the ``telemetry.chat_turn`` view (BYOK chat usage log)."""
+    con = duck.connect()
+    try:
+        duck.register_chat_turns(con)
+        return con.execute(sql).df()
+    finally:
+        con.close()
+
+
 def gold_last_updated() -> datetime | None:
     """Latest GOLD parquet mtime — proxy for when billing data was last published."""
     gold = paths.gold_dir()

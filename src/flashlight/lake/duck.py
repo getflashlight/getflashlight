@@ -19,6 +19,7 @@ from __future__ import annotations
 import duckdb
 
 from flashlight.lake import paths
+from flashlight.lake.chat_turns import empty_table as empty_chat_turn_table
 from flashlight.lake.driver_health_schema import empty_table as empty_driver_health_table
 from flashlight.lake.metrics_schema import empty_table as empty_metrics_table
 from flashlight.lake.schema import empty_table
@@ -110,6 +111,29 @@ def register_driver_health(con: duckdb.DuckDBPyConnection) -> None:
         con.register("_driver_health_empty", empty_driver_health_table())
         con.execute(
             "CREATE OR REPLACE VIEW metrics.driver_health AS SELECT * FROM _driver_health_empty"
+        )
+
+
+def register_chat_turns(con: duckdb.DuckDBPyConnection) -> None:
+    """Expose ``telemetry.chat_turn`` over the BYOK chat usage log.
+
+    Unlike :func:`register_metrics`/:func:`register_driver_health`, these files
+    aren't Hive-partitioned by directory — each is just one ``<turn_id>.parquet``
+    under :func:`~flashlight.lake.paths.chat_turns_dir` — so no
+    ``hive_partitioning`` flag is needed, just a flat glob.
+    """
+    con.execute("CREATE SCHEMA IF NOT EXISTS telemetry")
+    files = list(paths.chat_turns_dir().glob("*.parquet"))
+    if files:
+        glob = str(paths.chat_turns_dir() / "*.parquet").replace("'", "''")
+        con.execute(
+            f"CREATE OR REPLACE VIEW telemetry.chat_turn AS SELECT * FROM "
+            f"read_parquet('{glob}')"
+        )
+    else:
+        con.register("_chat_turn_empty", empty_chat_turn_table())
+        con.execute(
+            "CREATE OR REPLACE VIEW telemetry.chat_turn AS SELECT * FROM _chat_turn_empty"
         )
 
 

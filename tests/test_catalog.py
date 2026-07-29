@@ -35,6 +35,8 @@ def test_build_catalog_expands_per_group() -> None:
     assert "shared.tco_summary_month" in names
     assert "efficiency.waste_record" in names
     assert "driver_health.driver_health" in names
+    assert "aws.commitment_summary_month" in names
+    assert "aws.invoice_reconciliation_month" in names
     # No flat `gold.` names remain.
     assert not any(n.startswith("gold.") for n in names)
 

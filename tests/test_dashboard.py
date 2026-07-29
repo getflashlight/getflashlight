@@ -17,7 +17,14 @@ from decimal import Decimal
 import pytest
 
 from flashlight.core.settings import get_settings
-from flashlight.focus.enums import ChargeCategory, ComputeClass, ProviderName, ServiceCategory
+from flashlight.focus.enums import (
+    ChargeCategory,
+    CommitmentDiscountCategory,
+    CommitmentDiscountStatus,
+    ComputeClass,
+    ProviderName,
+    ServiceCategory,
+)
 from flashlight.focus.model import FocusRecord
 from flashlight.ingest.base import IngestWindow
 
@@ -76,5 +83,221 @@ def test_provider_page_renders_when_data_starts_midmonth(lake_home) -> None:  # 
             await user.should_see("Cloud spend overview")
             await user.open("/aws")
             await user.should_see("Redshift spend")
+
+    asyncio.run(_check())
+
+
+def test_provider_page_renders_commitment_panel_when_present(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The commitment-coverage panel (added alongside FOCUS Contract Commitment
+    support) must render real Used/Unused data when present, and the existing
+    smoke test above already proves it renders nothing (no crash) when absent."""
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    # AWS's own page is entirely rendered by redshift_focus.render() (see
+    # router.py's `group == "aws"` branch) — its bounds check scopes to Redshift's
+    # own FOCUS service names, so the record needs one for the page to render past
+    # that check into the Breakdown tab where the commitment panel lives.
+    window = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
+    used = _rec(15)
+    used.service_name = "Amazon Redshift"
+    used.commitment_discount_id = "cud-1"
+    used.commitment_discount_type = "Savings Plan"
+    used.commitment_discount_category = CommitmentDiscountCategory.SPEND
+    used.commitment_discount_status = CommitmentDiscountStatus.USED
+    unused = _rec(16)
+    unused.service_name = "Amazon Redshift"
+    unused.commitment_discount_id = "cud-2"
+    unused.commitment_discount_type = "Savings Plan"
+    unused.commitment_discount_category = CommitmentDiscountCategory.SPEND
+    unused.commitment_discount_status = CommitmentDiscountStatus.UNUSED
+    bronze.write_window("t", window, [used, unused], ingest_run_id="r1")
+    build_gold()
+
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/aws")
+            await user.should_see("Commitment coverage")
+
+    asyncio.run(_check())
+
+
+def test_chat_page_sends_a_question_and_renders_the_reply(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """BYOK chat page: typing a question and clicking Send wires through to the
+    engine and renders the reply — without ever calling a real LLM provider."""
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.chat_engine import ChatTurnResult
+    from flashlight.dashboard.router import build_pages
+    from flashlight.dashboard.views import chat as chat_view
+
+    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
+        messages.append({"role": "assistant", "content": "The answer is 42."})
+        return ChatTurnResult(text="The answer is 42.", steps=[])
+
+    monkeypatch.setattr(chat_view, "run_turn", fake_run_turn)
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/chat")
+            # "Chat" (the nav link) renders synchronously before the async page body
+            # resumes past `await client.connected()` — waiting on it is not proof the
+            # settings fields exist yet. Wait on one of those instead.
+            await user.should_see(marker="chat-model")
+            user.find(marker="chat-model").type("openai/gpt-4o")
+            user.find(marker="chat-api-key").type("sk-test")
+            user.find(marker="chat-question").type("what did I spend last month?")
+            user.find(marker="chat-send").click()
+            await user.should_see("The answer is 42.")
+
+    asyncio.run(_check())
+
+
+def test_chat_page_renders_a_tool_step_with_query_results(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Highest-risk new UI path: the tool-call transparency expansion actually
+    renders when a turn's result carries a query_metric step with rows."""
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.chat_engine import ChatTurnResult, ToolStep
+    from flashlight.dashboard.router import build_pages
+    from flashlight.dashboard.views import chat as chat_view
+
+    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
+        step = ToolStep(
+            name="query_metric",
+            arguments={"name": "shared.tco_summary_month"},
+            rows=[
+                {"charge_month": "2026-06-01", "net_cost": 1000.0},
+                {"charge_month": "2026-07-01", "net_cost": 1200.0},
+            ],
+        )
+        return ChatTurnResult(text="Spend rose from June to July.", steps=[step])
+
+    monkeypatch.setattr(chat_view, "run_turn", fake_run_turn)
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/chat")
+            await user.should_see(marker="chat-model")
+            user.find(marker="chat-model").type("openai/gpt-4o")
+            user.find(marker="chat-api-key").type("sk-test")
+            user.find(marker="chat-question").type("what did I spend?")
+            user.find(marker="chat-send").click()
+            await user.should_see("Queried query_metric")
+            await user.should_see("Spend rose from June to July.")
+
+    asyncio.run(_check())
+
+
+def test_chat_settings_persist_across_a_reload_in_the_same_tab(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Provider/model/base URL persist via app.storage.general (survives a
+    process restart, not just a page reload); the API key persists via the OS
+    keychain (faked here with an in-memory dict — the autouse `_no_real_keyring`
+    fixture blocks the real one) once the settings dialog's Done button is
+    clicked, which is the only place a save is triggered."""
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard import chat_credentials
+    from flashlight.dashboard.router import build_pages
+
+    fake_keychain: dict[str, str] = {}
+    monkeypatch.setattr(chat_credentials, "_keyring_get", fake_keychain.get)
+    monkeypatch.setattr(chat_credentials, "_keyring_set", fake_keychain.__setitem__)
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/chat")
+            await user.should_see(marker="chat-model")
+            provider = next(iter(user.find(marker="chat-provider").elements))
+            provider.value = "Anthropic (Claude)"  # type: ignore[attr-defined]
+            user.find(marker="chat-api-key").type("sk-persisted")
+            user.find(marker="chat-settings-done").click()
+
+            await user.open("/chat")  # simulate a reload within the same tab
+            await user.should_see(marker="chat-model")
+            model_elem = next(iter(user.find(marker="chat-model").elements))
+            api_key_elem = next(iter(user.find(marker="chat-api-key").elements))
+            model_after_reload = model_elem.value  # type: ignore[attr-defined]
+            api_key_after_reload = api_key_elem.value  # type: ignore[attr-defined]
+            assert model_after_reload == "anthropic/claude-sonnet-4-5"
+            assert api_key_after_reload == "sk-persisted"
+            assert fake_keychain == {"Anthropic (Claude)": "sk-persisted"}
+
+    asyncio.run(_check())
+
+
+def test_chat_falls_back_to_env_var_when_keychain_has_nothing(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """No keychain entry and no prior session — the FLASHLIGHT_CHAT_API_KEY env
+    var (same *_env indirection convention as connector credentials) prefills
+    the key field."""
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard import chat_credentials
+    from flashlight.dashboard.router import build_pages
+
+    monkeypatch.setenv(chat_credentials.ENV_VAR, "sk-from-env")
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/chat")
+            await user.should_see(marker="chat-model")
+            api_key_elem = next(iter(user.find(marker="chat-api-key").elements))
+            assert api_key_elem.value == "sk-from-env"  # type: ignore[attr-defined]
+
+    asyncio.run(_check())
+
+
+def test_usage_page_renders_empty_state_with_no_chat_activity(lake_home) -> None:  # type: ignore[no-untyped-def]
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/usage")
+            await user.should_see("Usage")
+            await user.should_see("No chat activity yet")
+
+    asyncio.run(_check())
+
+
+def test_usage_page_renders_logged_chat_turns(lake_home) -> None:  # type: ignore[no-untyped-def]
+    from datetime import datetime
+
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+    from flashlight.lake.chat_turns import record_chat_turn
+
+    record_chat_turn(
+        turn_id="t1",
+        session_id="s1",
+        model="openai/gpt-4o",
+        prompt_tokens=10,
+        completion_tokens=5,
+        total_tokens=15,
+        tool_call_count=1,
+        occurred_at=datetime.now(UTC),
+    )
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/usage")
+            # ui.table renders its rows client-side from a data prop, invisible to
+            # should_see's label/content matching — assert on the KPI labels instead,
+            # which prove the logged row was actually read back through the DuckDB view.
+            await user.should_see("Chat turns")
+            await user.should_see("Total tokens")
 
     asyncio.run(_check())

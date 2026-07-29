@@ -64,6 +64,20 @@ class CostMetric(StrEnum):
     CONTRACTED_COST = "ContractedCost"
 
 
+class CommitmentDiscountCategory(StrEnum):
+    """FOCUS CommitmentDiscountCategory — whether the commitment discounts spend or usage."""
+
+    SPEND = "Spend"
+    USAGE = "Usage"
+
+
+class CommitmentDiscountStatus(StrEnum):
+    """FOCUS CommitmentDiscountStatus — whether this charge used the commitment or not."""
+
+    USED = "Used"
+    UNUSED = "Unused"
+
+
 class ComputeClass(StrEnum):
     """Flashlight extension — drives the TCO double-count guard.
 

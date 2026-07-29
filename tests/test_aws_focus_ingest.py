@@ -159,6 +159,47 @@ def test_ingest_classifies_redshift_subcategory(lake_home, tmp_path, monkeypatch
     assert row[0] == "concurrency_scaling"
 
 
+def test_ingest_maps_commitment_and_invoice_columns(lake_home, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from flashlight.lake import duck
+
+    path = _write_parquet(
+        tmp_path / "focus.parquet",
+        [
+            {
+                "ProviderName": "AWS",
+                "BillingAccountId": "acct-1",
+                "ChargePeriodStart": date(2026, 6, 15),
+                "ChargePeriodEnd": date(2026, 6, 15),
+                "BillingCurrency": "USD",
+                "ChargeCategory": "Usage",
+                "ServiceCategory": "Compute",
+                "ServiceName": "AmazonEC2",
+                "EffectiveCost": 10.0,
+                "BilledCost": 10.0,
+                "CommitmentDiscountId": "cud-1",
+                "CommitmentDiscountType": "SavingsPlan",
+                "CommitmentDiscountCategory": "Spend",
+                "CommitmentDiscountStatus": "Used",
+                "CommitmentDiscountQuantity": 1.0,
+                "CommitmentDiscountUnit": "Hrs",
+                "InvoiceId": "inv-1",
+                "InvoiceIssuerName": "Amazon Web Services",
+            },
+        ],
+    )
+    connector = _connector(monkeypatch, tmp_path, [path], include_services=[])
+    connector.ingest(_WINDOW, run_id="r1")
+
+    con = duck.connect()
+    duck.register_bronze(con)
+    row = con.execute(
+        "SELECT commitment_discount_id, commitment_discount_category, "
+        "commitment_discount_status, invoice_id, invoice_issuer_name "
+        "FROM raw.focus_record"
+    ).fetchone()
+    assert row == ("cud-1", "Spend", "Used", "inv-1", "Amazon Web Services")
+
+
 def test_ingest_no_manifests_returns_zero(lake_home, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     connector = _connector(monkeypatch, tmp_path, [])
     assert connector.ingest(_WINDOW, run_id="r1") == 0

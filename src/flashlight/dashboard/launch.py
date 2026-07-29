@@ -9,10 +9,12 @@ Host/port come from settings.
 
 from __future__ import annotations
 
+import os
 import socket
 
 from flashlight.core.logging import get_logger
 from flashlight.core.settings import get_settings
+from flashlight.lake import paths
 
 logger = get_logger(__name__)
 
@@ -42,6 +44,16 @@ def serve_dashboard() -> None:
             f"  • Or free the port:      lsof -nP -iTCP:{port} -sTCP:LISTEN   then kill <PID>\n"
             f"  • Or pick another port:  FLASHLIGHT_DASHBOARD_PORT=8502 flashlight dashboard serve"
         )
+
+    # NiceGUI's app.storage.general (used to persist chat provider/model/base_url
+    # across restarts) reads this env var once, at import time — must be set
+    # before the first `nicegui` import, and it only mkdir's one level itself, so
+    # the directory needs to exist up front too. Falls under FLASHLIGHT_HOME
+    # rather than NiceGUI's own CWD-relative `.nicegui/` default so it moves with
+    # the rest of the lake, not with whatever directory the CLI was launched from.
+    storage_dir = paths.meta_dir() / "dashboard_storage"
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NICEGUI_STORAGE_PATH", str(storage_dir))
 
     from nicegui import ui
 

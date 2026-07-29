@@ -19,6 +19,8 @@ from flashlight.focus.enums import ChargeClass
 from flashlight.focus.model import FocusRecord
 from flashlight.ingest.connectors._coerce import (
     to_charge_category,
+    to_commitment_category,
+    to_commitment_status,
     to_datetime,
     to_decimal,
     to_service_category,
@@ -101,5 +103,14 @@ def map_focus_row(row: dict[str, Any], source_connector: str) -> FocusRecord | N
         consumed_quantity=_f(row.get("ConsumedQuantity")),
         consumed_unit=_s(row.get("ConsumedUnit")),
         tags=_tags(row.get("Tags")),
+        commitment_discount_id=_s(row.get("CommitmentDiscountId")),
+        commitment_discount_type=_s(row.get("CommitmentDiscountType")),
+        commitment_discount_category=to_commitment_category(_s(row.get("CommitmentDiscountCategory"))),
+        commitment_discount_name=_s(row.get("CommitmentDiscountName")),
+        commitment_discount_status=to_commitment_status(_s(row.get("CommitmentDiscountStatus"))),
+        commitment_discount_quantity=_f(row.get("CommitmentDiscountQuantity")),
+        commitment_discount_unit=_s(row.get("CommitmentDiscountUnit")),
+        invoice_id=_s(row.get("InvoiceId")),
+        invoice_issuer_name=_s(row.get("InvoiceIssuerName")),
         x_source_connector=source_connector,
     )

@@ -28,7 +28,12 @@ from __future__ import annotations
 
 import duckdb
 
-from flashlight.focus.enums import ChargeCategory, ServiceCategory
+from flashlight.focus.enums import (
+    ChargeCategory,
+    CommitmentDiscountCategory,
+    CommitmentDiscountStatus,
+    ServiceCategory,
+)
 from flashlight.focus.model import FOCUS_VERSION
 
 # Every FOCUS column the mapping reads; a column missing from a given source is
@@ -40,12 +45,17 @@ FOCUS_COLUMNS: tuple[str, ...] = (
     "ContractedCost", "ChargeCategory", "ChargeClass", "ChargeDescription",
     "ServiceCategory", "ServiceName", "SkuId", "RegionId", "ResourceId",
     "ResourceName", "ResourceType", "ConsumedQuantity", "ConsumedUnit", "Tags",
+    "CommitmentDiscountId", "CommitmentDiscountType", "CommitmentDiscountCategory",
+    "CommitmentDiscountName", "CommitmentDiscountStatus", "CommitmentDiscountQuantity",
+    "CommitmentDiscountUnit", "InvoiceId", "InvoiceIssuerName",
 )
 
 # Controlled vocab, generated from the enums (not hand-copied) so this can't drift
 # from focus/enums.py the way a second hard-coded literal list eventually would.
 _CHARGE_CATEGORIES_SQL = ", ".join(f"'{c.value}'" for c in ChargeCategory)
 _SERVICE_CATEGORIES_SQL = ", ".join(f"'{c.value}'" for c in ServiceCategory)
+_COMMITMENT_CATEGORIES_SQL = ", ".join(f"'{c.value}'" for c in CommitmentDiscountCategory)
+_COMMITMENT_STATUSES_SQL = ", ".join(f"'{c.value}'" for c in CommitmentDiscountStatus)
 
 # Passthrough identity columns a connector's FOCUS-shaped source may additionally
 # carry beyond the FOCUS spec itself (Databricks: the physical usage record's id +
@@ -208,6 +218,17 @@ def mapping_sql(
             nz(ConsumedUnit)                                        AS consumed_unit,
             CASE WHEN try_cast(nz(Tags) AS JSON) IS NULL THEN '{{}}' ELSE nz(Tags) END
                                                                     AS tags,
+            nz(CommitmentDiscountId)                                AS commitment_discount_id,
+            nz(CommitmentDiscountType)                              AS commitment_discount_type,
+            CASE WHEN nz(CommitmentDiscountCategory) IN ({_COMMITMENT_CATEGORIES_SQL})
+                 THEN nz(CommitmentDiscountCategory) ELSE NULL END  AS commitment_discount_category,
+            nz(CommitmentDiscountName)                              AS commitment_discount_name,
+            CASE WHEN nz(CommitmentDiscountStatus) IN ({_COMMITMENT_STATUSES_SQL})
+                 THEN nz(CommitmentDiscountStatus) ELSE NULL END    AS commitment_discount_status,
+            try_cast(nz(CommitmentDiscountQuantity) AS DOUBLE)      AS commitment_discount_quantity,
+            nz(CommitmentDiscountUnit)                              AS commitment_discount_unit,
+            nz(InvoiceId)                                           AS invoice_id,
+            nz(InvoiceIssuerName)                                   AS invoice_issuer_name,
             {compute_class_sql}                                     AS x_compute_class,
             '{focus_version}'                                       AS x_focus_version,
             {effective_is_list_sql}                                 AS x_effective_is_list,

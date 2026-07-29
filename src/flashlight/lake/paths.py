@@ -90,6 +90,11 @@ def runs_dir() -> Path:
     return meta_dir() / "runs"
 
 
+def chat_turns_dir() -> Path:
+    """BYOK chat usage log — one Parquet file per chat turn (append-only)."""
+    return meta_dir() / "chat_turns"
+
+
 def ensure_layout() -> None:
     """Create the lake directory skeleton (idempotent)."""
     for path in (
@@ -99,5 +104,6 @@ def ensure_layout() -> None:
         driver_health_dir(),
         gold_dir(),
         runs_dir(),
+        chat_turns_dir(),
     ):
         path.mkdir(parents=True, exist_ok=True)

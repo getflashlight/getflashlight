@@ -53,7 +53,7 @@ from flashlight.dashboard.data import gold_df
 from flashlight.dashboard.data import to_date as _d
 from flashlight.dashboard.theme import compact_money, md_money
 from flashlight.dashboard.views.efficiency_waste import _lens_table
-from flashlight.dashboard.views.provider_focus import _cost_subcategory
+from flashlight.dashboard.views.provider_focus import _commitment, _cost_subcategory
 from flashlight.efficiency.waste_rules import WASTE_RULES
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 
@@ -316,6 +316,11 @@ def _breakdown_section(sm: date, end: date) -> None:
     # service, since no other AWS service populates this view (see the function's
     # own docstring). Draws its own panel_title, so no extra wrapping needed here.
     _cost_subcategory(_GROUP, end, sm)
+    # Account-wide, NOT Redshift-scoped on purpose: a Savings Plan/RI commitment
+    # isn't tied to one service, so this is the whole AWS account's commitment
+    # coverage (Redshift RIs plus EC2/RDS/etc Savings Plans), same as the
+    # account-level "committed" bucket above. Renders nothing if empty.
+    _commitment(_GROUP, end, sm)
 
 
 def _tags_section(sm: date, end: date) -> None:

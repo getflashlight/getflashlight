@@ -204,6 +204,33 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
         dimensions=("charge_day", "provider_name"),
         measures=("net_cost", "gross_cost"),
     ),
+    ViewSpec(
+        view="commitment_summary_month",
+        title="Commitment coverage",
+        description="RI/Savings-Plan commitment spend per month, split by type/category/"
+        "status. commitment_discount_status='Unused' is the direct wasted-commitment "
+        "signal. Empty for providers with no commitment data (e.g. Databricks — no "
+        "system table exposes reservation/savings-plan data).",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=(
+            "provider_name",
+            "charge_month",
+            "commitment_discount_type",
+            "commitment_discount_category",
+            "commitment_discount_status",
+        ),
+        measures=("effective_cost", "billed_cost", "commitment_count"),
+    ),
+    ViewSpec(
+        view="invoice_reconciliation_month",
+        title="Invoice reconciliation",
+        description="Billed spend per (billing account, invoice, month) — verifies GOLD's "
+        "total ties to a specific invoice and groups a multi-invoice billing account. "
+        "Empty for providers with no invoice data (e.g. Databricks).",
+        cost_metric=CostMetric.BILLED_COST,
+        dimensions=("provider_name", "billing_account_id", "invoice_id", "charge_month"),
+        measures=("billed_cost",),
+    ),
 )
 
 # Shared/TCO: cross-provider, materialized once into the `shared` group.

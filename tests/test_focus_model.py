@@ -1,7 +1,14 @@
 from datetime import date, datetime
 from decimal import Decimal
 
-from flashlight.focus.enums import ChargeCategory, ComputeClass, ProviderName, ServiceCategory
+from flashlight.focus.enums import (
+    ChargeCategory,
+    CommitmentDiscountCategory,
+    CommitmentDiscountStatus,
+    ComputeClass,
+    ProviderName,
+    ServiceCategory,
+)
 from flashlight.focus.model import FocusRecord
 
 
@@ -48,3 +55,38 @@ def test_currency_uppercased() -> None:
 
 def test_default_compute_class() -> None:
     assert _record().x_compute_class == ComputeClass.NOT_APPLICABLE
+
+
+def test_commitment_and_invoice_fields_default_none() -> None:
+    r = _record()
+    assert r.commitment_discount_id is None
+    assert r.commitment_discount_category is None
+    assert r.commitment_discount_status is None
+    assert r.invoice_id is None
+    assert r.invoice_issuer_name is None
+
+
+def test_commitment_and_invoice_fields_roundtrip() -> None:
+    r = _record(
+        commitment_discount_id="cud-1",
+        commitment_discount_type="SavingsPlan",
+        commitment_discount_category=CommitmentDiscountCategory.SPEND,
+        commitment_discount_name="prod-savings-plan",
+        commitment_discount_status=CommitmentDiscountStatus.USED,
+        commitment_discount_quantity=1.5,
+        commitment_discount_unit="Hrs",
+        invoice_id="inv-2026-06",
+        invoice_issuer_name="Amazon Web Services",
+    )
+    assert r.commitment_discount_status == CommitmentDiscountStatus.USED
+    assert r.invoice_id == "inv-2026-06"
+
+
+def test_dedupe_key_changes_on_commitment_status() -> None:
+    a = _record(
+        commitment_discount_id="cud-1", commitment_discount_status=CommitmentDiscountStatus.USED
+    )
+    b = _record(
+        commitment_discount_id="cud-1", commitment_discount_status=CommitmentDiscountStatus.UNUSED
+    )
+    assert a.dedupe_key() != b.dedupe_key()

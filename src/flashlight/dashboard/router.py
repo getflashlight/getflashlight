@@ -37,7 +37,11 @@ def range_has_partial_month(end: date) -> bool:
 
 
 # ── Nav ──────────────────────────────────────────────────────────────────────
-_FIXED_NAV: tuple[tuple[str, str, str], ...] = (("/", "Home", "home"),)
+_FIXED_NAV: tuple[tuple[str, str, str], ...] = (
+    ("/", "Home", "home"),
+    ("/chat", "Chat", "chat"),
+    ("/usage", "Usage", "insights"),
+)
 
 
 def _nav_label(group: str) -> str:
@@ -115,11 +119,13 @@ def no_data_page(title: str) -> None:
 def build_pages() -> None:
     """Register every ``@ui.page()`` route. Call once, before ``ui.run()``."""
     from flashlight.dashboard.views import (
+        chat,
         driver_health,
         efficiency_waste,
         home_overview,
         provider_focus,
         redshift_focus,
+        usage,
     )
 
     @ui.page("/")
@@ -129,6 +135,16 @@ def build_pages() -> None:
                 no_data_page("Flashlight")
             else:
                 home_overview.render()
+
+    @ui.page("/chat")
+    async def _chat() -> None:
+        with shell("/chat"):
+            await chat.render()
+
+    @ui.page("/usage")
+    def _usage() -> None:
+        with shell("/usage"):
+            usage.render()
 
     def _render_databricks_page(label: str) -> None:
         """Efficiency & waste and client driver health are, in practice, Databricks

@@ -90,6 +90,7 @@ def render(
                 _spend_pivot(group, end, sm)
                 _cost_subcategory(group, end, sm)
                 _savings(group, label, end, sm)
+                _commitment(group, end, sm)
                 _driver_mom(group, end)
             with ui.tab_panel(tab_tags), chrome.panel():
                 _tags(group, label, end, sm)
@@ -538,6 +539,43 @@ def _savings(group: str, label: str, end: date, sm: date) -> None:
         labels={"month": "", "cost": "", "component": ""},
     )
     chrome.plot(chrome.style_fig(fig, has_legend=True, category_x=True))
+
+
+def _commitment(group: str, end: date, sm: date) -> None:
+    """RI/Savings-Plan commitment coverage — Used vs Unused $. Renders nothing where
+    the provider has no commitment data (e.g. Databricks — no system table exposes
+    reservation/savings-plan data, see gold.commitment_summary_month's own docstring).
+    """
+    cm = gold_df(
+        "SELECT commitment_discount_status, sum(effective_cost) AS cost "
+        f'FROM "{group}".commitment_summary_month '
+        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
+        "AND commitment_discount_status IS NOT NULL "
+        "GROUP BY commitment_discount_status"
+    )
+    if cm.empty:
+        return
+    chrome.panel_title("Commitment coverage")
+    unused = float(cm.loc[cm["commitment_discount_status"] == "Unused", "cost"].sum())
+    total = float(cm["cost"].sum())
+    pct = f"{100 * unused / total:.1f}%" if total else "—"
+    chrome.section_caption(
+        f"Reserved Instance / Savings Plan spend, split by whether it was drawn down "
+        f"this window. {pct} of commitment spend was Unused — that's recoverable."
+    )
+    fig = px.bar(
+        cm,
+        x="commitment_discount_status",
+        y="cost",
+        color="commitment_discount_status",
+        color_discrete_map={
+            "Used": chrome.ACCENT,
+            "Unused": chrome.WASTE,
+        },
+        labels={"commitment_discount_status": "", "cost": ""},
+    )
+    fig.update_layout(showlegend=False)
+    chrome.plot(chrome.style_fig(fig, has_legend=False, category_x=True))
 
 
 def _driver_mom(group: str, end: date) -> None:

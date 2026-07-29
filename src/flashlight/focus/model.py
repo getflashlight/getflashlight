@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field, field_validator
 from flashlight.focus.enums import (
     ChargeCategory,
     ChargeClass,
+    CommitmentDiscountCategory,
+    CommitmentDiscountStatus,
     ComputeClass,
     ServiceCategory,
 )
@@ -88,6 +90,21 @@ class FocusRecord(BaseModel):
     # ── Usage ───────────────────────────────────────────────────────────────
     consumed_quantity: float | None = None  # FOCUS: ConsumedQuantity
     consumed_unit: str | None = None  # FOCUS: ConsumedUnit
+
+    # ── Contract commitment (Conditional — NULL where a source has none, e.g.
+    # Databricks: no system table exposes reservation/savings-plan data) ────
+    commitment_discount_id: str | None = None  # FOCUS: CommitmentDiscountId
+    # FOCUS: CommitmentDiscountType — open, provider-specific (e.g. Reserved | SavingsPlan)
+    commitment_discount_type: str | None = None
+    commitment_discount_category: CommitmentDiscountCategory | None = None
+    commitment_discount_name: str | None = None  # FOCUS: CommitmentDiscountName
+    commitment_discount_status: CommitmentDiscountStatus | None = None
+    commitment_discount_quantity: float | None = None  # FOCUS: CommitmentDiscountQuantity
+    commitment_discount_unit: str | None = None  # FOCUS: CommitmentDiscountUnit
+
+    # ── Invoice details (Recommended/Conditional) ───────────────────────────
+    invoice_id: str | None = None  # FOCUS: InvoiceId
+    invoice_issuer_name: str | None = None  # FOCUS: InvoiceIssuerName
 
     # ── Tags (used for TCO attribution) ─────────────────────────────────────
     tags: dict[str, str] = Field(default_factory=dict)  # FOCUS: Tags
