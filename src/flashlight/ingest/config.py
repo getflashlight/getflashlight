@@ -175,6 +175,10 @@ class RedshiftConfig(BaseModel):
         return self
 
 
+ConnectorConfig = (
+    AwsFocusConfig | FocusFileConfig | DatabricksConfig | AwsInfraConfig | RedshiftConfig
+)
+
 _CONFIG_TYPES: dict[str, type[BaseModel]] = {
     "aws_focus": AwsFocusConfig,
     "focus_file": FocusFileConfig,
@@ -185,9 +189,7 @@ _CONFIG_TYPES: dict[str, type[BaseModel]] = {
 
 
 class ConnectionsFile(BaseModel):
-    connectors: list[
-        AwsFocusConfig | FocusFileConfig | DatabricksConfig | AwsInfraConfig | RedshiftConfig
-    ] = Field(default_factory=list)
+    connectors: list[ConnectorConfig] = Field(default_factory=list)
 
 
 def env(name: str) -> str | None:
@@ -227,18 +229,7 @@ def aws_client(
     )
 
 
-def load_connections(path: str | None = None) -> list[BaseModel]:
-    """Parse the connections YAML into typed, enabled connector configs.
-
-    Defaults to ``<home>/config/connections.yml`` (what ``flashlight init`` writes).
-    """
-    cfg_path = Path(path) if path else paths.connections_path()
-    if not cfg_path.exists():
-        raise ConfigError(
-            f"Connections file not found: {cfg_path}. Run `flashlight init` first."
-        )
-
-    raw = yaml.safe_load(cfg_path.read_text()) or {}
+def _parse_entries(raw: dict[str, Any]) -> list[BaseModel]:
     entries = raw.get("connectors", [])
     if not isinstance(entries, list):
         raise ConfigError("`connectors` must be a list")
@@ -249,7 +240,39 @@ def load_connections(path: str | None = None) -> list[BaseModel]:
         model = _CONFIG_TYPES.get(ctype)
         if model is None:
             raise ConfigError(f"Unknown connector type: {ctype!r}")
-        cfg = model.model_validate(entry)
-        if getattr(cfg, "enabled", True):
-            configs.append(cfg)
+        configs.append(model.model_validate(entry))
     return configs
+
+
+def load_all_connections(path: str | None = None) -> list[BaseModel]:
+    """Parse the connections YAML into typed connector configs, disabled included.
+
+    Defaults to ``<home>/config/connections.yml`` (what ``flashlight init`` writes).
+    Use :func:`load_connections` instead when you only want what ingest will run —
+    this is for callers (e.g. the dashboard's Connections page) that need to show
+    and edit disabled entries too.
+    """
+    cfg_path = Path(path) if path else paths.connections_path()
+    if not cfg_path.exists():
+        raise ConfigError(
+            f"Connections file not found: {cfg_path}. Run `flashlight init` first."
+        )
+    raw = yaml.safe_load(cfg_path.read_text()) or {}
+    return _parse_entries(raw)
+
+
+def load_connections(path: str | None = None) -> list[BaseModel]:
+    """Parse the connections YAML into typed, enabled connector configs."""
+    return [cfg for cfg in load_all_connections(path) if getattr(cfg, "enabled", True)]
+
+
+def save_connections(entries: list[BaseModel], path: str | None = None) -> None:
+    """Write connector configs back to the connections YAML (full overwrite).
+
+    Round-trips through the same Pydantic models :func:`load_all_connections` reads
+    back, so a save immediately followed by a load returns equivalent configs.
+    """
+    cfg_path = Path(path) if path else paths.connections_path()
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"connectors": [e.model_dump(exclude_none=True) for e in entries]}
+    cfg_path.write_text(yaml.safe_dump(payload, sort_keys=False))

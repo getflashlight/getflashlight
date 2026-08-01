@@ -627,6 +627,15 @@ class DatabricksConnector(Connector):
             "network_bytes": _opt_float(row.get("network_bytes")),
             # job only — materiality gate for the proxies above, not a signal itself.
             "avg_run_seconds": _opt_float(row.get("avg_run_seconds")),
+            # Policy-compliance signals (interactive/job clusters via cluster_meta,
+            # sql_warehouse/sql_warehouse_user via warehouse_meta; NULL for notebook — no
+            # cluster/warehouse identity). policy_id is cluster-only (no warehouse
+            # counterpart). tag_count is a resource-level tag count (system.compute.
+            # clusters/warehouses.tags), distinct from the per-usage-row `project` tag
+            # above — see policy_rules.py's cluster_tagging/warehouse_tagging/
+            # cluster_policy_assigned categories.
+            "policy_id": row.get("policy_id") or None,
+            "tag_count": _opt_int(row.get("tag_count")),
         }
         return EfficiencyRecord(
             provider_name="Databricks",

@@ -86,7 +86,10 @@ uv run ruff check src tests && uv run mypy src tests && uv run pytest
   has no GOLD group of its own (its cost flows into `aws.*`; only its efficiency/waste
   telemetry is connector-specific) — `views/redshift_focus.py` is a service-name-scoped
   tab nested on the AWS page, not a separate nav entry. Both dashboard and MCP are
-  read-only consumers of GOLD.
+  read-only consumers of GOLD. The one exception: `views/connections.py` lets a user
+  add/edit `connections.yml` sources and trigger a sync without the CLI — it still
+  never writes GOLD/BRONZE itself, it shells out to `flashlight ingest` as a
+  subprocess (`ingest_runner.py`), so `ingest` stays the sole writer either way.
 
 ## Key invariants (do not violate)
 

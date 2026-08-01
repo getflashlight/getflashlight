@@ -39,6 +39,7 @@ def range_has_partial_month(end: date) -> bool:
 # ── Nav ──────────────────────────────────────────────────────────────────────
 _FIXED_NAV: tuple[tuple[str, str, str], ...] = (
     ("/", "Home", "home"),
+    ("/connections", "Connections", "cable"),
     ("/chat", "Chat", "chat"),
     ("/usage", "Usage", "insights"),
 )
@@ -120,9 +121,11 @@ def build_pages() -> None:
     """Register every ``@ui.page()`` route. Call once, before ``ui.run()``."""
     from flashlight.dashboard.views import (
         chat,
+        connections,
         driver_health,
         efficiency_waste,
         home_overview,
+        policy,
         provider_focus,
         redshift_focus,
         usage,
@@ -136,6 +139,11 @@ def build_pages() -> None:
             else:
                 home_overview.render()
 
+    @ui.page("/connections")
+    def _connections() -> None:
+        with shell("/connections"):
+            connections.render()
+
     @ui.page("/chat")
     async def _chat() -> None:
         with shell("/chat"):
@@ -147,11 +155,12 @@ def build_pages() -> None:
             usage.render()
 
     def _render_databricks_page(label: str) -> None:
-        """Efficiency & waste and client driver health are, in practice, Databricks
-        signals (the only two waste_record producers are Databricks + Redshift, and
-        Redshift's waste already lives on its own Redshift-scoped page — see
-        redshift_focus.py; driver_health has exactly one producer: Databricks). So
-        they're nested here as extra tabs rather than separate top-level nav entries.
+        """Efficiency & waste, client driver health, and policy compliance are, in
+        practice, Databricks signals (the only two waste_record producers are
+        Databricks + Redshift, and Redshift's waste already lives on its own
+        Redshift-scoped page — see redshift_focus.py; driver_health and policy
+        compliance each have exactly one producer: Databricks). So they're nested
+        here as extra tabs rather than separate top-level nav entries.
         """
         provider_focus.render(
             "databricks",
@@ -159,6 +168,7 @@ def build_pages() -> None:
             extra_tabs=[
                 ("Efficiency & Waste", lambda: efficiency_waste.render("Databricks")),
                 ("Client Driver Health", driver_health.render),
+                ("Policy Compliance", policy.render),
             ],
         )
 

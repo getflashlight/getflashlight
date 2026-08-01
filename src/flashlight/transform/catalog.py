@@ -35,6 +35,14 @@ EFFICIENCY_GROUP = "efficiency"
 # cost_metric — this is a compliance/fleet-health signal, not spend or waste.
 DRIVER_HEALTH_GROUP = "driver_health"
 
+# The fixed group holding the policy-compliance view. Like EFFICIENCY, not
+# per-provider — policy_record already carries provider_name as a column. Fed by the
+# same metrics plane (metrics.efficiency_record) as efficiency/waste, classified by a
+# separate rule pool (flashlight.efficiency.policy_rules). No cost_metric — a
+# governance signal (are auto-terminate/autoscaling/tagging guardrails in place), not
+# spend or waste.
+POLICY_GROUP = "policy"
+
 
 @dataclass(frozen=True)
 class ViewSpec:
@@ -364,6 +372,46 @@ DRIVER_HEALTH_BASE_VIEWS: tuple[ViewSpec, ...] = (
 )
 
 
+# Policy compliance: pass/fail governance findings (auto-terminate, autoscaling,
+# cluster-policy assignment, tagging) + their KPI rollup, materialized once into the
+# `policy` group (provider_name is a column, not a group). Every ACTIVE rule in
+# policy_rules.py emits one row per applicable entity per month regardless of status —
+# a real coverage denominator, unlike waste_record's violations-only shape.
+POLICY_BASE_VIEWS: tuple[ViewSpec, ...] = (
+    ViewSpec(
+        view="policy_record",
+        title="Policy compliance record",
+        description="One row per (entity, month, policy_category): compliant, "
+        "non_compliant, or not_applicable (telemetry unmeasured for this entity). "
+        "Covers cost-guardrail policies (auto-terminate, autoscaling, cluster-policy "
+        "assignment) and attribution tagging (cluster/warehouse-level). No dollar "
+        "figure — see efficiency.waste_record for recoverable spend.",
+        cost_metric=None,
+        dimensions=(
+            "provider_name",
+            "charge_month",
+            "entity_type",
+            "entity_id",
+            "entity_name",
+            "owner_user",
+            "owner_project",
+            "policy_category",
+            "status",
+        ),
+        measures=(),
+    ),
+    ViewSpec(
+        view="policy_summary_month",
+        title="Policy compliance summary",
+        description="Entity count per month × policy_category × status — drives the "
+        "compliance-rate KPI (e.g. '80% of clusters have auto-terminate set').",
+        cost_metric=None,
+        dimensions=("charge_month", "policy_category", "status"),
+        measures=("entity_count",),
+    ),
+)
+
+
 def provider_group(provider_name: str) -> str:
     """Slug a ``provider_name`` into a filesystem/DuckDB-safe group id.
 
@@ -386,23 +434,25 @@ def _view(group: str, spec: ViewSpec) -> GoldView:
 
 
 def build_catalog(provider_groups: Iterable[str]) -> tuple[GoldView, ...]:
-    """Expand the base specs over the provider groups + the fixed shared/efficiency/driver_health
-    groups."""
+    """Expand the base specs over the provider groups + the fixed shared/efficiency/
+    driver_health/policy groups."""
     views: list[GoldView] = []
     for group in provider_groups:
         views.extend(_view(group, spec) for spec in PROVIDER_BASE_VIEWS)
     views.extend(_view(SHARED_GROUP, spec) for spec in SHARED_BASE_VIEWS)
     views.extend(_view(EFFICIENCY_GROUP, spec) for spec in EFFICIENCY_BASE_VIEWS)
     views.extend(_view(DRIVER_HEALTH_GROUP, spec) for spec in DRIVER_HEALTH_BASE_VIEWS)
+    views.extend(_view(POLICY_GROUP, spec) for spec in POLICY_BASE_VIEWS)
     return tuple(views)
 
 
 def discover_provider_groups() -> list[str]:
-    """Provider groups published under ``gold/`` (excludes shared/efficiency/driver_health)."""
+    """Provider groups published under ``gold/`` (excludes shared/efficiency/
+    driver_health/policy)."""
     gold = paths.gold_dir()
     if not gold.exists():
         return []
-    fixed = {SHARED_GROUP, EFFICIENCY_GROUP, DRIVER_HEALTH_GROUP}
+    fixed = {SHARED_GROUP, EFFICIENCY_GROUP, DRIVER_HEALTH_GROUP, POLICY_GROUP}
     return sorted(p.name for p in gold.iterdir() if p.is_dir() and p.name not in fixed)
 
 

@@ -9,6 +9,7 @@ Tools:
   query_metric(name, ...)         — rows from a GOLD view, optionally filtered/ordered
   list_dimension_values(name, …)  — distinct values of one dimension (discover filters)
   list_optimization_rules()       — the full waste/optimization rule pool (dashboard parity)
+  list_policy_rules()             — the full policy-compliance rule pool (dashboard parity)
   run_sql(sql, limit)             — ad-hoc read-only SELECT over gold/silver
 """
 
@@ -19,6 +20,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from flashlight.core.settings import get_settings
+from flashlight.efficiency.policy_rules import POLICY_RULES
 from flashlight.efficiency.waste_rules import WASTE_RULES
 from flashlight.gold.reader import QueryError, distinct_values, query_view, run_select
 from flashlight.transform.catalog import current_catalog, current_catalog_by_name
@@ -115,6 +117,29 @@ def list_optimization_rules() -> list[dict[str, Any]]:
             "source": r.source,
         }
         for r in WASTE_RULES
+    ]
+
+
+@mcp.tool()
+def list_policy_rules() -> list[dict[str, Any]]:
+    """List the full policy-compliance rule pool — deterministic and identical whether
+    read from here or the dashboard (plain SQL rules, no LLM/skill judgment).
+
+    `status` is "active" (already classifying real data into gold.policy_record) or
+    "blocked" (a documented check pending the telemetry named in `requires`). Unlike
+    waste rules, an active policy rule emits a row for every applicable entity every
+    month (compliant/non_compliant/not_applicable), not just violations.
+    """
+    return [
+        {
+            "category": r.category,
+            "label": r.label,
+            "remedy": r.remedy,
+            "status": "active" if r.applies_sql else "blocked",
+            "requires": list(r.requires),
+            "source": r.source,
+        }
+        for r in POLICY_RULES
     ]
 
 

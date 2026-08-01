@@ -5,6 +5,7 @@ from __future__ import annotations
 from flashlight.transform.catalog import (
     DRIVER_HEALTH_BASE_VIEWS,
     EFFICIENCY_BASE_VIEWS,
+    POLICY_BASE_VIEWS,
     PROVIDER_BASE_VIEWS,
     SHARED_BASE_VIEWS,
     build_catalog,
@@ -21,12 +22,14 @@ def test_provider_group_slugs() -> None:
 
 def test_build_catalog_expands_per_group() -> None:
     cat = build_catalog(["aws", "databricks"])
-    # provider-scoped views per provider + the fixed shared/efficiency/driver_health groups.
+    # provider-scoped views per provider + the fixed shared/efficiency/driver_health/
+    # policy groups.
     assert len(cat) == (
         len(PROVIDER_BASE_VIEWS) * 2
         + len(SHARED_BASE_VIEWS)
         + len(EFFICIENCY_BASE_VIEWS)
         + len(DRIVER_HEALTH_BASE_VIEWS)
+        + len(POLICY_BASE_VIEWS)
     )
 
     names = {v.name for v in cat}
@@ -35,6 +38,7 @@ def test_build_catalog_expands_per_group() -> None:
     assert "shared.tco_summary_month" in names
     assert "efficiency.waste_record" in names
     assert "driver_health.driver_health" in names
+    assert "policy.policy_record" in names
     assert "aws.commitment_summary_month" in names
     assert "aws.invoice_reconciliation_month" in names
     # No flat `gold.` names remain.
@@ -60,5 +64,6 @@ def test_empty_provider_set_still_has_fixed_groups() -> None:
         {f"shared.{s.view}" for s in SHARED_BASE_VIEWS}
         | {f"efficiency.{s.view}" for s in EFFICIENCY_BASE_VIEWS}
         | {f"driver_health.{s.view}" for s in DRIVER_HEALTH_BASE_VIEWS}
+        | {f"policy.{s.view}" for s in POLICY_BASE_VIEWS}
     )
     assert {v.name for v in cat} == expected

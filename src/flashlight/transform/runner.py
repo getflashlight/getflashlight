@@ -22,6 +22,7 @@ import duckdb
 
 from flashlight.core.logging import get_logger
 from flashlight.core.settings import get_settings
+from flashlight.efficiency.policy_rules import build_policy_record_sql
 from flashlight.efficiency.waste_rules import build_waste_record_sql
 from flashlight.lake import duck, paths
 from flashlight.lake.publish import atomic_publish
@@ -30,6 +31,8 @@ from flashlight.transform.catalog import (
     DRIVER_HEALTH_GROUP,
     EFFICIENCY_BASE_VIEWS,
     EFFICIENCY_GROUP,
+    POLICY_BASE_VIEWS,
+    POLICY_GROUP,
     PROVIDER_BASE_VIEWS,
     SHARED_BASE_VIEWS,
     SHARED_GROUP,
@@ -105,6 +108,11 @@ def build_gold() -> int:
         # deterministic across dashboard/MCP consumers.
         con.execute(build_waste_record_sql())
 
+        # gold.policy_record is the same config-driven pattern (flashlight.efficiency.
+        # policy_rules), compiled here so 070_gold_policy.sql's summary rollup can
+        # depend on it.
+        con.execute(build_policy_record_sql())
+
         for path in sorted(SQL_DIR.glob("*.sql")):
             for stmt in _statements(path.read_text()):
                 con.execute(stmt)
@@ -129,12 +137,13 @@ def build_gold() -> int:
                 )
                 published += 1
 
-        # Fixed cross-provider groups: TCO (shared) + efficiency/waste + driver health,
-        # unfiltered.
+        # Fixed cross-provider groups: TCO (shared) + efficiency/waste + driver health +
+        # policy compliance, unfiltered.
         fixed_groups = (
             (SHARED_GROUP, SHARED_BASE_VIEWS),
             (EFFICIENCY_GROUP, EFFICIENCY_BASE_VIEWS),
             (DRIVER_HEALTH_GROUP, DRIVER_HEALTH_BASE_VIEWS),
+            (POLICY_GROUP, POLICY_BASE_VIEWS),
         )
         for group, specs in fixed_groups:
             group_dir = staging / group

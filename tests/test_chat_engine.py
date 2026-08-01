@@ -84,7 +84,7 @@ def _chat_turn_rows() -> list[dict[str, object]]:
         con.close()
 
 
-def test_tool_schemas_cover_the_six_mcp_tools() -> None:
+def test_tool_schemas_cover_the_seven_mcp_tools() -> None:
     schemas = asyncio.run(chat_engine.tool_schemas())
     names = {s["function"]["name"] for s in schemas}
     assert names == {
@@ -93,6 +93,7 @@ def test_tool_schemas_cover_the_six_mcp_tools() -> None:
         "query_metric",
         "list_dimension_values",
         "list_optimization_rules",
+        "list_policy_rules",
         "run_sql",
     }
     assert all(s["type"] == "function" for s in schemas)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pandas as pd
 import pyarrow as pa
 
 from flashlight.core.logging import get_logger
@@ -63,3 +64,12 @@ def record_run(
         pq.write_table(table, paths.runs_dir() / f"{run_id}-{connector}.parquet")
     except Exception as exc:  # noqa: BLE001 - observability must not break ingest
         logger.warning("runlog_write_failed", connector=connector, error=str(exc))
+
+
+def read_runs(limit: int = 50) -> pd.DataFrame:
+    """Most recent ``limit`` connector runs, newest first. Empty if none logged yet."""
+    files = sorted(paths.runs_dir().glob("*.parquet"))
+    if not files:
+        return pd.DataFrame(columns=[f.name for f in RUN_SCHEMA])
+    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    return df.sort_values("finished_at", ascending=False).head(limit).reset_index(drop=True)
