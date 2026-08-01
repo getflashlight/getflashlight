@@ -61,7 +61,7 @@ The SILVER/GOLD layer enforces the rules that make FOCUS data safe to sum:
 
 - [Quick start](quickstart.md) — sample data to a running dashboard in two commands
 - [Architecture](architecture.md) — the BRONZE → SILVER → GOLD lake, and the invariants that keep it honest
-- [Connectors](connectors.md) — AWS, Databricks, FOCUS files, and the mapping SQL behind each one
+- [Connectors](connectors.md) — AWS, Databricks, Redshift, and the mapping SQL behind each one
 - [CLI reference](cli.md) — every `flashlight` command, generated straight from the CLI itself
 - [Efficiency / waste](design/efficiency-waste.md) — recoverable spend: idle time, underutilized capacity, wrong compute placement
 - <a href="llms.txt">llms.txt</a> — an index of these docs for LLM tooling; the MCP server (`flashlight mcp serve`) reads the same GOLD views the dashboard does

@@ -65,7 +65,7 @@ from flashlight.efficiency.model import EfficiencyRecord, EntityType
 from flashlight.focus.model import FocusRecord
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 from flashlight.ingest.base import Connector, IngestWindow
-from flashlight.ingest.config import RedshiftConfig, aws_client, env
+from flashlight.ingest.config import RedshiftConfig, aws_client, effective_connector_name, env
 from flashlight.lake import duck as lake_duck
 
 logger = get_logger(__name__)
@@ -213,6 +213,10 @@ class RedshiftConnector(Connector):
 
     def __init__(self, config: RedshiftConfig) -> None:
         self._config = config
+        # Instance-level, shadowing the class constant above — see aws_focus.py's
+        # AwsFocusConnector.__init__ for why (BRONZE partitioning stays distinct
+        # across multiple Redshift-cluster connections).
+        self.name = effective_connector_name(config)
         self._data = aws_client(
             "redshift-data",
             region=config.region,

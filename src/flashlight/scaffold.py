@@ -26,21 +26,22 @@ _CONNECTIONS_TEMPLATE = """\
 #     flashlight sample
 connectors: []
 
-  # - type: focus_file
-  #   enabled: true
-  #   path: /path/to/your/focus_export.csv   # or .parquet
-  #   respect_window: false
-
   # - type: aws_focus
   #   enabled: true
+  #   name: Prod
   #   s3_bucket: my-focus-export-bucket
   #   s3_prefix: focus_data
   #   region: us-east-1
+  #   # cost_source defaults to focus_export (the S3 export above); set to
+  #   # cost_explorer instead to query Cost Explorer directly (coarser, no
+  #   # export needed, but needs ce:GetCostAndUsage) — pick one, no fallback.
+  #   # cost_source: cost_explorer
   #   # include_services defaults to Redshift only; set explicitly to widen, e.g.:
   #   # include_services: []   # [] = every service (the whole account)
 
   # - type: databricks
   #   enabled: true
+  #   name: Prod workspace
   #   host: https://my-workspace.cloud.databricks.com
   #   token_env: DATABRICKS_TOKEN
   #   sql_warehouse_id: abc123

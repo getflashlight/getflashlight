@@ -5,7 +5,11 @@ Connector configs (``ingest/config.py``) only ever hold an env var *name*
 dashboard's Connections page is stored here, keyed by that env var name, and
 resolved back into the ``flashlight ingest`` subprocess's environment at sync
 time (see ``dashboard/ingest_runner.py``) rather than ever being written to
-``connections.yml``.
+``connections.yml``. Since the lookup key *is* the env var name, two
+connections that share one would share one keychain entry — ``config.py``'s
+``scoped_env_name`` defaults every connection's env var name to something
+derived from its own (enforced-unique) ``name``, so this only happens when a
+user explicitly opts into sharing one by hand-setting the same name twice.
 
 Its own keychain service name (``flashlight-ingest``, vs. chat's
 ``flashlight-chat``) so a connector token and a chat API key never collide even

@@ -8,9 +8,10 @@ run, rather than calling ``ingest/runner.py::run_ingest`` in-process, so
 
 from __future__ import annotations
 
+import asyncio
 import os
-import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from flashlight.dashboard.connection_credentials import load_secret
@@ -33,16 +34,36 @@ def _secrets_env(connections_path: Path) -> dict[str, str]:
     return env
 
 
-def sync_now(
-    connections_path: Path, *, full_refresh: bool = False
-) -> subprocess.CompletedProcess[str]:
-    """Run ``flashlight ingest`` against *connections_path*, blocking.
+async def stream_sync(
+    connections_path: Path,
+    on_line: Callable[[str], None],
+    *,
+    full_refresh: bool = False,
+    connector: str | None = None,
+) -> int:
+    """Run ``flashlight ingest`` against *connections_path*, calling ``on_line``
+    with each stdout/stderr line as the subprocess produces it (a live tail —
+    users otherwise stare at a bare spinner for the whole sync), and returning
+    its exit code once it finishes.
 
-    Call via ``nicegui.run.io_bound`` from an async click handler — this is a
-    long-running, blocking call and must not run directly in the event loop.
+    A real ``asyncio`` subprocess, not ``nicegui.run.io_bound`` wrapping a
+    blocking ``subprocess.run`` — awaiting its stdout naturally yields back to
+    the event loop between lines, so the caller's ``on_line`` (pushing into a
+    ``ui.log``) renders as output arrives instead of all at once at the end.
+
+    ``connector`` restricts the run to one connector (the per-connection Sync
+    button); omitted, every enabled connector runs (the "Sync now" button).
     """
     env = {**os.environ, **_secrets_env(connections_path)}
     cmd = [sys.executable, "-m", "flashlight.cli", "ingest", "--connections", str(connections_path)]
     if full_refresh:
         cmd.append("--full-refresh")
-    return subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if connector is not None:
+        cmd.extend(["--connector", connector])
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    assert proc.stdout is not None
+    async for raw_line in proc.stdout:
+        on_line(raw_line.decode(errors="replace").rstrip("\n"))
+    return await proc.wait()

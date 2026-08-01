@@ -61,7 +61,7 @@ plugins:
           - index.md: Overview — what Flashlight is and why the numbers are trustworthy
           - quickstart.md: Sample data to a running dashboard in two commands
           - architecture.md: The BRONZE → SILVER → GOLD lake and its invariants
-          - connectors.md: AWS, Databricks, FOCUS files, and the mapping SQL
+          - connectors.md: AWS, Databricks, Redshift, and the mapping SQL
           - cli.md: Every `flashlight` command
         Design:
           - design/efficiency-waste.md: The efficiency/waste GOLD group and its rules

@@ -15,9 +15,12 @@ once the app is in use.
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
+from fastapi import HTTPException
 from nicegui import ui
 
+from flashlight.core.settings import get_settings
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import (
     NO_DATA_MSG,
@@ -37,12 +40,23 @@ def range_has_partial_month(end: date) -> bool:
 
 
 # ── Nav ──────────────────────────────────────────────────────────────────────
-_FIXED_NAV: tuple[tuple[str, str, str], ...] = (
-    ("/", "Home", "home"),
-    ("/connections", "Connections", "cable"),
-    ("/chat", "Chat", "chat"),
-    ("/usage", "Usage", "insights"),
-)
+def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
+    """The always-present nav rows, minus the write-surface pages (Connections:
+    edits connections.yml + spawns an ingest subprocess; Chat: BYOK key storage +
+    outbound LLM calls) when running as a public demo (see ``build_pages``'s
+    matching route gate), plus a Docs entry when a static docs site is mounted.
+    """
+    nav = [
+        ("/", "Home", "home"),
+        ("/connections", "Connections", "cable"),
+        ("/chat", "Chat", "chat"),
+        ("/usage", "Usage", "insights"),
+    ]
+    if get_settings().demo:
+        nav = [item for item in nav if item[0] not in ("/connections", "/chat")]
+    if get_settings().docs_dir:
+        nav.append(("/docs", "Docs", "menu_book"))
+    return tuple(nav)
 
 
 def _nav_label(group: str) -> str:
@@ -83,7 +97,7 @@ def shell(active_path: str) -> ui.column:
         ui.label("OVERVIEW").classes("text-xs font-semibold px-2 mb-1").style(
             f"color:{chrome.INK_MUTED}"
         )
-        for href, label, icon in _FIXED_NAV:
+        for href, label, icon in _fixed_nav():
             _nav_row(label=label, icon=icon, href=href, active=active_path == href)
         if groups:
             ui.label("BY PROVIDER").classes("text-xs font-semibold px-2 mb-1 mt-3").style(
@@ -119,6 +133,8 @@ def no_data_page(title: str) -> None:
 
 def build_pages() -> None:
     """Register every ``@ui.page()`` route. Call once, before ``ui.run()``."""
+    from nicegui import app
+
     from flashlight.dashboard.views import (
         chat,
         connections,
@@ -131,6 +147,8 @@ def build_pages() -> None:
         usage,
     )
 
+    settings = get_settings()
+
     @ui.page("/")
     def _home() -> None:
         with shell("/"):
@@ -139,15 +157,26 @@ def build_pages() -> None:
             else:
                 home_overview.render()
 
-    @ui.page("/connections")
-    def _connections() -> None:
-        with shell("/connections"):
-            connections.render()
+    # Connections (edits connections.yml, spawns an ingest subprocess) and Chat
+    # (BYOK key storage, outbound LLM calls) are the dashboard's only write/mutation
+    # surfaces — routes aren't registered at all in demo mode, so they 404 instead
+    # of just being hidden from nav (see _fixed_nav above).
+    if not settings.demo:
 
-    @ui.page("/chat")
-    async def _chat() -> None:
-        with shell("/chat"):
-            await chat.render()
+        @ui.page("/connections")
+        def _connections() -> None:
+            with shell("/connections"):
+                connections.render()
+
+        @ui.page("/chat")
+        async def _chat() -> None:
+            with shell("/chat"):
+                await chat.render()
+
+    if settings.docs_dir and Path(settings.docs_dir).is_dir():
+        from fastapi.staticfiles import StaticFiles
+
+        app.mount("/docs", StaticFiles(directory=settings.docs_dir, html=True), name="docs")
 
     @ui.page("/usage")
     def _usage() -> None:
@@ -172,18 +201,25 @@ def build_pages() -> None:
             ],
         )
 
-    for group in discover_provider_groups():
+    # One parameterized route, not one @ui.page per group discovered right now —
+    # discover_provider_groups() reads gold/ live, so it can (and does) return a
+    # different answer *after* the dashboard has booted: a provider's first sync
+    # publishes GOLD for it, and the nav (built fresh on every render — see
+    # shell() above) immediately shows a link for it. A group-at-a-time loop here
+    # only registers routes for what existed at boot, so that new nav link 404s
+    # until the dashboard process is restarted. Checking membership per request
+    # instead means a group's page and its nav link agree at all times.
+    @ui.page("/{group}")
+    def _provider_page(group: str) -> None:
+        if group not in discover_provider_groups():
+            raise HTTPException(status_code=404)
         label = provider_label(group)
-
-        def _provider_page(group: str = group, label: str = label) -> None:
-            with shell(f"/{group}"):
-                if not has_data():
-                    no_data_page(f"{label} spend")
-                elif group == "aws":
-                    redshift_focus.render()
-                elif group == "databricks":
-                    _render_databricks_page(label)
-                else:
-                    provider_focus.render(group, label)
-
-        ui.page(f"/{group}")(_provider_page)
+        with shell(f"/{group}"):
+            if not has_data():
+                no_data_page(f"{label} spend")
+            elif group == "aws":
+                redshift_focus.render()
+            elif group == "databricks":
+                _render_databricks_page(label)
+            else:
+                provider_focus.render(group, label)

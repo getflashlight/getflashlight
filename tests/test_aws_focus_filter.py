@@ -128,7 +128,12 @@ def test_s3_secret_sql_falls_back_to_static_keys_without_profile(monkeypatch) ->
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "static-key")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "static-secret")
 
-    connector = _connector(monkeypatch)
+    # Explicit access_key_env/secret_key_env, matching the env vars set above —
+    # left at the class default, these would instead be scoped per-connection
+    # (see config.py's scoped_env_name) and so wouldn't resolve to those names.
+    connector = _connector(
+        monkeypatch, access_key_env="AWS_ACCESS_KEY_ID", secret_key_env="AWS_SECRET_ACCESS_KEY"
+    )
     sql = connector._s3_secret_sql()
 
     assert "KEY_ID 'static-key'" in sql

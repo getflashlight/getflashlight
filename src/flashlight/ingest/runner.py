@@ -27,17 +27,14 @@ from flashlight.efficiency.model import EfficiencyRecord
 from flashlight.ingest.base import Connector, IngestWindow, ProgressCallback
 from flashlight.ingest.config import (
     AwsFocusConfig,
-    AwsInfraConfig,
     DatabricksConfig,
-    FocusFileConfig,
     RedshiftConfig,
+    effective_connector_name,
     load_connections,
 )
 from flashlight.ingest.connectors import (
     AwsFocusConnector,
-    AwsInfraConnector,
     DatabricksConnector,
-    FocusFileConnector,
     RedshiftConnector,
 )
 from flashlight.lake import bronze, driver_health, metrics, runlog
@@ -48,9 +45,7 @@ logger = get_logger(__name__)
 
 _REGISTRY: dict[type[BaseModel], type[Connector]] = {
     AwsFocusConfig: AwsFocusConnector,
-    FocusFileConfig: FocusFileConnector,
     DatabricksConfig: DatabricksConnector,
-    AwsInfraConfig: AwsInfraConnector,
     RedshiftConfig: RedshiftConnector,
 }
 
@@ -148,6 +143,7 @@ def run_ingest(
     connections: str | None = None,
     no_transform: bool = False,
     full_refresh: bool = False,
+    connector: str | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> int:
     """Pull every enabled connector for the window, then rebuild GOLD. Returns rows.
@@ -162,12 +158,19 @@ def run_ingest(
     run's ``[start, end]`` pull, instead of only replacing that window's own
     partitions — see :func:`run_connector`. Orthogonal to ``start``/``end``:
     those still decide what gets pulled back in.
+
+    ``connector`` restricts the run to the one connector whose
+    :func:`effective_connector_name` matches (the dashboard's per-connection Sync
+    button; the CLI's ``--connector``) — everything else about the run (window,
+    full_refresh, the GOLD rebuild reading all of BRONZE afterward) is unchanged.
     """
     end = end or date.today()
     start = start or (end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
     window = IngestWindow(start=start, end=end)
 
     configs = load_connections(connections)
+    if connector is not None:
+        configs = [c for c in configs if effective_connector_name(c) == connector]
     if not configs:
         logger.warning("ingest_no_connectors")
         return 0

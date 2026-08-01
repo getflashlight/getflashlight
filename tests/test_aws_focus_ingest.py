@@ -324,3 +324,110 @@ def test_ingest_pushes_down_service_allow_list(lake_home, tmp_path, monkeypatch)
     connector = _connector(monkeypatch, tmp_path, [path], include_services=["AmazonS3"])
     written = connector.ingest(_WINDOW, run_id="r1")
     assert written == 1
+
+
+# ── cost_source="cost_explorer" ──────────────────────────────────────────────
+
+
+def _ce_connector(monkeypatch, **config_kw: object):  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        "flashlight.ingest.connectors.aws_focus.aws_client", MagicMock(return_value=MagicMock())
+    )
+    config = AwsFocusConfig.model_validate(
+        {"cost_source": "cost_explorer", "region": "us-west-2", **config_kw}
+    )
+    return AwsFocusConnector(config)
+
+
+def test_ingest_cost_explorer_path_skips_manifest_scan(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from flashlight.lake import duck
+
+    connector = _ce_connector(monkeypatch)
+    monkeypatch.setattr(
+        connector,
+        "_manifest_files",
+        lambda window: (_ for _ in ()).throw(AssertionError("must not scan S3 manifests")),
+    )
+    connector._ce.get_cost_and_usage.return_value = {
+        "ResultsByTime": [
+            {
+                "TimePeriod": {"Start": "2026-06-15", "End": "2026-06-16"},
+                "Groups": [
+                    {
+                        "Keys": ["Amazon Redshift"],
+                        "Metrics": {"UnblendedCost": {"Amount": "12.50"}},
+                    },
+                ],
+            }
+        ]
+    }
+
+    written = connector.ingest(_WINDOW, run_id="r1")
+    assert written == 1
+
+    con = duck.connect()
+    duck.register_bronze(con)
+    row = con.execute(
+        "SELECT service_name, effective_cost, x_source_connector FROM raw.focus_record"
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "Amazon Redshift"
+    assert float(row[1]) == pytest.approx(12.50)
+    assert row[2] == "aws_focus"
+
+
+def test_ce_filter_uses_include_services() -> None:
+    connector = AwsFocusConnector(
+        AwsFocusConfig(cost_source="cost_explorer", include_services=["Amazon Redshift"])
+    )
+    assert connector._ce_filter() == {
+        "Dimensions": {"Key": "SERVICE", "Values": ["Amazon Redshift"]}
+    }
+
+
+def test_ce_filter_empty_when_include_services_widened() -> None:
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer", include_services=[]))
+    assert connector._ce_filter() == {}
+
+
+def test_map_ce_group_drops_zero_cost() -> None:
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer"))
+    group = {"Keys": ["Amazon Redshift"], "Metrics": {"UnblendedCost": {"Amount": "0"}}}
+    assert connector._map_ce_group(group, date(2026, 6, 1), date(2026, 6, 2)) is None
+
+
+def test_map_ce_group_categorizes_redshift_as_analytics() -> None:
+    from flashlight.focus.enums import ServiceCategory
+
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer"))
+    group = {"Keys": ["Amazon Redshift"], "Metrics": {"UnblendedCost": {"Amount": "5.00"}}}
+    record = connector._map_ce_group(group, date(2026, 6, 1), date(2026, 6, 2))
+    assert record is not None
+    assert record.service_category == ServiceCategory.ANALYTICS
+    assert record.service_name == "Amazon Redshift"
+
+
+def test_map_ce_group_falls_back_to_other_for_unknown_service() -> None:
+    from flashlight.focus.enums import ServiceCategory
+
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer"))
+    group = {
+        "Keys": ["Amazon Elastic Compute Cloud - Compute"],
+        "Metrics": {"UnblendedCost": {"Amount": "5.00"}},
+    }
+    record = connector._map_ce_group(group, date(2026, 6, 1), date(2026, 6, 2))
+    assert record is not None
+    assert record.service_category == ServiceCategory.OTHER
+
+
+def test_paginate_follows_next_page_token() -> None:
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer"))
+    page1 = {
+        "ResultsByTime": [{"TimePeriod": {"Start": "2026-06-01", "End": "2026-06-02"}}],
+        "NextPageToken": "p2",
+    }
+    page2 = {"ResultsByTime": [{"TimePeriod": {"Start": "2026-06-02", "End": "2026-06-03"}}]}
+    connector._ce.get_cost_and_usage = MagicMock(side_effect=[page1, page2])
+    results = connector._paginate(TimePeriod={"Start": "2026-06-01", "End": "2026-06-30"})
+    assert len(results) == 2
+    assert connector._ce.get_cost_and_usage.call_count == 2

@@ -130,6 +130,11 @@ def ingest(
     start: str | None = typer.Option(None, help="ISO start date (default: 35d lookback)"),
     end: str | None = typer.Option(None, help="ISO end date (default: today)"),
     connections: str | None = typer.Option(None, help="Path to connections.yml"),
+    connector: str | None = typer.Option(
+        None,
+        "--connector",
+        help="Only run this connector (its configured `name`, or `type` if unnamed)",
+    ),
     no_transform: bool = typer.Option(False, "--no-transform", help="Skip SILVER/GOLD refresh"),
     full_refresh: bool = typer.Option(
         False,
@@ -161,6 +166,7 @@ def ingest(
             start=date.fromisoformat(start) if start else None,
             end=date.fromisoformat(end) if end else None,
             connections=connections,
+            connector=connector,
             no_transform=no_transform,
             full_refresh=full_refresh,
             on_progress=_progress_printer(),

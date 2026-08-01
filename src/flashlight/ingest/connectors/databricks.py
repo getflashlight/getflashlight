@@ -34,7 +34,7 @@ from flashlight.efficiency.model import EfficiencyRecord, EntityType
 from flashlight.focus import sql_mapping
 from flashlight.focus.enums import ComputeClass
 from flashlight.ingest.base import Connector, IngestWindow, ProgressCallback
-from flashlight.ingest.config import DatabricksConfig, env
+from flashlight.ingest.config import DatabricksConfig, effective_connector_name, env
 from flashlight.ingest.connectors._coerce import to_decimal
 from flashlight.lake import bronze
 from flashlight.lake.driver_health_schema import DriverHealthRecord
@@ -225,6 +225,10 @@ class DatabricksConnector(Connector):
 
     def __init__(self, config: DatabricksConfig) -> None:
         self._config = config
+        # Instance-level, shadowing the class constant above — see aws_focus.py's
+        # AwsFocusConnector.__init__ for why (BRONZE partitioning stays distinct
+        # across multiple Databricks-workspace connections).
+        self.name = effective_connector_name(config)
         token = env(config.token_env)
         if not token:
             raise ConnectorError(self.name, f"Missing token env {config.token_env}")
@@ -247,7 +251,7 @@ class DatabricksConnector(Connector):
         """Vectorized bulk path: the FOCUS query's result is staged by Databricks as
         presigned-URL CSV chunks (``Disposition.EXTERNAL_LINKS``) regardless of size —
         DuckDB reads those links straight off cloud storage and maps them
-        (:mod:`flashlight.focus.sql_mapping`), same as ``aws_focus``/``focus_file``. No
+        (:mod:`flashlight.focus.sql_mapping`), same as ``aws_focus``. No
         per-row download-parse-``FocusRecord`` loop: for ``system.billing.usage`` at
         real-account scale that loop was the actual bottleneck (millions of rows/month
         through ``json.loads`` + a Python dict + Pydantic validation, three passes for

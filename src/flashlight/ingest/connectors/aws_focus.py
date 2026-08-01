@@ -17,6 +17,15 @@ predicate pushdown: the ``include_services`` allow-list and the charge-period
 window become a WHERE clause, so a data-platform-scoped pull reads a fraction of
 the bytes instead of pulling the whole account into memory. Postgres stays the
 warehouse — DuckDB is only the S3-Parquet read engine for ingestion.
+
+``AwsFocusConfig.cost_source`` picks between this vectorized S3 path
+("focus_export", default) and a Cost Explorer fallback ("cost_explorer") —
+an explicit choice, not automatic detection: only a connection that opts into
+Cost Explorer needs ``ce:GetCostAndUsage``. The CE path is coarser (account-
+level ``SERVICE`` totals, no per-charge detail, no cost-subcategory
+classification) and — since the old Databricks-cluster-tag attribution this
+once supported (``aws_infra``) was dropped along with it — scoped only by
+``include_services``, not by resource tag.
 """
 
 from __future__ import annotations
@@ -24,7 +33,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterator
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import boto3
@@ -35,16 +44,18 @@ from flashlight.core.logging import get_logger
 from flashlight.core.settings import get_settings
 from flashlight.efficiency.model import EfficiencyRecord, EntityType
 from flashlight.focus import sql_mapping
+from flashlight.focus.enums import ChargeCategory, ProviderName, ServiceCategory
+from flashlight.focus.model import FocusRecord
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 from flashlight.ingest.base import Connector, IngestWindow, ProgressCallback
-from flashlight.ingest.config import AwsFocusConfig, aws_client, env
+from flashlight.ingest.config import AwsFocusConfig, aws_client, effective_connector_name, env
 from flashlight.ingest.connectors._coerce import to_decimal
 from flashlight.lake import bronze
 from flashlight.lake import duck as lake_duck
 
 logger = get_logger(__name__)
 
-# FOCUS ServiceName for S3 (confirmed usage in aws_infra.py's coarser Cost Explorer path).
+# FOCUS ServiceName for S3, used by fetch_efficiency's intelligent-tiering signal below.
 _S3_SERVICE_NAME = "Amazon Simple Storage Service"
 
 # fetch_efficiency's S3 intelligent-tiering signal — aggregated straight out of this
@@ -84,10 +95,21 @@ class AwsFocusConnector(Connector):
 
     def __init__(self, config: AwsFocusConfig) -> None:
         self._config = config
+        # Instance-level, shadowing the class constant above — the connection's own
+        # chosen name, so BRONZE partitioning (x_source_connector=<name>/...) and the
+        # runlog/dashboard stay distinct across multiple AWS-cost-source connections.
+        self.name = effective_connector_name(config)
         # Empty allow-list = every service; otherwise keep only these ServiceNames.
         self._allowed = set(config.include_services)
         self._s3 = aws_client(
             "s3",
+            region=config.region,
+            profile=config.aws_profile,
+            access_key_env=config.access_key_env,
+            secret_key_env=config.secret_key_env,
+        )
+        self._ce = aws_client(
+            "ce",
             region=config.region,
             profile=config.aws_profile,
             access_key_env=config.access_key_env,
@@ -101,10 +123,16 @@ class AwsFocusConnector(Connector):
         run_id: str,
         on_progress: ProgressCallback | None = None,
     ) -> int:
-        """Vectorized bulk path: DuckDB reads the manifest-listed S3 Parquet with the
-        window/service predicate pushed down, maps it (:mod:`flashlight.focus.sql_mapping`),
-        and writes straight to BRONZE — no FocusRecord objects, no per-row Python.
+        """``cost_source="cost_explorer"``: drain :meth:`fetch` (Cost Explorer) through
+        the inherited row-based writer. ``cost_source="focus_export"`` (default):
+        vectorized bulk path — DuckDB reads the manifest-listed S3 Parquet with the
+        window/service predicate pushed down, maps it
+        (:mod:`flashlight.focus.sql_mapping`), and writes straight to BRONZE — no
+        FocusRecord objects, no per-row Python.
         """
+        if self._config.cost_source == "cost_explorer":
+            return super().ingest(window, run_id=run_id, on_progress=on_progress)
+
         files = self._manifest_files(window)
         if not files:
             return 0
@@ -160,6 +188,9 @@ class AwsFocusConnector(Connector):
             logger.warning("aws_focus_no_manifests", prefix=self._config.s3_prefix)
             return []
 
+        # Only reached when cost_source="focus_export" (ingest()'s branch), which the
+        # config validator guarantees means s3_bucket is set.
+        assert self._config.s3_bucket is not None
         files: list[str] = []
         for period, manifest_key in sorted(manifests.items()):
             manifest = self._read_manifest(manifest_key)
@@ -168,6 +199,83 @@ class AwsFocusConnector(Connector):
         if not files:
             logger.warning("aws_focus_manifest_no_files", periods=sorted(manifests))
         return files
+
+    # ── Cost Explorer path (cost_source="cost_explorer") ────────────────────
+    def fetch(self, window: IngestWindow) -> Iterator[FocusRecord]:
+        """Coarse account-level cost via Cost Explorer, grouped by SERVICE + day —
+        no per-charge detail, no cost-subcategory classification, no resource/tag
+        dimension (the old Databricks-cluster-tag attribution this once supported,
+        via ``aws_infra``, was dropped, not ported — see the module docstring).
+        Only reached via :meth:`ingest`'s ``cost_source="cost_explorer"`` branch,
+        draining this through the base class's row-based writer.
+        """
+        try:
+            results = self._paginate(
+                TimePeriod={
+                    "Start": str(window.start),
+                    "End": str(window.end + timedelta(days=1)),
+                },
+                Granularity="DAILY",
+                Metrics=["UnblendedCost"],
+                Filter=self._ce_filter(),
+                GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ConnectorError(self.name, f"Cost Explorer query failed: {exc}") from exc
+
+        for period in results:
+            p_start = date.fromisoformat(period["TimePeriod"]["Start"])
+            p_end = date.fromisoformat(period["TimePeriod"]["End"])
+            for group in period.get("Groups", []):
+                record = self._map_ce_group(group, p_start, p_end)
+                if record is not None:
+                    yield record
+
+    def _ce_filter(self) -> dict[str, Any]:
+        if not self._allowed:
+            return {}
+        return {"Dimensions": {"Key": "SERVICE", "Values": sorted(self._allowed)}}
+
+    def _paginate(self, **kwargs: Any) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        while True:
+            resp = self._ce.get_cost_and_usage(**kwargs)
+            out.extend(resp.get("ResultsByTime", []))
+            token = resp.get("NextPageToken")
+            if not token:
+                return out
+            kwargs["NextPageToken"] = token
+
+    def _map_ce_group(
+        self, group: dict[str, Any], p_start: date, p_end: date
+    ) -> FocusRecord | None:
+        keys = group.get("Keys", [])
+        service_name = keys[0] if keys else "Unknown"
+        cost = to_decimal(group.get("Metrics", {}).get("UnblendedCost", {}).get("Amount"))
+        if cost == 0:
+            return None
+        category = (
+            ServiceCategory.ANALYTICS
+            if service_name in REDSHIFT_SERVICE_NAMES
+            else ServiceCategory.OTHER
+        )
+        return FocusRecord(
+            provider_name=ProviderName.AWS,
+            billing_account_id="aws-cost-explorer",
+            billing_period_start=p_start.replace(day=1),
+            billing_period_end=p_end,
+            charge_period_start=_dt(p_start),
+            charge_period_end=_dt(p_end),
+            billed_cost=cost,
+            effective_cost=cost,
+            list_cost=cost,
+            contracted_cost=cost,
+            charge_category=ChargeCategory.USAGE,
+            charge_description=f"{service_name} (Cost Explorer)",
+            service_category=category,
+            service_name=service_name,
+            x_source_connector=self.name,
+        )
 
     def fetch_efficiency(self, window: IngestWindow) -> Iterator[EfficiencyRecord]:
         """S3 storage-tiering signal, read from this connector's own BRONZE rows —
@@ -367,6 +475,10 @@ def _period_in_window(period: str, window: IngestWindow) -> bool:
     month_start = date(year, month, 1)
     month_end = date(year + (month == 12), (month % 12) + 1, 1) - timedelta(days=1)
     return not (month_end < window.start or month_start > window.end)
+
+
+def _dt(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day)
 
 
 def _extract_data_file_keys(manifest: dict[str, Any], bucket: str, manifest_key: str) -> list[str]:

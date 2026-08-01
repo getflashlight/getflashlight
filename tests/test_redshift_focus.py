@@ -36,15 +36,17 @@ def test_redshift_config_accepts_cluster_or_workgroup() -> None:
 
 
 def test_redshift_config_disabled_by_default() -> None:
-    # Supplementary telemetry connector, same posture as aws_infra — opt-in.
+    # Supplementary telemetry connector — opt-in, not on by default.
     assert RedshiftConfig.model_validate({"cluster_identifier": "prod"}).enabled is False
 
 
 def test_redshift_config_aws_profile_defaults_unset() -> None:
     config = RedshiftConfig.model_validate({"cluster_identifier": "prod"})
     assert config.aws_profile is None
-    # access_key_env/secret_key_env still get their usual defaults regardless.
-    assert config.access_key_env == "AWS_ACCESS_KEY_ID"
+    # access_key_env/secret_key_env still default (scoped by name/type, since two
+    # connections must never silently share one keychain entry — see config.py's
+    # scoped_env_name) regardless of aws_profile.
+    assert config.access_key_env == "AWS_ACCESS_KEY_ID__REDSHIFT"
 
 
 def test_redshift_config_accepts_aws_profile() -> None:

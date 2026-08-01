@@ -54,7 +54,7 @@ class Connector(ABC):
         instead override :meth:`ingest` directly with one vectorized DuckDB SQL
         write (see :mod:`flashlight.focus.sql_mapping`) and leave this method
         unimplemented — no FocusRecord objects, no per-row Python at all. See
-        ``ingest/connectors/aws_focus.py`` / ``focus_file.py``.
+        ``ingest/connectors/aws_focus.py``.
 
         Implementations must stamp ``x_source_connector = self.name`` on each
         record and pick FOCUS-valid controlled-vocabulary values, falling back

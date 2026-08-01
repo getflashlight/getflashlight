@@ -74,6 +74,35 @@ flashlight ingest               # pull configured connectors → BRONZE, rebuild
 * MCP: `http://localhost:8002` (`flashlight mcp serve`; streamable-http, for agents)
 * CLI: `flashlight init | ingest | transform | mcp serve | dashboard serve | aws create-export`
 
+## Try the live demo (self-hosted)
+
+A prebuilt image with a mocked, multi-month FOCUS/efficiency/driver-health/
+policy dataset (no real billing, no config needed) is published to GHCR on
+every push to `main`:
+
+```bash
+docker run -p 8501:8501 ghcr.io/ychaparala/getflashlight-demo:latest
+# → http://localhost:8501
+```
+
+Or with Compose:
+
+```yaml
+services:
+  flashlight-demo:
+    image: ghcr.io/ychaparala/getflashlight-demo:latest
+    ports: ["8501:8501"]
+    restart: unless-stopped
+```
+
+Runs with `FLASHLIGHT_DEMO=1` (disables the BYOK chat and connections pages —
+the dashboard's only write/mutation surfaces) and mocked data baked in from
+the committed `demo/lake/` dataset — nothing downloaded or written at
+runtime, safe to expose publicly. The full docs site is bundled too — click
+"Docs" in the left nav, or go straight to `/docs`. Put it behind your own
+reverse proxy (Caddy/nginx/Traefik) for TLS — the container only serves
+plain HTTP.
+
 ## FOCUS handling (why the numbers are trustworthy)
 
 The SILVER/GOLD layer enforces the rules that make FOCUS data safe to sum:
@@ -86,11 +115,10 @@ explicit **unattributed** bucket rather than hidden.
 
 | Connector | Source | How it maps to FOCUS |
 |---|---|---|
-| `aws_focus` | AWS Data Exports (FOCUS 1.x Parquet in S3) | already FOCUS — light coercion |
-| `focus_file` | Local FOCUS CSV/Parquet (sample data, any vendor export) | already FOCUS — light coercion |
+| `aws_focus` | AWS Data Exports (FOCUS 1.x Parquet in S3), or Cost Explorer via `cost_source="cost_explorer"` | S3 export: already FOCUS, light coercion. Cost Explorer: coarser account-level totals, mapped in Python |
 | `databricks` | Databricks system tables | **vendored Databricks → FOCUS 1.3 SQL** (below) |
-| `aws_infra` | AWS Cost Explorer (fallback when no native FOCUS export) | mapped to FOCUS in Python |
-| `bigquery` / `snowflake` / `redshift` | — | stubs (planned) |
+| `redshift` | Redshift Data API + Cost Explorer (efficiency/waste only, no cost mapping) | — |
+| `bigquery` / `snowflake` | — | stubs (planned) |
 
 ### Databricks mapping (based on the Databricks FOCUS query)
 
@@ -108,9 +136,9 @@ carry it, but the TCO double-count guard needs it.
 
 - **Run it standalone.** Paste it into Databricks SQL / a notebook (set the
   `:account_prices` parameter) to materialize a FOCUS table, export it to
-  Parquet/Delta, and ingest via `aws_focus`/`focus_file` — no live API needed.
+  Parquet/Delta, and ingest via `aws_focus`'s S3 FOCUS export path — no live API needed.
 - **Template for other warehouses.** It's the reference pattern for *source-side*
-  FOCUS mapping; the planned `snowflake`/`bigquery`/`redshift` connectors follow the
+  FOCUS mapping; the planned `snowflake`/`bigquery` connectors follow the
   same shape (run a warehouse-native FOCUS query, then `map_focus_row`).
 - **Fork & extend.** The upstream mapping is explicitly "best-effort"; edit the
   vendored copy to add columns or refine the `billing_origin_product` taxonomy. To
@@ -123,8 +151,8 @@ carry it, but the TCO double-count guard needs it.
 
 ```bash
 uv sync
-uv run ruff check src tests
-uv run mypy src tests
+uv run ruff check src tests scripts
+uv run mypy src tests scripts
 uv run pytest
 ```
 
@@ -133,7 +161,7 @@ uv run pytest
 ```
 src/flashlight/
   focus/      canonical FOCUS model + enums
-  ingest/     connectors (aws_focus, databricks, aws_infra) + runner
+  ingest/     connectors (aws_focus, databricks, redshift) + runner
   lake/       the Parquet layer: paths, schema, bronze writes, DuckDB, publish
   transform/  SILVER/GOLD SQL + runner (builds gold/*.parquet) + metric catalog
   gold/       reader.py — the shared GOLD read surface (MCP + dashboard)

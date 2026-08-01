@@ -69,6 +69,48 @@ def test_all_connectors_run_even_after_a_failure(monkeypatch) -> None:  # type: 
     assert built == [True]
 
 
+def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The dashboard's per-connection Sync button (and the CLI's --connector) pass
+    `connector=<effective name>` — only that one connector's config should reach
+    build_connector/run_connector, everything else about the run is unchanged.
+    """
+    class _Config:
+        def __init__(self, type: str) -> None:  # noqa: A002 - mirrors ConnectorConfig's own field name
+            self.type = type
+            self.name = None
+
+    built: list[bool] = []
+    ran: list[str] = []
+    outcomes = [
+        ConnectorOutcome(name="aws_focus", rows=10, ok=True),
+        ConnectorOutcome(name="redshift", rows=0, ok=True),
+    ]
+    configs = [_Config("aws_focus"), _Config("redshift")]
+    outcome_by_config = dict(zip(configs, outcomes, strict=True))
+    monkeypatch.setattr(runner, "load_connections", lambda _c: configs)
+    monkeypatch.setattr(runner, "build_connector", lambda c: c)
+
+    def _run_connector(conn, _w, _on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
+        outcome = outcome_by_config[conn]
+        ran.append(outcome.name)
+        return outcome
+
+    monkeypatch.setattr(runner, "run_connector", _run_connector)
+
+    def _build_gold() -> int:
+        built.append(True)
+        return 1
+
+    monkeypatch.setattr(runner, "build_gold", _build_gold)
+    monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
+
+    rows = run_ingest(connector="redshift")
+    assert ran == ["redshift"]
+    assert rows == 0
+    assert built == [True]
+
+
 def test_all_fail_skips_gold_rebuild(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     built: list[bool] = []
     ran: list[str] = []

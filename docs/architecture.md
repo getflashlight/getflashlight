@@ -38,7 +38,7 @@ Details: [Efficiency / waste](design/efficiency-waste.md).
 ```
 src/flashlight/
   focus/      canonical FOCUS model + enums
-  ingest/     connectors (aws_focus, databricks, aws_infra) + runner
+  ingest/     connectors (aws_focus, databricks, redshift) + runner
   lake/       the Parquet layer: paths, schema, bronze writes, DuckDB, publish
   transform/  SILVER/GOLD SQL + runner (builds gold/*.parquet) + metric catalog
   gold/       reader.py — the shared GOLD read surface (MCP + dashboard)

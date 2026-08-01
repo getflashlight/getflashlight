@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8501
 
+    # Public-demo mode: disables the Chat and Connections pages (BYOK keychain
+    # writes, outbound LLM calls, connections.yml edits, subprocess ingest) — the
+    # dashboard's only write/mutation surfaces — so a self-hosted demo over mocked
+    # data is safe to expose publicly. See demo/README.md.
+    demo: bool = False
+    # Absolute path to a prebuilt static site (e.g. `mkdocs build`'s output) to
+    # mount at /docs. None (default) skips the mount and the nav entry.
+    docs_dir: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:

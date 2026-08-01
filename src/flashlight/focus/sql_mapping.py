@@ -16,12 +16,12 @@ below are generated from :mod:`flashlight.focus.enums` rather than duplicated as
 string literals, and the dedupe key uses the same sha256 algorithm as
 :meth:`FocusRecord.dedupe_key`.
 
-Used by ``ingest/connectors/aws_focus.py``, ``ingest/connectors/focus_file.py`` and
-``lake/seed.py`` — the three connectors whose source is already FOCUS-shaped and
-DuckDB-scannable. Connectors that build ``FocusRecord`` objects from an API/SDK
-response (Databricks, Redshift, aws_infra) don't use this — DuckDB has nothing to
-scan there, so the per-row Python path (``Connector.fetch`` -> the default
-``Connector.ingest``, see ``ingest/base.py``) is the correct tool for them.
+Used by ``ingest/connectors/aws_focus.py`` and ``lake/seed.py`` — sources that are
+already FOCUS-shaped and DuckDB-scannable. Connectors that build ``FocusRecord``
+objects from an API/SDK response (Databricks, Redshift, aws_focus's own Cost
+Explorer path) don't use this — DuckDB has nothing to scan there, so the per-row
+Python path (``Connector.fetch`` -> the default ``Connector.ingest``, see
+``ingest/base.py``) is the correct tool for them.
 """
 
 from __future__ import annotations

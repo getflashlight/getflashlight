@@ -4,7 +4,7 @@ The row-based counterpart of :mod:`flashlight.focus.sql_mapping` (the same rules
 in DuckDB SQL) — used by connectors whose source isn't itself DuckDB-scannable, so
 mapping has to happen in Python: ``databricks.py``'s vendored SQL query already
 projects FOCUS-named columns, and each row goes through this. Connectors reading an
-already-FOCUS-shaped file/blob directly (``aws_focus``, ``focus_file``) use the SQL
+already-FOCUS-shaped file/blob directly (``aws_focus``) use the SQL
 path instead — see ``ingest/base.py``'s ``Connector.fetch``/``ingest`` docstrings for
 which one a new connector should implement. Tolerates the ``NULL`` / empty sentinels
 real FOCUS exports use for missing values.

@@ -33,14 +33,14 @@ def _row(**over: object) -> dict[str, object]:
 
 def test_open_provider_name_preserved() -> None:
     # Microsoft/Oracle aren't in our enum constants — must pass through as strings.
-    microsoft = map_focus_row(_row(), "focus_file")
-    oracle = map_focus_row(_row(ProviderName="Oracle"), "focus_file")
+    microsoft = map_focus_row(_row(), "test_connector")
+    oracle = map_focus_row(_row(ProviderName="Oracle"), "test_connector")
     assert microsoft is not None and microsoft.provider_name == "Microsoft"
     assert oracle is not None and oracle.provider_name == "Oracle"
 
 
 def test_null_tokens_become_none() -> None:
-    rec = map_focus_row(_row(), "focus_file")
+    rec = map_focus_row(_row(), "test_connector")
     assert rec is not None
     assert rec.resource_id is None  # "NULL" -> None
     assert rec.charge_class is None  # "NULL" -> None
@@ -48,7 +48,7 @@ def test_null_tokens_become_none() -> None:
 
 
 def test_space_separated_timestamp_parsed() -> None:
-    rec = map_focus_row(_row(), "focus_file")
+    rec = map_focus_row(_row(), "test_connector")
     assert rec is not None and rec.charge_period_start.hour == 22
 
 

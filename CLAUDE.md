@@ -47,7 +47,7 @@ uv run flashlight transform        # rebuild GOLD from BRONZE (no re-pull)
 uv run flashlight mcp serve        # MCP server :8002 (agents)
 uv run flashlight dashboard serve  # NiceGUI dashboard :8501 (humans)
 uv run flashlight aws create-export  # create the AWS FOCUS export
-uv run ruff check src tests && uv run mypy src tests && uv run pytest
+uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run pytest
 ```
 
 ## Architecture (`src/flashlight/`)
@@ -56,9 +56,17 @@ uv run ruff check src tests && uv run mypy src tests && uv run pytest
   vocab (`enums.py`). Every connector maps its source into a `FocusRecord`; this
   is the one contract between ingestion and storage.
 - **`ingest/`** — `Connector` ABC (`base.py`), YAML config (`config.py`), the
-  `runner.py` orchestrator, and `connectors/` (aws_focus, focus_file, databricks,
-  aws_infra, plus stubs for bigquery/snowflake/redshift). FOCUS-shaped sources share
-  `connectors/_focus_map.py`. The **databricks** connector runs the vendored
+  `runner.py` orchestrator, and `connectors/` (aws_focus, databricks, redshift, plus
+  stubs for bigquery/snowflake). Each connector config carries an optional `name`
+  (falls back to `type`; enforced unique via `effective_connector_name`) — needed
+  once there's more than one connection of a type (e.g. several Redshift clusters),
+  since `Connector.name` is set from it and is what BRONZE partitioning, the runlog,
+  and the dashboard use to tell connections apart. **`aws_focus`** is the one AWS
+  cost source — `AwsFocusConfig.cost_source` picks `"focus_export"` (the S3 FOCUS
+  Data Export, default) or `"cost_explorer"` (a coarser Cost Explorer fallback, no
+  export needed but needs `ce:GetCostAndUsage`) explicitly; there's no automatic
+  detection between them. FOCUS-shaped sources share `connectors/_focus_map.py`.
+  The **databricks** connector runs the vendored
   Databricks→FOCUS 1.3 query (`connectors/sql/databricks_focus_1_3.sql`, from
   `databricks-solutions/cloud-infra-costs`) on a warehouse and maps its output —
   don't reintroduce hand-rolled DBU math. Re-pull that file upstream to update it.
@@ -122,7 +130,12 @@ uv run ruff check src tests && uv run mypy src tests && uv run pytest
 - **Charge-period grain only** when aggregating; never the billing period.
 - **TCO double-count guard** (`silver.tco_resource_month`): classic compute = DBU +
   attributed AWS infra; serverless = DBU only. The `x_compute_class` stamped by the
-  Databricks connector drives this.
+  Databricks connector drives this. The AWS-infra side of this (EC2/EBS spend
+  tagged to a Databricks cluster) has no configurable ingestion path any more — the
+  `aws_infra` Cost Explorer connector that once supplied it was folded into
+  `aws_focus`'s Redshift-scoped Cost Explorer fallback (`cost_source="cost_explorer"`,
+  no tag/cluster attribution) and not ported. Classic-compute rows only get the DBU
+  side unless a future connector reintroduces AWS-infra attribution.
 - **Partition-replace ingest**: each run is authoritative for the (connector,
   charge-period window) it pulls — `lake.bronze.write_window` removes that
   connector's `x_source_connector=…/charge_month=…/` partition dirs across the
