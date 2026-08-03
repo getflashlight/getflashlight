@@ -30,3 +30,15 @@ def _no_real_keyring(monkeypatch):  # type: ignore[no-untyped-def]
     monkeypatch.setattr(chat_credentials, "_keyring_set", lambda provider, value: None)
     monkeypatch.setattr(connection_credentials, "_keyring_get", lambda env_name: None)
     monkeypatch.setattr(connection_credentials, "_keyring_set", lambda env_name, value: None)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_policy_thresholds():  # type: ignore[no-untyped-def]
+    """Policy thresholds are cached per process and resolved from FLASHLIGHT_HOME, so a
+    test that writes its own ``policies.yml`` would otherwise leak those values into
+    every later test (and inherit an earlier test's)."""
+    from flashlight.efficiency.policy_config import get_thresholds
+
+    get_thresholds.cache_clear()
+    yield
+    get_thresholds.cache_clear()

@@ -132,6 +132,14 @@
 -- and spot-check cause_detail.policy_id/tag_count before trusting the policy_record rows
 -- that depend on them.
 --
+-- ADDED 2026-08-03, NOT YET VALIDATED against a live warehouse: auto_stop_minutes
+-- (system.compute.warehouses — the warehouse counterpart to a cluster's
+-- auto_termination_minutes, NULL on every non-warehouse branch). Feeds policy_rules.py's
+-- warehouse_auto_stop category. Same caveat as policy_id/tag_count above: the column name
+-- is Databricks' documented system-table schema, not yet confirmed live. If this workspace
+-- doesn't expose it, the query fails loudly on the warehouse_meta CTE rather than silently
+-- reporting every warehouse as unmeasured — drop the column and re-block the rule.
+--
 -- NOT YET VALIDATED against a live warehouse: notebook_id/notebook_path on rows where
 -- billing_origin_product IN ('INTERACTIVE','NOTEBOOKS') (serverless notebooks) — the
 -- fields themselves are proven for FOCUS resource naming (databricks_focus_1_3.sql:325,
@@ -319,7 +327,8 @@ cluster_meta AS (
 -- drives sql_warehouse_serverless_pricing_gap / sql_warehouse_high_frequency_workload
 -- (waste_rules.py) instead of inferring serverless from SKU text.
 warehouse_meta AS (
-  SELECT warehouse_id, warehouse_name, warehouse_type, size(tags) AS tag_count
+  SELECT warehouse_id, warehouse_name, warehouse_type, size(tags) AS tag_count,
+         auto_stop_minutes
   FROM system.compute.warehouses
   QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) = 1
 ),
@@ -461,7 +470,9 @@ SELECT
   -- Same ephemeral per-run cluster join as worker_node_type/core_count above — policy_id/
   -- tag_count describe the job's underlying cluster config, not the job itself.
   MAX(cmj.policy_id)                                        AS policy_id,
-  MAX(cmj.tag_count)                                        AS tag_count
+  MAX(cmj.tag_count)                                        AS tag_count,
+  -- auto_stop is a SQL-warehouse concept; clusters use auto_termination_minutes above.
+  CAST(NULL AS BIGINT)                                      AS auto_stop_minutes
 FROM usage u
 LEFT JOIN util ut ON ut.cluster_id = u.cluster_id AND ut.charge_month = u.charge_month
 LEFT JOIN runs r  ON r.job_id      = u.job_id     AND r.charge_month  = u.charge_month
@@ -505,7 +516,8 @@ SELECT
   MAX(ut.pct_time_high_cpu_wait), MAX(ut.pct_time_high_mem_swap),
   MIN(ut.min_local_disk_free_bytes), MAX(ut.network_bytes),
   CAST(NULL AS DOUBLE),  -- avg_run_seconds: no job-run concept for interactive clusters
-  MAX(cm.policy_id), MAX(cm.tag_count)
+  MAX(cm.policy_id), MAX(cm.tag_count),
+  CAST(NULL AS BIGINT)  -- auto_stop_minutes: warehouse-only concept
 FROM usage u
 LEFT JOIN util ut ON ut.cluster_id = u.cluster_id AND ut.charge_month = u.charge_month
 LEFT JOIN cluster_meta cm ON cm.cluster_id = u.cluster_id
@@ -535,7 +547,8 @@ SELECT
   CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
   CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
   CAST(NULL AS STRING),  -- policy_id: cluster-only concept, no warehouse counterpart
-  MAX(wm.tag_count)
+  MAX(wm.tag_count),
+  MAX(wm.auto_stop_minutes)
 FROM usage u
 LEFT JOIN warehouse_meta wm ON wm.warehouse_id = u.warehouse_id
 LEFT JOIN warehouse_query_stats qs
@@ -570,7 +583,8 @@ SELECT
   CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
   CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
   CAST(NULL AS STRING),  -- policy_id: cluster-only concept, no warehouse counterpart
-  MAX(wm.tag_count)
+  MAX(wm.tag_count),
+  MAX(wm.auto_stop_minutes)
 FROM usage u
 JOIN warehouse_query_users wqu
   ON wqu.warehouse_id = u.warehouse_id AND wqu.charge_month = u.charge_month
@@ -603,8 +617,9 @@ SELECT
   CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
   CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
   CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
-  -- Serverless notebooks have no cluster/warehouse identity to join for policy_id/tag_count.
-  CAST(NULL AS STRING), CAST(NULL AS BIGINT)
+  -- Serverless notebooks have no cluster/warehouse identity to join for policy_id/
+  -- tag_count/auto_stop_minutes.
+  CAST(NULL AS STRING), CAST(NULL AS BIGINT), CAST(NULL AS BIGINT)
 FROM usage u
 WHERE u.product IN ('INTERACTIVE', 'NOTEBOOKS') AND u.notebook_id IS NOT NULL
 GROUP BY u.notebook_id, u.run_as, u.charge_month

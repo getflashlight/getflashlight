@@ -50,7 +50,6 @@ def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
         ("/", "Home", "home"),
         ("/connections", "Connections", "cable"),
         ("/chat", "Chat", "chat"),
-        ("/usage", "Usage", "insights"),
     ]
     if get_settings().demo:
         nav = [item for item in nav if item[0] not in ("/connections", "/chat")]

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import duckdb
 
+from flashlight.core.settings import get_settings
 from flashlight.lake import paths
 from flashlight.lake.chat_turns import empty_table as empty_chat_turn_table
 from flashlight.lake.driver_health_schema import empty_table as empty_driver_health_table
@@ -38,9 +39,17 @@ def connect() -> duckdb.DuckDBPyConnection:
     ``sql_mapping.ensure_helpers``'s identical pin on the ingest-time connection —
     this is the shared factory transform/dashboard/MCP all read through, so it
     needs the same pin.
+
+    Also caps memory and points spill at the lake home: DuckDB defaults to ~80% of
+    system RAM per connection, and this is a laptop tool where several connections
+    (ingest workers, a transform, the dashboard) can be live at once.
     """
     con = duckdb.connect(":memory:")
     con.execute("SET TimeZone='UTC'")
+    temp_dir = paths.duckdb_temp_dir()
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    con.execute(f"SET memory_limit='{get_settings().duckdb_memory_limit}'")
+    con.execute(f"SET temp_directory='{str(temp_dir).replace(chr(39), chr(39) * 2)}'")
     return con
 
 

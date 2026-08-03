@@ -72,6 +72,27 @@ def _sql_quote(value: str) -> str:
     return value.replace("'", "''")
 
 
+def _materialize_sources(con: duckdb.DuckDBPyConnection) -> None:
+    """Read each source Parquet root once, into a temp table the views then read.
+
+    SILVER/GOLD are unmaterialized views, and every published file is its own
+    ``COPY (SELECT …)`` — so without this each of the ~N×13+10 COPYs re-executes the
+    whole view chain down to a fresh Parquet scan. Swapping the source views for
+    in-memory temp tables collapses that to one scan per root.
+
+    ponytail: whole-lake materialization, bounded by the connection's memory_limit
+    (it spills past that). A window-scoped incremental rebuild is the upgrade path if
+    spilling ever costs more than the re-scans did.
+    """
+    for schema_view, temp in (
+        ("raw.focus_record", "_bronze_mat"),
+        ("metrics.efficiency_record", "_efficiency_mat"),
+        ("metrics.driver_health", "_driver_health_mat"),
+    ):
+        con.execute(f"CREATE TEMP TABLE {temp} AS SELECT * FROM {schema_view}")  # noqa: S608
+        con.execute(f"CREATE OR REPLACE VIEW {schema_view} AS SELECT * FROM {temp}")  # noqa: S608
+
+
 def _discover_providers(con: duckdb.DuckDBPyConnection) -> list[str]:
     """Distinct, non-empty ``provider_name`` values present in SILVER.
 
@@ -101,6 +122,7 @@ def build_gold() -> int:
         duck.register_bronze(con)  # creates schema raw + raw.focus_record
         duck.register_metrics(con)  # creates schema metrics + metrics.efficiency_record
         duck.register_driver_health(con)  # creates metrics.driver_health
+        _materialize_sources(con)
 
         # gold.waste_record is config-driven (flashlight.efficiency.waste_rules), not a
         # static .sql file — compiled here so 050_gold_waste.sql's summary rollup can

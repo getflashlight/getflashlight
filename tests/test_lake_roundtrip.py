@@ -194,3 +194,64 @@ def test_tag_explosion(lake_home) -> None:  # type: ignore[no-untyped-def]
     pairs = {(r["tag_key"], r["tag_value"]) for r in rows}
     assert ("team", "data") in pairs
     assert ("env", "prod") in pairs
+
+
+def test_tag_coverage_keeps_untagged_spend_visible(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The tag views drop untagged rows; coverage is what stops that reading as 100%."""
+    from flashlight.gold.reader import query_view
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    bronze.write_window(
+        "t",
+        _WINDOW,
+        [
+            _rec(ProviderName.AWS, "AmazonEC2", "30", tags={"team": "data"}),
+            _rec(ProviderName.AWS, "AmazonS3", "10"),  # untagged
+        ],
+        ingest_run_id="r1",
+    )
+    build_gold()
+
+    row = query_view("aws.spend_tag_coverage_month")[0]
+    assert float(row["net_cost"]) == pytest.approx(40.0)
+    assert float(row["tagged_cost"]) == pytest.approx(30.0)
+    assert float(row["untagged_cost"]) == pytest.approx(10.0)
+    assert float(row["tagged_pct"]) == pytest.approx(75.0)
+
+    # The breakdown view really does omit that $10 — which is why coverage exists.
+    tagged_total = sum(float(r["net_cost"]) for r in query_view("aws.spend_by_tag_month"))
+    assert tagged_total == pytest.approx(30.0)
+
+
+def test_tag_coverage_excludes_credits(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Untagged credits must not push coverage above 100% or untagged_cost below zero.
+
+    Regression: measuring coverage over *net* cost on the FOCUS sample (which carries
+    untagged credits) reported tagged_pct = 281.8% and untagged_cost = -$100.
+    """
+    from flashlight.gold.reader import query_view
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    credit = _rec(ProviderName.AWS, "AmazonEC2", "-100")
+    credit.charge_category = ChargeCategory.CREDIT
+    bronze.write_window(
+        "t",
+        _WINDOW,
+        [
+            _rec(ProviderName.AWS, "AmazonEC2", "120", tags={"team": "data"}),
+            _rec(ProviderName.AWS, "AmazonS3", "40"),  # untagged charge
+            credit,  # untagged credit — the row that broke the naive version
+        ],
+        ingest_run_id="r1",
+    )
+    build_gold()
+
+    row = query_view("aws.spend_tag_coverage_month")[0]
+    assert float(row["net_cost"]) == pytest.approx(60.0)  # 120 + 40 - 100
+    assert float(row["gross_cost"]) == pytest.approx(160.0)  # charges only
+    assert float(row["tagged_cost"]) == pytest.approx(120.0)
+    assert float(row["untagged_cost"]) == pytest.approx(40.0)
+    assert float(row["tagged_pct"]) == pytest.approx(75.0)
+    assert 0 <= float(row["tagged_pct"]) <= 100

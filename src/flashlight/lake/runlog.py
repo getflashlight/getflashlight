@@ -72,6 +72,13 @@ def read_runs(limit: int = 50) -> pd.DataFrame:
     if not files:
         return pd.DataFrame(columns=[f.name for f in RUN_SCHEMA])
     df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    # A None `detail` (every successful connector — see record_run's default)
+    # round-trips through Parquet and back out of pandas as a float NaN, not
+    # None. bool(nan) is True in Python, so every caller checking "is there a
+    # detail to show" the obvious way (`if row.get("detail")`) would render the
+    # literal text "nan" instead of nothing. Normalize once here, at the read
+    # boundary, rather than trusting every consumer to know this gotcha.
+    df["detail"] = df["detail"].astype(object).where(df["detail"].notna(), None)
     return df.sort_values("finished_at", ascending=False).head(limit).reset_index(drop=True)
 
 

@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import markdown2
 import pandas as pd
 import plotly.express as px
 from nicegui import app, ui
@@ -59,8 +58,13 @@ def _render_rows(rows: list[dict[str, Any]], *, key: str) -> None:
     df = pd.DataFrame(rows)
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     other_cols = [c for c in df.columns if c not in numeric_cols]
-    if len(numeric_cols) == 1 and len(other_cols) == 1 and 2 <= len(df) <= 50:
-        x_col, y_col = other_cols[0], numeric_cols[0]
+    # A column that never varies (e.g. provider_name — still present, constant,
+    # on a per-provider-sliced view like aws.monthly_bill even once filtered/
+    # narrowed to one provider) carries no charting information; only a column
+    # that actually varies counts as the chart's one real dimension.
+    varying_other_cols = [c for c in other_cols if df[c].nunique(dropna=False) > 1]
+    if len(numeric_cols) == 1 and len(varying_other_cols) == 1 and 2 <= len(df) <= 50:
+        x_col, y_col = varying_other_cols[0], numeric_cols[0]
         fig = px.bar(df, x=x_col, y=y_col, labels={x_col: "", y_col: ""})
         currency_axis = "y" if _is_money_col(y_col) else None
         chrome.plot(chrome.style_fig(fig, category_x=True, currency_axis=currency_axis))
@@ -71,26 +75,38 @@ def _render_rows(rows: list[dict[str, Any]], *, key: str) -> None:
 
 
 def _render_tool_step(step: ToolStep, *, key: str) -> None:
+    # The chart/table *is* the answer, so it renders inline, always visible —
+    # only the raw call (SQL/args), a debugging detail, sits behind the fold.
+    # run_sql is the exception: it's the model's own freeform SQL, not a
+    # tested view, so a wrong GROUP BY/join/window function can produce a
+    # plausible-looking but silently wrong chart — open by default so the
+    # actual query is immediately auditable, not one extra click away.
     label = f"Queried {step.name}" if step.rows is not None else f"Called {step.name}"
-    expansion = ui.expansion(label, icon="terminal").classes("w-full")
+    expansion = ui.expansion(label, icon="terminal", value=step.name == "run_sql").classes("w-full")
     expansion.style(f"color:{chrome.INK_SECONDARY}")
     with expansion:
         if step.name == "run_sql" and "sql" in step.arguments:
             ui.code(str(step.arguments["sql"]), language="sql").classes("w-full")
         elif step.arguments:
             ui.code(json.dumps(step.arguments, indent=2), language="json").classes("w-full")
-        if step.error:
-            ui.label(f"Error: {step.error}").classes("text-xs").style(f"color:{chrome.WASTE}")
-        elif step.rows:
-            _render_rows(step.rows, key=key)
-        elif step.rows == []:
-            ui.label("No rows returned.").classes("text-xs").style(f"color:{chrome.INK_MUTED}")
+    if step.error:
+        ui.label(f"Error: {step.error}").classes("text-xs").style(f"color:{chrome.WASTE}")
+    elif step.rows:
+        _render_rows(step.rows, key=key)
+    elif step.rows == []:
+        ui.label("No rows returned.").classes("text-xs").style(f"color:{chrome.INK_MUTED}")
+
 
 _PRESETS: dict[str, dict[str, str]] = {
     "OpenAI": {"model": "openai/gpt-4o", "base_url": ""},
     "Anthropic (Claude)": {"model": "anthropic/claude-sonnet-4-5", "base_url": ""},
     "Google (Gemini)": {"model": "gemini/gemini-2.0-flash", "base_url": ""},
     "Ollama (local)": {"model": "ollama/llama3", "base_url": "http://localhost:11434"},
+    # litellm's Databricks provider needs the "databricks/" prefix on the model
+    # (a bare Foundation Model API endpoint name like "databricks-gpt-oss-20b"
+    # raises "LLM Provider NOT provided") plus the workspace URL as base_url,
+    # e.g. https://<workspace-host>/serving-endpoints.
+    "Databricks": {"model": "databricks/databricks-gpt-oss-20b", "base_url": ""},
     "Custom / self-hosted": {"model": "", "base_url": ""},
 }
 _DEFAULT_PROVIDER = "OpenAI"
@@ -104,6 +120,12 @@ _EXAMPLE_PROMPTS = (
 
 async def render() -> None:
     await ui.context.client.connected()  # general/tab storage are only ready after this resolves
+    if ui.context.client.is_deleted:
+        # connected() also returns for a client NiceGUI pruned while it was still
+        # waiting for a socket that never showed up (e.g. a prefetch/crawler GET,
+        # or a tab that never opened its websocket) — not a real page load, so
+        # there's no client-bound storage (app.storage.tab) left to render into.
+        return
 
     chrome.section_title("Chat")
     chrome.section_caption(
@@ -161,7 +183,7 @@ async def render() -> None:
             .mark("chat-model")
         )
         base_url_input = (
-            ui.input("Base URL (only for self-hosted/custom)")
+            ui.input("Base URL (Databricks workspace, or self-hosted/custom)")
             .classes("w-full")
             .bind_value(app.storage.general, "chat_base_url")
             .mark("chat-base-url")
@@ -194,9 +216,13 @@ async def render() -> None:
 
     with ui.row().classes("w-full items-center justify-between"):
         status_label = ui.label().classes("text-sm").style(f"color:{chrome.INK_MUTED}")
-        ui.button(icon="settings", on_click=settings_dialog.open).props(
-            "flat round dense"
-        ).mark("chat-settings-button")
+        with ui.row().classes("items-center gap-1"):
+            ui.button(icon="insights", on_click=lambda: ui.navigate.to("/usage")).props(
+                "flat round dense"
+            ).tooltip("Usage").mark("chat-usage-button")
+            ui.button(icon="settings", on_click=settings_dialog.open).props(
+                "flat round dense"
+            ).mark("chat-settings-button")
 
     def _refresh_status() -> None:
         status_label.text = (
@@ -251,6 +277,9 @@ async def render() -> None:
             input_box.value = ""
             with message_area:
                 ui.chat_message(question, sent=True)
+                with ui.row().classes("items-center gap-2") as thinking:
+                    ui.spinner(size="1.2rem").style(f"color:{chrome.INK_MUTED}")
+                    ui.label("Thinking...").classes("text-sm").style(f"color:{chrome.INK_MUTED}")
             _scroll_down()
             messages.append({"role": "user", "content": question})
             send_button.props("loading")
@@ -264,16 +293,33 @@ async def render() -> None:
                     session_id=session_id,
                 )
             finally:
+                thinking.delete()
                 send_button.props(remove="loading")
                 input_box.props(remove="disable")
             turn_counter += 1
             with message_area, ui.column().classes("w-full gap-2"):
                 for i, step in enumerate(result.steps):
                     _render_tool_step(step, key=f"chat-step-{turn_counter}-{i}")
-                ui.html(markdown2.markdown(result.text)).style(
+                ui.markdown(result.text, extras=["fenced-code-blocks", "tables"]).style(
                     f"color:{chrome.INK_PRIMARY}; line-height:1.6;"
                 )
+                if result.options:
+                    # A vertical list, not a chip row: chips truncate to a short
+                    # pill, which doesn't leave room for an option to actually
+                    # describe itself (e.g. "All services across all providers
+                    # (default)") — a full-width row wraps naturally instead.
+                    with ui.list().props("bordered separator dense").classes("w-full").style(
+                        f"border-radius:8px;border-color:{chrome.BORDER};"
+                    ):
+                        for i, option in enumerate(result.options):
+                            ui.item(option, on_click=lambda o=option: _send_option(o)).style(
+                                f"color:{chrome.INK_SECONDARY}"
+                            ).mark(f"chat-option-{turn_counter}-{i}")
             _scroll_down()
+
+        async def _send_option(option: str) -> None:
+            input_box.value = option
+            await send()
 
         with ui.row().classes("w-full gap-2 items-center pt-3 px-4 pb-4"):
             input_box = (

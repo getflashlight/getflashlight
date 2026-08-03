@@ -29,6 +29,15 @@ def connections_path() -> Path:
     return config_dir() / "connections.yml"
 
 
+def policies_path() -> Path:
+    """Optional cost-policy threshold overrides (``flashlight init`` scaffolds it).
+
+    Absent means "use the efficient defaults" — see
+    :mod:`flashlight.efficiency.policy_config`.
+    """
+    return config_dir() / "policies.yml"
+
+
 def bronze_dir() -> Path:
     """BRONZE root, Hive-partitioned ``x_source_connector=…/charge_month=…/``."""
     return home() / "bronze"
@@ -74,6 +83,15 @@ def gold_signature() -> tuple[tuple[str, int], ...]:
             for p in gold.glob("*/*.parquet")
         )
     )
+
+
+def duckdb_temp_dir() -> Path:
+    """Spill dir for DuckDB once a query exceeds ``FLASHLIGHT_DUCKDB_MEMORY_LIMIT``.
+
+    Under the lake home rather than the system temp dir so a large transform spills
+    onto the same volume the user already gave us space on.
+    """
+    return home() / "tmp" / "duckdb"
 
 
 def gold_staging_dir() -> Path:

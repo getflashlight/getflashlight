@@ -49,6 +49,8 @@ _REGISTRY: dict[type[BaseModel], type[Connector]] = {
     RedshiftConfig: RedshiftConnector,
 }
 
+#: Fallback when ``FLASHLIGHT_INGEST_LOOKBACK_DAYS`` is unset — see
+#: :attr:`~flashlight.core.settings.Settings.ingest_lookback_days`.
 DEFAULT_LOOKBACK_DAYS = 35
 
 
@@ -179,7 +181,7 @@ def run_ingest(
     see ``dashboard/ingest_runner.py::stream_sync``).
     """
     end = end or date.today()
-    start = start or (end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
+    start = start or (end - timedelta(days=get_settings().ingest_lookback_days))
     window = IngestWindow(start=start, end=end)
     run_id = run_id or bronze.new_run_id()
 
@@ -223,6 +225,18 @@ def run_ingest(
             failed.append(outcome.name)
             logger.error("connector_failed", connector=outcome.name, detail=outcome.detail)
 
+    # Publish GOLD from the cost pull immediately — don't make dashboard-visible
+    # cost data wait on the slower, best-effort efficiency/driver-health phases
+    # below. build_gold() is a full, idempotent rebuild from whatever's
+    # currently on disk (see transform/runner.py), safe to call again after
+    # those phases finish (below) — this just means a process that dies
+    # partway through them (e.g. killed mid-efficiency-pull) still leaves
+    # already-successfully-pulled cost data published, instead of leaving GOLD
+    # untouched until a sync completes end to end.
+    if not no_transform and succeeded_connectors:
+        published = build_gold()
+        logger.info("transform_done", gold_views=published, phase="cost")
+
     # Best-effort efficiency/waste pull (secondary to cost): each connector that exposes
     # utilization telemetry writes aggregated EfficiencyRecords to the metrics plane. A
     # failure here warns and skips — it must NOT block the canonical cost pipeline.
@@ -236,13 +250,15 @@ def run_ingest(
     # DriverHealthRecords. Same never-block-cost-ingest guarantee as efficiency.
     _run_driver_health(window, succeeded_connectors)
 
-    # Rebuild SILVER/GOLD from whatever succeeded, so it's queryable even if some
-    # connectors failed. A failed connector's own window is left as it was before
-    # this run (bronze.write_window re-purges on error, never leaving a partial
+    # Final holistic rebuild — same idempotent build_gold() as above, now
+    # picking up whatever fresh efficiency/waste and driver-health data those
+    # two phases just wrote (the earlier publish above ran before either had a
+    # chance to). A failed connector's own window is left as it was before this
+    # run (bronze.write_window re-purges on error, never leaving a partial
     # write), so GOLD never reflects a half-written pull.
     if not no_transform and succeeded_connectors:
         published = build_gold()
-        logger.info("transform_done", gold_views=published)
+        logger.info("transform_done", gold_views=published, phase="final")
     logger.info(
         "ingest_complete",
         connectors=len(connectors),

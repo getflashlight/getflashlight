@@ -41,6 +41,17 @@ class Settings(BaseSettings):
     # concurrent memory, not just wall-clock.
     ingest_max_workers: int = 3
 
+    # Per-connection DuckDB memory ceiling (lake/duck.py). DuckDB's own default is
+    # ~80% of system RAM, which on a laptop means one transform can starve the rest
+    # of the machine — and ingest_max_workers connections can be live at once. Over
+    # the cap DuckDB spills to <home>/tmp/duckdb instead of failing.
+    duckdb_memory_limit: str = "4GB"
+
+    # How far back an ingest pulls when no explicit --start/--end is given
+    # (ingest/runner.py). Raise it to backfill history — forecasting needs 60+ days
+    # of complete days before it will emit a trend.
+    ingest_lookback_days: int = 35
+
     mcp_host: str = "0.0.0.0"
     mcp_port: int = 8002
     dashboard_host: str = "127.0.0.1"

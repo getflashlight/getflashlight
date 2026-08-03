@@ -20,6 +20,7 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from flashlight.core.settings import get_settings
+from flashlight.efficiency.policy_config import referenced_thresholds
 from flashlight.efficiency.policy_rules import POLICY_RULES
 from flashlight.efficiency.waste_rules import WASTE_RULES
 from flashlight.gold.reader import QueryError, distinct_values, query_view, run_select
@@ -66,19 +67,34 @@ def describe_metric(name: str) -> dict[str, Any]:
 def query_metric(
     name: str,
     limit: int = 200,
-    order_by: str | None = None,
+    order_by: str | list[str] | None = None,
     descending: bool = False,
     filters: dict[str, Any] | None = None,
+    measures: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return rows from a GOLD metric view. `name` is group-qualified, e.g. 'aws.monthly_bill'.
 
     `filters` is an equality map over the view's dimensions/measures, e.g.
-    {"charge_month": "2026-07-01", "compute_family": "job"}. Use list_dimension_values
-    first if you don't already know the valid value (a tag key, a sku_id, ...).
+    {"charge_month": "2026-07-01", "compute_family": "job"}. A value may also be
+    a list to match any of several values, e.g. {"charge_month": ["2026-06-01",
+    "2026-07-01"]} for a few specific months. Use list_dimension_values first if
+    you don't already know the valid value (a tag key, a sku_id, ...).
+    `order_by` is a single column name; a list is also accepted (only the first
+    entry is used — sorting is single-column) since models commonly send one.
+    `measures` narrows the returned columns to this subset of the view's measures
+    (default: every measure) — pass exactly one (e.g. ["net_cost"]) to get a
+    chartable one-dimension/one-measure result instead of every cost column.
     """
+    if isinstance(order_by, list):
+        order_by = order_by[0] if order_by else None
     try:
         rows = query_view(
-            name, limit=limit, order_by=order_by, descending=descending, filters=filters
+            name,
+            limit=limit,
+            order_by=order_by,
+            descending=descending,
+            filters=filters,
+            measures=measures,
         )
     except QueryError as exc:
         return {"error": str(exc), "available": list(current_catalog_by_name())}
@@ -129,6 +145,10 @@ def list_policy_rules() -> list[dict[str, Any]]:
     "blocked" (a documented check pending the telemetry named in `requires`). Unlike
     waste rules, an active policy rule emits a row for every applicable entity every
     month (compliant/non_compliant/not_applicable), not just violations.
+
+    `thresholds` gives the numbers a rule is actually enforcing (e.g. the maximum
+    auto-termination timeout that still counts as compliant). They come from the
+    user's `config/policies.yml`, defaulting to Flashlight's efficient values.
     """
     return [
         {
@@ -138,6 +158,9 @@ def list_policy_rules() -> list[dict[str, Any]]:
             "status": "active" if r.applies_sql else "blocked",
             "requires": list(r.requires),
             "source": r.source,
+            "thresholds": referenced_thresholds(
+                r.applies_sql, r.compliant_sql, r.not_applicable_sql, r.detail_sql
+            ),
         }
         for r in POLICY_RULES
     ]

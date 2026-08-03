@@ -178,6 +178,29 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
         measures=("net_cost",),
     ),
     ViewSpec(
+        view="spend_forecast_month",
+        title="Spend forecast / month",
+        description="Forward-looking spend. forecast_kind='run_rate' projects the current "
+        "month from its completed-day average; 'trend' extrapolates a least-squares line "
+        "over the next 3 months and is NULL until history_days >= 60 (too little history "
+        "to fit). The newest day is excluded everywhere — billing exports land 24-48h late.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=("provider_name", "charge_month", "forecast_kind"),
+        measures=("forecast_cost", "actual_to_date", "history_days"),
+    ),
+    ViewSpec(
+        view="spend_tag_coverage_month",
+        title="Tag coverage / month",
+        description="How much of each month's spend carries at least one cost-allocation "
+        "tag (tagged_cost/tagged_pct) versus none at all (untagged_cost). The honest "
+        "denominator for the tag views, which drop untagged spend by construction. "
+        "Measured over charges only (credits excluded), so tagged_pct is a real 0-100 "
+        "share; net_cost reconciles against monthly_bill.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=("provider_name", "charge_month"),
+        measures=("net_cost", "gross_cost", "tagged_cost", "untagged_cost", "tagged_pct"),
+    ),
+    ViewSpec(
         view="sku_month_over_month",
         title="SKU month-over-month variance",
         description="Per-SKU cost change decomposed into volume_effect (Δusage × prior rate) "

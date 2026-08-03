@@ -115,13 +115,40 @@ def _kpis(
     net, lst, sav = float(agg["net"]), float(agg["lst"]), float(agg["sav"])
     disc = f"{100 * sav / lst:.1f}%" if lst else "—"
     span = f"{start:%b %d} → {end:%b %d}" + (" · partial" if partial else "")
-    chrome.kpi_row(
-        [
-            (f"{label} net", compact_money(net), span),
-            (f"{label} list", compact_money(lst), "before discounts", "paid"),
-            (f"{label} savings", compact_money(sav), "vs list", "savings"),
-            ("Realized discount", disc, "off list", "savings"),
-        ],
+    cards: list[chrome.KpiCard] = [
+        (f"{label} net", compact_money(net), span),
+        (f"{label} list", compact_money(lst), "before discounts", "paid"),
+        (f"{label} savings", compact_money(sav), "vs list", "savings"),
+        ("Realized discount", disc, "off list", "savings"),
+    ]
+    projected = _projected_this_month(group)
+    if projected is not None:
+        cards.append(projected)
+    chrome.kpi_row(cards)
+
+
+def _projected_this_month(group: str) -> tuple[str, str, str] | None:
+    """Where the latest month lands at its current run rate, or None if unknowable.
+
+    Only the run_rate row is shown here — it's the number that's actionable mid-month.
+    The 3-month trend rows live in the forecast view for whoever wants them.
+    """
+    try:
+        row = gold_df(
+            "SELECT charge_month, forecast_cost, actual_to_date, history_days "
+            f'FROM "{group}".spend_forecast_month '
+            "WHERE forecast_kind = 'run_rate' ORDER BY charge_month DESC LIMIT 1"
+        )
+    except Exception:  # noqa: BLE001 - view absent until the next transform
+        return None
+    if row.empty or row["forecast_cost"].iloc[0] is None:
+        return None
+    days = int(row["history_days"].iloc[0])
+    month = pd.Timestamp(row["charge_month"].iloc[0])
+    return (
+        "Projected",
+        compact_money(float(row["forecast_cost"].iloc[0])),
+        f"{month:%b %Y} at {days}-day run rate",
     )
 
 
@@ -638,6 +665,28 @@ def _driver_mom(group: str, end: date) -> None:
     )
 
 
+def _tag_coverage(group: str, end: date, sm: date) -> None:
+    """How much of the range's spend is attributable at all.
+
+    The breakdown below drops untagged rows by construction, so without this a
+    fully-untagged bill renders as a tidy, complete-looking tag table.
+    """
+    cov = gold_df(
+        "SELECT sum(gross_cost) AS gross, sum(tagged_cost) AS tagged, "
+        f'sum(untagged_cost) AS untagged FROM "{group}".spend_tag_coverage_month '
+        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}'"
+    )
+    if cov.empty or not cov["gross"].iloc[0]:
+        return
+    gross = float(cov["gross"].iloc[0])
+    tagged = float(cov["tagged"].iloc[0] or 0)
+    untagged = float(cov["untagged"].iloc[0] or 0)
+    chrome.section_caption(
+        f"{tagged / gross:.0%} of charges in range carry a cost-allocation tag — "
+        f"{compact_money(untagged)} is unattributed and absent from the breakdown below."
+    )
+
+
 def _tags(group: str, label: str, end: date, sm: date) -> None:
     keys = gold_df(
         f'SELECT tag_key, sum(net_cost) AS net FROM "{group}".spend_by_tag_month '
@@ -645,6 +694,7 @@ def _tags(group: str, label: str, end: date, sm: date) -> None:
         "GROUP BY tag_key ORDER BY net DESC"
     )
     chrome.panel_title("Spend by tag")
+    _tag_coverage(group, end, sm)
     if keys.empty:
         _info("No tagged spend in range.")
         return

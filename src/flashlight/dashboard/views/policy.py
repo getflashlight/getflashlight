@@ -12,7 +12,9 @@ from nicegui import ui
 
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import gold_df
+from flashlight.efficiency.policy_config import get_thresholds
 from flashlight.efficiency.policy_rules import POLICY_RULES
+from flashlight.lake import paths
 
 _EMPTY_MSG = (
     "No policy-compliance data yet. This view needs the Databricks system-table pull "
@@ -104,3 +106,27 @@ def render() -> None:
                 rename=_RENAME,
                 max_rows=_MAX_ROWS,
             )
+
+    _thresholds_panel()
+
+
+def _thresholds_panel() -> None:
+    """The numbers behind the pass/fail verdicts, and where to change them.
+
+    Compliance is only meaningful if you can see the threshold it was judged against
+    — and edit it when your org's policy differs from Flashlight's default.
+    """
+    thresholds = get_thresholds()
+    with chrome.panel():
+        chrome.panel_title("Policy thresholds")
+        chrome.section_caption(
+            f"The values these verdicts were measured against. Edit {paths.policies_path()} "
+            "and re-run `flashlight transform` to change them — thresholds are baked into "
+            "the published data, so the dashboard and any agent always agree."
+        )
+        for name, field in type(thresholds).model_fields.items():
+            with ui.row().classes("items-baseline gap-2"):
+                ui.label(f"{getattr(thresholds, name)}").classes("text-sm font-medium")
+                ui.label(field.description or name).classes("text-sm").style(
+                    f"color:{chrome.INK_MUTED}"
+                )

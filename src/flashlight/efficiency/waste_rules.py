@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from flashlight.efficiency.policy_config import threshold_values
+
 
 @dataclass(frozen=True)
 class WasteRule:
@@ -106,7 +108,7 @@ WASTE_RULES: tuple[WasteRule, ...] = (
         label="Underutilized capacity",
         remedy="Right-size to a smaller instance/cluster or consolidate workloads onto "
         "shared compute.",
-        where_sql="utilization_pct IS NOT NULL AND utilization_pct <= 20",
+        where_sql="utilization_pct IS NOT NULL AND utilization_pct <= {underutilized_pct}",
         detail_sql="'util ' || round(utilization_pct)::INT || '%'",
         recoverable_cost_sql="round(billed_cost * (1 - utilization_pct / 100.0), 2)",
         confidence_sql="CASE WHEN coalesce(pct_runs_underutilized, 0) >= 0.8 "
@@ -784,18 +786,24 @@ def build_waste_record_sql() -> str:
 
     Config-driven: adding a :class:`WasteRule` with ``where_sql`` set is picked up
     here with no other code change — the next ``flashlight transform`` classifies it.
+    Rule SQL carrying ``{placeholder}`` names is filled from
+    :mod:`~flashlight.efficiency.policy_config` here, so a threshold change lands in
+    the published GOLD rather than being re-applied per reader.
     """
-    active = [r for r in WASTE_RULES if r.where_sql is not None]
+    # Pair each rule with its narrowed where_sql — the filter alone doesn't tell the
+    # type checker the Optional is gone.
+    active = [(r, r.where_sql) for r in WASTE_RULES if r.where_sql is not None]
+    fill = threshold_values()
     branches = "\nUNION ALL\n".join(
         f"""SELECT provider_name, charge_month, entity_type, entity_id, entity_name,
        owner_user, owner_project, billed_cost,
        '{r.category}' AS waste_category, '{r.lens}' AS lens,
-       {r.detail_sql} AS detail,
-       {r.recoverable_cost_sql} AS recoverable_cost,
-       {r.confidence_sql} AS confidence
+       {r.detail_sql.format(**fill)} AS detail,
+       {r.recoverable_cost_sql.format(**fill)} AS recoverable_cost,
+       {r.confidence_sql.format(**fill)} AS confidence
 FROM e
-WHERE {r.where_sql}"""
-        for r in active
+WHERE {where_sql.format(**fill)}"""
+        for r, where_sql in active
     )
     return f"""
 CREATE OR REPLACE VIEW gold.waste_record AS

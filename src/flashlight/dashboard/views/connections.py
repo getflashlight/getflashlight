@@ -810,10 +810,12 @@ def render() -> None:
             if groups.empty:
                 chrome.empty_state("history", "No syncs yet", "Run a sync to see its history here.")
                 return
-            detail = read_runs(limit=1000)
-            connector_filter.set_options(["All", *sorted(detail["connector"].unique())])
+            runs_detail = read_runs(limit=1000)
+            connector_filter.set_options(["All", *sorted(runs_detail["connector"].unique())])
             if connector_filter.value != "All":
-                matching = set(detail.loc[detail["connector"] == connector_filter.value, "run_id"])
+                matching = set(
+                    runs_detail.loc[runs_detail["connector"] == connector_filter.value, "run_id"]
+                )
                 groups = groups[groups["run_id"].isin(matching)]
                 if groups.empty:
                     chrome.empty_state(
@@ -824,7 +826,9 @@ def render() -> None:
                 run_id = run["run_id"]
                 started = pd.Timestamp(run["started_at"]).strftime("%Y-%m-%d %H:%M %Z")
                 failed = run["status"] == "failed"
-                connectors_df = detail[detail["run_id"] == run_id].sort_values("connector")
+                connectors_df = runs_detail[runs_detail["run_id"] == run_id].sort_values(
+                    "connector"
+                )
                 log_path = paths.sync_log_path(run_id)
                 with ui.row().classes("w-full items-center gap-2"):
                     expansion = (
@@ -843,20 +847,25 @@ def render() -> None:
                 with expansion, ui.column().classes("w-full gap-1 pl-2"):
                     for _, row in connectors_df.iterrows():
                         row_failed = row["status"] == "failed"
-                        with ui.row().classes("w-full items-center gap-3"):
-                            ui.label(row["connector"]).classes("text-xs").style(
-                                f"color:{chrome.INK_PRIMARY}; width:160px"
-                            )
-                            ui.label("failed" if row_failed else "ok").classes("text-xs").style(
-                                f"color:{chrome.WASTE if row_failed else chrome.OPPORTUNITY}; "
-                                "width:60px"
-                            )
-                            ui.label(f"{int(row['rows']):,} rows").classes("text-xs").style(
-                                f"color:{chrome.INK_MUTED}; width:110px"
-                            )
-                            if row.get("detail"):
-                                ui.label(str(row["detail"])).classes("text-xs").style(
-                                    f"color:{chrome.WASTE}"
+                        detail = row.get("detail")  # None unless this connector failed
+                        with ui.column().classes("w-full gap-0"):
+                            with ui.row().classes("w-full items-center gap-3"):
+                                ui.label(row["connector"]).classes("text-xs").style(
+                                    f"color:{chrome.INK_PRIMARY}; width:160px"
+                                )
+                                ui.label("failed" if row_failed else "ok").classes(
+                                    "text-xs"
+                                ).style(
+                                    f"color:{chrome.WASTE if row_failed else chrome.OPPORTUNITY}; "
+                                    "width:60px"
+                                )
+                                ui.label(f"{int(row['rows']):,} rows").classes("text-xs").style(
+                                    f"color:{chrome.INK_MUTED}; width:110px"
+                                )
+                            if detail:
+                                ui.label(str(detail)).classes("text-xs pl-4").style(
+                                    f"color:{chrome.WASTE}; white-space:normal; "
+                                    "word-break:break-word;"
                                 )
 
         def _open_saved_log(path: Path, label: str) -> None:

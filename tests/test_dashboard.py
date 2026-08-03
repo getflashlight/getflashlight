@@ -187,6 +187,48 @@ def test_connections_page_renders_sync_toolbar_and_empty_states(lake_home) -> No
     asyncio.run(_check())
 
 
+def test_connections_page_renders_multiple_sync_history_groups(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Regression test: history_body() reused the name `detail` for both the
+    whole per-connector-rows DataFrame (read_runs()'s result) and, inside the
+    nested per-connector loop, each row's own error-detail string — the second
+    assignment clobbered the DataFrame variable, so the SECOND run group's
+    `connectors_df = detail[detail["run_id"] == run_id]` line crashed with
+    "'NoneType' object is not subscriptable" (detail was still a plain string/
+    None left over from the first group's inner loop). Only reproduces with 2+
+    run groups — a single-sync test wouldn't hit the second outer-loop
+    iteration where the clobbered variable actually gets read.
+    """
+    from datetime import UTC, datetime
+
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+    from flashlight.lake import runlog
+
+    def _ts(minute: int) -> datetime:
+        return datetime(2026, 1, 1, 0, minute, tzinfo=UTC)
+
+    runlog.record_run(
+        run_id="sync-1", connector="aws_focus", status="success", rows=10,
+        started_at=_ts(0), finished_at=_ts(1),
+    )
+    runlog.record_run(
+        run_id="sync-2", connector="databricks", status="failed", rows=0,
+        started_at=_ts(2), finished_at=_ts(3), detail="expired token",
+    )
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/connections")
+            await user.should_see("Connections")
+            await user.should_see("aws_focus")
+            await user.should_see("databricks")
+            await user.should_see("expired token")
+
+    asyncio.run(_check())
+
+
 def test_connections_page_sync_button_streams_output_without_crashing(  # type: ignore[no-untyped-def]
     lake_home, monkeypatch
 ) -> None:
@@ -308,6 +350,44 @@ def test_chat_page_sends_a_question_and_renders_the_reply(lake_home, monkeypatch
     asyncio.run(_check())
 
 
+def test_chat_page_renders_clarify_options_as_clickable_chips(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Clicking an option chip sends its text as the next question, rather than
+    requiring the user to type a reply to the model's clarifying question."""
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.chat_engine import ChatTurnResult
+    from flashlight.dashboard.router import build_pages
+    from flashlight.dashboard.views import chat as chat_view
+
+    sent_questions: list[str] = []
+
+    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
+        sent_questions.append(messages[-1]["content"])
+        if len(sent_questions) == 1:
+            return ChatTurnResult(
+                text="Which time window?", steps=[], options=["Last month", "Year to date"]
+            )
+        return ChatTurnResult(text="Here you go.", steps=[])
+
+    monkeypatch.setattr(chat_view, "run_turn", fake_run_turn)
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/chat")
+            await user.should_see(marker="chat-model")
+            user.find(marker="chat-model").type("openai/gpt-4o")
+            user.find(marker="chat-api-key").type("sk-test")
+            user.find(marker="chat-question").type("what did I spend?")
+            user.find(marker="chat-send").click()
+            await user.should_see("Which time window?")
+            user.find(marker="chat-option-1-0").click()
+            await user.should_see("Here you go.")
+
+    asyncio.run(_check())
+    assert sent_questions == ["what did I spend?", "Last month"]
+
+
 def test_chat_page_renders_a_tool_step_with_query_results(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Highest-risk new UI path: the tool-call transparency expansion actually
     renders when a turn's result carries a query_metric step with rows."""
@@ -341,6 +421,92 @@ def test_chat_page_renders_a_tool_step_with_query_results(lake_home, monkeypatch
             user.find(marker="chat-send").click()
             await user.should_see("Queried query_metric")
             await user.should_see("Spend rose from June to July.")
+
+    asyncio.run(_check())
+
+
+def test_chat_page_run_sql_step_defaults_open_others_stay_collapsed(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """run_sql is the model's own freeform SQL, not a tested view — its debug
+    expansion should default open so the query is auditable at a glance,
+    unlike a purpose-built tool step like query_metric."""
+    from nicegui import ui
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.chat_engine import ChatTurnResult, ToolStep
+    from flashlight.dashboard.router import build_pages
+    from flashlight.dashboard.views import chat as chat_view
+
+    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
+        steps = [
+            ToolStep(name="list_metrics", arguments={}, rows=None),
+            ToolStep(
+                name="run_sql",
+                arguments={"sql": "SELECT 1"},
+                rows=[{"charge_month": "2026-07-01", "net_cost": 1000.0}],
+            ),
+        ]
+        return ChatTurnResult(text="Here you go.", steps=steps)
+
+    monkeypatch.setattr(chat_view, "run_turn", fake_run_turn)
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/chat")
+            await user.should_see(marker="chat-model")
+            user.find(marker="chat-model").type("openai/gpt-4o")
+            user.find(marker="chat-api-key").type("sk-test")
+            user.find(marker="chat-question").type("which service grew the most?")
+            user.find(marker="chat-send").click()
+            await user.should_see("Queried run_sql")
+
+            expansions = {e.text: e.value for e in user.find(kind=ui.expansion).elements}
+            assert expansions == {
+                "Called list_metrics": False,
+                "Queried run_sql": True,
+            }
+
+    asyncio.run(_check())
+
+
+def test_chat_page_charts_despite_a_constant_dimension_column(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Regression test: aws.monthly_bill keeps `provider_name` as a column even
+    once sliced/filtered to one provider (still constant, e.g. always "AWS") —
+    that must not count as a second dimension and block the chart; only a
+    column that actually varies (charge_month here) should."""
+    from nicegui import ui
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.chat_engine import ChatTurnResult, ToolStep
+    from flashlight.dashboard.router import build_pages
+    from flashlight.dashboard.views import chat as chat_view
+
+    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
+        step = ToolStep(
+            name="query_metric",
+            arguments={"name": "aws.monthly_bill", "measures": ["net_cost"]},
+            rows=[
+                {"provider_name": "AWS", "charge_month": "2026-06-01", "net_cost": 1000.0},
+                {"provider_name": "AWS", "charge_month": "2026-07-01", "net_cost": 1200.0},
+            ],
+        )
+        return ChatTurnResult(text="Spend rose from June to July.", steps=[step])
+
+    monkeypatch.setattr(chat_view, "run_turn", fake_run_turn)
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/chat")
+            await user.should_see(marker="chat-model")
+            user.find(marker="chat-model").type("openai/gpt-4o")
+            user.find(marker="chat-api-key").type("sk-test")
+            user.find(marker="chat-question").type("chart my spend")
+            user.find(marker="chat-send").click()
+            await user.should_see("Spend rose from June to July.")
+            assert len(user.find(kind=ui.plotly).elements) == 1
+            with pytest.raises(AssertionError):  # no table — the chart heuristic matched
+                user.find(kind=ui.table)
 
     asyncio.run(_check())
 
@@ -448,5 +614,73 @@ def test_usage_page_renders_logged_chat_turns(lake_home) -> None:  # type: ignor
             # which prove the logged row was actually read back through the DuckDB view.
             await user.should_see("Chat turns")
             await user.should_see("Total tokens")
+
+    asyncio.run(_check())
+
+
+def test_policy_page_shows_effective_thresholds(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """A compliance verdict is only meaningful next to the threshold it was judged
+    against — and the file where a user changes it."""
+    from datetime import date as _date
+    from decimal import Decimal as _Decimal
+
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.efficiency.model import EfficiencyRecord, EntityType
+    from flashlight.lake import bronze, metrics
+    from flashlight.transform.runner import build_gold
+
+    window = IngestWindow(_date(2026, 5, 1), _date(2026, 5, 31))
+    # A Databricks cost row so the provider group (and its page) exists at all —
+    # the policy tab is nested on it.
+    bronze.write_window(
+        "t",
+        window,
+        [
+            FocusRecord(
+                provider_name=ProviderName.DATABRICKS,
+                billing_account_id="acct",
+                billing_period_start=_date(2026, 5, 1),
+                billing_period_end=_date(2026, 5, 31),
+                charge_period_start=datetime(2026, 5, 15, tzinfo=UTC),
+                charge_period_end=datetime(2026, 5, 15, 1, tzinfo=UTC),
+                billed_cost=_Decimal("100"),
+                effective_cost=_Decimal("100"),
+                list_cost=_Decimal("100"),
+                charge_category=ChargeCategory.USAGE,
+                service_category=ServiceCategory.ANALYTICS,
+                service_name="Databricks SQL",
+                x_source_connector="t",
+            )
+        ],
+        ingest_run_id="r1",
+    )
+    metrics.write_efficiency(
+        window,
+        [
+            EfficiencyRecord(
+                provider_name="Databricks",
+                charge_month=_date(2026, 5, 1),
+                entity_type=EntityType.INTERACTIVE,
+                entity_id="cl-sluggish",
+                billed_cost=_Decimal("100"),
+                cause_detail={"auto_termination_minutes": 600},
+                x_source_connector="databricks",
+            )
+        ],
+    )
+    build_gold()
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/databricks")
+            await user.should_see("Policy Compliance")
+            user.find("Policy Compliance").click()
+            await user.should_see("Policy thresholds")
+            # The default ceiling, shown so the verdict above is interpretable.
+            await user.should_see("60")
 
     asyncio.run(_check())

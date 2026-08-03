@@ -673,6 +673,10 @@ class DatabricksConnector(Connector):
             # cluster_policy_assigned categories.
             "policy_id": row.get("policy_id") or None,
             "tag_count": _opt_int(row.get("tag_count")),
+            # sql_warehouse/sql_warehouse_user only — the warehouse counterpart to a
+            # cluster's auto_termination_minutes. See policy_rules.py's
+            # warehouse_auto_stop category.
+            "auto_stop_minutes": _opt_int(row.get("auto_stop_minutes")),
         }
         return EfficiencyRecord(
             provider_name="Databricks",

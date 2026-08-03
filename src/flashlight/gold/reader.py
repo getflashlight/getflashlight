@@ -84,13 +84,20 @@ def query_view(
     order_by: str | None = None,
     descending: bool = False,
     filters: dict[str, Any] | None = None,
+    measures: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return rows from a catalogued GOLD view. Only known views are allowed.
 
     ``filters`` is an equality map over the view's dimensions/measures (e.g.
     ``{"charge_month": "2026-07-01", "compute_family": "job"}``) — the common case
-    for an agent that already knows what it's looking for. For anything filters
-    can't express (ranges, joins, aggregation), use ``run_sql``.
+    for an agent that already knows what it's looking for. A value may also be a
+    list for an IN-match (e.g. ``{"charge_month": ["2026-06-01", "2026-07-01"]}``).
+    For anything filters can't express (ranges, joins, aggregation), use ``run_sql``.
+
+    ``measures`` narrows the returned columns to the view's dimensions plus this
+    subset of its measures (default: every measure) — e.g. a view with several
+    cost measures (net/gross/credit/...) returns all of them unless narrowed,
+    which is too wide to chart as one dimension + one measure.
     """
     view = current_catalog_by_name().get(view_name)
     if view is None:
@@ -98,15 +105,32 @@ def query_view(
 
     allowed = set(view.dimensions) | set(view.measures)
     limit = max(1, min(limit, MAX_LIMIT))
-    sql = f'SELECT * FROM {view.name}'  # noqa: S608 - name validated against catalog
+    if measures:
+        unknown = [m for m in measures if m not in view.measures]
+        if unknown:
+            raise QueryError(
+                f"Not a measure on {view_name}: {unknown}; measures are {list(view.measures)}"
+            )
+        columns = ", ".join([*view.dimensions, *measures])
+        sql = f'SELECT {columns} FROM {view.name}'  # noqa: S608 - names validated against catalog
+    else:
+        sql = f'SELECT * FROM {view.name}'  # noqa: S608 - name validated against catalog
     params: list[Any] = []
     if filters:
         conditions = []
         for column, value in filters.items():
             if column not in allowed:
                 raise QueryError(f"Cannot filter by {column!r} on {view_name}")
-            conditions.append(f"{column} = ?")  # noqa: S608 - column validated against catalog
-            params.append(value)
+            if isinstance(value, list):
+                if not value:
+                    raise QueryError(f"Empty filter list for {column!r} on {view_name}")
+                placeholders = ", ".join("?" for _ in value)
+                # noqa: S608 - column validated against catalog
+                conditions.append(f"{column} IN ({placeholders})")
+                params.extend(value)
+            else:
+                conditions.append(f"{column} = ?")  # noqa: S608 - column validated against catalog
+                params.append(value)
         sql += " WHERE " + " AND ".join(conditions)
     if order_by:
         if order_by not in allowed:

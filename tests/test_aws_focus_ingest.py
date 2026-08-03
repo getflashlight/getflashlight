@@ -326,6 +326,62 @@ def test_ingest_pushes_down_service_allow_list(lake_home, tmp_path, monkeypatch)
     assert written == 1
 
 
+# ── manifest listing ─────────────────────────────────────────────────────────
+
+
+def _manifest_connector(monkeypatch, listing: dict[str, list[str]], **config_kw: object):  # type: ignore[no-untyped-def]
+    """Connector whose S3 answers ``listing`` (prefix -> keys) and records what was listed.
+
+    ``CommonPrefixes`` for the delimited call is derived from the keys, mimicking S3.
+    """
+    monkeypatch.setattr(
+        "flashlight.ingest.connectors.aws_focus.aws_client", MagicMock(return_value=MagicMock())
+    )
+    connector = AwsFocusConnector(
+        AwsFocusConfig.model_validate({"s3_bucket": "b", "region": "us-west-2", **config_kw})
+    )
+    scanned: list[str] = []
+
+    def paginate(Bucket: str, Prefix: str) -> list[dict[str, object]]:  # noqa: N803
+        scanned.append(Prefix)
+        keys = [k for k in listing.get("__all__", []) if k.startswith(Prefix)]
+        return [{"Contents": [{"Key": k} for k in keys]}]
+
+    def list_objects_v2(Bucket: str, Prefix: str, Delimiter: str) -> dict[str, object]:  # noqa: N803
+        children = {
+            k[len(Prefix) :].split("/")[0]
+            for k in listing.get("__all__", [])
+            if k.startswith(Prefix) and "/" in k[len(Prefix) :]
+        }
+        return {"CommonPrefixes": [{"Prefix": f"{Prefix}{c}/"} for c in sorted(children)]}
+
+    connector._s3.get_paginator.return_value.paginate = paginate
+    connector._s3.list_objects_v2 = list_objects_v2
+    return connector, scanned
+
+
+_MANIFEST_KEY = "focus/my-export/metadata/billing_period=2026-06/foo-Manifest.json"
+_DATA_KEY = "focus/my-export/data/billing_period=2026-06/chunk-0.snappy.parquet"
+
+
+def test_list_manifests_scans_metadata_subtree_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The data/ subtree — every Parquet the export ever wrote — must never be listed."""
+    connector, scanned = _manifest_connector(
+        monkeypatch, {"__all__": [_MANIFEST_KEY, _DATA_KEY]}, s3_prefix="focus"
+    )
+    assert connector._list_partition_manifests() == {"2026-06": _MANIFEST_KEY}
+    assert scanned == ["focus/metadata/", "focus/my-export/metadata/"]
+    assert not any("/data/" in p for p in scanned)
+
+
+def test_list_manifests_falls_back_to_full_prefix(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A layout that nests metadata/ deeper than one level still ingests, via fallback."""
+    deep = "focus/a/b/my-export/metadata/billing_period=2026-06/foo-Manifest.json"
+    connector, scanned = _manifest_connector(monkeypatch, {"__all__": [deep]}, s3_prefix="focus")
+    assert connector._list_partition_manifests() == {"2026-06": deep}
+    assert scanned[-1] == "focus"  # the whole-prefix fallback ran last
+
+
 # ── cost_source="cost_explorer" ──────────────────────────────────────────────
 
 

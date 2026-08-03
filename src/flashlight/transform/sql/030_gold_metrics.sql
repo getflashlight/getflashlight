@@ -192,6 +192,44 @@ CROSS JOIN unnest(json_keys(f.tags)) AS t(tag_key)
 GROUP BY tag_key, tag_value, f.provider_name, f.charge_month;
 
 
+-- ── "How much of my spend can I actually attribute?" — tag coverage ──────────────
+-- The honest denominator for the two tag views above. Both explode the Tags JSON with
+-- a CROSS JOIN, so untagged rows vanish from them entirely — a tag breakdown alone can
+-- look like full coverage when most of the bill carries no tags at all. This view keeps
+-- the untagged remainder visible (attribution honesty: never silently dropped), and is
+-- what a "tag coverage" KPI reconciles against.
+--
+-- Tagged = the Tags JSON has at least one key. `tags` is '{}' both when the source
+-- reported no tags and when it reported something unparseable (see lake/schema.py and
+-- focus/sql_mapping.py) — either way this is spend we cannot attribute, which is the
+-- question being asked.
+--
+-- Coverage is measured over CHARGES ONLY (`NOT is_credit`), never net. Credits are
+-- negative rows and are typically untagged, so a net-based split reports a negative
+-- untagged_cost and a tagged share above 100% — observed on the FOCUS sample, which
+-- has untagged credits. "How much of what I was charged can I attribute?" is the
+-- question, and a credit isn't something you attribute to a team. net_cost is kept
+-- alongside for reconciliation against monthly_bill.
+CREATE OR REPLACE VIEW gold.spend_tag_coverage_month AS
+SELECT
+    provider_name,
+    charge_month,
+    sum(cost)                                            AS net_cost,
+    sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
+    sum(cost) FILTER (WHERE NOT is_credit AND json_array_length(json_keys(tags)) > 0)
+                                                         AS tagged_cost,
+    sum(cost) FILTER (WHERE NOT is_credit AND json_array_length(json_keys(tags)) = 0)
+                                                         AS untagged_cost,
+    CASE WHEN sum(cost) FILTER (WHERE NOT is_credit) > 0
+         THEN round(100 * sum(cost) FILTER (
+                  WHERE NOT is_credit AND json_array_length(json_keys(tags)) > 0
+              ) / sum(cost) FILTER (WHERE NOT is_credit), 1)
+         ELSE NULL END                                   AS tagged_pct,
+    bool_or(is_partial_period)                           AS is_partial_period
+FROM silver.focus_normalized
+GROUP BY provider_name, charge_month;
+
+
 -- ── "Am I realizing my negotiated discount?" — list vs effective ─────────────────
 CREATE OR REPLACE VIEW gold.savings_summary_month AS
 SELECT

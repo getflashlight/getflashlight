@@ -76,6 +76,13 @@ def test_policy_classification(lake_home) -> None:  # type: ignore[no-untyped-de
         _rec("wh-tagged", EntityType.SQL_WAREHOUSE, cause_detail={"tag_count": 1}),
         # untagged warehouse → non_compliant
         _rec("wh-untagged", EntityType.SQL_WAREHOUSE, cause_detail={"tag_count": 0}),
+        # auto-stop within the 30-min default → compliant
+        _rec("wh-autostop", EntityType.SQL_WAREHOUSE, cause_detail={"auto_stop_minutes": 10}),
+        # auto-stop set but far over the policy → non_compliant (presence isn't enough)
+        _rec("wh-slow-autostop", EntityType.SQL_WAREHOUSE,
+             cause_detail={"auto_stop_minutes": 240}),
+        # auto-stop telemetry unmeasured → not_applicable, never a false violation
+        _rec("wh-unmeasured-autostop", EntityType.SQL_WAREHOUSE, cause_detail={}),
         # job entity — no policy rule applies to jobs (interactive/sql_warehouse only)
         _rec("job-1", EntityType.JOB, cause_detail={}),
     ]
@@ -101,6 +108,10 @@ def test_policy_classification(lake_home) -> None:  # type: ignore[no-untyped-de
     assert idx[("wh-tagged", "warehouse_tagging")]["status"] == "compliant"
     assert idx[("wh-untagged", "warehouse_tagging")]["status"] == "non_compliant"
 
+    assert idx[("wh-autostop", "warehouse_auto_stop")]["status"] == "compliant"
+    assert idx[("wh-slow-autostop", "warehouse_auto_stop")]["status"] == "non_compliant"
+    assert idx[("wh-unmeasured-autostop", "warehouse_auto_stop")]["status"] == "not_applicable"
+
     # jobs get no interactive/sql_warehouse-scoped rules at all
     assert not any(k[0] == "job-1" for k in idx)
     # sql_warehouse entities get no cluster-scoped rules
@@ -109,6 +120,79 @@ def test_policy_classification(lake_home) -> None:  # type: ignore[no-untyped-de
         and k[1] in ("auto_terminate", "autoscaling", "cluster_policy_assigned")
         for k in idx
     )
+
+
+def _write_policies(home, body: str) -> None:  # type: ignore[no-untyped-def]
+    from flashlight.efficiency.policy_config import get_thresholds
+    from flashlight.lake import paths
+
+    paths.config_dir().mkdir(parents=True, exist_ok=True)
+    paths.policies_path().write_text(body)
+    get_thresholds.cache_clear()
+
+
+def test_auto_terminate_honours_configured_ceiling(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """A timeout that's set but longer than the org policy is a violation, not a pass."""
+    from flashlight.gold.reader import query_view
+    from flashlight.lake import metrics
+    from flashlight.transform.runner import build_gold
+
+    _write_policies(lake_home, "thresholds:\n  max_auto_termination_minutes: 45\n")
+    metrics.write_efficiency(
+        _WINDOW,
+        [
+            _rec("cl-brisk", EntityType.INTERACTIVE,
+                 cause_detail={"auto_termination_minutes": 30}),
+            _rec("cl-sluggish", EntityType.INTERACTIVE,
+                 cause_detail={"auto_termination_minutes": 120}),
+        ],
+    )
+    build_gold()
+    idx = _by_entity_category(query_view("policy.policy_record"))
+
+    assert idx[("cl-brisk", "auto_terminate")]["status"] == "compliant"
+    assert idx[("cl-sluggish", "auto_terminate")]["status"] == "non_compliant"
+    # The threshold the verdict was measured against is visible in the row itself.
+    assert "45" in str(idx[("cl-sluggish", "auto_terminate")]["detail"])
+
+
+def test_underutilized_threshold_is_configurable(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The waste pool reads the same policies.yml — a stricter bar flags more waste."""
+    from flashlight.gold.reader import query_view
+    from flashlight.lake import metrics
+    from flashlight.transform.runner import build_gold
+
+    _write_policies(lake_home, "thresholds:\n  underutilized_pct: 50\n")
+    metrics.write_efficiency(
+        _WINDOW,
+        [_rec("cl-meh", EntityType.INTERACTIVE, utilization_pct=40.0, cause_detail={})],
+    )
+    build_gold()
+    categories = {
+        str(r["waste_category"])
+        for r in query_view("efficiency.waste_record")
+        if r["entity_id"] == "cl-meh"
+    }
+    # 40% utilization passes the default 20% bar but fails the configured 50% one.
+    assert "underutilized" in categories
+
+
+def test_missing_policies_file_uses_efficient_defaults(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """policies.yml is an optional override — absent means defaults, not an error."""
+    from flashlight.efficiency.policy_config import PolicyThresholds, get_thresholds
+    from flashlight.lake import paths
+
+    assert not paths.policies_path().exists()
+    assert get_thresholds() == PolicyThresholds()
+
+
+def test_malformed_policies_file_is_loud(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Silently defaulting would change every classification without telling anyone."""
+    from flashlight.efficiency.policy_config import get_thresholds
+
+    _write_policies(lake_home, "thresholds:\n  max_auto_termination_minutes: not-a-number\n")
+    with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+        get_thresholds()
 
 
 def test_policy_summary_rolls_up(lake_home) -> None:  # type: ignore[no-untyped-def]

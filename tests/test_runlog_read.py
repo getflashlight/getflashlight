@@ -46,6 +46,22 @@ def test_read_runs_sorted_newest_first_and_limited() -> None:
     assert list(df_all["connector"]) == ["databricks", "aws_focus"]
 
 
+def test_read_runs_detail_is_none_not_nan_for_a_successful_connector() -> None:
+    """record_run's default `detail=None` (every successful connector) round-trips
+    through Parquet and back out of pandas as a float NaN, not None — and
+    bool(nan) is True in Python, so a consumer's `if row.get("detail")` would
+    otherwise render the literal text "nan" instead of nothing (a real
+    regression in the dashboard's sync history). read_runs() must normalize it.
+    """
+    runlog.record_run(
+        run_id="run-1", connector="aws_focus", status="success", rows=10,
+        started_at=_ts(0), finished_at=_ts(1),
+    )
+    detail = runlog.read_runs().iloc[0]["detail"]
+    assert detail is None
+    assert not detail  # the actual failure mode: bool(nan) is True, bool(None) is False
+
+
 def test_read_run_groups_empty_when_nothing_logged() -> None:
     df = runlog.read_run_groups()
     assert df.empty

@@ -48,8 +48,36 @@ connectors: []
 """
 
 
+def _policies_template() -> str:
+    """The starter policies.yml, documented from the model's own field descriptions
+    so the file can't drift from the defaults it's showing."""
+    from flashlight.efficiency.policy_config import PolicyThresholds
+
+    lines = [
+        "# Cost-policy thresholds. Every value below is already the default — this",
+        "# file exists so you can tighten or relax them for your org. Delete it and",
+        "# Flashlight falls back to these same defaults.",
+        "#",
+        "# Changing a value takes effect on the next `flashlight transform`/`ingest`:",
+        "# thresholds are baked into the published GOLD, so the dashboard, the MCP",
+        "# server, and any agent all classify identically.",
+        "#",
+        "# The rules themselves (what Flashlight checks) are the shipped catalog —",
+        "# see the Policy page or the MCP `list_policy_rules` tool.",
+        "",
+        "thresholds:",
+    ]
+    defaults = PolicyThresholds()
+    for name, field in PolicyThresholds.model_fields.items():
+        if field.description:
+            lines.append(f"  # {field.description}")
+        lines.append(f"  {name}: {getattr(defaults, name)}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def scaffold(force: bool = False) -> None:
-    """Create ``<home>/{config,bronze,gold,meta}`` and a starter connections.yml."""
+    """Create ``<home>/{config,bronze,gold,meta}`` plus starter connections/policies YAML."""
     paths.ensure_layout()
 
     conn = paths.connections_path()
@@ -57,8 +85,14 @@ def scaffold(force: bool = False) -> None:
         conn.write_text(_CONNECTIONS_TEMPLATE)
         logger.info("connections_written", path=str(conn))
 
+    policies = paths.policies_path()
+    if force or not policies.exists():
+        policies.write_text(_policies_template())
+        logger.info("policies_written", path=str(policies))
+
     typer.echo(f"\nFlashlight initialized at {paths.home()}")
     typer.echo("\nNext steps:")
     typer.echo("  flashlight sample            # download the FOCUS sample + seed it (no config)")
     typer.echo(f"  # or edit {conn} to add your sources, then: flashlight ingest")
+    typer.echo(f"  # cost-policy thresholds (optional): {policies}")
     typer.echo("  flashlight dashboard serve   # dashboard → http://127.0.0.1:8501")

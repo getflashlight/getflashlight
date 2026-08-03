@@ -1185,14 +1185,20 @@ class RedshiftConnector(Connector):
             con = lake_duck.connect()
             try:
                 lake_duck.register_bronze(con)
+                # charge_month is the Hive partition column — bounding it lets DuckDB
+                # skip whole month directories instead of opening every month any
+                # connector has ever written.
                 rows = con.execute(
                     "SELECT x_cost_subcategory, sum(effective_cost) AS cost "
                     "FROM raw.focus_record "
                     "WHERE service_name IN (?, ?) "
+                    "AND charge_month >= ? AND charge_month <= ? "
                     "AND charge_period_start >= ? AND charge_period_start < ? "
                     "GROUP BY x_cost_subcategory",
                     [
                         *REDSHIFT_SERVICE_NAMES,
+                        window.start.strftime("%Y-%m"),
+                        window.end.strftime("%Y-%m"),
                         window.start,
                         window.end + timedelta(days=1),
                     ],

@@ -59,9 +59,12 @@ logger = get_logger(__name__)
 _S3_SERVICE_NAME = "Amazon Simple Storage Service"
 
 # fetch_efficiency's S3 intelligent-tiering signal — aggregated straight out of this
-# connector's own BRONZE rows (params: x_source_connector, service_name, window start,
-# window end-exclusive). Grouping/SUM/bool_or happen in DuckDB; Python only ever sees
-# one row per (bucket, month), not one row per line item.
+# connector's own BRONZE rows (params: x_source_connector, service_name, first/last
+# charge_month in the window, window start, window end-exclusive). Grouping/SUM/bool_or
+# happen in DuckDB; Python only ever sees one row per (bucket, month), not one row per
+# line item. The charge_month bounds are the Hive partition column, so DuckDB prunes
+# whole month directories before opening any file — the charge_period_start bounds
+# alone would still force a read of every month this connector ever wrote.
 _S3_TIERING_SQL = """
     SELECT
         resource_id,
@@ -77,6 +80,8 @@ _S3_TIERING_SQL = """
     FROM raw.focus_record
     WHERE x_source_connector = ?
       AND service_name = ?
+      AND charge_month >= ?
+      AND charge_month <= ?
       AND resource_id IS NOT NULL
       AND charge_period_start >= ?
       AND charge_period_start < ?
@@ -305,7 +310,14 @@ class AwsFocusConnector(Connector):
             lake_duck.register_bronze(con)
             rows = con.execute(
                 _S3_TIERING_SQL,
-                [self.name, _S3_SERVICE_NAME, window.start, window.end + timedelta(days=1)],
+                [
+                    self.name,
+                    _S3_SERVICE_NAME,
+                    window.start.strftime("%Y-%m"),
+                    window.end.strftime("%Y-%m"),
+                    window.start,
+                    window.end + timedelta(days=1),
+                ],
             ).fetchall()
             columns = [d[0] for d in con.description]
         finally:
@@ -335,20 +347,46 @@ class AwsFocusConnector(Connector):
 
     # ── S3 / manifest ────────────────────────────────────────────────────────
     def _list_partition_manifests(self) -> dict[str, str]:
-        """Map billing period (YYYY-MM) → its partition-level manifest S3 key."""
+        """Map billing period (YYYY-MM) → its partition-level manifest S3 key.
+
+        Scans only the ``metadata/`` subtrees, not the whole export: the ``data/``
+        siblings hold every Parquet chunk the export has ever written (thousands of
+        keys, growing with its age) and none of them can match ``_MANIFEST_RE``.
+        Falls back to listing the configured prefix whole if the narrow scan finds
+        nothing, so an unanticipated layout still ingests — just slower.
+        """
         try:
-            paginator = self._s3.get_paginator("list_objects_v2")
-            manifests: dict[str, str] = {}
-            for page in paginator.paginate(
-                Bucket=self._config.s3_bucket, Prefix=self._config.s3_prefix
-            ):
+            manifests = self._scan_manifests(self._metadata_prefixes())
+            return manifests or self._scan_manifests([self._config.s3_prefix])
+        except Exception as exc:  # noqa: BLE001
+            raise ConnectorError(self.name, f"S3 list failed: {exc}") from exc
+
+    def _metadata_prefixes(self) -> list[str]:
+        """Candidate ``metadata/`` prefixes: one per export-name dir directly under
+        ``s3_prefix`` (the documented layout), plus ``s3_prefix`` itself in case it
+        already points at an export root. One delimited LIST, no recursion."""
+        root = self._config.s3_prefix.strip("/")
+        base = f"{root}/" if root else ""
+        resp = self._s3.list_objects_v2(
+            Bucket=self._config.s3_bucket, Prefix=base, Delimiter="/"
+        )
+        nested = [
+            f"{cp['Prefix']}metadata/"
+            for cp in resp.get("CommonPrefixes", [])
+            if isinstance(cp.get("Prefix"), str)
+        ]
+        return [f"{base}metadata/", *nested]
+
+    def _scan_manifests(self, prefixes: list[str]) -> dict[str, str]:
+        paginator = self._s3.get_paginator("list_objects_v2")
+        manifests: dict[str, str] = {}
+        for prefix in prefixes:
+            for page in paginator.paginate(Bucket=self._config.s3_bucket, Prefix=prefix):
                 for obj in page.get("Contents", []):
                     m = _MANIFEST_RE.search(obj["Key"])
                     if m:
                         manifests[m.group(1)] = obj["Key"]
-            return manifests
-        except Exception as exc:  # noqa: BLE001
-            raise ConnectorError(self.name, f"S3 list failed: {exc}") from exc
+        return manifests
 
     def _read_manifest(self, key: str) -> dict[str, Any]:
         try:
