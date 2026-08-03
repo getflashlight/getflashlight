@@ -17,11 +17,11 @@ classifiers = [
 dependencies = [
     # Connector SDKs are imported eagerly by ingest, so they're required for now.
     # Making them optional extras needs lazy connector imports (follow-up).
-    "boto3>=1.43.56",
-    "databricks-sdk>=0.122.0",
+    "boto3>=1.43.61",
+    "databricks-sdk>=0.123.0",
     "duckdb>=1.5.5",
     "httpx>=0.28.1",
-    "mcp>=1.28.1",
+    "mcp>=2.0.0",
     "nicegui>=3.15.0",
     "pandas>=3.0.5",
     "platformdirs>=4.11.0",
@@ -66,7 +66,7 @@ dev = [
     "mypy>=2.3.0",
     "pre-commit>=4.6.1",
     "pytest>=9.1.1",
-    "ruff>=0.16.0",
+    "ruff>=0.16.1",
 ]
 docs = [
     "mkdocs-material>=9.7.7",
