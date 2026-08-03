@@ -73,3 +73,40 @@ def read_runs(limit: int = 50) -> pd.DataFrame:
         return pd.DataFrame(columns=[f.name for f in RUN_SCHEMA])
     df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
     return df.sort_values("finished_at", ascending=False).head(limit).reset_index(drop=True)
+
+
+GROUP_COLUMNS = ["run_id", "started_at", "finished_at", "rows", "connectors", "status"]
+
+
+def read_run_groups(limit: int = 20) -> pd.DataFrame:
+    """One row per whole sync (every connector sharing a ``run_id``), newest first —
+    the dashboard's per-run history view. Aggregates :func:`read_runs`'s
+    per-connector rows: the run's overall ``[min started_at, max finished_at]``
+    span, total rows, connector count, and a worst-of ``status`` ("failed" if any
+    connector in the run failed, else "success").
+
+    Reads a wide connector-row window (well beyond ``limit`` runs' worth) before
+    grouping, so a run isn't silently split across a truncation boundary — a
+    ``run_id`` only ever has a handful of connector rows, so this stays cheap.
+    Runs logged before ``run_id`` became a shared-per-sync id (each connector had
+    its own) degrade gracefully: each of those old rows is its own one-connector
+    group, not merged with anything.
+    """
+    df = read_runs(limit=max(limit * 20, 200))
+    if df.empty:
+        return pd.DataFrame(columns=GROUP_COLUMNS)
+    grouped = (
+        df.groupby("run_id", as_index=False)
+        .agg(
+            started_at=("started_at", "min"),
+            finished_at=("finished_at", "max"),
+            rows=("rows", "sum"),
+            connectors=("connector", "count"),
+            failed=("status", lambda s: bool((s == "failed").any())),
+        )
+        .assign(status=lambda d: d["failed"].map({True: "failed", False: "success"}))
+        .drop(columns=["failed"])
+    )
+    return (
+        grouped.sort_values("finished_at", ascending=False).head(limit).reset_index(drop=True)
+    )

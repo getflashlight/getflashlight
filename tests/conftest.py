@@ -23,7 +23,8 @@ def _no_real_keyring(monkeypatch):  # type: ignore[no-untyped-def]
     permission prompt outside an interactive desktop session, and would leave
     real entries behind. Defaults to "nothing stored"; a test that needs to
     exercise persistence overrides these with its own in-memory fake."""
-    from flashlight.dashboard import chat_credentials, connection_credentials
+    from flashlight.dashboard import chat_credentials
+    from flashlight.ingest import connection_credentials
 
     monkeypatch.setattr(chat_credentials, "_keyring_get", lambda provider: None)
     monkeypatch.setattr(chat_credentials, "_keyring_set", lambda provider, value: None)

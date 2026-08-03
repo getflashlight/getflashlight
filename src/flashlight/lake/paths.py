@@ -90,6 +90,19 @@ def runs_dir() -> Path:
     return meta_dir() / "runs"
 
 
+def sync_logs_dir() -> Path:
+    """Saved sync transcripts — one text file per whole ``run_ingest()`` call, named
+    by its shared ``run_id`` (see :mod:`flashlight.lake.runlog`). Written by the
+    dashboard's :func:`flashlight.dashboard.ingest_runner.stream_sync` as it tails
+    a sync subprocess, so a run's log survives closing the dialog that started it.
+    """
+    return meta_dir() / "sync_logs"
+
+
+def sync_log_path(run_id: str) -> Path:
+    return sync_logs_dir() / f"{run_id}.log"
+
+
 def chat_turns_dir() -> Path:
     """BYOK chat usage log — one Parquet file per chat turn (append-only)."""
     return meta_dir() / "chat_turns"
@@ -104,6 +117,7 @@ def ensure_layout() -> None:
         driver_health_dir(),
         gold_dir(),
         runs_dir(),
+        sync_logs_dir(),
         chat_turns_dir(),
     ):
         path.mkdir(parents=True, exist_ok=True)

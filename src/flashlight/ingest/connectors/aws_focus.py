@@ -136,6 +136,13 @@ class AwsFocusConnector(Connector):
         files = self._manifest_files(window)
         if not files:
             return 0
+        # Everything below is one vectorized DuckDB pass — no per-row Python, so
+        # no natural per-row progress hook — and against a real export this can
+        # run for minutes with nothing else printed in between. These two lines
+        # are the only visibility the live tail (dashboard sync / CLI) gets
+        # during that stretch; without them "still listing/reading S3" and
+        # "hung" look identical from the outside.
+        logger.info("aws_focus_scan_start", files=len(files))
 
         con = duckdb.connect()
         try:
@@ -153,6 +160,7 @@ class AwsFocusConnector(Connector):
                 f"WHERE {_scan_where_literal(self._allowed, window)})"
             )
             present = sql_mapping.present_columns(con, source_sql)
+            logger.info("aws_focus_writing_bronze", files=len(files))
             mapped = sql_mapping.mapping_sql(
                 source_sql,
                 connector=self.name,
@@ -179,6 +187,7 @@ class AwsFocusConnector(Connector):
         """Current-version S3 Parquet keys for every billing period overlapping
         ``window``, read from each period's manifest (not a ``*.parquet`` glob — see
         the module docstring for why)."""
+        logger.info("aws_focus_listing_manifests", prefix=self._config.s3_prefix)
         manifests = {
             period: key
             for period, key in self._list_partition_manifests().items()
@@ -187,6 +196,7 @@ class AwsFocusConnector(Connector):
         if not manifests:
             logger.warning("aws_focus_no_manifests", prefix=self._config.s3_prefix)
             return []
+        logger.info("aws_focus_manifests_found", periods=sorted(manifests))
 
         # Only reached when cost_source="focus_export" (ingest()'s branch), which the
         # config validator guarantees means s3_bucket is set.

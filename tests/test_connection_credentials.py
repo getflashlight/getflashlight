@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from flashlight.dashboard import connection_credentials
+from flashlight.ingest import connection_credentials
 
 
 def test_load_secret_returns_keychain_value(monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -137,12 +137,18 @@ async def render() -> None:
             "remembered on this machine; the key is stored in your OS keychain."
         ).classes("text-xs").style(f"color:{chrome.INK_MUTED}")
 
+        # provider_select's on_change is wired up AFTER model_input/base_url_input/
+        # api_key_input exist (below), not passed as a constructor kwarg here:
+        # bind_value's initial sync (pulling a value already persisted from a prior
+        # run out of app.storage.general) fires on_change synchronously, during
+        # this very statement — while model_input et al. are still unassigned in
+        # this enclosing scope, which crashed with "cannot access free variable
+        # 'model_input'" for anyone with a previously-saved chat_provider.
         provider_select = (
             ui.select(
                 list(_PRESETS),
                 label="Provider",
                 value=_DEFAULT_PROVIDER,
-                on_change=lambda e: _on_provider_change(e.value),
             )
             .classes("w-full")
             .bind_value(app.storage.general, "chat_provider")
@@ -163,6 +169,7 @@ async def render() -> None:
         api_key_input = (
             ui.input("API key").props("type=password").classes("w-full").mark("chat-api-key")
         )
+        provider_select.on_value_change(lambda e: _on_provider_change(e.value))
         if not model_input.value:  # first time anything has been configured — prefill
             _apply_preset(provider_select.value)
         api_key_input.value = _load_key_for(provider_select.value)

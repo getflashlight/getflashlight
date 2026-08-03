@@ -1,15 +1,20 @@
-"""Ingest connector secrets — OS keychain, same pattern as :mod:`chat_credentials`.
+"""Ingest connector secrets — OS keychain, same pattern as
+:mod:`flashlight.dashboard.chat_credentials`.
 
 Connector configs (``ingest/config.py``) only ever hold an env var *name*
 (``token_env``, ``access_key_env``, ...); the actual secret value entered in the
-dashboard's Connections page is stored here, keyed by that env var name, and
-resolved back into the ``flashlight ingest`` subprocess's environment at sync
-time (see ``dashboard/ingest_runner.py``) rather than ever being written to
-``connections.yml``. Since the lookup key *is* the env var name, two
-connections that share one would share one keychain entry — ``config.py``'s
-``scoped_env_name`` defaults every connection's env var name to something
-derived from its own (enforced-unique) ``name``, so this only happens when a
-user explicitly opts into sharing one by hand-setting the same name twice.
+dashboard's Connections page is stored here, keyed by that env var name, rather
+than ever being written to ``connections.yml``. ``config.py``'s ``env()`` — the
+one place every connector resolves a ``*_env`` name — checks the real process
+environment first and falls back to :func:`load_secret` here, so a connector
+config resolves the same secret the same way whether it's built by the
+dashboard's subprocess or a bare ``flashlight ingest`` run in a terminal; there
+is no separate "pre-populate the subprocess env" step to keep in sync with
+this. Since the lookup key *is* the env var name, two connections that share
+one would share one keychain entry — ``config.py``'s ``scoped_env_name``
+defaults every connection's env var name to something derived from its own
+(enforced-unique) ``name``, so this only happens when a user explicitly opts
+into sharing one by hand-setting the same name twice.
 
 Its own keychain service name (``flashlight-ingest``, vs. chat's
 ``flashlight-chat``) so a connector token and a chat API key never collide even

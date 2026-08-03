@@ -80,6 +80,7 @@ def build_connector(config: BaseModel) -> Connector:
 def run_connector(
     connector: Connector,
     window: IngestWindow,
+    run_id: str,
     on_progress: ProgressCallback | None = None,
     *,
     full_refresh: bool = False,
@@ -93,6 +94,13 @@ def run_connector(
     ``connector.ingest()`` — the default (row-based) or a connector's own
     vectorized override; see ``ingest/base.py``.
 
+    ``run_id`` is shared across every connector in the same :func:`run_ingest`
+    call (generated once there, not per connector here) — it's what lets the
+    dashboard's "Recent sync history" group connector rows back into one sync,
+    and what every BRONZE row this connector writes gets stamped with
+    (``x_ingest_run_id``) alongside its own ``x_source_connector``, so nothing
+    about per-row traceability is lost by sharing it.
+
     ``full_refresh`` wipes this connector's entire bronze history
     (:func:`flashlight.lake.bronze.purge_connector`) before the normal
     window-scoped ``ingest()`` call — so any partition outside ``window`` is
@@ -101,7 +109,6 @@ def run_connector(
     """
     if full_refresh:
         bronze.purge_connector(connector.name)
-    run_id = bronze.new_run_id()
     started_at = datetime.now(UTC)
     if on_progress:
         on_progress("start", connector.name, 0)
@@ -145,6 +152,7 @@ def run_ingest(
     full_refresh: bool = False,
     connector: str | None = None,
     on_progress: ProgressCallback | None = None,
+    run_id: str | None = None,
 ) -> int:
     """Pull every enabled connector for the window, then rebuild GOLD. Returns rows.
 
@@ -163,10 +171,17 @@ def run_ingest(
     :func:`effective_connector_name` matches (the dashboard's per-connection Sync
     button; the CLI's ``--connector``) — everything else about the run (window,
     full_refresh, the GOLD rebuild reading all of BRONZE afterward) is unchanged.
+
+    ``run_id`` identifies this whole sync in the run log (see :func:`run_connector`)
+    — generated here if the caller doesn't supply one (a bare CLI invocation), or
+    passed in by a caller that needs to know it up front (the dashboard's
+    ``--run-id``, so it can name a log file before the subprocess even starts —
+    see ``dashboard/ingest_runner.py::stream_sync``).
     """
     end = end or date.today()
     start = start or (end - timedelta(days=DEFAULT_LOOKBACK_DAYS))
     window = IngestWindow(start=start, end=end)
+    run_id = run_id or bronze.new_run_id()
 
     configs = load_connections(connections)
     if connector is not None:
@@ -175,28 +190,35 @@ def run_ingest(
         logger.warning("ingest_no_connectors")
         return 0
 
+    # Built once per config and reused across the cost/efficiency/driver-health
+    # phases below (instead of building fresh per phase) so a connector's
+    # instance-level caches — e.g. Databricks' resolved SQL warehouse id and
+    # account-prices probe — pay their network round-trip once per run, not
+    # once per phase.
+    connectors = [build_connector(config) for config in configs]
+
     # Each connector's fetch()/write targets its own x_source_connector BRONZE
     # partition dir (see lake/bronze.py) and its own runlog file, so concurrent
     # pulls don't contend — a bounded pool overlaps their network/DuckDB wait
     # instead of summing it. Pool.map preserves input order in its results
     # regardless of which thread finishes first, so the zip below stays correct.
-    with ThreadPoolExecutor(max_workers=_max_workers(len(configs))) as pool:
+    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
         outcomes = list(
             pool.map(
-                lambda config: run_connector(
-                    build_connector(config), window, on_progress, full_refresh=full_refresh
+                lambda conn: run_connector(
+                    conn, window, run_id, on_progress, full_refresh=full_refresh
                 ),
-                configs,
+                connectors,
             )
         )
 
     total = 0
     failed: list[str] = []
-    succeeded_configs: list[BaseModel] = []
-    for config, outcome in zip(configs, outcomes, strict=True):
+    succeeded_connectors: list[Connector] = []
+    for conn, outcome in zip(connectors, outcomes, strict=True):
         if outcome.ok:
             total += outcome.rows
-            succeeded_configs.append(config)
+            succeeded_connectors.append(conn)
         else:
             failed.append(outcome.name)
             logger.error("connector_failed", connector=outcome.name, detail=outcome.detail)
@@ -207,24 +229,24 @@ def run_ingest(
     # Only the connectors whose cost pull just succeeded are retried — one whose
     # fetch() already failed almost certainly has broken creds/config, and
     # re-invoking it here would just duplicate that failure.
-    _run_efficiency(window, succeeded_configs)
+    _run_efficiency(window, succeeded_connectors, on_progress)
 
     # Best-effort driver-health pull (fleet-health/compliance, unrelated to waste): each
     # connector that exposes client-driver telemetry writes aggregated
     # DriverHealthRecords. Same never-block-cost-ingest guarantee as efficiency.
-    _run_driver_health(window, succeeded_configs)
+    _run_driver_health(window, succeeded_connectors)
 
     # Rebuild SILVER/GOLD from whatever succeeded, so it's queryable even if some
     # connectors failed. A failed connector's own window is left as it was before
     # this run (bronze.write_window re-purges on error, never leaving a partial
     # write), so GOLD never reflects a half-written pull.
-    if not no_transform and succeeded_configs:
+    if not no_transform and succeeded_connectors:
         published = build_gold()
         logger.info("transform_done", gold_views=published)
     logger.info(
         "ingest_complete",
-        connectors=len(configs),
-        succeeded=len(succeeded_configs),
+        connectors=len(connectors),
+        succeeded=len(succeeded_connectors),
         failed=len(failed),
         rows=total,
     )
@@ -233,10 +255,22 @@ def run_ingest(
     return total
 
 
-def _run_efficiency(window: IngestWindow, configs: list[BaseModel]) -> int:
+def _run_efficiency(
+    window: IngestWindow,
+    connectors: list[Connector],
+    on_progress: ProgressCallback | None = None,
+) -> int:
     """Pull efficiency records for every connector that exposes them (concurrently,
     bounded — see :func:`_max_workers`), then write them all in one call. Best-effort:
-    a per-connector pull failure is logged and skipped, never raised.
+    a per-connector pull failure is logged and skipped, never raised — a connector
+    whose *cost* pull already reported "done" (see :func:`run_connector`) otherwise
+    looks fully synced even though its efficiency/waste telemetry silently never
+    landed (the whole payload, for a connector like Redshift whose cost pull is a
+    deliberate no-op). ``on_progress`` — same callback ``run_connector`` uses for the
+    cost pull's start/done/failed events — gets an ``efficiency_done``/
+    ``efficiency_failed`` event per connector here too, so a caller (the CLI, the
+    dashboard's sync log) can tell the difference between "cost pull done" and
+    "this connector is actually finished."
 
     The single combined write isn't just for thread-safety — ``write_efficiency``
     purges its target provider/month partitions wholesale before writing, and more
@@ -244,23 +278,29 @@ def _run_efficiency(window: IngestWindow, configs: list[BaseModel]) -> int:
     both emit "AWS"). Writing per-connector, even run one at a time, means the second
     connector's write purges and silently drops the first connector's rows. Gathering
     every connector's records first and writing once is the actual fix; running the
-    fetches concurrently is free on top of it.
+    fetches concurrently is free on top of it. That batching only affects when
+    records hit disk, not when a connector's own pull is known to have succeeded or
+    failed — the progress event fires as soon as *that* is known, not after the
+    later combined write.
     """
 
-    def _pull(config: BaseModel) -> list[EfficiencyRecord]:
-        connector = build_connector(config)
-        name = getattr(connector, "name", type(connector).__name__)
+    def _pull(connector: Connector) -> list[EfficiencyRecord]:
+        name = connector.name
         try:
             records = list(connector.fetch_efficiency(window))
         except Exception as exc:  # noqa: BLE001 - secondary signal; never block ingest
             logger.warning("efficiency_pull_failed", connector=name, error=str(exc))
+            if on_progress:
+                on_progress("efficiency_failed", name, 0)
             return []
         if records:
             logger.info("efficiency_fetched", connector=name, rows=len(records))
+        if on_progress:
+            on_progress("efficiency_done", name, len(records))
         return records
 
-    with ThreadPoolExecutor(max_workers=_max_workers(len(configs))) as pool:
-        all_records = [record for batch in pool.map(_pull, configs) for record in batch]
+    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+        all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
 
     if not all_records:
         return 0
@@ -269,7 +309,7 @@ def _run_efficiency(window: IngestWindow, configs: list[BaseModel]) -> int:
     return written
 
 
-def _run_driver_health(window: IngestWindow, configs: list[BaseModel]) -> int:
+def _run_driver_health(window: IngestWindow, connectors: list[Connector]) -> int:
     """Pull driver-health records for every connector that exposes them (concurrently,
     bounded), then write them all in one call. Best-effort, same never-block-cost-
     ingest guarantee as :func:`_run_efficiency` — and the same purge-before-write
@@ -277,9 +317,8 @@ def _run_driver_health(window: IngestWindow, configs: list[BaseModel]) -> int:
     but the fix is the same shape and costs nothing extra to apply now).
     """
 
-    def _pull(config: BaseModel) -> list[DriverHealthRecord]:
-        connector = build_connector(config)
-        name = getattr(connector, "name", type(connector).__name__)
+    def _pull(connector: Connector) -> list[DriverHealthRecord]:
+        name = connector.name
         try:
             records = list(connector.fetch_driver_health(window))
         except Exception as exc:  # noqa: BLE001 - secondary signal; never block ingest
@@ -289,8 +328,8 @@ def _run_driver_health(window: IngestWindow, configs: list[BaseModel]) -> int:
             logger.info("driver_health_fetched", connector=name, rows=len(records))
         return records
 
-    with ThreadPoolExecutor(max_workers=_max_workers(len(configs))) as pool:
-        all_records = [record for batch in pool.map(_pull, configs) for record in batch]
+    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+        all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
 
     if not all_records:
         return 0

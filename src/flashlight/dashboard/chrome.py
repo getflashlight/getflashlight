@@ -139,6 +139,41 @@ def kpi_row(cards: Sequence[KpiCard], *, columns: int | None = None) -> None:
             kpi(title, value, sub, color=color)
 
 
+def empty_state(
+    icon: str,
+    title: str,
+    caption: str,
+    *,
+    button_label: str | None = None,
+    on_click: Callable[[], object] | None = None,
+) -> None:
+    """A centered icon + title + caption + optional CTA, for a section with
+    nothing in it yet — first-run guidance instead of a bare caption line
+    ("No connections yet — add one below."), which reads like an error rather
+    than an invitation.
+    """
+    with ui.column().classes("w-full items-center gap-2").style("padding:32px 0;"):
+        ui.icon(icon, size="2rem").style(f"color:{DEEMPHASIS}")
+        ui.label(title).classes("text-sm font-medium").style(f"color:{INK_SECONDARY}")
+        ui.label(caption).classes("text-xs").style(f"color:{INK_MUTED};max-width:420px;text-align:center;")
+        if button_label and on_click:
+            ui.button(button_label, icon="add", on_click=on_click).props(
+                "flat no-caps color=primary"
+            ).classes("mt-1")
+
+
+def status_badge(enabled: bool) -> None:
+    """A colored-dot + label pill — Enabled/Disabled — instead of plain colored
+    text, so status reads as a status at a glance (same dot-plus-label shape as
+    most connector/integration lists elsewhere)."""
+    color = OPPORTUNITY if enabled else INK_MUTED
+    with ui.row().classes("items-center gap-1.5"):
+        ui.element("div").style(
+            f"width:6px;height:6px;border-radius:50%;background:{color};flex:none;"
+        )
+        ui.label("Enabled" if enabled else "Disabled").classes("text-xs").style(f"color:{color}")
+
+
 def provider_card(
     *,
     name: str,

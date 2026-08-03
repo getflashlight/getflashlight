@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from flashlight.core.exceptions import ConfigError
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
+from flashlight.ingest.connection_credentials import load_secret
 from flashlight.lake import paths
 
 
@@ -28,7 +29,7 @@ def scoped_env_name(base: str, *, name: str | None, ctype: str) -> str:
 
     Two connections of the same type otherwise default to the exact same env
     var name (and so the exact same OS-keychain entry, see
-    ``dashboard/connection_credentials.py``) — scoping by the connection's own
+    ``connection_credentials.py``) — scoping by the connection's own
     (enforced-unique) name/type keeps their secrets independent by default,
     without the user having to pick distinct names themselves.
     """
@@ -175,6 +176,16 @@ class RedshiftConfig(BaseModel):
     # connection). Leave unset to auto-discover via describe_clusters as before.
     db_host: str | None = None
     db_port: int | None = None
+    # Optional SQL run once right after a SQL connection opens (bastion tunnel or
+    # direct — no effect on the Data API path, which has no persistent session to
+    # set this on), before any of the real efficiency queries. The intended use is
+    # WLM routing — e.g. ``SET query_group TO 'my_wlm_queue';`` to give this
+    # connector's queries priority on a busy production cluster — but this is
+    # deployment-specific WLM tuning, not something the shared codebase should
+    # hard-code a queue/group name for. Put the real value in your own
+    # connections.yml (already gitignored, see config/connections.yml in
+    # .gitignore) rather than committing it.
+    session_init_sql: str | None = None
     # Named AWS profile (~/.aws/credentials or ~/.aws/config, incl. SSO profiles) to
     # authenticate as — takes priority over access_key_env/secret_key_env below when
     # set. Most convenient for local/dev use against a real account; leave unset for
@@ -246,15 +257,24 @@ class ConnectionsFile(BaseModel):
 
 
 def env(name: str) -> str | None:
-    """Read an environment variable (helper for connectors).
+    """Resolve a connector secret by its ``*_env`` name (helper for connectors).
+
+    Checks the real process environment first (a real shell export, or ``.env``
+    via ``load_dotenv()`` in ``cli.py`` — either way this is what a bare
+    ``flashlight ingest`` run in a terminal has), then falls back to the
+    OS-keychain entry the dashboard's Connections page saves to
+    (:func:`flashlight.ingest.connection_credentials.load_secret`) — the same
+    one lookup a connector uses regardless of whether it's built by the
+    dashboard's sync subprocess or invoked directly, so there's exactly one
+    place secret resolution can go wrong instead of two divergent ones.
 
     A present-but-empty value — ``AWS_ACCESS_KEY_ID=`` in a ``.env`` reads back as
-    ``""`` — is treated as *unset* (returns ``None``), so connectors fall back to
-    their default credential chain (instance role, ``~/.aws/credentials``, …)
-    instead of sending an explicit empty credential that AWS rejects as a malformed
-    authorization header.
+    ``""`` — is treated as *unset* (falls through to the keychain, then
+    ``None``), so connectors fall back to their default credential chain
+    (instance role, ``~/.aws/credentials``, …) instead of sending an explicit
+    empty credential that AWS rejects as a malformed authorization header.
     """
-    return os.environ.get(name) or None
+    return os.environ.get(name) or load_secret(name) or None
 
 
 def aws_client(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from flashlight.core.exceptions import IngestError
+from flashlight.core.exceptions import ConnectorError, IngestError
 from flashlight.ingest import runner
 from flashlight.ingest.runner import ConnectorOutcome, run_ingest
 from flashlight.lake import bronze as bronze_module
@@ -29,7 +29,7 @@ def _stub(monkeypatch, outcomes: list[ConnectorOutcome], built: list[bool], ran:
     monkeypatch.setattr(runner, "load_connections", lambda _c: configs)
     monkeypatch.setattr(runner, "build_connector", lambda c: c)
 
-    def _run_connector(conn, _w, _on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
+    def _run_connector(conn, _w, _run_id, _on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
         outcome = outcome_by_config[conn]
         ran.append(outcome.name)
         return outcome
@@ -41,7 +41,7 @@ def _stub(monkeypatch, outcomes: list[ConnectorOutcome], built: list[bool], ran:
         return 11
 
     monkeypatch.setattr(runner, "build_gold", _build_gold)
-    monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c, _p=None: 0)
     monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
 
 
@@ -90,7 +90,7 @@ def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatc
     monkeypatch.setattr(runner, "load_connections", lambda _c: configs)
     monkeypatch.setattr(runner, "build_connector", lambda c: c)
 
-    def _run_connector(conn, _w, _on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
+    def _run_connector(conn, _w, _run_id, _on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
         outcome = outcome_by_config[conn]
         ran.append(outcome.name)
         return outcome
@@ -102,7 +102,7 @@ def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatc
         return 1
 
     monkeypatch.setattr(runner, "build_gold", _build_gold)
-    monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c, _p=None: 0)
     monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
 
     rows = run_ingest(connector="redshift")
@@ -162,7 +162,7 @@ def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  
     efficiency_configs: list[list[object]] = []
     driver_health_configs: list[list[object]] = []
 
-    def _record_efficiency(_w: object, configs: list[object]) -> int:
+    def _record_efficiency(_w: object, configs: list[object], _p: object = None) -> int:
         efficiency_configs.append(configs)
         return 0
 
@@ -185,12 +185,12 @@ def test_run_ingest_threads_progress_callback_to_every_connector(monkeypatch) ->
     monkeypatch.setattr(runner, "load_connections", lambda _c: [object(), object()])
     monkeypatch.setattr(runner, "build_connector", lambda c: c)
     monkeypatch.setattr(runner, "build_gold", lambda: 0)
-    monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c, _p=None: 0)
     monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
 
     received: list[object] = []
 
-    def _run_connector(_conn, _w, on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
+    def _run_connector(_conn, _w, _run_id, on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
         received.append(on_progress)
         return ConnectorOutcome(name="x", rows=1, ok=True)
 
@@ -209,7 +209,6 @@ def test_run_connector_emits_start_done_and_failed_events(monkeypatch) -> None: 
     from flashlight.ingest.base import Connector, IngestWindow
     from flashlight.ingest.runner import run_connector
 
-    monkeypatch.setattr(bronze_module, "new_run_id", lambda: "r1")
     monkeypatch.setattr(runlog_module, "record_run", lambda **_kw: None)
 
     class _Ok(Connector):
@@ -234,11 +233,11 @@ def test_run_connector_emits_start_done_and_failed_events(monkeypatch) -> None: 
 
     events: list[tuple[str, str, int]] = []
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
-    run_connector(_Ok(), window, on_progress=lambda *e: events.append(e))
+    run_connector(_Ok(), window, "r1", on_progress=lambda *e: events.append(e))
     assert events == [("start", "ok", 0), ("done", "ok", 0)]
 
     events.clear()
-    run_connector(_Broken(), window, on_progress=lambda *e: events.append(e))
+    run_connector(_Broken(), window, "r1", on_progress=lambda *e: events.append(e))
     assert events == [("start", "broken", 0), ("failed", "broken", 0)]
 
 
@@ -248,7 +247,6 @@ def test_run_connector_full_refresh_purges_connector_bronze_first(monkeypatch) -
     from flashlight.ingest.base import Connector, IngestWindow
     from flashlight.ingest.runner import run_connector
 
-    monkeypatch.setattr(bronze_module, "new_run_id", lambda: "r1")
     monkeypatch.setattr(runlog_module, "record_run", lambda **_kw: None)
 
     class _Stub(Connector):
@@ -262,10 +260,10 @@ def test_run_connector_full_refresh_purges_connector_bronze_first(monkeypatch) -
     monkeypatch.setattr(bronze_module, "purge_connector", lambda name: purged.append(name))
 
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
-    run_connector(_Stub(), window, full_refresh=False)
+    run_connector(_Stub(), window, "r1", full_refresh=False)
     assert purged == []
 
-    run_connector(_Stub(), window, full_refresh=True)
+    run_connector(_Stub(), window, "r1", full_refresh=True)
     assert purged == ["aws_focus"]
 
 
@@ -322,12 +320,10 @@ def test_efficiency_writes_are_merged_not_clobbered(monkeypatch) -> None:  # typ
         def fetch_efficiency(self, _window: object) -> Iterator[EfficiencyRecord]:
             return iter(self._records)
 
-    configs = [object(), object()]
-    connectors = {
-        configs[0]: _Fake("aws_focus", [record_a]),
-        configs[1]: _Fake("redshift", [record_b]),
-    }
-    monkeypatch.setattr(runner, "build_connector", lambda c: connectors[c])
+    connectors = [
+        _Fake("aws_focus", [record_a]),
+        _Fake("redshift", [record_b]),
+    ]
 
     writes: list[list[EfficiencyRecord]] = []
 
@@ -338,8 +334,48 @@ def test_efficiency_writes_are_merged_not_clobbered(monkeypatch) -> None:  # typ
     monkeypatch.setattr(metrics_module, "write_efficiency", _write_efficiency)
 
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
-    written = runner._run_efficiency(window, configs)  # type: ignore[arg-type]
+    written = runner._run_efficiency(window, connectors)  # type: ignore[arg-type]
 
     assert written == 2
     assert len(writes) == 1  # one combined write, not one per connector
     assert {r.entity_id for r in writes[0]} == {"a", "b"}
+
+
+def test_efficiency_progress_reports_done_and_failed_per_connector(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A connector whose cost pull is a no-op (Redshift) otherwise reports "done"
+    while its real payload — fetch_efficiency — is still silently running or has
+    failed with nothing printed. _run_efficiency must emit its own progress event
+    per connector so that gap is visible (see connections.py's own comment on
+    _CONNECTOR_DONE_RE for the user-facing symptom this fixes).
+    """
+    from collections.abc import Iterator
+    from datetime import date
+
+    from flashlight.efficiency.model import EfficiencyRecord
+    from flashlight.ingest.base import IngestWindow
+
+    class _Ok:
+        name = "redshift-ok"
+
+        def fetch_efficiency(self, _window: object) -> Iterator[EfficiencyRecord]:
+            return iter(())
+
+    class _Broken:
+        name = "redshift-broken"
+
+        def fetch_efficiency(self, _window: object) -> Iterator[EfficiencyRecord]:
+            raise ConnectorError(self.name, "Statement did not complete in time")
+
+    connectors = [_Ok(), _Broken()]
+
+    events: list[tuple[str, str, int]] = []
+    window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
+    runner._run_efficiency(
+        window,
+        connectors,  # type: ignore[arg-type]
+        lambda event, name, rows: events.append((event, name, rows)),
+    )
+
+    by_name = {name: (event, rows) for event, name, rows in events}
+    assert by_name["redshift-ok"] == ("efficiency_done", 0)
+    assert by_name["redshift-broken"] == ("efficiency_failed", 0)

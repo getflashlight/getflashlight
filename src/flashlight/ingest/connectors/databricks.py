@@ -164,17 +164,38 @@ def _compute_class_sql() -> str:
     )
 
 
-def _csv_source_sql(links: list[str], columns: list[str]) -> str:
-    """The bare ``read_csv(...)`` table expression over presigned chunk links.
+def _csv_source_sql(con: duckdb.DuckDBPyConnection, links: list[str], columns: list[str]) -> str:
+    """The ``read_csv(...)`` table expression over presigned chunk links.
 
     ``all_varchar=true`` deliberately skips DuckDB's type inference: every column
     gets re-parsed from text by ``sql_mapping.mapping_sql`` anyway (the same
     tolerant ``nz()``/``try_cast`` treatment a Parquet or local-CSV FOCUS source
     gets), so there's no Databricks-type -> DuckDB-type mapping to maintain here.
+
+    The Statement Execution API's EXTERNAL_LINKS/CSV disposition doesn't document
+    whether a chunk's file starts with its own header line — observed in practice
+    to sometimes be true for the first chunk (surfaces downstream as a bogus row
+    with e.g. ``BillingCurrency = 'BillingCurrency'``, tripping the single-currency
+    assert). ``header=false`` + explicit ``names=`` (from the manifest schema,
+    not the file) handles the common headerless case; probing chunk 0's own first
+    row and skipping it when it's verbatim the header is what catches the other
+    case without guessing which one applies.
     """
-    urls = "[" + ", ".join(_sql_str(link) for link in links) + "]"
     names = "[" + ", ".join(_sql_str(c) for c in columns) + "]"
-    return f"read_csv({urls}, header=false, all_varchar=true, names={names})"
+    first_relation = (
+        f"read_csv({_sql_str(links[0])}, header=false, all_varchar=true, names={names})"
+    )
+    first_row = con.execute(f"SELECT * FROM {first_relation} LIMIT 1").fetchone()
+    if first_row is not None and list(first_row) == columns:
+        first_relation = (
+            f"read_csv({_sql_str(links[0])}, header=false, all_varchar=true, "
+            f"names={names}, skip=1)"
+        )
+    if len(links) == 1:
+        return first_relation
+    rest_urls = "[" + ", ".join(_sql_str(link) for link in links[1:]) + "]"
+    rest_relation = f"read_csv({rest_urls}, header=false, all_varchar=true, names={names})"
+    return f"(SELECT * FROM {first_relation} UNION ALL SELECT * FROM {rest_relation})"
 
 
 def _sql_str(value: str) -> str:
@@ -282,7 +303,7 @@ class DatabricksConnector(Connector):
             con.execute("INSTALL httpfs; LOAD httpfs;")
             con.execute("SET http_timeout = 180;")
             sql_mapping.ensure_helpers(con)
-            source_sql = _csv_source_sql(links, columns)
+            source_sql = _csv_source_sql(con, links, columns)
             present = sql_mapping.present_columns(con, source_sql)
             mapped = sql_mapping.mapping_sql(
                 source_sql,
@@ -354,16 +375,28 @@ class DatabricksConnector(Connector):
         return f"{sql}\nWHERE u.usage_date BETWEEN '{window.start}' AND '{window.end}'"
 
     def _render_vectorized_query(self, window: IngestWindow) -> str:
-        """``_render_query`` wrapped for CSV-safe result staging.
+        """``_render_query`` patched for CSV-safe result staging.
 
         Spark's CSV writer can't serialize a ``MAP`` cell (the vendored query's
         ``Tags`` column, ``u.custom_tags`` — a real ``MAP<STRING, STRING>``, unlike
         every other FOCUS column here which is already scalar) — stringify it to JSON
         ourselves before requesting ``Format.CSV``, the same ``to_json`` treatment
         :func:`flashlight.focus.sql_mapping._stringify` gives a structured column read
-        from Parquet.
+        from Parquet. Substituted in the final projection rather than wrapped in an
+        outer ``SELECT * REPLACE (...)`` — that star-syntax extension isn't parsed by
+        every SQL warehouse version (PARSE_SYNTAX_ERROR on some), while a plain
+        column substitution needs no engine feature beyond baseline SQL.
         """
-        return f"SELECT * REPLACE (to_json(Tags) AS Tags) FROM ({self._render_query(window)})"
+        sql = self._render_query(window)
+        patched = sql.replace("u.custom_tags AS Tags,", "to_json(u.custom_tags) AS Tags,", 1)
+        if patched == sql:
+            raise ConnectorError(
+                self.name,
+                "vendored FOCUS query no longer has the expected "
+                "'u.custom_tags AS Tags,' projection — update the Tags substitution "
+                "in _render_vectorized_query to match the new query text.",
+            )
+        return patched
 
     def _execute_external_links(self, sql: str) -> tuple[list[str], list[str]]:
         """Run ``sql`` and return (presigned chunk links, column names) — no download,

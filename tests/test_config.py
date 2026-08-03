@@ -128,6 +128,23 @@ def test_env_treats_empty_as_unset(monkeypatch) -> None:  # type: ignore[no-unty
     assert env("FLASHLIGHT_TEST_CRED") is None
 
 
+def test_env_falls_back_to_keychain_when_unset(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """One ingest approach: a bare ``flashlight ingest`` run in a terminal must
+    resolve the exact same secret a dashboard-triggered sync would, with no
+    separate "populate the subprocess env from the keychain" step required
+    (see ``connection_credentials.py`` and ``dashboard/ingest_runner.py``).
+    """
+    from flashlight.ingest import connection_credentials
+
+    monkeypatch.delenv("FLASHLIGHT_TEST_CRED", raising=False)
+    monkeypatch.setattr(connection_credentials, "_keyring_get", lambda name: "from-keychain")
+    assert env("FLASHLIGHT_TEST_CRED") == "from-keychain"
+
+    # A real process env var still wins over the keychain.
+    monkeypatch.setenv("FLASHLIGHT_TEST_CRED", "from-env")
+    assert env("FLASHLIGHT_TEST_CRED") == "from-env"
+
+
 def test_aws_client_uses_named_profile_when_set(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     fake_session = MagicMock()
     fake_session_fn = MagicMock(return_value=fake_session)

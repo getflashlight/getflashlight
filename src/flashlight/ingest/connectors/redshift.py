@@ -52,7 +52,8 @@ lazily imported so the default install doesn't need it.
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -71,13 +72,9 @@ from flashlight.lake import duck as lake_duck
 logger = get_logger(__name__)
 
 _EFFICIENCY_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_efficiency.sql"
-_QUERY_PATTERN_QUERY_PATH = (
-    Path(__file__).parent / "sql" / "redshift_query_pattern_metrics.sql"
-)
+_QUERY_PATTERN_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_query_pattern_metrics.sql"
 _USER_ACTIVITY_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_user_activity.sql"
-_SPECTRUM_TABLE_QUERY_PATH = (
-    Path(__file__).parent / "sql" / "redshift_spectrum_table_usage.sql"
-)
+_SPECTRUM_TABLE_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_spectrum_table_usage.sql"
 _TERMINAL_STATES = {"FINISHED", "ABORTED", "FAILED"}
 
 # Floor/cap for the query-pattern pull — a cluster can have thousands of distinct query
@@ -90,6 +87,14 @@ _QUERY_PATTERN_TOP_N = 200
 # Same bounded-pool reasoning, keyed to exec time so the heaviest users are never
 # dropped even on a cluster with many distinct DB logins (one per job/service account).
 _USER_ACTIVITY_TOP_N = 50
+
+# Bounds every ThreadPoolExecutor this connector opens for its OWN internal query
+# fan-out (not ingest/runner.py's outer per-connector pool) — same reasoning as
+# databricks.py's _TABLE_INVENTORY_CONCURRENCY: this connector's own concurrency
+# must not recreate the WLM contention the fan-out is meant to fix. 3 covers the
+# widest fan-out used here (query_patterns/user_activity/spectrum_table_usage, and
+# separately table_inventory/table_usage/table_owner).
+_EFFICIENCY_CONCURRENCY = 3
 
 # Table-access history, joined to the table inventory by table_id (STL_SCAN.tbl ==
 # SVV_TABLE_INFO.table_id, same join key the runbook's table_usage load script uses).
@@ -231,6 +236,13 @@ class RedshiftConnector(Connector):
             access_key_env=config.access_key_env,
             secret_key_env=config.secret_key_env,
         )
+        self._redshift_serverless = aws_client(
+            "redshift-serverless",
+            region=config.region,
+            profile=config.aws_profile,
+            access_key_env=config.access_key_env,
+            secret_key_env=config.secret_key_env,
+        )
 
     def fetch(self, window: IngestWindow) -> Iterator[FocusRecord]:
         """No-op: Redshift cost already flows through ``aws_focus``. See module docstring."""
@@ -241,22 +253,12 @@ class RedshiftConnector(Connector):
         entity_id = self._config.cluster_identifier or self._config.workgroup_name
         assert entity_id is not None  # RedshiftConfig requires exactly one
 
-        # One connection for the whole pull, reused across all 7 queries below
-        # (previously each reconnected from scratch): a tunneled connection if
-        # `bastion_host` is set, a direct (no-tunnel) connection if `db_password_env`
-        # is set instead, or nullcontext() — a no-op yielding None — for the Data API
-        # path, where each call is already an independently authenticated request
-        # with nothing to reuse.
-        conn_scope: AbstractContextManager[Any]
         if self._config.bastion_host is not None:
             mode = "bastion_tunnel"
-            conn_scope = self._bastion_connection()
         elif self._config.db_password_env is not None:
             mode = "direct_sql"
-            conn_scope = self._direct_connection()
         else:
             mode = "data_api"
-            conn_scope = nullcontext()
         logger.info(
             "redshift_efficiency_start",
             mode=mode,
@@ -264,12 +266,173 @@ class RedshiftConnector(Connector):
             window_start=str(window.start),
             window_end=str(window.end),
         )
-        with conn_scope as conn:
-            cost = self._cost_breakdown(window)
-            # Cheap probe first: a lone MIN() on stl_query, not the full joined
-            # percentile query. Lets an unmeasurable window skip cluster_activity's
-            # real cost too (see _EARLIEST_RETAINED_SQL), not just the other three
-            # windowed queries below.
+
+        cost = self._cost_breakdown(window)
+        reserved = self._reserved_node_coverage()
+        # The activity chain (probe -> cluster_activity -> gated query_patterns/
+        # user_activity/spectrum_table_usage) and the table-inventory chain
+        # (table_inventory/table_usage/table_owner, unconditional and independent of
+        # the activity gate) don't depend on each other — see _run_lanes. Each lane
+        # opens its own connection(s) via lane_conn(), a tunneled connection if
+        # `bastion_host` is set, a direct (no-tunnel) connection if `db_password_env`
+        # is set instead, or a no-op yielding None for the Data API path, where
+        # every call is already an independently authenticated request with no
+        # connection to share.
+        with self._lane_connection_factory(mode) as lane_conn:
+            activity, activity_records, table_records = self._run_lanes(
+                window, entity_id, month, cost, lane_conn
+            )
+
+        cause: dict[str, Any] = {
+            "compute_cost": cost.get("compute"),
+            "concurrency_scaling_cost": cost.get("concurrency_scaling"),
+            "storage_cost": cost.get("storage"),
+            "spectrum_scan_cost": cost.get("spectrum_scan"),
+            "wlm_queue_wait_ms_p95": activity.get("wlm_queue_wait_ms_p95"),
+            "wlm_queue_wait_ms_p99": activity.get("wlm_queue_wait_ms_p99"),
+            "wlm_wait_to_exec_ratio": activity.get("wlm_wait_to_exec_ratio"),
+            "disk_spill_query_count": activity.get("disk_spill_query_count"),
+            # Reuses the same cause_detail key Databricks sql_warehouse rules
+            # already unpack (see waste_rules.py's `e` CTE) — the disk-spill
+            # rule's denominator.
+            "query_count": activity.get("query_count"),
+            "concurrency_scaling_active_seconds": activity.get(
+                "concurrency_scaling_active_seconds"
+            ),
+            "on_demand_node_hours": reserved.get("on_demand_node_hours"),
+            "reserved_node_hours": reserved.get("reserved_node_hours"),
+            # Only carried when True — a clean cause_detail should call out the
+            # unusual case, not assert the normal one on every record.
+            "activity_window_unmeasurable": activity.get("activity_window_unmeasurable")
+            or None,
+            # Only carried on a partial window (retention didn't reach back to
+            # window.start) — the caveat "idle"/disk-spill/etc. need to avoid
+            # implying full-window coverage over what's really a shorter measured
+            # span.
+            "activity_measured_since": activity.get("activity_measured_since"),
+        }
+        total_cost = sum(v for v in cost.values() if v is not None)
+        yield EfficiencyRecord(
+            provider_name="AWS",
+            charge_month=month,
+            # Reused, not a new entity type: a Redshift cluster/workgroup is
+            # SQL-warehouse-shaped (shared compute, cost-attributable per owner,
+            # no honest per-entity utilization%) — see EntityType's own
+            # docstring and CLAUDE.md's "SQL warehouses have no per-entity
+            # utilization" invariant. utilization_pct is deliberately left
+            # unset here for the same reason.
+            entity_type=EntityType.SQL_WAREHOUSE,
+            entity_id=entity_id,
+            entity_name=entity_id,
+            billed_cost=Decimal(str(total_cost)) if total_cost else Decimal("0"),
+            activity_count=activity.get("query_count"),
+            cause_detail={k: v for k, v in cause.items() if v is not None},
+            x_source_connector=self.name,
+        )
+        if activity.get("activity_window_unmeasurable"):
+            logger.info(
+                "redshift_windowed_queries_skipped",
+                reason="activity_window_unmeasurable",
+            )
+        yield from activity_records
+        yield from table_records
+
+    def _lane_connection_factory(
+        self, mode: str
+    ) -> AbstractContextManager[Callable[[], AbstractContextManager[Any]]]:
+        """Resolves whatever setup a lane connection needs ONCE (SSH tunnel,
+        cluster endpoint, credentials), then yields a zero-arg callable that opens
+        ONE fresh connection per call — cheap, since the expensive part already
+        happened. Each of ``fetch_efficiency()``'s lanes calls this once per
+        connection it needs, safe to do concurrently since every call returns its
+        own independent connection object, never a shared one.
+        """
+        if mode == "bastion_tunnel":
+            return self._bastion_lane_connections()
+        if mode == "direct_sql":
+            return self._direct_lane_connections()
+        return nullcontext(lambda: nullcontext(None))
+
+    @contextmanager
+    def _bastion_lane_connections(self) -> Iterator[Callable[[], AbstractContextManager[Any]]]:
+        with self._bastion_tunnel() as tunnel:
+            creds = self._bastion_credentials()
+            yield lambda: self._open_sql_connection(
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
+                user=creds["user"],
+                password=creds["password"],
+                error_prefix="bastion SQL connection failed",
+            )
+
+    @contextmanager
+    def _direct_lane_connections(self) -> Iterator[Callable[[], AbstractContextManager[Any]]]:
+        try:
+            import redshift_connector  # noqa: F401
+        except ImportError as exc:
+            raise ConnectorError(
+                self.name,
+                "db_password_env is configured but the 'redshift-bastion' extra "
+                "isn't installed (it also provides the direct-connection driver) — "
+                'run: pip install "getflashlight[redshift-bastion]"',
+            ) from exc
+
+        assert self._config.db_password_env is not None  # caller checks this
+        assert self._config.db_user is not None  # RedshiftConfig enforces this
+        password = env(self._config.db_password_env)
+        if not password:
+            raise ConnectorError(
+                self.name,
+                f"db_password_env={self._config.db_password_env!r} is set but "
+                "empty/unset in the environment",
+            )
+        endpoint = self._cluster_endpoint()
+        db_user = self._config.db_user
+        yield lambda: self._open_sql_connection(
+            host=endpoint["host"],
+            port=endpoint["port"],
+            user=db_user,
+            password=password,
+            error_prefix="direct SQL connection failed",
+        )
+
+    def _run_lanes(
+        self,
+        window: IngestWindow,
+        entity_id: str,
+        month: date,
+        cost: dict[str, float],
+        lane_conn: Callable[[], AbstractContextManager[Any]],
+    ) -> tuple[dict[str, Any], list[EfficiencyRecord], list[EfficiencyRecord]]:
+        """Runs the activity chain and the table-inventory chain concurrently — they
+        don't depend on each other (see fetch_efficiency's docstring comment). The
+        table lane runs on a background thread while the activity lane runs here;
+        each opens its own lane_conn() connection(s), so no connection is ever
+        touched from more than one thread.
+        """
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            table_future = pool.submit(
+                self._run_table_inventory_lane, window, entity_id, month, lane_conn
+            )
+            activity, activity_records = self._run_activity_lane(
+                window, entity_id, month, cost.get("compute", 0.0), lane_conn
+            )
+            table_records = table_future.result()
+        return activity, activity_records, table_records
+
+    def _run_activity_lane(
+        self,
+        window: IngestWindow,
+        entity_id: str,
+        month: date,
+        compute_cost: float,
+        lane_conn: Callable[[], AbstractContextManager[Any]],
+    ) -> tuple[dict[str, Any], list[EfficiencyRecord]]:
+        # Cheap probe first: a lone MIN() on stl_query, not the full joined
+        # percentile query. Lets an unmeasurable window skip cluster_activity's
+        # real cost too (see _EARLIEST_RETAINED_SQL), not just the other three
+        # windowed queries below.
+        with lane_conn() as conn:
             earliest_retained = self._probe_earliest_retained(conn)
             unmeasurable = _activity_unmeasurable(window.end, earliest_retained)
             if unmeasurable:
@@ -282,73 +445,121 @@ class RedshiftConnector(Connector):
                 activity: dict[str, Any] = _unmeasurable_activity()
             else:
                 activity = self._activity(window, conn, name="cluster_activity")
-            reserved = self._reserved_node_coverage()
 
-            cause: dict[str, Any] = {
-                "compute_cost": cost.get("compute"),
-                "concurrency_scaling_cost": cost.get("concurrency_scaling"),
-                "storage_cost": cost.get("storage"),
-                "spectrum_scan_cost": cost.get("spectrum_scan"),
-                "wlm_queue_wait_ms_p95": activity.get("wlm_queue_wait_ms_p95"),
-                "wlm_queue_wait_ms_p99": activity.get("wlm_queue_wait_ms_p99"),
-                "wlm_wait_to_exec_ratio": activity.get("wlm_wait_to_exec_ratio"),
-                "disk_spill_query_count": activity.get("disk_spill_query_count"),
-                # Reuses the same cause_detail key Databricks sql_warehouse rules
-                # already unpack (see waste_rules.py's `e` CTE) — the disk-spill
-                # rule's denominator.
-                "query_count": activity.get("query_count"),
-                "concurrency_scaling_active_seconds": activity.get(
-                    "concurrency_scaling_active_seconds"
-                ),
-                "on_demand_node_hours": reserved.get("on_demand_node_hours"),
-                "reserved_node_hours": reserved.get("reserved_node_hours"),
-                # Only carried when True — a clean cause_detail should call out the
-                # unusual case, not assert the normal one on every record.
-                "activity_window_unmeasurable": activity.get("activity_window_unmeasurable")
-                or None,
-                # Only carried on a partial window (retention didn't reach back to
-                # window.start) — the caveat "idle"/disk-spill/etc. need to avoid
-                # implying full-window coverage over what's really a shorter measured
-                # span.
-                "activity_measured_since": activity.get("activity_measured_since"),
-            }
-            total_cost = sum(v for v in cost.values() if v is not None)
-            yield EfficiencyRecord(
-                provider_name="AWS",
-                charge_month=month,
-                # Reused, not a new entity type: a Redshift cluster/workgroup is
-                # SQL-warehouse-shaped (shared compute, cost-attributable per owner,
-                # no honest per-entity utilization%) — see EntityType's own
-                # docstring and CLAUDE.md's "SQL warehouses have no per-entity
-                # utilization" invariant. utilization_pct is deliberately left
-                # unset here for the same reason.
-                entity_type=EntityType.SQL_WAREHOUSE,
-                entity_id=entity_id,
-                entity_name=entity_id,
-                billed_cost=Decimal(str(total_cost)) if total_cost else Decimal("0"),
-                activity_count=activity.get("query_count"),
-                cause_detail={k: v for k, v in cause.items() if v is not None},
-                x_source_connector=self.name,
+        # query_patterns/user_activity/spectrum_table_usage all filter on the same
+        # starttime BETWEEN :start_date/:end_date against the same STL_*/SVL_*
+        # system tables _activity() already probed above — if that probe found the
+        # window entirely past retention (activity_window_unmeasurable), these three
+        # are guaranteed empty too. Skipping them turns a ~5min blind rescan into a
+        # log line.
+        if activity.get("activity_window_unmeasurable"):
+            return activity, []
+
+        def _patterns() -> list[EfficiencyRecord]:
+            with lane_conn() as conn:
+                return list(self._fetch_query_patterns(window, entity_id, month, conn))
+
+        def _users() -> list[EfficiencyRecord]:
+            with lane_conn() as conn:
+                return list(
+                    self._fetch_user_activity(window, entity_id, month, compute_cost, conn)
+                )
+
+        def _spectrum() -> list[EfficiencyRecord]:
+            with lane_conn() as conn:
+                return list(self._fetch_spectrum_table_usage(window, entity_id, month, conn))
+
+        with ThreadPoolExecutor(max_workers=_EFFICIENCY_CONCURRENCY) as pool:
+            futures = [pool.submit(fn) for fn in (_patterns, _users, _spectrum)]
+            records = [rec for f in futures for rec in f.result()]
+        return activity, records
+
+    def _run_table_inventory_lane(
+        self,
+        window: IngestWindow,
+        entity_id: str,
+        month: date,
+        lane_conn: Callable[[], AbstractContextManager[Any]],
+    ) -> list[EfficiencyRecord]:
+        """table_inventory isn't window-filtered (current catalog state), so it
+        always runs, independent of the activity gate above. table_usage/
+        table_owner are independent enrichments joined onto table_inventory's rows
+        in Python (by :meth:`_build_table_inventory_records`), not each other's
+        dependency — so all three run concurrently. One difference from the old
+        fully-serial version: previously a table_inventory failure skipped
+        table_usage/table_owner too (saving two round trips); now all three are
+        already in flight before any failure is known, so a table_inventory
+        failure no longer saves that work. Each still degrades independently on
+        its own failure, same as before.
+        """
+
+        def _inventory() -> list[dict[str, Any]]:
+            with lane_conn() as conn:
+                try:
+                    return self._execute(_TABLE_INVENTORY_SQL, conn, name="table_inventory")
+                except ConnectorError as exc:
+                    logger.warning("redshift_table_inventory_failed", error=str(exc))
+                    return []
+
+        def _usage() -> list[dict[str, Any]]:
+            with lane_conn() as conn:
+                try:
+                    return self._execute(_TABLE_USAGE_SQL, conn, name="table_usage")
+                except ConnectorError as exc:
+                    logger.warning("redshift_table_usage_failed", error=str(exc))
+                    return []
+
+        def _owner() -> list[dict[str, Any]]:
+            with lane_conn() as conn:
+                try:
+                    return self._execute(_TABLE_OWNER_SQL, conn, name="table_owner")
+                except ConnectorError as exc:
+                    logger.warning("redshift_table_owner_failed", error=str(exc))
+                    return []
+
+        with ThreadPoolExecutor(max_workers=_EFFICIENCY_CONCURRENCY) as pool:
+            inv_f = pool.submit(_inventory)
+            usage_f = pool.submit(_usage)
+            owner_f = pool.submit(_owner)
+            rows, usage_rows, owner_rows = inv_f.result(), usage_f.result(), owner_f.result()
+
+        return list(
+            self._build_table_inventory_records(
+                window, entity_id, month, rows, usage_rows, owner_rows
             )
-            # query_patterns/user_activity/spectrum_table_usage all filter on the same
-            # starttime BETWEEN :start_date/:end_date against the same STL_*/SVL_*
-            # system tables _activity() already probed above — if that probe found the
-            # window entirely past retention (activity_window_unmeasurable), these three
-            # are guaranteed empty too. Skipping them turns a ~5min blind rescan into a
-            # log line. table_inventory isn't window-filtered (current catalog state), so
-            # it always runs.
-            if activity.get("activity_window_unmeasurable"):
-                logger.info(
-                    "redshift_windowed_queries_skipped",
-                    reason="activity_window_unmeasurable",
-                )
-            else:
-                yield from self._fetch_query_patterns(window, entity_id, month, conn)
-                yield from self._fetch_user_activity(
-                    window, entity_id, month, cost.get("compute", 0.0), conn
-                )
-                yield from self._fetch_spectrum_table_usage(window, entity_id, month, conn)
-            yield from self._fetch_table_inventory(window, entity_id, month, conn)
+        )
+
+    def test_connection(self) -> str:
+        """Resolves the configured cluster/workgroup via AWS, then exercises whichever
+        connection mode ``RedshiftConfig`` selects with a throwaway ``SELECT 1`` — the
+        dashboard's "Test connection" button's one call. Mirrors ``fetch_efficiency``'s
+        own mode dispatch below (``bastion_host`` -> SSH tunnel, ``db_password_env`` ->
+        direct SQL, else -> Data API) so a pass here means a real sync would use the
+        same path successfully.
+        """
+        cfg = self._config
+        if cfg.cluster_identifier:
+            endpoint = self._cluster_endpoint()
+            resolved = f"cluster resolved to {endpoint['host']}:{endpoint['port']}"
+        else:
+            workgroup = self._workgroup_status()
+            resolved = f"workgroup resolved (status={workgroup.get('status', '?')})"
+
+        # ponytail: two describe_clusters calls on this path (here + inside
+        # _bastion_connection/_direct_connection) — a manual one-click test, not the
+        # hot fetch_efficiency path, so passing the endpoint through isn't worth the
+        # signature churn.
+        if cfg.bastion_host is not None:
+            with self._bastion_connection() as conn:
+                self._execute("SELECT 1", conn, name="test_connection")
+            return f"{resolved} · SSH tunnel + SQL SELECT 1 succeeded"
+        elif cfg.db_password_env is not None:
+            with self._direct_connection() as conn:
+                self._execute("SELECT 1", conn, name="test_connection")
+            return f"{resolved} · direct SQL SELECT 1 succeeded"
+        else:
+            self._execute("SELECT 1", name="test_connection")
+            return f"{resolved} · Data API SELECT 1 succeeded"
 
     # ── Data API (system-table query) ───────────────────────────────────────
     def _probe_earliest_retained(self, conn: Any = None) -> date | None:
@@ -379,8 +590,7 @@ class RedshiftConnector(Connector):
         # full requested window. Surfaced so a consumer can caveat "measured since
         # <date>" instead of implying full-window coverage.
         partial = (
-            not unmeasurable and earliest_retained is not None
-            and earliest_retained > window.start
+            not unmeasurable and earliest_retained is not None and earliest_retained > window.start
         )
         if unmeasurable:
             logger.warning(
@@ -412,9 +622,7 @@ class RedshiftConnector(Connector):
                 None if unmeasurable else _opt_int(row.get("disk_spill_query_count"))
             ),
             "concurrency_scaling_active_seconds": (
-                None
-                if unmeasurable
-                else _opt_float(row.get("concurrency_scaling_active_seconds"))
+                None if unmeasurable else _opt_float(row.get("concurrency_scaling_active_seconds"))
             ),
             "activity_measured_since": str(earliest_retained) if partial else None,
             "activity_window_unmeasurable": unmeasurable,
@@ -531,32 +739,29 @@ class RedshiftConnector(Connector):
                 x_source_connector=self.name,
             )
 
-    def _fetch_table_inventory(
-        self, window: IngestWindow, cluster_id: str, month: date, conn: Any = None
+    def _build_table_inventory_records(
+        self,
+        window: IngestWindow,
+        cluster_id: str,
+        month: date,
+        rows: list[dict[str, Any]],
+        usage_rows: list[dict[str, Any]],
+        owner_rows: list[dict[str, Any]],
     ) -> Iterator[EfficiencyRecord]:
-        try:
-            rows = self._execute(_TABLE_INVENTORY_SQL, conn, name="table_inventory")
-        except ConnectorError as exc:
-            logger.warning("redshift_table_inventory_failed", error=str(exc))
-            return
+        """Joins the three independently-fetched query results in Python — unchanged
+        from the old ``_fetch_table_inventory``, just no longer calling ``_execute``
+        inline (that now happens concurrently in :meth:`_run_table_inventory_lane`).
+        """
         usage_by_table_id: dict[Any, dict[str, Any]] = {}
-        try:
-            for usage_row in self._execute(_TABLE_USAGE_SQL, conn, name="table_usage"):
-                table_id = usage_row.get("table_id")
-                if table_id is not None:
-                    usage_by_table_id[table_id] = usage_row
-        except ConnectorError as exc:
-            # Usage enrichment is optional — table inventory still ships without it.
-            logger.warning("redshift_table_usage_failed", error=str(exc))
+        for usage_row in usage_rows:
+            table_id = usage_row.get("table_id")
+            if table_id is not None:
+                usage_by_table_id[table_id] = usage_row
         owner_by_schema_table: dict[tuple[Any, Any], Any] = {}
-        try:
-            for owner_row in self._execute(_TABLE_OWNER_SQL, conn, name="table_owner"):
-                owner_by_schema_table[(owner_row.get("schemaname"), owner_row.get("tablename"))] = (
-                    owner_row.get("tableowner")
-                )
-        except ConnectorError as exc:
-            # Owner enrichment is optional — table inventory still ships without it.
-            logger.warning("redshift_table_owner_failed", error=str(exc))
+        for owner_row in owner_rows:
+            owner_by_schema_table[(owner_row.get("schemaname"), owner_row.get("tablename"))] = (
+                owner_row.get("tableowner")
+            )
         for row in rows:
             full_name = f"{row.get('database')}.{row.get('schema')}.{row.get('table')}"
             size_mb = _opt_float(row.get("size"))
@@ -736,16 +941,44 @@ class RedshiftConnector(Connector):
             if not next_token:
                 return rows
 
+    def _run_session_init(self, conn: Any) -> None:
+        """Run ``RedshiftConfig.session_init_sql`` once, right after a SQL connection
+        opens — before any of the real efficiency queries reuse it. Deployment-
+        specific WLM tuning (e.g. ``SET query_group TO 'my_wlm_queue';`` so this
+        connector's queries get priority over a busy production cluster's other
+        traffic) lives in the operator's own connections.yml, not this codebase —
+        see ``RedshiftConfig.session_init_sql``'s own docstring. A failure here
+        surfaces the same way any other query failure does (``_execute`` isn't used
+        because this runs before the connection is handed to callers, but the
+        rollback-on-failure reasoning is the same: an unset/typo'd WLM queue name
+        would otherwise abort the connection's transaction and silently break every
+        query after it).
+        """
+        if not self._config.session_init_sql:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(self._config.session_init_sql)
+            logger.info("redshift_session_init_applied", sql=self._config.session_init_sql)
+        except Exception as exc:  # noqa: BLE001
+            raise ConnectorError(self.name, f"session_init_sql failed: {exc}") from exc
+
     # ── Direct SQL over an SSH bastion tunnel (RedshiftConfig.bastion_host) ──────
     @contextmanager
-    def _bastion_connection(self) -> Iterator[Any]:
-        """One SSH tunnel + one DB connection, opened once and yielded for reuse
-        across every query in a single ``fetch_efficiency()`` pull — not
-        reconnected per query.
+    def _bastion_tunnel(self) -> Iterator[Any]:
+        """Opens just the SSH tunnel (no DB connection) and yields the
+        ``SSHTunnelForwarder`` — ``sshtunnel`` forwards each new inbound
+        connection over its own SSH channel on the same already-open transport,
+        so several DB connections can be opened through this one tunnel via
+        :meth:`_open_sql_connection` (see :meth:`_bastion_lane_connections`),
+        without repeating the SSH handshake or cluster-endpoint resolution below.
         """
+        # redshift_connector is checked here too (even though this method never
+        # calls it) so a missing extra fails before opening any tunnel, not on the
+        # first lane connection.
         try:
             import paramiko
-            import redshift_connector
+            import redshift_connector  # noqa: F401
             from sshtunnel import SSHTunnelForwarder
         except ImportError as exc:
             raise ConnectorError(
@@ -767,7 +1000,6 @@ class RedshiftConnector(Connector):
         assert cfg.bastion_user is not None  # RedshiftConfig enforces this
         assert cfg.bastion_private_key_path is not None  # RedshiftConfig enforces this
         endpoint = self._cluster_endpoint()
-        creds = self._bastion_credentials()
         key_pass = (
             env(cfg.bastion_private_key_passphrase_env)
             if cfg.bastion_private_key_passphrase_env
@@ -781,22 +1013,60 @@ class RedshiftConnector(Connector):
                 ssh_private_key_password=key_pass,
                 remote_bind_address=(endpoint["host"], endpoint["port"]),
             ) as tunnel:
-                conn = redshift_connector.connect(
-                    host="127.0.0.1",
-                    port=tunnel.local_bind_port,
-                    database=cfg.database,
-                    user=creds["user"],
-                    password=creds["password"],
-                    ssl=True,
-                )
-                try:
-                    yield conn
-                finally:
-                    conn.close()
+                yield tunnel
         except ConnectorError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise ConnectorError(self.name, f"bastion SQL connection failed: {exc}") from exc
+            raise ConnectorError(self.name, f"bastion tunnel failed: {exc}") from exc
+
+    @contextmanager
+    def _bastion_connection(self) -> Iterator[Any]:
+        """One SSH tunnel + one DB connection — the single-connection convenience
+        wrapper :meth:`test_connection` uses. ``fetch_efficiency()`` instead opens
+        the tunnel once via :meth:`_bastion_tunnel` and fans several connections
+        through it (see :meth:`_bastion_lane_connections`).
+        """
+        with self._bastion_tunnel() as tunnel:
+            creds = self._bastion_credentials()
+            with self._open_sql_connection(
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
+                user=creds["user"],
+                password=creds["password"],
+                error_prefix="bastion SQL connection failed",
+            ) as conn:
+                yield conn
+
+    @contextmanager
+    def _open_sql_connection(
+        self, *, host: str, port: int, user: str, password: str, error_prefix: str
+    ) -> Iterator[Any]:
+        """Connect, run session_init, yield, close — the reusable body every SQL
+        connection this connector opens shares. Callers (:meth:`_bastion_connection`,
+        :meth:`_bastion_lane_connections`, :meth:`_direct_connection`,
+        :meth:`_direct_lane_connections`) have already verified the
+        'redshift-bastion' extra is importable before reaching here, and already
+        resolved whatever's expensive (tunnel, endpoint, credentials) — this only
+        does the one still-per-connection thing: opening a new socket.
+        """
+        import redshift_connector
+
+        try:
+            conn = redshift_connector.connect(
+                host=host,
+                port=port,
+                database=self._config.database,
+                user=user,
+                password=password,
+                ssl=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ConnectorError(self.name, f"{error_prefix}: {exc}") from exc
+        try:
+            self._run_session_init(conn)
+            yield conn
+        finally:
+            conn.close()
 
     # ── Direct SQL, no tunnel (RedshiftConfig.db_password_env) ──────────────────
     @contextmanager
@@ -804,11 +1074,12 @@ class RedshiftConnector(Connector):
         """One direct SQL connection straight to the cluster's real endpoint — no
         SSH tunnel, for a cluster reachable directly. Authenticates with a
         local/native DB account password (``RedshiftConfig.db_password_env`` —
-        RedshiftConfig enforces ``db_user`` alongside it). Opened once and reused
-        across every query in the pull, same as the bastion path.
+        RedshiftConfig enforces ``db_user`` alongside it). The single-connection
+        convenience wrapper :meth:`test_connection` uses; ``fetch_efficiency()``
+        instead uses :meth:`_direct_lane_connections`.
         """
         try:
-            import redshift_connector
+            import redshift_connector  # noqa: F401
         except ImportError as exc:
             raise ConnectorError(
                 self.name,
@@ -827,23 +1098,14 @@ class RedshiftConnector(Connector):
                 "empty/unset in the environment",
             )
         endpoint = self._cluster_endpoint()
-        try:
-            conn = redshift_connector.connect(
-                host=endpoint["host"],
-                port=endpoint["port"],
-                database=self._config.database,
-                user=self._config.db_user,
-                password=password,
-                ssl=True,
-            )
-            try:
-                yield conn
-            finally:
-                conn.close()
-        except ConnectorError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise ConnectorError(self.name, f"direct SQL connection failed: {exc}") from exc
+        with self._open_sql_connection(
+            host=endpoint["host"],
+            port=endpoint["port"],
+            user=self._config.db_user,
+            password=password,
+            error_prefix="direct SQL connection failed",
+        ) as conn:
+            yield conn
 
     def _cluster_endpoint(self) -> dict[str, Any]:
         """The Redshift cluster's own host/port — not the bastion's. Uses the
@@ -853,15 +1115,31 @@ class RedshiftConnector(Connector):
         if self._config.db_host is not None:
             return {"host": self._config.db_host, "port": self._config.db_port or 5439}
         assert self._config.cluster_identifier is not None  # RedshiftConfig enforces this
-        clusters = self._redshift.describe_clusters(
-            ClusterIdentifier=self._config.cluster_identifier
-        ).get("Clusters", [])
+        try:
+            clusters = self._redshift.describe_clusters(
+                ClusterIdentifier=self._config.cluster_identifier
+            ).get("Clusters", [])
+        except Exception as exc:  # noqa: BLE001
+            raise ConnectorError(self.name, f"describe_clusters failed: {exc}") from exc
         if not clusters:
-            raise ConnectorError(
-                self.name, f"cluster {self._config.cluster_identifier} not found"
-            )
+            raise ConnectorError(self.name, f"cluster {self._config.cluster_identifier} not found")
         endpoint = clusters[0].get("Endpoint", {})
         return {"host": endpoint["Address"], "port": endpoint["Port"]}
+
+    def _workgroup_status(self) -> dict[str, Any]:
+        """Serverless equivalent of ``_cluster_endpoint``'s ``describe_clusters`` —
+        resolves ``self._config.workgroup_name`` via ``redshift-serverless``'s
+        ``GetWorkgroup``. Used only by ``test_connection`` today; ``fetch_efficiency``'s
+        Data API path resolves the workgroup server-side via ``WorkgroupName`` and never
+        needs this client-side lookup.
+        """
+        assert self._config.workgroup_name is not None  # caller checks this
+        try:
+            return self._redshift_serverless.get_workgroup(  # type: ignore[no-any-return]
+                workgroupName=self._config.workgroup_name
+            )["workgroup"]
+        except Exception as exc:  # noqa: BLE001
+            raise ConnectorError(self.name, f"get_workgroup failed: {exc}") from exc
 
     def _bastion_credentials(self) -> dict[str, str]:
         """DB credentials for the bastion connection — static password if configured,

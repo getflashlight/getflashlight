@@ -107,6 +107,40 @@ def _csv_row(**overrides: str) -> str:
     return ",".join(overrides.get(c, "") for c in cols)
 
 
+def test_csv_source_sql_drops_leading_header_row_from_first_chunk(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Databricks' EXTERNAL_LINKS/CSV disposition isn't documented on whether a
+    chunk file starts with its own header line — observed in practice to
+    sometimes be true for the first chunk only, which would otherwise ingest a
+    bogus row (every field equal to its own column name, e.g.
+    BillingCurrency='BillingCurrency') and trip the single-currency assert.
+    ``_csv_source_sql`` must detect and skip that header row on chunk 0, while a
+    later chunk with no header of its own keeps all of its real data rows.
+    """
+    columns = list(sql_mapping.FOCUS_COLUMNS) + ["x_RecordId", "x_RecordType"]
+    base = {
+        "ProviderName": "Databricks",
+        "BillingAccountId": "acct-1",
+        "BillingCurrency": "USD",
+        "ChargeCategory": "Usage",
+        "ServiceCategory": "Analytics",
+        "ResourceId": "cluster-1",
+        "x_RecordId": "rec-A",
+        "x_RecordType": "ORIGINAL",
+    }
+    chunk0 = tmp_path / "chunk0.csv"
+    chunk0.write_text(",".join(columns) + "\n" + _csv_row(**base) + "\n")
+    chunk1 = tmp_path / "chunk1.csv"
+    chunk1.write_text(_csv_row(**{**base, "x_RecordId": "rec-B"}) + "\n")
+
+    con = duckdb.connect()
+    source_sql = _csv_source_sql(con, [str(chunk0), str(chunk1)], columns)
+    rows = con.execute(
+        f"SELECT BillingCurrency, x_RecordId FROM {source_sql} ORDER BY x_RecordId"  # noqa: S608
+    ).fetchall()
+
+    assert rows == [("USD", "rec-A"), ("USD", "rec-B")]
+
+
 def test_vectorized_mapping_keeps_corrections_distinct_and_stamps_compute_class(  # type: ignore[no-untyped-def]
     tmp_path,
 ) -> None:
@@ -159,7 +193,7 @@ def test_vectorized_mapping_keeps_corrections_distinct_and_stamps_compute_class(
     columns = list(sql_mapping.FOCUS_COLUMNS) + ["x_RecordId", "x_RecordType"]
     con = duckdb.connect()
     sql_mapping.ensure_helpers(con)
-    source_sql = _csv_source_sql([str(csv_path)], columns)
+    source_sql = _csv_source_sql(con, [str(csv_path)], columns)
     present = sql_mapping.present_columns(con, source_sql)
     mapped = sql_mapping.mapping_sql(
         source_sql,

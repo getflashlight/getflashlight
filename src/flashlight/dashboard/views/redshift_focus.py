@@ -59,7 +59,6 @@ from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 
 _GROUP = "aws"
 _PROVIDER = "AWS"
-_CONNECTOR = "redshift"
 _SERVICE_IN = ", ".join(f"'{s}'" for s in sorted(REDSHIFT_SERVICE_NAMES))
 _SKU_SCOPE = (
     f"sku_id IN (SELECT DISTINCT sku_id FROM {_GROUP}.resource_month "
@@ -390,11 +389,17 @@ def _cost_cluster_ids() -> set[str]:
 def _telemetry_cluster_ids() -> list[str]:
     """Clusters an actual `redshift` connector entry has pulled telemetry for —
     entity_id for entity_type='sql_warehouse' under provider AWS is the cluster
-    identifier itself (see ingest/connectors/redshift.py).
+    identifier itself (see ingest/connectors/redshift.py). Not filtered by
+    x_source_connector: a Redshift connector entry's ``name`` (and so its
+    x_source_connector stamp) is whatever connections.yml names it (e.g.
+    "Prod"/"BI" for multiple clusters, see effective_connector_name) — never
+    literally "redshift" once more than one cluster is configured. provider_name
+    ='AWS' + entity_type='sql_warehouse' is already Redshift-only (see module
+    docstring), so no further connector-name filter is needed.
     """
     df = gold_df(
         "SELECT DISTINCT entity_id FROM efficiency.efficiency_entity_month "
-        f"WHERE provider_name = '{_PROVIDER}' AND x_source_connector = '{_CONNECTOR}' "
+        f"WHERE provider_name = '{_PROVIDER}' "
         "AND entity_type = 'sql_warehouse' ORDER BY entity_id"
     )
     return list(df["entity_id"]) if not df.empty else []
@@ -453,8 +458,7 @@ def _cluster_waste_section(cluster_id: str) -> None:
     )
     coverage = gold_df(
         "SELECT DISTINCT charge_month, entity_type FROM efficiency.efficiency_entity_month "
-        f"WHERE provider_name = '{_PROVIDER}' AND x_source_connector = '{_CONNECTOR}' "
-        f"AND {scope}"
+        f"WHERE provider_name = '{_PROVIDER}' AND {scope}"
     )
     if coverage.empty:
         return  # shouldn't happen — cluster_id came from this same view

@@ -87,6 +87,39 @@ def test_provider_page_renders_when_data_starts_midmonth(lake_home) -> None:  # 
     asyncio.run(_check())
 
 
+def test_provider_page_reachable_after_first_sync_post_boot(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Regression: a provider's GOLD group can appear *after* the dashboard has
+    already booted (its first successful sync, run from the Connections page in
+    the same long-running process). discover_provider_groups() reads gold/ live
+    so the nav link shows up immediately — the page route must be reachable too,
+    not 404 until the process is restarted (router.py used to register one
+    @ui.page per group discovered only at build_pages() time).
+    """
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            # No GOLD published yet at boot — discover_provider_groups() is empty.
+            build_pages()
+
+            # A sync completes *after* boot, publishing the "aws" group for the
+            # first time — same timing as a user adding a connection and hitting
+            # Sync in the Connections page of an already-running dashboard.
+            from flashlight.lake import bronze
+            from flashlight.transform.runner import build_gold
+
+            window = IngestWindow(date(2026, 5, 31), date(2026, 5, 31))
+            bronze.write_window("t", window, [_rec(31)], ingest_run_id="r1")
+            build_gold()
+
+            await user.open("/aws")
+            await user.should_see("Redshift spend")
+
+    asyncio.run(_check())
+
+
 def test_provider_page_renders_commitment_panel_when_present(lake_home) -> None:  # type: ignore[no-untyped-def]
     """The commitment-coverage panel (added alongside FOCUS Contract Commitment
     support) must render real Used/Unused data when present, and the existing
@@ -125,6 +158,122 @@ def test_provider_page_renders_commitment_panel_when_present(lake_home) -> None:
             await user.should_see("Commitment coverage")
 
     asyncio.run(_check())
+
+
+def test_connections_page_renders_sync_toolbar_and_empty_states(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Regression smoke test for the Connections page toolbar (the shared
+    chrome.date_range_control popover, not a bespoke one-off — see
+    connections.py) and its empty states, with no data sources configured.
+    """
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/connections")
+            await user.should_see("Connections")
+            await user.should_see("Full refresh")
+            await user.should_see("No data sources yet")
+            await user.should_see("No syncs yet")
+
+            # The date-range trigger is the same chrome.date_range_control
+            # popover used on every other page (its own click-to-expand
+            # behavior is covered where it's defined) — just confirm
+            # connections.py actually wired one up.
+            assert "icon=event" in str(user.current_layout)
+
+    asyncio.run(_check())
+
+
+def test_connections_page_sync_button_streams_output_without_crashing(  # type: ignore[no-untyped-def]
+    lake_home, monkeypatch
+) -> None:
+    """End-to-end regression for the "Sync now" click path.
+
+    Two real bugs happened here and never showed up in a plain render() smoke
+    test, because both needed an actual button click to trigger: (1)
+    ui.timer(0.1, ..., once=True) firing after the page's slot was torn down
+    ("parent slot ... has been deleted"), and (2) its replacement,
+    background_tasks.create(), running with no slot context at all ("the
+    current slot cannot be determined") — which additionally blocked
+    render()'s own remaining code (including wiring up this very button) when
+    awaited inline instead. asyncio.create_subprocess_exec is mocked so this
+    doesn't need a real `flashlight ingest` subprocess; nicegui's own
+    core.app.handle_exception is wrapped to fail the test loudly if anything
+    the button click triggers raises, instead of silently swallowing it the
+    way the app itself does in production.
+    """
+    from nicegui import core, ui
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    class _FakeStdout:
+        def __init__(self, lines: list[bytes]) -> None:
+            self._lines = lines
+
+        def __aiter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __anext__(self) -> bytes:
+            if not self._lines:
+                raise StopAsyncIteration
+            return self._lines.pop(0)
+
+    class _FakeProcess:
+        def __init__(self, lines: list[bytes], returncode: int) -> None:
+            self.stdout = _FakeStdout(lines)
+            self._returncode = returncode
+
+        async def wait(self) -> int:
+            return self._returncode
+
+    async def _fake_create_subprocess_exec(*cmd, **kwargs):  # type: ignore[no-untyped-def]
+        lines = [b"  Prod-Focus ...\n", b"  Prod-Focus ... 42 rows done\n"]
+        return _FakeProcess(lines, returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    caught: list[Exception] = []
+    orig_handle_exception = core.app.handle_exception
+
+    def _loud_handle_exception(exception: Exception) -> None:
+        caught.append(exception)
+        return orig_handle_exception(exception)
+
+    monkeypatch.setattr(core.app, "handle_exception", _loud_handle_exception)
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/connections")
+            await user.should_see("Full refresh")
+
+            user.find("Sync now").click()
+            await user.should_see("Syncing all connections")
+
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                try:
+                    await user.should_see("exit code")
+                    break
+                except AssertionError:
+                    continue
+            await user.should_see("exit code")
+
+            log_lines = [
+                child.text
+                for element in user.find(kind=ui.log).elements
+                for child in element
+                if isinstance(child, ui.label)
+            ]
+            assert "  Prod-Focus ..." in log_lines
+            assert "  Prod-Focus ... 42 rows done" in log_lines
+
+    asyncio.run(_check())
+    assert not caught, f"sync click triggered unexpected exception(s): {caught}"
 
 
 def test_chat_page_sends_a_question_and_renders_the_reply(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
