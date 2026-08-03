@@ -327,7 +327,7 @@ def test_chat_page_sends_a_question_and_renders_the_reply(lake_home, monkeypatch
     from flashlight.dashboard.router import build_pages
     from flashlight.dashboard.views import chat as chat_view
 
-    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
+    async def fake_run_turn(messages, question, **kwargs):  # type: ignore[no-untyped-def]
         messages.append({"role": "assistant", "content": "The answer is 42."})
         return ChatTurnResult(text="The answer is 42.", steps=[])
 
@@ -361,8 +361,8 @@ def test_chat_page_renders_clarify_options_as_clickable_chips(lake_home, monkeyp
 
     sent_questions: list[str] = []
 
-    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
-        sent_questions.append(messages[-1]["content"])
+    async def fake_run_turn(messages, question, **kwargs):  # type: ignore[no-untyped-def]
+        sent_questions.append(question)
         if len(sent_questions) == 1:
             return ChatTurnResult(
                 text="Which time window?", steps=[], options=["Last month", "Year to date"]
@@ -397,7 +397,7 @@ def test_chat_page_renders_a_tool_step_with_query_results(lake_home, monkeypatch
     from flashlight.dashboard.router import build_pages
     from flashlight.dashboard.views import chat as chat_view
 
-    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
+    async def fake_run_turn(messages, question, **kwargs):  # type: ignore[no-untyped-def]
         step = ToolStep(
             name="query_metric",
             arguments={"name": "shared.tco_summary_month"},
@@ -436,7 +436,7 @@ def test_chat_page_run_sql_step_defaults_open_others_stay_collapsed(lake_home, m
     from flashlight.dashboard.router import build_pages
     from flashlight.dashboard.views import chat as chat_view
 
-    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
+    async def fake_run_turn(messages, question, **kwargs):  # type: ignore[no-untyped-def]
         steps = [
             ToolStep(name="list_metrics", arguments={}, rows=None),
             ToolStep(
@@ -481,7 +481,7 @@ def test_chat_page_charts_despite_a_constant_dimension_column(lake_home, monkeyp
     from flashlight.dashboard.router import build_pages
     from flashlight.dashboard.views import chat as chat_view
 
-    async def fake_run_turn(messages, **kwargs):  # type: ignore[no-untyped-def]
+    async def fake_run_turn(messages, question, **kwargs):  # type: ignore[no-untyped-def]
         step = ToolStep(
             name="query_metric",
             arguments={"name": "aws.monthly_bill", "measures": ["net_cost"]},
@@ -542,7 +542,7 @@ def test_chat_settings_persist_across_a_reload_in_the_same_tab(lake_home, monkey
             api_key_elem = next(iter(user.find(marker="chat-api-key").elements))
             model_after_reload = model_elem.value  # type: ignore[attr-defined]
             api_key_after_reload = api_key_elem.value  # type: ignore[attr-defined]
-            assert model_after_reload == "anthropic/claude-sonnet-4-5"
+            assert model_after_reload == "claude-sonnet-4-5"
             assert api_key_after_reload == "sk-persisted"
             assert fake_keychain == {"Anthropic (Claude)": "sk-persisted"}
 

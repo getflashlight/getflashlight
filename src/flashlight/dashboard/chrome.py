@@ -63,11 +63,17 @@ FAVICON_SVG = (
 
 HEAD_CSS = f"""
 <style>
+:root {{ --fl-header-h: 57px; }}  /* header: py-3 + text line + 1px bottom border */
 body, .q-page, .nicegui-content {{
     background: {PAGE} !important;
     color: {INK_PRIMARY};
     font-family: {FONT_STACK};
 }}
+/* A full-height page (chat) needs its own scrolling region, so the page-level
+   wrapper must not add padding or scroll of its own. Scoped to .fl-full-height
+   so every other (report-style, scroll-the-page) view is untouched. */
+.fl-full-height .nicegui-content {{ padding: 0 !important; }}
+.fl-full-height .q-page {{ overflow: hidden; }}
 .fl-table .q-table__card {{ background: transparent !important; box-shadow: none !important; }}
 .fl-table thead th {{
     color: {INK_MUTED} !important; font-size: 12px !important; font-weight: 600 !important;
@@ -205,6 +211,7 @@ def style_fig(
     has_legend: bool = False,
     currency_axis: str | None = "y",
     category_x: bool = False,
+    title: str | None = None,
 ) -> go.Figure:
     """Flat, quiet chart chrome: transparent canvas, hairline grid, muted axis text.
 
@@ -214,13 +221,17 @@ def style_fig(
     under them (e.g. showing "May 31" under what is actually the June bar). Leave
     it False for a real continuous date axis (e.g. daily spend by `charge_day`),
     where date-aware spacing/zoom is the wanted behavior.
+
+    ``title`` names what's plotted directly on the chart — every other chart in
+    this dashboard sits under a section heading that already says so, but a chart
+    with no surrounding heading (e.g. one dropped into a chat reply) needs its own.
     """
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         height=height,
-        margin=dict(l=8, r=8, t=28 if has_legend else 4, b=8),
+        margin=dict(l=8, r=8, t=28 if (has_legend or title) else 4, b=8),
         font=dict(family=FONT_STACK, size=12, color=INK_MUTED),
         showlegend=has_legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title_text="")
@@ -228,6 +239,9 @@ def style_fig(
         else None,
         hoverlabel=dict(bgcolor=SURFACE, bordercolor=BORDER, font_size=12, font_color=INK_PRIMARY),
         bargap=0.5,
+        title=dict(text=title, font=dict(size=13, color=INK_SECONDARY), x=0, xanchor="left")
+        if title
+        else None,
     )
     fig.update_xaxes(
         showgrid=False, zeroline=False, linecolor=BASELINE, color=INK_MUTED, title_text=""

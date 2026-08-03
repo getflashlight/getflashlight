@@ -82,12 +82,20 @@ def _nav_row(*, label: str, icon: str, href: str, active: bool) -> None:
     row.on("click", lambda: ui.navigate.to(href))
 
 
-def shell(active_path: str) -> ui.column:
+def shell(active_path: str, *, full_height: bool = False) -> ui.column:
     """Page chrome (left drawer nav + header) shared by every page. Returns the
     content container to build the page body inside — call as ``with shell(path):``.
+
+    *full_height* swaps the usual scroll-down-a-report container (centered,
+    max-w-6xl, padded, gap-8) for one that fills the viewport below the header
+    with no padding of its own — for the chat page, which owns its whole
+    vertical space (a scrolling transcript with a composer pinned under it,
+    chat-app style) rather than being one more stacked report section.
     """
     ui.dark_mode().enable()
     ui.add_head_html(chrome.HEAD_CSS)
+    if full_height:
+        ui.add_body_html('<script>document.body.classList.add("fl-full-height")</script>')
 
     groups = discover_provider_groups()
     with ui.left_drawer(fixed=True).style(
@@ -122,6 +130,13 @@ def shell(active_path: str) -> ui.column:
                     f"color:{chrome.INK_MUTED}"
                 )
 
+    if full_height:
+        # min-height:0 matters: without it this flex child refuses to shrink below
+        # its content, so the transcript's own scroll area never gets a bounded
+        # height and the page scrolls instead of the message list.
+        return ui.column().classes("w-full p-0 gap-0").style(
+            "height:calc(100vh - var(--fl-header-h));min-height:0;"
+        )
     return ui.column().classes("w-full max-w-6xl mx-auto p-6 gap-8")
 
 
@@ -169,7 +184,7 @@ def build_pages() -> None:
 
         @ui.page("/chat")
         async def _chat() -> None:
-            with shell("/chat"):
+            with shell("/chat", full_height=True):
                 await chat.render()
 
     if settings.docs_dir and Path(settings.docs_dir).is_dir():

@@ -39,6 +39,7 @@ from typing import Any
 import pandas as pd
 import plotly.express as px
 from nicegui import app, ui
+from pydantic_ai.messages import ModelMessage
 
 from flashlight.dashboard import chat_credentials, chrome
 from flashlight.dashboard.chat_engine import ToolStep, run_turn
@@ -65,9 +66,25 @@ def _render_rows(rows: list[dict[str, Any]], *, key: str) -> None:
     varying_other_cols = [c for c in other_cols if df[c].nunique(dropna=False) > 1]
     if len(numeric_cols) == 1 and len(varying_other_cols) == 1 and 2 <= len(df) <= 50:
         x_col, y_col = varying_other_cols[0], numeric_cols[0]
+        is_money = _is_money_col(y_col)
+        value_format = "$%{y:,.0f}" if is_money else "%{y:,.0f}"
         fig = px.bar(df, x=x_col, y=y_col, labels={x_col: "", y_col: ""})
-        currency_axis = "y" if _is_money_col(y_col) else None
-        chrome.plot(chrome.style_fig(fig, category_x=True, currency_axis=currency_axis))
+        fig.update_traces(
+            marker_color=chrome.ACCENT,
+            text=df[y_col],
+            texttemplate=value_format.replace("%{y", "%{text"),
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate=f"%{{x}}<br>{value_format}<extra></extra>",
+        )
+        chrome.plot(
+            chrome.style_fig(
+                fig,
+                category_x=True,
+                currency_axis="y" if is_money else None,
+                title=y_col.replace("_", " ").title(),
+            )
+        )
     else:
         money_cols = [c for c in numeric_cols if _is_money_col(c)]
         num_cols = [c for c in numeric_cols if c not in money_cols]
@@ -98,16 +115,26 @@ def _render_tool_step(step: ToolStep, *, key: str) -> None:
 
 
 _PRESETS: dict[str, dict[str, str]] = {
-    "OpenAI": {"model": "openai/gpt-4o", "base_url": ""},
-    "Anthropic (Claude)": {"model": "anthropic/claude-sonnet-4-5", "base_url": ""},
-    "Google (Gemini)": {"model": "gemini/gemini-2.0-flash", "base_url": ""},
-    "Ollama (local)": {"model": "ollama/llama3", "base_url": "http://localhost:11434"},
-    # litellm's Databricks provider needs the "databricks/" prefix on the model
-    # (a bare Foundation Model API endpoint name like "databricks-gpt-oss-20b"
-    # raises "LLM Provider NOT provided") plus the workspace URL as base_url,
-    # e.g. https://<workspace-host>/serving-endpoints.
-    "Databricks": {"model": "databricks/databricks-gpt-oss-20b", "base_url": ""},
-    "Custom / self-hosted": {"model": "", "base_url": ""},
+    "OpenAI": {"provider": "openai", "model": "gpt-4o", "base_url": ""},
+    "Anthropic (Claude)": {"provider": "anthropic", "model": "claude-sonnet-4-5", "base_url": ""},
+    "Google (Gemini)": {"provider": "google", "model": "gemini-2.0-flash", "base_url": ""},
+    # "openai_compatible" covers anything speaking the OpenAI chat-completions
+    # wire format that isn't one of the three native providers above — Ollama's
+    # own OpenAI-compatible endpoint lives under /v1.
+    "Ollama (local)": {
+        "provider": "openai_compatible",
+        "model": "llama3",
+        "base_url": "http://localhost:11434/v1",
+    },
+    # Databricks' Foundation Model API is OpenAI-compatible too — base_url is
+    # the workspace's serving-endpoints URL, e.g.
+    # https://<workspace-host>/serving-endpoints.
+    "Databricks": {
+        "provider": "openai_compatible",
+        "model": "databricks-gpt-oss-20b",
+        "base_url": "",
+    },
+    "Custom / self-hosted": {"provider": "openai_compatible", "model": "", "base_url": ""},
 }
 _DEFAULT_PROVIDER = "OpenAI"
 
@@ -238,7 +265,7 @@ async def render() -> None:
     if not api_key_input.value:
         settings_dialog.open()
 
-    messages: list[dict[str, object]] = []
+    messages: list[ModelMessage] = []
     session_id = ui.context.client.tab_id or ui.context.client.id
     turn_counter = 0
 
@@ -264,7 +291,7 @@ async def render() -> None:
         def _scroll_down() -> None:
             scroll_area.scroll_to(percent=1.0)
 
-        async def send() -> None:
+        async def send(*, answering_clarification: bool = False) -> None:
             nonlocal turn_counter
             question = input_box.value.strip()
             if not question:
@@ -281,16 +308,21 @@ async def render() -> None:
                     ui.spinner(size="1.2rem").style(f"color:{chrome.INK_MUTED}")
                     ui.label("Thinking...").classes("text-sm").style(f"color:{chrome.INK_MUTED}")
             _scroll_down()
-            messages.append({"role": "user", "content": question})
             send_button.props("loading")
             input_box.props("disable")
+            provider = _PRESETS.get(provider_select.value or "", _PRESETS[_DEFAULT_PROVIDER])[
+                "provider"
+            ]
             try:
                 result = await run_turn(
                     messages,
+                    question,
+                    provider=provider,
                     api_key=api_key_input.value,
                     model=model_input.value,
                     base_url=base_url_input.value or None,
                     session_id=session_id,
+                    answering_clarification=answering_clarification,
                 )
             finally:
                 thinking.delete()
@@ -318,8 +350,13 @@ async def render() -> None:
             _scroll_down()
 
         async def _send_option(option: str) -> None:
+            # Clicking an option we offered resolves the ambiguity by
+            # construction — flagged so the engine can't answer it with yet
+            # another clarifying question (confirmed live: a weak model asked
+            # "which month?" straight after the user picked an option that
+            # already said "for the previous month (default)").
             input_box.value = option
-            await send()
+            await send(answering_clarification=True)
 
         with ui.row().classes("w-full gap-2 items-center pt-3 px-4 pb-4"):
             input_box = (
