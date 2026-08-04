@@ -160,6 +160,44 @@ def test_provider_page_renders_commitment_panel_when_present(lake_home) -> None:
     asyncio.run(_check())
 
 
+def test_provider_page_renders_when_lake_predates_a_catalogued_view(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Regression: a GOLD lake published before a view was added must not 500 the page.
+
+    ``duck.register_gold`` only registers files that exist, so a view added to the
+    catalog after the last ``flashlight transform`` is absent from the DuckDB catalog
+    entirely and querying it raises — which took down the whole provider route when
+    ``spend_tag_coverage_month``/``spend_forecast_month`` shipped. The panels reading
+    them now check ``gold_view_published`` first (see provider_focus.py).
+    """
+    from flashlight.lake import bronze, paths
+    from flashlight.transform.runner import build_gold
+
+    # GCP routes to the plain provider_focus page (AWS → redshift_focus, Databricks →
+    # the extra-tabs variant), which is where both affected panels live.
+    window = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
+    rec = _rec(15)
+    rec.provider_name = ProviderName.GCP
+    bronze.write_window("t", window, [rec], ingest_run_id="r1")
+    build_gold()
+
+    # Roll the published lake back to what an older transform would have left behind.
+    for view in ("spend_tag_coverage_month", "spend_forecast_month"):
+        (paths.gold_dir() / "gcp" / f"{view}.parquet").unlink()
+
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/gcp")
+            await user.should_see("GCP spend")
+            await user.should_see("run `flashlight transform`")
+
+    asyncio.run(_check())
+
+
 def test_connections_page_renders_sync_toolbar_and_empty_states(lake_home) -> None:  # type: ignore[no-untyped-def]
     """Regression smoke test for the Connections page toolbar (the shared
     chrome.date_range_control popover, not a bespoke one-off — see

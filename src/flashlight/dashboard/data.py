@@ -31,6 +31,18 @@ def has_data() -> bool:
     return any(paths.gold_dir().glob("*/*.parquet"))
 
 
+def gold_view_published(group: str, view: str) -> bool:
+    """True when ``gold/<group>/<view>.parquet`` exists on disk.
+
+    Same source of truth as :func:`flashlight.lake.duck.register_gold`, which only
+    registers files that exist — so a view added to the catalog but absent from the
+    last publish (a lake that hasn't been re-transformed since an upgrade) is simply
+    not in the DuckDB catalog, and querying it raises. Panels reading a view newer
+    than the lake check this first and skip instead of taking the page down.
+    """
+    return (paths.gold_dir() / group / f"{view}.parquet").exists()
+
+
 def provider_label(group: str) -> str:
     """Human label for a provider group — the provider_name in its data, else the titled slug."""
     try:

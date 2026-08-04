@@ -19,7 +19,7 @@ from nicegui.events import GenericEventArguments
 
 from flashlight.dashboard import chrome, router
 from flashlight.dashboard.chrome import DateState
-from flashlight.dashboard.data import gold_df
+from flashlight.dashboard.data import gold_df, gold_view_published
 from flashlight.dashboard.data import to_date as _d
 from flashlight.dashboard.summary import _service_movers, driver_dim, provider_spend_summary
 from flashlight.dashboard.theme import compact_money, delta_variant, provider_color, rgba_hex
@@ -132,15 +132,18 @@ def _projected_this_month(group: str) -> tuple[str, str, str] | None:
 
     Only the run_rate row is shown here — it's the number that's actionable mid-month.
     The 3-month trend rows live in the forecast view for whoever wants them.
+
+    Absent from a lake published before the forecast view existed, so the file is
+    checked rather than the query being wrapped in a bare except — a real SQL error
+    should still surface loudly.
     """
-    try:
-        row = gold_df(
-            "SELECT charge_month, forecast_cost, actual_to_date, history_days "
-            f'FROM "{group}".spend_forecast_month '
-            "WHERE forecast_kind = 'run_rate' ORDER BY charge_month DESC LIMIT 1"
-        )
-    except Exception:  # noqa: BLE001 - view absent until the next transform
+    if not gold_view_published(group, "spend_forecast_month"):
         return None
+    row = gold_df(
+        "SELECT charge_month, forecast_cost, actual_to_date, history_days "
+        f'FROM "{group}".spend_forecast_month '
+        "WHERE forecast_kind = 'run_rate' ORDER BY charge_month DESC LIMIT 1"
+    )
     if row.empty or row["forecast_cost"].iloc[0] is None:
         return None
     days = int(row["history_days"].iloc[0])
@@ -670,7 +673,16 @@ def _tag_coverage(group: str, end: date, sm: date) -> None:
 
     The breakdown below drops untagged rows by construction, so without this a
     fully-untagged bill renders as a tidy, complete-looking tag table.
+
+    Skipped (with a rebuild hint) on a lake published before this view existed — see
+    :func:`gold_view_published`. The caption is the honest thing to show: the
+    breakdown below is still correct, it just can't say what it omits.
     """
+    if not gold_view_published(group, "spend_tag_coverage_month"):
+        chrome.section_caption(
+            "Tag coverage is unavailable until GOLD is rebuilt — run `flashlight transform`."
+        )
+        return
     cov = gold_df(
         "SELECT sum(gross_cost) AS gross, sum(tagged_cost) AS tagged, "
         f'sum(untagged_cost) AS untagged FROM "{group}".spend_tag_coverage_month '
