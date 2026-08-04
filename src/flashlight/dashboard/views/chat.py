@@ -42,7 +42,7 @@ from nicegui import app, ui
 from pydantic_ai.messages import ModelMessage
 
 from flashlight.dashboard import chat_credentials, chrome
-from flashlight.dashboard.chat_engine import ToolStep, run_turn
+from flashlight.dashboard.chat_engine import ChartSpec, ToolStep, run_turn
 
 _MONEY_HINTS = ("cost", "amount", "spend", "price", "waste", "savings")
 
@@ -51,10 +51,141 @@ def _is_money_col(name: str) -> bool:
     return any(hint in name.lower() for hint in _MONEY_HINTS)
 
 
-def _render_rows(rows: list[dict[str, Any]], *, key: str) -> None:
-    """Chart when the shape is unambiguous (one dimension, one measure, a
-    handful of rows); a plain table otherwise. Not a general auto-viz engine —
-    a wrong guess here just means a table instead of a chart, never a crash.
+_TEMPORAL_HINTS = ("month", "date", "day", "period", "week", "year", "hour")
+
+
+def _informative_dims(df: pd.DataFrame, varying_cols: list[str]) -> list[str]:
+    """Drop dimensions that add no distinguishing information — the ones already
+    determined by a finer column present in the same rows.
+
+    A constant column is the obvious case (already filtered out by the caller),
+    but ``service_category`` is the same thing one step up: every ``service_name``
+    has exactly one category, so it splits nothing. It still *varies*, so it
+    counted as a third dimension and pushed the real screenshot case
+    (category + service + month) past the two-dimension limit into a table.
+    Keeping only informative columns leaves service x month — a stacked bar.
+    """
+    def preference(col: str) -> tuple[bool, int, int]:
+        """Which of two interchangeable columns to keep, highest first.
+
+        Cardinality is the main signal (the finer column determines the coarser,
+        not vice versa), but two columns are often *mutually* determining — a
+        1:1 pair like service_category/service_name when each category happens to
+        have one service in the result. Dropping the wrong one of those silently
+        loses the axis that matters, so break the tie deliberately: keep a
+        temporal column (a trend must stay drawable on time), then the more
+        specific label, which the catalog puts further right ("JOBS" over
+        "Analytics").
+        """
+        is_temporal = any(h in col.lower() for h in _TEMPORAL_HINTS)
+        return is_temporal, df[col].nunique(dropna=False), varying_cols.index(col)
+
+    kept: list[str] = []
+    # Most-preferred first, so a droppable column is tested against the one that
+    # should survive it, not the other way round.
+    for col in sorted(varying_cols, key=preference, reverse=True):
+        determined_by_a_kept_col = any(
+            df.groupby(k, dropna=False)[col].nunique(dropna=False).max() <= 1 for k in kept
+        )
+        if determined_by_a_kept_col:
+            continue
+        kept.append(col)
+    return [c for c in varying_cols if c in kept]  # back to the view's column order
+
+
+def _infer_spec(df: pd.DataFrame, varying_cols: list[str]) -> tuple[str, str | None, str] | None:
+    """Infer ``(x, series, kind)`` from the row shape when the model declared no
+    ChartSpec — the deterministic floor under the declaration.
+
+    It has to be a real floor, not a formality: a live gpt-oss-20b declared a
+    chart for "show me the monthly trend" but *not* for "visualize databricks
+    spend year to date by service", the very question that needs one. A weak
+    model complies probabilistically, so the no-declaration path still has to
+    produce something readable.
+
+    query_metric returns *every* dimension of a view (there's no way to narrow
+    them the way `measures` narrows measures), so results routinely carry two
+    real dimensions — and a second dimension is a *series*, not extra text to
+    staple onto the axis label. Treating it as the latter is what drew 39 bars
+    titled "Networking · NETWORKING · 2026-07-01".
+
+    The hard requirement either way is **one row per drawn point**: repeats
+    would stack several segments where the reader sees one value. Anything with
+    more than two varying dimensions has no honest 2-D reading, so it stays a
+    table.
+    """
+    varying_cols = _informative_dims(df, varying_cols)
+    unique = [c for c in varying_cols if df[c].nunique(dropna=False) == len(df)]
+    if unique:
+        # Prefer a temporal column when one qualifies: "spend by month" should be
+        # a time series even if some other column happens to be unique too.
+        temporal = [c for c in unique if any(h in c.lower() for h in _TEMPORAL_HINTS)]
+        if temporal:
+            return temporal[0], None, "bar"
+        # Otherwise the most granular label. Several columns are often *equally*
+        # unique (service_category and service_name both are, once one row per
+        # service); the catalog lists a view's dimensions coarse-to-fine, so the
+        # rightmost one is the more specific label — "JOBS" says more than
+        # "Analytics".
+        chosen = max(unique, key=lambda c: (df[c].nunique(dropna=False), varying_cols.index(c)))
+        return chosen, None, "bar"
+    if len(varying_cols) != 2 or len(df.drop_duplicates(subset=varying_cols)) != len(df):
+        return None
+    # Two dimensions, one row per pair: a stacked bar. The wider one goes on x so
+    # the narrower one becomes the (legible, palette-sized) stack — 13 services
+    # split by 3 months, not 3 months split by 13 services.
+    by_width = sorted(varying_cols, key=lambda c: df[c].nunique(dropna=False), reverse=True)
+    return by_width[0], by_width[1], "stacked_bar"
+
+
+# The categorical palette has 8 slots, so at most 8 series: 7 named + "Other".
+# More than that is unreadable regardless of colours (see chrome.CATEGORICAL_SLOTS,
+# "color follows identity, never rank").
+_MAX_SERIES = len(chrome.CATEGORICAL_SLOTS)
+_OTHER_SERIES = "Other"
+
+
+def _resolve_chart(
+    df: pd.DataFrame, chart: ChartSpec | None, numeric_cols: list[str]
+) -> tuple[str, str | None, str] | None:
+    """Validate a model-declared ChartSpec against the columns that actually came
+    back — ``(x, series, kind)`` if it holds up, else None to fall back to
+    shape inference.
+
+    The model names columns from the catalog in its prompt, not from the result,
+    so it can name one this particular query didn't return (a narrowed
+    `measures`, a different view than it meant). Never trust it blind: an
+    unknown column would raise inside Plotly, and a non-unique (x, series) pair
+    would quietly draw two segments where the reader sees one total.
+    """
+    if chart is None or len(numeric_cols) != 1:
+        return None
+    if chart.x not in df.columns:
+        return None
+    series = chart.series if chart.series and chart.series != chart.x else None
+    if series is not None and series not in df.columns:
+        return None
+    keys = [chart.x] if series is None else [chart.x, series]
+    if len(df.drop_duplicates(subset=keys)) != len(df):
+        return None
+    return chart.x, series, chart.kind
+
+
+def _cap_series(df: pd.DataFrame, series: str, y_col: str) -> pd.DataFrame:
+    """Fold all but the top _MAX_SERIES-1 series into one "Other" bucket, so the
+    legend stays readable and every slot keeps a distinct colour. Totals are
+    preserved — nothing is dropped, only grouped."""
+    totals = df.groupby(series)[y_col].sum().sort_values(ascending=False)
+    if len(totals) <= _MAX_SERIES:
+        return df
+    keep = set(totals.index[: _MAX_SERIES - 1])
+    return df.assign(**{series: df[series].where(df[series].isin(keep), _OTHER_SERIES)})
+
+
+def _render_rows(rows: list[dict[str, Any]], *, key: str, chart: ChartSpec | None = None) -> None:
+    """Draw the chart the model asked for; fall back to inferring one from the
+    row shape; fall back again to a plain table. Never a general auto-viz
+    engine — a wrong guess here means a table instead of a chart, never a crash.
     """
     df = pd.DataFrame(rows)
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -62,33 +193,82 @@ def _render_rows(rows: list[dict[str, Any]], *, key: str) -> None:
     # A column that never varies (e.g. provider_name — still present, constant,
     # on a per-provider-sliced view like aws.monthly_bill even once filtered/
     # narrowed to one provider) carries no charting information; only a column
-    # that actually varies counts as the chart's one real dimension.
+    # that actually varies is a candidate for the chart's axis.
     varying_other_cols = [c for c in other_cols if df[c].nunique(dropna=False) > 1]
-    if len(numeric_cols) == 1 and len(varying_other_cols) == 1 and 2 <= len(df) <= 50:
-        x_col, y_col = varying_other_cols[0], numeric_cols[0]
-        is_money = _is_money_col(y_col)
-        value_format = "$%{y:,.0f}" if is_money else "%{y:,.0f}"
-        fig = px.bar(df, x=x_col, y=y_col, labels={x_col: "", y_col: ""})
-        fig.update_traces(
-            marker_color=chrome.ACCENT,
-            text=df[y_col],
-            texttemplate=value_format.replace("%{y", "%{text"),
-            textposition="outside",
-            cliponaxis=False,
-            hovertemplate=f"%{{x}}<br>{value_format}<extra></extra>",
-        )
-        chrome.plot(
-            chrome.style_fig(
-                fig,
-                category_x=True,
-                currency_axis="y" if is_money else None,
-                title=y_col.replace("_", " ").title(),
-            )
-        )
+    chartable = len(numeric_cols) == 1 and bool(varying_other_cols) and 2 <= len(df) <= 200
+    spec = _resolve_chart(df, chart, numeric_cols) if chartable else None
+    if spec is None and chartable:
+        # Nothing usable declared — an MCP agent never declares, and a weak model
+        # often forgets to, so fall back to reading the shape.
+        spec = _infer_spec(df, varying_other_cols)
+    if spec is not None:
+        _plot(df, spec, numeric_cols[0])
     else:
         money_cols = [c for c in numeric_cols if _is_money_col(c)]
         num_cols = [c for c in numeric_cols if c not in money_cols]
         chrome.flat_table(df, key=key, money_cols=money_cols, num_cols=num_cols)
+
+
+def _plot(df: pd.DataFrame, spec: tuple[str, str | None, str], y_col: str) -> None:
+    x_col, series, kind = spec
+    is_money = _is_money_col(y_col)
+    value_format = "$%{y:,.0f}" if is_money else "%{y:,.0f}"
+    temporal_x = any(hint in x_col.lower() for hint in _TEMPORAL_HINTS)
+    if series is not None:
+        df = _cap_series(df, series, y_col)
+    # A category breakdown reads as a ranking, so order it by size; a time axis
+    # must keep its own order or the trend is destroyed. With a series, rank by
+    # each x value's total rather than by an arbitrary segment.
+    if not temporal_x:
+        totals = df.groupby(x_col)[y_col].sum().sort_values(ascending=False)
+        rank = {k: i for i, k in enumerate(totals.index)}
+        df = df.sort_values(x_col, key=lambda col: col.map(rank))
+    else:
+        df = df.sort_values(x_col)
+    labels = {x_col: "", y_col: ""}
+    if kind == "line":
+        fig = px.line(
+            df, x=x_col, y=y_col, color=series, labels=labels, markers=True,
+            color_discrete_sequence=list(chrome.CATEGORICAL_SLOTS),
+        )
+    else:
+        # Any bar chart with a series is stacked, whichever bar kind was asked
+        # for: grouping put 8 months x 13 services side by side as 104 thin bars
+        # (a live model declared kind="bar" with series="charge_month" for a
+        # year-to-date breakdown), which is the same unreadability the composite
+        # axis had. Spend is additive, so a stack's total is the number the
+        # question was actually about — and ChartSpec has no "grouped" kind to
+        # override this with, deliberately.
+        fig = px.bar(
+            df, x=x_col, y=y_col, color=series, labels=labels,
+            color_discrete_sequence=list(chrome.CATEGORICAL_SLOTS),
+            barmode="stack",
+        )
+    if series is None:
+        # Per-value labels only make sense on a single series; on a stack they
+        # collide with the segments above them. Colour has to be set with the
+        # property that trace type actually has — passing `line_color` to a Bar
+        # is rejected by Plotly even as None.
+        styling: dict[str, Any] = {
+            "text": df[y_col],
+            "texttemplate": value_format.replace("%{y", "%{text"),
+            "cliponaxis": False,
+        }
+        if kind == "line":
+            styling |= {"line_color": chrome.ACCENT, "textposition": "top center"}
+        else:
+            styling |= {"marker_color": chrome.ACCENT, "textposition": "outside"}
+        fig.update_traces(**styling)
+    fig.update_traces(hovertemplate=f"%{{x}}<br>{value_format}<extra></extra>")
+    chrome.plot(
+        chrome.style_fig(
+            fig,
+            category_x=kind != "line" or not temporal_x,
+            currency_axis="y" if is_money else None,
+            title=y_col.replace("_", " ").title(),
+            has_legend=series is not None,
+        )
+    )
 
 
 def _render_tool_step(step: ToolStep, *, key: str) -> None:
@@ -109,7 +289,7 @@ def _render_tool_step(step: ToolStep, *, key: str) -> None:
     if step.error:
         ui.label(f"Error: {step.error}").classes("text-xs").style(f"color:{chrome.WASTE}")
     elif step.rows:
-        _render_rows(step.rows, key=key)
+        _render_rows(step.rows, key=key, chart=step.chart)
     elif step.rows == []:
         ui.label("No rows returned.").classes("text-xs").style(f"color:{chrome.INK_MUTED}")
 
@@ -138,10 +318,18 @@ _PRESETS: dict[str, dict[str, str]] = {
 }
 _DEFAULT_PROVIDER = "OpenAI"
 
-_EXAMPLE_PROMPTS = (
-    "What did I spend last month?",
-    "Which service grew the most month over month?",
-    "How much recoverable spend is there right now?",
+# (headline, detail) — the two are concatenated into the question actually sent,
+# so the detail carries real specificity into the prompt instead of being
+# decorative subtitle text.
+_SUGGESTIONS = (
+    ("Break down last month's spend", "by service, across every connected provider"),
+    ("Find recoverable spend", "idle and underutilized resources right now"),
+    ("Compare month over month", "which service grew the most, and by how much"),
+)
+
+_DISCLAIMER = (
+    "Responses are generated from your published FOCUS spend data and can "
+    "contain errors — verify figures before acting on them."
 )
 
 
@@ -153,12 +341,6 @@ async def render() -> None:
         # or a tab that never opened its websocket) — not a real page load, so
         # there's no client-bound storage (app.storage.tab) left to render into.
         return
-
-    chrome.section_title("Chat")
-    chrome.section_caption(
-        "Ask about your spend using your own LLM API key — sent straight to the "
-        "provider you choose, never stored in plain text by Flashlight."
-    )
 
     def _load_key_for(provider: str) -> str:
         """Same-tab edits (if a keychain write failed) win over the persisted value."""
@@ -241,7 +423,12 @@ async def render() -> None:
                 "flat no-caps color=primary"
             ).mark("chat-settings-done")
 
-    with ui.row().classes("w-full items-center justify-between"):
+    # A compact top bar (model name + actions) instead of a page title/caption
+    # block: this page is a chat surface, so the vertical space goes to the
+    # transcript, the way every chat app spends it.
+    with ui.row().classes("w-full items-center justify-between px-5 py-2 shrink-0").style(
+        f"border-bottom:1px solid {chrome.BORDER};"
+    ):
         status_label = ui.label().classes("text-sm").style(f"color:{chrome.INK_MUTED}")
         with ui.row().classes("items-center gap-1"):
             ui.button(icon="insights", on_click=lambda: ui.navigate.to("/usage")).props(
@@ -269,24 +456,54 @@ async def render() -> None:
     session_id = ui.context.client.tab_id or ui.context.client.id
     turn_counter = 0
 
-    with chrome.panel().style("height:65vh; display:flex; flex-direction:column; padding:0;"):
-        with ui.scroll_area().classes("w-full").style("flex:1; padding:20px;") as scroll_area:
-            with ui.column().classes("w-full max-w-3xl mx-auto gap-3") as message_area:
-                placeholder = ui.column().classes("w-full items-center gap-2").style(
-                    "padding-top:15vh;"
-                )
-                with placeholder:
-                    ui.icon("bolt", size="2rem").style(f"color:{chrome.INK_MUTED}")
-                    ui.label("Ask anything about your spend").classes("text-sm").style(
-                        f"color:{chrome.INK_SECONDARY}"
+    # Two layout modes, one composer. Empty state: everything (heading,
+    # composer, suggestions) sits vertically centered in the page. First
+    # question: the hero is hidden, the transcript takes the height, and the
+    # same composer element is *moved* to the bottom bar — moved rather than
+    # duplicated so there's only ever one input to keep in sync (NiceGUI's
+    # Element.move, verified present in this version).
+    with ui.column().classes("w-full items-stretch gap-0").style("flex:1;min-height:0;"):
+        hero = ui.column().classes("w-full items-center justify-center gap-0 px-4").style(
+            "flex:1;min-height:0;"
+        )
+        with hero:
+            with ui.row().classes("items-center gap-3 pb-6"):
+                ui.icon("bolt", size="2rem").style(f"color:{chrome.ACCENT}")
+                ui.label("What do you want to know about your spend?").classes(
+                    "text-2xl font-medium"
+                ).style(f"color:{chrome.INK_PRIMARY}")
+            composer_slot_hero = ui.column().classes("w-full items-center gap-0")
+            with ui.column().classes("w-full max-w-3xl gap-0 pt-6"):
+                with ui.row().classes("items-center gap-1 pb-1"):
+                    ui.icon("bolt", size="0.9rem").style(f"color:{chrome.INK_MUTED}")
+                    ui.label("Suggested").classes("text-xs font-medium").style(
+                        f"color:{chrome.INK_MUTED}"
                     )
-                    for prompt in _EXAMPLE_PROMPTS:
-                        ui.chip(prompt, on_click=lambda p=prompt: _use_example(p)).props(
-                            "outline"
-                        ).style(f"color:{chrome.INK_SECONDARY};border-color:{chrome.BORDER}")
+                for i, (headline, detail) in enumerate(_SUGGESTIONS):
+                    row = (
+                        ui.column()
+                        .classes("w-full gap-0 py-2 px-2 rounded-lg cursor-pointer")
+                        .mark(f"chat-suggestion-{i}")
+                    )
+                    with row:
+                        ui.label(headline).classes("text-base").style(
+                            f"color:{chrome.INK_PRIMARY}"
+                        )
+                        ui.label(detail).classes("text-xs").style(f"color:{chrome.INK_MUTED}")
+                    row.on(
+                        "click",
+                        lambda h=headline, d=detail: _use_suggestion(f"{h} — {d}"),
+                    )
 
-        def _use_example(prompt: str) -> None:
+        transcript = ui.scroll_area().classes("w-full").style("flex:1;min-height:0;")
+        transcript.set_visibility(False)
+        with transcript:
+            message_area = ui.column().classes("w-full max-w-3xl mx-auto gap-3 px-4 py-6")
+        scroll_area = transcript
+
+        async def _use_suggestion(prompt: str) -> None:
             input_box.value = prompt
+            await send()
 
         def _scroll_down() -> None:
             scroll_area.scroll_to(percent=1.0)
@@ -300,7 +517,13 @@ async def render() -> None:
                 ui.notify("Set a model and API key first", type="warning")
                 settings_dialog.open()
                 return
-            placeholder.set_visibility(False)
+            if hero.visible:
+                # First question of the session: leave the centered empty state
+                # for the transcript layout, taking the composer down with it.
+                hero.set_visibility(False)
+                transcript.set_visibility(True)
+                bottom_bar.set_visibility(True)
+                composer.move(composer_slot_bottom)
             input_box.value = ""
             with message_area:
                 ui.chat_message(question, sent=True)
@@ -330,6 +553,21 @@ async def render() -> None:
                 input_box.props(remove="disable")
             turn_counter += 1
             with message_area, ui.column().classes("w-full gap-2"):
+                if result.reasoning:
+                    # Collapsed by default — it's debugging detail, not the
+                    # answer. Open it and it's the only record of what the model
+                    # was trying to do on a turn that produced no answer at all.
+                    with ui.expansion(
+                        f"Model reasoning ({len(result.reasoning)} step"
+                        f"{'s' if len(result.reasoning) > 1 else ''})",
+                        icon="psychology",
+                    ).classes("w-full").style(f"color:{chrome.INK_MUTED}").mark(
+                        f"chat-reasoning-{turn_counter}"
+                    ):
+                        for trace in result.reasoning:
+                            ui.label(trace).classes("text-xs whitespace-pre-wrap").style(
+                                f"color:{chrome.INK_MUTED}"
+                            )
                 for i, step in enumerate(result.steps):
                     _render_tool_step(step, key=f"chat-step-{turn_counter}-{i}")
                 ui.markdown(result.text, extras=["fenced-code-blocks", "tables"]).style(
@@ -358,15 +596,34 @@ async def render() -> None:
             input_box.value = option
             await send(answering_clarification=True)
 
-        with ui.row().classes("w-full gap-2 items-center pt-3 px-4 pb-4"):
-            input_box = (
-                ui.input(placeholder="Ask about your spend...")
-                .props("outlined dense rounded")
-                .classes("flex-1 text-base")
-                .style("font-size:15px;")
-                .on("keydown.enter", send)
-                .mark("chat-question")
+        # The bottom bar the composer moves into once a conversation starts —
+        # hidden (and empty) while the centered empty state owns the composer.
+        bottom_bar = ui.column().classes("w-full items-center shrink-0 px-4 pb-4 pt-1")
+        bottom_bar.set_visibility(False)
+        with bottom_bar:
+            composer_slot_bottom = ui.column().classes("w-full items-center gap-0")
+            ui.label(_DISCLAIMER).classes("text-xs pt-2 text-center").style(
+                f"color:{chrome.INK_MUTED}"
             )
-            send_button = (
-                ui.button(icon="send", on_click=send).props("round color=primary").mark("chat-send")
+
+        # One soft rounded surface holding the field and send button, built
+        # inside the empty state's slot and later moved to bottom_bar.
+        with composer_slot_hero:
+            composer = ui.row().classes("w-full max-w-3xl gap-2 items-center px-3 py-1").style(
+                f"background:{chrome.SURFACE};border:1px solid {chrome.BORDER};"
+                "border-radius:26px;"
             )
+            with composer:
+                input_box = (
+                    ui.input(placeholder="Ask about your spend...")
+                    .props("borderless dense")
+                    .classes("flex-1 text-base")
+                    .style("font-size:15px;")
+                    .on("keydown.enter", send)
+                    .mark("chat-question")
+                )
+                send_button = (
+                    ui.button(icon="arrow_upward", on_click=send)
+                    .props("round dense color=primary")
+                    .mark("chat-send")
+                )

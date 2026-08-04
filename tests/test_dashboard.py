@@ -350,6 +350,41 @@ def test_chat_page_sends_a_question_and_renders_the_reply(lake_home, monkeypatch
     asyncio.run(_check())
 
 
+def test_chat_page_suggestion_sends_headline_and_detail(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The empty state's suggestions are two-line (headline + detail) but must
+    send a single, fully specific question — the detail carries the real
+    specificity ("by service, across every connected provider"), so dropping it
+    would send a vaguer prompt than the user actually clicked on."""
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.chat_engine import ChatTurnResult
+    from flashlight.dashboard.router import build_pages
+    from flashlight.dashboard.views import chat as chat_view
+
+    asked: list[str] = []
+
+    async def fake_run_turn(messages, question, **kwargs):  # type: ignore[no-untyped-def]
+        asked.append(question)
+        return ChatTurnResult(text="Here you go.", steps=[])
+
+    monkeypatch.setattr(chat_view, "run_turn", fake_run_turn)
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/chat")
+            await user.should_see(marker="chat-model")
+            user.find(marker="chat-model").type("openai/gpt-4o")
+            user.find(marker="chat-api-key").type("sk-test")
+            user.find(marker="chat-suggestion-0").click()
+            await user.should_see("Here you go.")
+
+    asyncio.run(_check())
+
+    headline, detail = chat_view._SUGGESTIONS[0]  # noqa: SLF001
+    assert asked == [f"{headline} — {detail}"]
+
+
 def test_chat_page_renders_clarify_options_as_clickable_chips(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Clicking an option chip sends its text as the next question, rather than
     requiring the user to type a reply to the model's clarifying question."""
@@ -386,6 +421,76 @@ def test_chat_page_renders_clarify_options_as_clickable_chips(lake_home, monkeyp
 
     asyncio.run(_check())
     assert sent_questions == ["what did I spend?", "Last month"]
+
+
+def test_infer_spec_picks_the_finer_label_when_dimensions_are_interchangeable() -> None:
+    """Regression test: "visualize this spend" rendered a table, because
+    query_metric returns *every* dimension of a view (no way to narrow them the
+    way `measures` narrows measures) and the old heuristic demanded exactly one
+    varying dimension column. Both service_category and service_name vary here,
+    which is a perfectly chartable spend breakdown."""
+    import pandas as pd
+
+    from flashlight.dashboard.views.chat import _infer_spec
+
+    rows = [
+        {"service_category": "Other", "service_name": "GENIE", "net_cost": 108.29},
+        {"service_category": "Analytics", "service_name": "JOBS", "net_cost": 11961.19},
+        {"service_category": "Databases", "service_name": "SQL", "net_cost": 5021.24},
+    ]
+    df = pd.DataFrame(rows)
+    # service_category is 1:1 with service_name here, so one is dropped as
+    # uninformative — it must be the coarser label that goes.
+    assert _infer_spec(df, ["service_category", "service_name"]) == ("service_name", None, "bar")
+
+
+def test_infer_spec_prefers_a_temporal_column_for_a_trend() -> None:
+    """A month column must win even when another column is also unique, or a
+    trend question silently becomes a category ranking."""
+    import pandas as pd
+
+    from flashlight.dashboard.views.chat import _infer_spec
+
+    df = pd.DataFrame(
+        [
+            {"note": "a", "charge_month": "2026-05-01", "net_cost": 1.0},
+            {"note": "b", "charge_month": "2026-06-01", "net_cost": 2.0},
+        ]
+    )
+    # note and charge_month are 1:1 here, so one is dropped as uninformative —
+    # dropping the temporal one would make a trend undrawable.
+    assert _infer_spec(df, ["note", "charge_month"]) == ("charge_month", None, "bar")
+
+
+def test_infer_spec_draws_two_dimensions_as_a_stack_not_a_mashed_label() -> None:
+    """Two dimensions with repeats in each is the stacked-bar case. It used to
+    become one composite axis label per row ("JOBS · 2026-06-01"), which at real
+    scale was 39 unreadable bars. A pair that repeats even together has no
+    honest reading at all and must stay a table."""
+    import pandas as pd
+
+    from flashlight.dashboard.views.chat import _infer_spec
+
+    df = pd.DataFrame(
+        [
+            {"service_name": "JOBS", "charge_month": "2026-06-01", "net_cost": 10.0},
+            {"service_name": "JOBS", "charge_month": "2026-07-01", "net_cost": 12.0},
+            {"service_name": "SQL", "charge_month": "2026-06-01", "net_cost": 5.0},
+        ]
+    )
+    assert _infer_spec(df, ["service_name", "charge_month"]) == (
+        "service_name",
+        "charge_month",
+        "stacked_bar",
+    )
+
+    dupes = pd.DataFrame(
+        [
+            {"service_name": "JOBS", "charge_month": "2026-06-01", "net_cost": 10.0},
+            {"service_name": "JOBS", "charge_month": "2026-06-01", "net_cost": 20.0},
+        ]
+    )
+    assert _infer_spec(dupes, ["service_name", "charge_month"]) is None
 
 
 def test_chat_page_renders_a_tool_step_with_query_results(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -684,3 +789,155 @@ def test_policy_page_shows_effective_thresholds(lake_home) -> None:  # type: ign
             await user.should_see("60")
 
     asyncio.run(_check())
+
+
+def test_resolve_chart_honours_a_declared_stacked_bar() -> None:
+    """Regression test: "visualize databricks spend year to date by service"
+    returned service x month rows and the shape-inference mashed both dimensions
+    into one axis, drawing 39 bars labelled "Networking · NETWORKING ·
+    2026-07-01". Shape can't carry intent — the same columns mean x=service_name
+    for that question and x=charge_month for "the monthly trend" — so the model
+    declares it (see ChartSpec)."""
+    import pandas as pd
+
+    from flashlight.dashboard.chat_engine import ChartSpec
+    from flashlight.dashboard.views.chat import _resolve_chart
+
+    df = pd.DataFrame(
+        [
+            {"service_name": s, "charge_month": m, "net_cost": 1.0}
+            for s in ("JOBS", "SQL")
+            for m in ("2026-06-01", "2026-07-01")
+        ]
+    )
+    spec = ChartSpec(kind="stacked_bar", x="service_name", series="charge_month")
+    assert _resolve_chart(df, spec, ["net_cost"]) == ("service_name", "charge_month", "stacked_bar")
+    # Same rows, other intent — the model's declaration is what differs.
+    trend = ChartSpec(kind="stacked_bar", x="charge_month", series="service_name")
+    expected = ("charge_month", "service_name", "stacked_bar")
+    assert _resolve_chart(df, trend, ["net_cost"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("label", "spec_kwargs"),
+    [
+        # The model names columns from the catalog in its prompt, not from the
+        # result, so it can name one this query didn't return.
+        ("unknown x", {"x": "nope"}),
+        ("unknown series", {"x": "service_name", "series": "nope"}),
+        # x alone repeats (one row per service *per month*): drawing it would put
+        # several segments on one tick, reading as though one were the total.
+        ("x is not unique", {"x": "service_name"}),
+    ],
+)
+def test_resolve_chart_rejects_what_it_cannot_honour(label: str, spec_kwargs: dict) -> None:  # type: ignore[type-arg]
+    import pandas as pd
+
+    from flashlight.dashboard.chat_engine import ChartSpec
+    from flashlight.dashboard.views.chat import _resolve_chart
+
+    df = pd.DataFrame(
+        [
+            {"service_name": s, "charge_month": m, "net_cost": 1.0}
+            for s in ("JOBS", "SQL")
+            for m in ("2026-06-01", "2026-07-01")
+        ]
+    )
+    assert _resolve_chart(df, ChartSpec(**spec_kwargs), ["net_cost"]) is None, label
+
+
+def test_cap_series_folds_the_tail_into_other_without_losing_total() -> None:
+    """More series than palette slots is unreadable whatever the colours, but
+    nothing may be dropped — the folded bucket must still carry its spend."""
+    import pandas as pd
+
+    from flashlight.dashboard.views.chat import _MAX_SERIES, _cap_series
+
+    df = pd.DataFrame(
+        [{"service_name": f"svc{i}", "net_cost": float(i)} for i in range(_MAX_SERIES + 5)]
+    )
+    capped = _cap_series(df, "service_name", "net_cost")
+    assert capped["service_name"].nunique() == _MAX_SERIES
+    assert "Other" in set(capped["service_name"])
+    assert capped["net_cost"].sum() == df["net_cost"].sum()
+
+
+def test_infer_spec_falls_back_to_a_stacked_bar_for_service_by_month() -> None:
+    """The deterministic floor under the declaration, and the case that produced
+    the bug: a live gpt-oss-20b declared a chart for "show me the monthly trend"
+    but *not* for "visualize databricks spend year to date by service". With no
+    declaration the shape must still read as service x month, not as 39 bars
+    labelled "Networking · NETWORKING · 2026-07-01".
+
+    service_category is dropped as uninformative: it varies, but every service
+    has exactly one category, so it splits nothing and would otherwise count as
+    a third dimension and force a table.
+    """
+    import pandas as pd
+
+    from flashlight.dashboard.views.chat import _infer_spec, _informative_dims
+
+    df = pd.DataFrame(
+        [
+            {"provider_name": "Databricks", "service_category": c, "service_name": s,
+             "charge_month": m, "net_cost": 1.0}
+            for c, s in (("Analytics", "JOBS"), ("Databases", "SQL"), ("Other", "APPS"))
+            for m in ("2026-05-01", "2026-06-01", "2026-07-01")
+        ]
+    )
+    varying = [c for c in df.columns if c != "net_cost" and df[c].nunique() > 1]
+    assert _informative_dims(df, varying) == ["service_name", "charge_month"]
+    # Wider dimension on x so the stack stays palette-sized: services split by
+    # months, not months split by services.
+    assert _infer_spec(df, varying) == ("service_name", "charge_month", "stacked_bar")
+
+
+def test_infer_spec_stays_a_table_when_there_is_no_honest_two_dimension_reading() -> None:
+    """Three genuinely independent dimensions can't be drawn in 2-D without
+    hiding one, so it stays a table rather than pretending."""
+    import pandas as pd
+
+    from flashlight.dashboard.views.chat import _infer_spec
+
+    df = pd.DataFrame(
+        [{"a": a, "b": b, "c": c, "v": 1.0} for a in "xy" for b in "pq" for c in "12"]
+    )
+    assert _infer_spec(df, ["a", "b", "c"]) is None
+
+
+def test_plot_stacks_a_bar_with_a_series_however_the_kind_was_declared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live model declared kind="bar" with series="charge_month" for a
+    year-to-date breakdown; grouping that put 8 months x 13 services side by side
+    as ~104 thin bars. Spend is additive, so with a series present the stack —
+    whose total is the number the question was about — is always the right read.
+    """
+    import pandas as pd
+    import plotly.express as px
+
+    from flashlight.dashboard import chrome
+    from flashlight.dashboard.views import chat as chat_view
+
+    captured: list[dict[str, object]] = []
+    real_bar = px.bar
+
+    def spy_bar(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        captured.append(kwargs)
+        return real_bar(*args, **kwargs)
+
+    # monkeypatch (not bare assignment) so both globals are restored even if this
+    # test fails — chrome.plot is shared module state that every chart test uses.
+    monkeypatch.setattr(px, "bar", spy_bar)
+    monkeypatch.setattr(chrome, "plot", lambda fig, **kwargs: None)
+
+    df = pd.DataFrame(
+        [
+            {"service_name": s, "charge_month": m, "net_cost": 1.0}
+            for s in ("JOBS", "SQL")
+            for m in ("2026-06-01", "2026-07-01")
+        ]
+    )
+    chat_view._plot(df, ("service_name", "charge_month", "bar"), "net_cost")  # noqa: SLF001
+    assert captured
+    assert captured[0]["barmode"] == "stack"

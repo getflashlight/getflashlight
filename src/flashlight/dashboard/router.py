@@ -131,12 +131,9 @@ def shell(active_path: str, *, full_height: bool = False) -> ui.column:
                 )
 
     if full_height:
-        # min-height:0 matters: without it this flex child refuses to shrink below
-        # its content, so the transcript's own scroll area never gets a bounded
-        # height and the page scrolls instead of the message list.
-        return ui.column().classes("w-full p-0 gap-0").style(
-            "height:calc(100vh - var(--fl-header-h));min-height:0;"
-        )
+        # flex:1 against the flex-column .q-page set up in HEAD_CSS — takes
+        # whatever height is left under the real header without naming it here.
+        return ui.column().classes("w-full p-0 gap-0").style("flex:1;min-height:0;")
     return ui.column().classes("w-full max-w-6xl mx-auto p-6 gap-8")
 
 

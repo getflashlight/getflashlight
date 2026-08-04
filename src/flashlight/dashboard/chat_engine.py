@@ -33,13 +33,15 @@ import asyncio
 import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, cast
 
 import httpx
 from mcp.types import CallToolResult
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart
@@ -53,11 +55,14 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import RunUsage
 from pydantic_graph import BaseNode, End, Graph, GraphBuilder, GraphRunContext
 
+from flashlight.core.logging import get_logger
 from flashlight.dashboard.data import provider_label
 from flashlight.gold.reader import distinct_values
 from flashlight.lake.chat_turns import record_chat_turn
 from flashlight.mcp.server import mcp
 from flashlight.transform.catalog import current_catalog, discover_provider_groups
+
+logger = get_logger(__name__)
 
 # ponytail: a plan round makes zero native tool calls, so a healthy model
 # finishes in exactly 1 model request — this is headroom for pydantic-ai's own
@@ -69,6 +74,14 @@ from flashlight.transform.catalog import current_catalog, discover_provider_grou
 # *empty* rounds for free (they never reach pydantic-ai), but a malformed
 # tool-call payload is a real request and does count here.
 _OUTPUT_REQUEST_LIMIT = 8
+
+# How many times a node re-asks after its structured output fails validation.
+# pydantic-ai's default is 1, which a live Databricks gpt-oss-20b blew through
+# on 3 of 4 identical runs ("Exceeded maximum output retries (1)") — one
+# malformed plan and the whole turn died. _normalize_step now absorbs the
+# specific malformation that caused those, so this is headroom for the next
+# unknown one rather than the primary fix.
+_OUTPUT_RETRIES = 3
 
 # ponytail: ceilings against a runaway plan, not floors — raise if a real
 # workflow needs a bigger single-turn plan or more filter-value lookups.
@@ -160,6 +173,9 @@ class ToolStep:
     arguments: dict[str, Any]
     rows: list[dict[str, Any]] | None = None  # only query_metric/run_sql populate this
     error: str | None = None
+    # How the model asked for these rows to be drawn, if it did (see ChartSpec).
+    # Validated against the real columns by the view before it's used.
+    chart: ChartSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +183,10 @@ class ChatTurnResult:
     text: str
     steps: list[ToolStep] = field(default_factory=list)
     options: list[str] = field(default_factory=list)  # from a ClarifyingQuestion, if asked
+    # The model's own reasoning traces for this turn, when the provider sent any
+    # (see _split_content_parts). Surfaced collapsed in the UI — mainly so a
+    # turn that produced no answer still shows what the model was trying to do.
+    reasoning: list[str] = field(default_factory=list)
 
 
 class ClarifyingQuestion(BaseModel):
@@ -193,9 +213,47 @@ class ClarifyingQuestion(BaseModel):
 # A test guards each step's field set against the real tool signature.
 
 
+class ChartSpec(BaseModel):
+    """How to draw a step's rows, declared by the model rather than guessed from
+    the returned shape.
+
+    The shape alone can't carry intent: "spend year to date by service" and
+    "the monthly trend" return the exact same columns (service_name,
+    charge_month, net_cost) but want service on x and month on x respectively.
+    Inferring from rows produced a 39-bar chart labelled
+    "Networking · NETWORKING · 2026-07-01" for the first — not a wrong palette,
+    a wrong question answered. The model already knows both the intent and the
+    view's columns (the catalog is in its prompt), so it says so here; it rides
+    on the plan it was emitting anyway, costing no extra model call.
+
+    Validated against the columns actually returned before use, with the
+    row-shape inference as the fallback — so a wrong or absent chart degrades to
+    today's behaviour instead of breaking the answer.
+    """
+
+    kind: Literal["bar", "line", "stacked_bar"] = Field(
+        default="bar",
+        description="'line' for a trend over time; 'stacked_bar' when a second "
+        "dimension breaks each bar down (spend per service split by month); "
+        "'bar' for a plain ranking.",
+    )
+    x: str = Field(description="The dimension column to put on the x axis.")
+    series: str | None = Field(
+        default=None,
+        description="A second dimension to split each x value by (the stack or "
+        "line colour). Leave null when the result has only one dimension.",
+    )
+
+
 class QueryMetricStep(BaseModel):
     tool: Literal["query_metric"] = "query_metric"
     name: str = Field(description="Provider-scoped view name, e.g. 'aws.monthly_bill'.")
+    chart: ChartSpec | None = Field(
+        default=None,
+        description="How to visualise these rows. Set it whenever the user asks "
+        "to see, chart, graph, plot or visualise something, or asks for a trend "
+        "or breakdown; leave null when the answer is prose or a single number.",
+    )
     limit: int = 200
     order_by: str | list[str] | None = None
     descending: bool = False
@@ -262,6 +320,56 @@ PLAN_STEP_MODELS: tuple[type[BaseModel], ...] = (
 )
 
 
+_PLAN_TOOL_NAMES = frozenset(
+    str(m.model_fields["tool"].default) for m in PLAN_STEP_MODELS  # noqa: SLF001 - our own models
+)
+# Keys a model plausibly nests a step's arguments under instead of inlining them.
+_ARG_WRAPPER_KEYS = ("args", "arguments", "parameters", "params", "input")
+
+
+def _normalize_step(raw: Any) -> Any:
+    """Coerce the shapes models *actually* emit for a plan step into the flat,
+    ``tool``-discriminated shape PlanStep declares.
+
+    Confirmed against a live Databricks gpt-oss-20b, which failed 3 of 4
+    identical runs with `Unable to extract tag using discriminator 'tool'` /
+    `steps.0.query_metric.name Field required` because it nests the arguments
+    under the tool's own name rather than inlining them next to a ``tool`` tag::
+
+        {"query_metric": {"name": "aws.spend_by_service_month", ...}}
+        {"tool": "query_metric", "query_metric": {"name": ..., ...}}
+        {"tool": "query_metric", "args": {"name": ..., ...}}
+
+    All three mean the same call, so accepting them is strictly better than
+    burning a retry and then failing the turn. Deliberately Postel's law: the
+    internal type stays strict (a real discriminated union, exhaustively matched
+    in _execute_step) while parsing is liberal about how it arrived. Anything
+    unrecognized is passed straight through so pydantic still raises its own
+    clear validation error rather than this silently inventing a step."""
+    if not isinstance(raw, dict):
+        return raw
+    step: dict[str, Any] = dict(raw)
+    tool = step.get("tool")
+    if not isinstance(tool, str) or tool not in _PLAN_TOOL_NAMES:
+        # No usable tag: adopt the single tool-named key as the tag, e.g.
+        # {"query_metric": {...}} -> {"tool": "query_metric", ...}.
+        named = [k for k in step if k in _PLAN_TOOL_NAMES]
+        if len(named) != 1:
+            return raw
+        tool = named[0]
+        step["tool"] = tool
+    # Tag present (now or already) — hoist arguments out of any nested wrapper,
+    # whether keyed by the tool's own name or a generic "args"-style key.
+    for wrapper in (tool, *_ARG_WRAPPER_KEYS):
+        nested = step.get(wrapper)
+        if isinstance(nested, dict):
+            step.pop(wrapper)
+            # Explicit outer fields win over the nested copy: if the model wrote
+            # both, the flat one is the one it committed to last.
+            step = {**nested, **step}
+    return step
+
+
 class Plan(BaseModel):
     """A committed, deduped-before-execution set of read-only tool calls — the
     model commits to this once, in one structured-output round, instead of
@@ -270,6 +378,11 @@ class Plan(BaseModel):
     (independent) reads concurrently."""
 
     steps: list[PlanStep] = Field(default_factory=list, max_length=MAX_PLAN_STEPS)
+
+    @field_validator("steps", mode="before")
+    @classmethod
+    def _accept_nested_steps(cls, value: Any) -> Any:
+        return [_normalize_step(s) for s in value] if isinstance(value, list) else value
 
 
 class ExploreRequest(BaseModel):
@@ -282,6 +395,11 @@ class ExploreRequest(BaseModel):
     a second, must-commit PlanNode call."""
 
     lookups: list[ListDimensionValuesStep] = Field(min_length=1, max_length=MAX_EXPLORE_LOOKUPS)
+
+    @field_validator("lookups", mode="before")
+    @classmethod
+    def _accept_nested_lookups(cls, value: Any) -> Any:
+        return [_normalize_step(s) for s in value] if isinstance(value, list) else value
 
 
 _ROUND_LIMIT_MESSAGE = (
@@ -299,23 +417,50 @@ EMPTY_ROUND_RETRY_LIMIT = 3
 
 _HARMONY_MARKER = re.compile(r"<\|.*$", re.DOTALL)
 
+# The model's own reasoning for the current turn, collected off the wire by
+# _QuirkTransport (see _split_content_parts) and drained by run_turn.
+# A ContextVar rather than a parameter because _build_model — the one seam a
+# turn has into transport construction — is called per graph node with no
+# access to ChatState, and a ContextVar is per-task, so concurrent turns from
+# different browser tabs can't cross-contaminate.
+_reasoning_sink: ContextVar[list[str] | None] = ContextVar("_reasoning_sink", default=None)
 
-def _flatten_content_parts(content: object) -> str | None:
-    """Normalize an OpenAI-compatible message's `content` into a plain string.
+# HTTP clients built during the current turn, closed by run_turn when it ends
+# (see _build_model). Same per-task ContextVar reasoning as _reasoning_sink.
+_http_clients: ContextVar[list[httpx.AsyncClient] | None] = ContextVar(
+    "_http_clients", default=None
+)
+
+
+def _record_reasoning(text: str) -> None:
+    sink = _reasoning_sink.get()
+    if sink is not None and text.strip():
+        sink.append(text.strip())
+
+
+def _split_content_parts(content: object) -> tuple[str, str] | None:
+    """Split an OpenAI-compatible message's `content` into (answer text, reasoning).
+
     Confirmed against a live Databricks gpt-oss response: `content` can arrive
     as a list of typed parts (e.g. `[{"type": "reasoning", "text": "..."}]`)
     instead of a plain string — pydantic-ai's OpenAI-compatible parser expects
     `content: str | None` per the real OpenAI wire contract, and choked on the
     list with a Pydantic serializer warning, silently treating the round as
     unusable and burning a retry on it instead of surfacing a clean error.
-    A reasoning-only part list also isn't a real answer anyway — only
-    "text"-typed parts count. Returns None (leave alone) if content wasn't a
-    list to begin with."""
+
+    Only "text" parts are a real answer, but the reasoning parts are the single
+    most useful thing to have when a turn fails: on a reasoning-only round (the
+    exact shape behind "didn't get a final answer within this turn's round
+    limit") the model's actual intent survives *nowhere else*. They used to be
+    dropped on the floor, which is what made that failure impossible to debug —
+    now they're returned so the caller can keep them. Returns None (leave
+    alone) if content wasn't a list to begin with."""
     if not isinstance(content, list):
         return None
-    return "".join(
-        p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
-    )
+    parts = [p for p in content if isinstance(p, dict)]
+    answer = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+    reasoning = "\n".join(p.get("text", "") for p in parts if p.get("type") != "text")
+    return answer, reasoning
 
 
 class _QuirkTransport(httpx.AsyncBaseTransport):
@@ -359,9 +504,16 @@ class _QuirkTransport(httpx.AsyncBaseTransport):
                 message = body["choices"][0]["message"]
             except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                 return response  # not a shape we know how to inspect — pass through as-is
-            flattened = _flatten_content_parts(message.get("content"))
-            if flattened is not None:
-                message["content"] = flattened
+            split = _split_content_parts(message.get("content"))
+            if split is not None:
+                message["content"], reasoning = split
+                _record_reasoning(reasoning)
+            # Some OpenAI-compatible servers (Databricks among them) put the
+            # thinking in a sibling `reasoning_content` field instead of a typed
+            # content part — same information, different shape, equally worth
+            # keeping when a turn goes wrong.
+            if isinstance(message.get("reasoning_content"), str):
+                _record_reasoning(message["reasoning_content"])
             is_empty = not message.get("content") and not message.get("tool_calls")
             if is_empty and attempt < EMPTY_ROUND_RETRY_LIMIT:
                 continue
@@ -410,13 +562,18 @@ def _build_model(provider: str, model: str, api_key: str, base_url: str | None) 
         return AnthropicModel(model, provider=AnthropicProvider(api_key=api_key, base_url=base_url))
     if provider == "google":
         return GoogleModel(model, provider=GoogleProvider(api_key=api_key, base_url=base_url))
+    client = httpx.AsyncClient(transport=_QuirkTransport())
+    # Registered so run_turn can close it when the turn ends — an AsyncClient
+    # holds a keep-alive connection pool open, and one per turn adds up over a
+    # long-lived dashboard process. Tracked out-of-band rather than returned
+    # because _build_model is the seam tests monkeypatch, so its signature
+    # stays "provider config in, Model out".
+    clients = _http_clients.get()
+    if clients is not None:
+        clients.append(client)
     return OpenAIChatModel(
         model,
-        provider=OpenAIProvider(
-            api_key=api_key,
-            base_url=base_url,
-            http_client=httpx.AsyncClient(transport=_QuirkTransport()),
-        ),
+        provider=OpenAIProvider(api_key=api_key, base_url=base_url, http_client=client),
     )
 
 
@@ -444,20 +601,43 @@ async def _call_mcp_tool(name: str, kwargs: dict[str, Any]) -> Any:
 
 
 def _agent_model(state: ChatState) -> Model:
-    return _build_model(state.provider, state.model, state.api_key, state.base_url)
+    """One Model per turn, shared by every node.
+
+    Each node used to build its own, which meant a fresh httpx.AsyncClient and
+    so a fresh TLS+TCP handshake to the provider for Plan, for any re-plan, and
+    again for Synthesize — 2-3 handshakes to answer one question, when they all
+    talk to the same endpoint with the same credentials. Reusing one client lets
+    the connection stay keep-alive across the whole turn."""
+    if state.agent_model is None:
+        state.agent_model = _build_model(state.provider, state.model, state.api_key, state.base_url)
+    return state.agent_model
+
+
+def _step_args(step: PlanStep) -> dict[str, Any]:
+    """The step's real MCP arguments — everything except the discriminator and
+    ``chart``, which is presentation the model attaches for the UI and not a
+    parameter any tool accepts. Also what the dedup key is built from, so two
+    otherwise-identical queries don't both run just because one asked to be
+    drawn differently."""
+    return step.model_dump(exclude={"tool", "chart"})
 
 
 async def _execute_step(step: PlanStep) -> Any:
-    return await _call_mcp_tool(step.tool, step.model_dump(exclude={"tool"}))
+    return await _call_mcp_tool(step.tool, _step_args(step))
 
 
 def _step_to_tool_step(step: PlanStep, result: Any) -> ToolStep:
-    args = step.model_dump(exclude={"tool"})
+    args = _step_args(step)
+    chart = getattr(step, "chart", None)
     if isinstance(result, dict):
         return ToolStep(
-            name=step.tool, arguments=args, rows=result.get("rows"), error=result.get("error")
+            name=step.tool,
+            arguments=args,
+            rows=result.get("rows"),
+            error=result.get("error"),
+            chart=chart,
         )
-    return ToolStep(name=step.tool, arguments=args)
+    return ToolStep(name=step.tool, arguments=args, chart=chart)
 
 
 _tool_schemas_cache: list[tuple[str, str, dict[str, Any]]] | None = None
@@ -536,7 +716,11 @@ _PLAN_INSTRUCTIONS = (
     "already answered earlier in this conversation).\n\n"
     "Metric names are provider-scoped (e.g. \"aws.monthly_bill\", "
     "\"databricks.monthly_bill\") — there is no single metric with every "
-    "provider's spend already combined. The \"shared\" group is Databricks TCO "
+    "provider's spend already combined. Because each view is already scoped to "
+    "one provider, never filter it by provider_name: every row is that provider "
+    "already, and a guessed value simply matches nothing — filters are exact and "
+    "case-sensitive, so \"databricks\" finds none of the \"Databricks\" rows. "
+    "The \"shared\" group is Databricks TCO "
     "only (DBU vs. attributed AWS infra), not a general cross-provider total. "
     "For \"across all providers\"/\"total\" spend, or a computed comparison "
     "(month-over-month growth, which grew the most), plan one query_metric "
@@ -547,11 +731,18 @@ _PLAN_INSTRUCTIONS = (
     "plausible-looking result that's silently wrong. Only plan a run_sql step "
     "when query_metric genuinely can't express the question (e.g. no view has "
     "the dimension you need), and keep it as simple as possible.\n\n"
-    "When the user asks for a chart, graph, or trend, plan a query_metric step "
-    "with measures=[the one relevant measure] (e.g. [\"net_cost\"]) so the "
-    "result is one dimension + one measure — a chart renders automatically "
-    "from that shape. Leaving measures unset returns every measure on the view "
-    "(net/gross/credit/list/savings/...), which is too wide to chart."
+    "When the user asks to see, chart, graph, plot or visualise something, or "
+    "asks for a trend or a breakdown, set two things on the query_metric step: "
+    "measures=[the one relevant measure] (e.g. [\"net_cost\"] — leaving it unset "
+    "returns every measure on the view, which is too wide to chart), and "
+    "chart={...} saying how to draw it. You choose the axis, because only you "
+    "know which breakdown was asked for: \"spend by service\" means "
+    "x=service_name, while \"the monthly trend\" means x=charge_month, even "
+    "though both queries return the same columns. If a second dimension varies "
+    "in the rows (e.g. you asked for several months of per-service spend), name "
+    "it as series so each bar is split by it, rather than leaving the two "
+    "dimensions to collide on one axis. Only the dimensions of the view you "
+    "query are available as x/series."
 )
 
 _EXPLORE_INSTRUCTIONS = (
@@ -590,12 +781,23 @@ _SYNTHESIZE_INSTRUCTIONS = (
 )
 
 
+_EMPTY_PLAN_RETRY_INSTRUCTIONS = (
+    "Your previous answer planned no steps at all. You have no spend data unless "
+    "you plan for it: if this question is about cost, spend, usage or waste in "
+    "any form, plan at least one query_metric step against a view listed above — "
+    "do not reply that you lack the data. Leave steps empty only if the message "
+    "genuinely needs none (a greeting, or thanks)."
+)
+
+
 def _plan_instructions(
     *,
     allow_explore: bool,
     allow_clarify: bool,
     explored: dict[str, tuple[ListDimensionValuesStep, Any]],
     tool_catalog: str,
+    empty_plan_retry: bool = False,
+    data_failures: list[str] | None = None,
 ) -> str:
     sections = [
         _PLAN_INSTRUCTIONS,
@@ -617,7 +819,50 @@ def _plan_instructions(
         sections.append(_MUST_COMMIT_INSTRUCTIONS)
     if not allow_clarify:
         sections.append(_ANSWERED_CLARIFICATION_INSTRUCTIONS)
+    if empty_plan_retry:
+        sections.append(_EMPTY_PLAN_RETRY_INSTRUCTIONS)
+    if data_failures:
+        sections.append(
+            "Your previous plan produced no usable data. Fix the cause and plan "
+            "again — do not tell the user the data is missing:\n"
+            + "\n".join(f"- {f}" for f in data_failures)
+        )
     return "\n\n".join(s for s in sections if s)
+
+
+def _step_failure(step: ToolStep) -> str | None:
+    """A one-line, *actionable* description of why a step yielded nothing, or
+    None if it produced data (so a caller can tell "all steps failed" from
+    "some worked").
+
+    For an empty filtered query this looks up what the filtered dimensions
+    really contain, because "no rows" alone is undiagnosable: a live model sent
+    ``provider_name: "databricks"`` against data that says ``"Databricks"`` and
+    concluded the data didn't exist. Values are matched exactly, so naming the
+    real ones is the difference between a recoverable miss and a dead end.
+    """
+    if step.error:
+        return f"{step.name}({step.arguments}) failed: {step.error}"
+    if step.rows is None or step.rows:
+        return None
+    detail = f"{step.name}({step.arguments}) returned no rows"
+    view = step.arguments.get("name")
+    filters = step.arguments.get("filters")
+    if not isinstance(view, str) or not isinstance(filters, dict):
+        return detail
+    hints = []
+    for column in filters:
+        try:
+            values = distinct_values(view, str(column), limit=25)
+        except Exception:  # noqa: BLE001 - a measure or unknown column: no hint to give
+            continue
+        if values:
+            hints.append(f"{column} actually contains {[str(v) for v in values]}")
+    if hints:
+        detail += (
+            f" — filter values are matched exactly and are case-sensitive; {'; '.join(hints)}"
+        )
+    return detail
 
 
 def _describe_step(step: ToolStep) -> str:
@@ -641,6 +886,10 @@ class ChatState:
     model: str
     base_url: str | None
     allow_clarify: bool = True
+    agent_model: Model | None = None  # built once per turn, see _agent_model
+    empty_plan_retried: bool = False
+    data_retried: bool = False  # one re-plan after every step came back empty/errored
+    data_failures: list[str] = field(default_factory=list)
     pending_lookups: list[ListDimensionValuesStep] | None = None
     explored: dict[str, tuple[ListDimensionValuesStep, Any]] = field(default_factory=dict)
     plan: Plan | None = None
@@ -672,13 +921,20 @@ class PlanNode(BaseNode[ChatState, None, ChatTurnResult]):
             allow_clarify=ctx.state.allow_clarify,
             explored=ctx.state.explored,
             tool_catalog=tool_catalog,
+            empty_plan_retry=ctx.state.empty_plan_retried,
+            data_failures=ctx.state.data_failures,
         )
         output_types: list[type[BaseModel]] = [Plan]
         if self.allow_explore:
             output_types.insert(0, ExploreRequest)
         if ctx.state.allow_clarify:
             output_types.insert(0, ClarifyingQuestion)
-        agent = Agent(_agent_model(ctx.state), instructions=instructions, output_type=output_types)
+        agent = Agent(
+            _agent_model(ctx.state),
+            instructions=instructions,
+            output_type=output_types,
+            retries={"output": _OUTPUT_RETRIES},
+        )
         result = await agent.run(
             ctx.state.question,
             message_history=ctx.state.history,
@@ -692,6 +948,17 @@ class PlanNode(BaseNode[ChatState, None, ChatTurnResult]):
                 ctx.state.pending_lookups = request.lookups
                 return ExploreNode()
             case Plan() as plan:
+                if not plan.steps and not ctx.state.empty_plan_retried:
+                    # An empty plan is legitimate for a greeting or a followup
+                    # already answered, but a live gpt-oss-20b also returned one
+                    # for "break down last month's spend" and then honestly
+                    # reported "I don't have any data" — a useless answer from a
+                    # perfectly answerable question. One bounded re-ask (the flag
+                    # makes it exactly one, so a real greeting still settles) is
+                    # cheaper than shipping that non-answer.
+                    logger.info("chat_plan_empty_retry", model=ctx.state.model)
+                    ctx.state.empty_plan_retried = True
+                    return PlanNode(allow_explore=False)
                 ctx.state.plan = plan
                 return ExecuteNode()
             case _:
@@ -711,7 +978,7 @@ class ExploreNode(BaseNode[ChatState, None, ChatTurnResult]):
         assert ctx.state.pending_lookups is not None
         by_key: dict[str, ListDimensionValuesStep] = {}
         for lookup in ctx.state.pending_lookups:
-            by_key.setdefault(_dedup_key(lookup.tool, lookup.model_dump(exclude={"tool"})), lookup)
+            by_key.setdefault(_dedup_key(lookup.tool, _step_args(lookup)), lookup)
         keys = list(by_key)
         outcomes = await asyncio.gather(*(_execute_step(by_key[key]) for key in keys))
         ctx.state.explored = {
@@ -729,7 +996,7 @@ class ExecuteNode(BaseNode[ChatState, None, ChatTurnResult]):
     reaches DuckDB twice, dedeuped in code before execution rather than
     reactively after a duplicate call already happened."""
 
-    async def run(self, ctx: GraphRunContext[ChatState, None]) -> SynthesizeNode:
+    async def run(self, ctx: GraphRunContext[ChatState, None]) -> SynthesizeNode | PlanNode:
         assert ctx.state.plan is not None
         by_key: dict[str, PlanStep] = {}
         results: dict[str, Any] = {}
@@ -737,7 +1004,7 @@ class ExecuteNode(BaseNode[ChatState, None, ChatTurnResult]):
             by_key[key] = lookup
             results[key] = outcome
         for step in ctx.state.plan.steps:
-            by_key.setdefault(_dedup_key(step.tool, step.model_dump(exclude={"tool"})), step)
+            by_key.setdefault(_dedup_key(step.tool, _step_args(step)), step)
 
         to_run = [key for key in by_key if key not in results]
         if to_run:
@@ -745,6 +1012,22 @@ class ExecuteNode(BaseNode[ChatState, None, ChatTurnResult]):
             results.update(zip(to_run, outcomes, strict=True))
 
         ctx.state.steps = [_step_to_tool_step(by_key[key], results[key]) for key in by_key]
+        if ctx.state.plan.steps and not ctx.state.data_retried:
+            failures = [_step_failure(step) for step in ctx.state.steps]
+            if all(failures) and any(failures):
+                # Every step came back empty or errored, so there is nothing to
+                # answer from — and the model can't see why. Confirmed live twice:
+                # `order_by="net_cost DESC"` errored and it replied "please retry
+                # without the order_by clause", and a `provider_name: "databricks"`
+                # filter (wrong case — the data says "Databricks" — and redundant
+                # on an already-provider-scoped view) returned zero rows and it
+                # replied "no records were returned, I'm unable to visualize".
+                # Both are recoverable, so hand the failures back for exactly one
+                # more plan rather than reporting a dead end.
+                ctx.state.data_retried = True
+                ctx.state.data_failures = [f for f in failures if f]
+                logger.info("chat_data_empty_retry", model=ctx.state.model, steps=len(failures))
+                return PlanNode(allow_explore=False)
         return SynthesizeNode()
 
 
@@ -832,6 +1115,10 @@ async def run_turn(
         base_url=base_url,
         allow_clarify=not answering_clarification,
     )
+    reasoning: list[str] = []
+    _reasoning_sink.set(reasoning)
+    http_clients: list[httpx.AsyncClient] = []
+    _http_clients.set(http_clients)
 
     def _log(result: ChatTurnResult) -> ChatTurnResult:
         record_chat_turn(
@@ -847,21 +1134,60 @@ async def run_turn(
         return result
 
     try:
+        return await _run_graph(state, messages, question, api_key, reasoning, _log)
+    finally:
+        for client in http_clients:
+            await client.aclose()
+
+
+async def _run_graph(
+    state: ChatState,
+    messages: list[ModelMessage],
+    question: str,
+    api_key: str,
+    reasoning: list[str],
+    _log: Callable[[ChatTurnResult], ChatTurnResult],
+) -> ChatTurnResult:
+    """The turn itself, split out so run_turn's ``finally`` can close the HTTP
+    clients the turn built regardless of how it ended."""
+    model = state.model
+    try:
         # cast: _graph is left unparameterized (see _build_graph) so mypy can't
         # resolve .run()'s OutputT on its own — GraphBuilder(output_type=ChatTurnResult)
         # already pins this at runtime.
         result = cast(ChatTurnResult, await _graph.run(inputs=PlanNode(), state=state))
-    except (UsageLimitExceeded, UnexpectedModelBehavior):
+    except (UsageLimitExceeded, UnexpectedModelBehavior) as exc:
         # ponytail: two distinct pydantic-ai exceptions both mean "didn't get
         # a real structured output within budget" — UsageLimitExceeded is
         # _OUTPUT_REQUEST_LIMIT exhausted; a model stuck returning
         # invalid/empty output (e.g. every _QuirkTransport retry still empty)
         # hits pydantic-ai's own output-retry budget first and raises
-        # UnexpectedModelBehavior instead. Same user-facing story either way.
-        return _log(ChatTurnResult(text=_ROUND_LIMIT_MESSAGE))
+        # UnexpectedModelBehavior instead. Same user-facing story either way,
+        # but log which one and why: this message used to be a dead end, with
+        # the actual cause (and the model's own reasoning) thrown away, making
+        # a real, reproducible failure impossible to diagnose from the UI.
+        logger.warning(
+            "chat_turn_no_final_answer",
+            model=model,
+            error_type=type(exc).__name__,
+            error=_redact(_root_cause(exc), api_key),
+            reasoning_traces=len(reasoning),
+        )
+        return _log(
+            ChatTurnResult(
+                text=f"{_ROUND_LIMIT_MESSAGE}\n\n_{type(exc).__name__}: "
+                f"{_redact(str(exc), api_key)}_",
+                reasoning=reasoning,
+            )
+        )
     except Exception as exc:  # noqa: BLE001 - bad key/base_url/network: expected, not exceptional
-        return _log(ChatTurnResult(text=f"Request failed: {_redact(_root_cause(exc), api_key)}"))
+        logger.warning("chat_turn_request_failed", model=model, error=type(exc).__name__)
+        return _log(
+            ChatTurnResult(
+                text=f"Request failed: {_redact(_root_cause(exc), api_key)}", reasoning=reasoning
+            )
+        )
 
     messages.append(ModelRequest.user_text_prompt(question))
     messages.append(ModelResponse(parts=[TextPart(result.text)]))
-    return _log(result)
+    return _log(replace(result, reasoning=reasoning))

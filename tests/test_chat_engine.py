@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 from openai import AsyncOpenAI
+from pydantic import ValidationError
 from pydantic_ai.messages import ModelResponse, SystemPromptPart, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -274,6 +275,105 @@ def test_mcp_tools_exclude_list_metrics_but_cover_the_rest() -> None:
     assert all(description for _name, description, _schema in schemas)
 
 
+@pytest.mark.parametrize(
+    ("label", "raw"),
+    [
+        # The two shapes a live Databricks gpt-oss-20b actually produced, which
+        # failed 3 of 4 identical runs before _normalize_step existed.
+        ("nested under tool name", {"query_metric": {"name": "aws.monthly_bill"}}),
+        ("tag plus nested", {"tool": "query_metric", "query_metric": {"name": "aws.monthly_bill"}}),
+        # Same instinct, generic wrapper keys.
+        ("tag plus args", {"tool": "query_metric", "args": {"name": "aws.monthly_bill"}}),
+        (
+            "tag plus parameters",
+            {"tool": "query_metric", "parameters": {"name": "aws.monthly_bill"}},
+        ),
+        # Already correct — must pass through untouched.
+        ("already flat", {"tool": "query_metric", "name": "aws.monthly_bill"}),
+    ],
+)
+def test_plan_accepts_the_step_shapes_models_actually_emit(label: str, raw: dict) -> None:  # type: ignore[type-arg]
+    """Regression test: gpt-oss-20b nests a step's arguments under the tool's own
+    name instead of inlining them beside a `tool` tag, which failed Plan's
+    discriminated union outright ("Unable to extract tag using discriminator
+    'tool'") and killed the turn. All of these mean the same call, so parsing is
+    liberal while the internal type stays a strict union."""
+    step = chat_engine.Plan(steps=[raw]).steps[0]
+    assert step.tool == "query_metric"
+    assert isinstance(step, chat_engine.QueryMetricStep)
+    assert step.name == "aws.monthly_bill", label
+
+
+def test_plan_still_rejects_an_unrecognizable_step() -> None:
+    """The normalizer must not paper over a genuinely unknown step by inventing
+    one — pydantic's own validation error is the right outcome so the model gets
+    told, and retries."""
+    with pytest.raises(ValidationError):
+        chat_engine.Plan(steps=[{"not_a_tool": {"foo": 1}}])
+    with pytest.raises(ValidationError):
+        # Ambiguous: two tool-named keys, no way to know which was meant.
+        chat_engine.Plan(steps=[{"query_metric": {}, "run_sql": {}}])
+
+
+def test_explore_request_accepts_nested_lookups() -> None:
+    nested = {"name": "aws.monthly_bill", "dimension": "charge_month"}
+    request = chat_engine.ExploreRequest(lookups=[{"list_dimension_values": nested}])
+    assert request.lookups[0].dimension == "charge_month"
+
+
+def test_run_turn_re_asks_once_when_the_plan_comes_back_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: a live gpt-oss-20b answered "break down last month's
+    spend" with an empty plan and then said "I don't have any data" — a useless
+    non-answer to an answerable question. An empty plan gets exactly one re-ask
+    (bounded, so a real greeting still settles) with an explicit nudge."""
+    _ingest_may_aws()
+    instructions: list[str | None] = []
+    plans = [
+        _plan_response([]),  # first attempt: nothing planned
+        _plan_response([{"tool": "query_metric", "name": "aws.monthly_bill"}]),  # after the nudge
+    ]
+
+    def fn(messages: Any, info: Any) -> ModelResponse:
+        instructions.append(messages[-1].instructions)
+        if not info.output_tools:
+            return _text_response("You spent $10.")
+        return plans.pop(0)
+
+    _use_model(monkeypatch, FunctionModel(fn))
+
+    result = _run_turn([], "what did I spend?", session_id="sempty")
+
+    assert result.text == "You spent $10."
+    assert [s.name for s in result.steps] == ["query_metric"]
+    assert "planned no steps at all" in (instructions[1] or "")
+
+
+def test_run_turn_accepts_a_second_empty_plan_without_looping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine greeting needs no data — the empty-plan re-ask is capped at one,
+    so a model that legitimately plans nothing twice still gets an answer out
+    rather than looping."""
+    plan_calls = 0
+
+    def fn(messages: Any, info: Any) -> ModelResponse:
+        nonlocal plan_calls
+        if not info.output_tools:
+            return _text_response("Hi — ask me about your spend.")
+        plan_calls += 1
+        return _plan_response([])
+
+    _use_model(monkeypatch, FunctionModel(fn))
+
+    result = _run_turn([], "hello", session_id="sgreet")
+
+    assert result.text == "Hi — ask me about your spend."
+    assert plan_calls == 2  # the original plus exactly one re-ask, then it settles
+    assert result.steps == []
+
+
 def test_plan_step_models_match_real_mcp_tool_signatures() -> None:
     """Drift guard: each typed PlanStep model hand-mirrors a real MCP tool's
     signature (see the comment above QueryMetricStep for why) — if a tool's
@@ -284,7 +384,10 @@ def test_plan_step_models_match_real_mcp_tool_signatures() -> None:
     for model_cls in chat_engine.PLAN_STEP_MODELS:
         tool_name = model_cls.model_fields["tool"].default
         schema_fields = set(schemas[tool_name].get("properties", {}))
-        step_fields = set(model_cls.model_fields) - {"tool"}
+        # `chart` is presentation the model attaches for the UI (see ChartSpec),
+        # not an argument any MCP tool accepts — excluded here for the same
+        # reason _step_args excludes it before dispatch.
+        step_fields = set(model_cls.model_fields) - {"tool", "chart"}
         assert step_fields == schema_fields, tool_name
 
 
@@ -316,7 +419,9 @@ def test_run_turn_never_persists_instructions_into_message_history(
     Plan/Synthesize calls this turn made — no tool-call noise leaks in."""
 
     def fn(messages: Any, info: Any) -> ModelResponse:
-        return _text_response("ok") if not info.output_tools else _plan_response([])
+        if not info.output_tools:
+            return _text_response("ok")
+        return _plan_response([{"tool": "list_optimization_rules"}])
 
     _use_model(monkeypatch, FunctionModel(fn))
 
@@ -330,8 +435,10 @@ def test_run_turn_never_persists_instructions_into_message_history(
 
 def test_run_turn_without_tool_call_logs_one_row(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty-steps Plan (no new data needed — a greeting, a followup
-    already answered) skips straight to Synthesize."""
-    responses = [_plan_response([]), _text_response("The answer is 42.")]
+    already answered) reaches Synthesize with nothing gathered. Two plan
+    responses because an empty plan gets exactly one re-ask first (see
+    test_run_turn_accepts_a_second_empty_plan_without_looping)."""
+    responses = [_plan_response([]), _plan_response([]), _text_response("The answer is 42.")]
     _use_model(monkeypatch, FunctionModel(lambda messages, info: responses.pop(0)))
 
     messages: list[Any] = []
@@ -343,8 +450,8 @@ def test_run_turn_without_tool_call_logs_one_row(monkeypatch: pytest.MonkeyPatch
     assert len(rows) == 1
     assert rows[0]["session_id"] == "s1"
     assert rows[0]["model"] == "openai/gpt-4o"
-    assert rows[0]["prompt_tokens"] == 20  # summed across the Plan + Synthesize calls
-    assert rows[0]["completion_tokens"] == 10
+    assert rows[0]["prompt_tokens"] == 30  # summed across both Plan calls + Synthesize
+    assert rows[0]["completion_tokens"] == 15
     assert rows[0]["tool_call_count"] == 0
     # No message text or API key ever land in the telemetry row.
     assert set(rows[0]) == {
@@ -396,6 +503,7 @@ def test_run_turn_dedups_a_repeated_identical_step_in_one_plan(
     reactively after it already ran. Verified by counting real dispatches,
     not by inspecting message history (which no longer carries tool-call
     parts at all)."""
+    _ingest_may_aws()  # so describe_metric resolves; an all-errored plan re-plans
     calls: list[tuple[str, dict[str, Any]]] = []
     original = chat_engine._call_mcp_tool
 
@@ -584,7 +692,7 @@ def test_run_turn_recovers_from_an_invalid_plan_step_via_output_retry(
             ],
             usage=RequestUsage(input_tokens=10, output_tokens=5),
         ),
-        _plan_response([]),
+        _plan_response([{"tool": "list_optimization_rules"}]),
         _text_response("recovered"),
     ]
     _use_model(monkeypatch, FunctionModel(lambda messages, info: responses.pop(0)))
@@ -635,7 +743,7 @@ def test_run_turn_cannot_ask_a_second_clarification_when_answering_one(
         offered.append(names)
         if not names:
             return _text_response("You spent $10.")
-        return _plan_response([])
+        return _plan_response([{"tool": "list_optimization_rules"}])
 
     _use_model(monkeypatch, FunctionModel(fn))
 
@@ -704,7 +812,7 @@ def test_run_turn_runs_an_explore_round_before_committing_to_a_plan(
         if "final_result_ExploreRequest" in names:
             return _explore_response([{"name": "aws.monthly_bill", "dimension": dimension}])
         assert "final_result_ExploreRequest" not in names  # capped at one explore round
-        return _plan_response([])
+        return _plan_response([{"tool": "list_optimization_rules"}])
 
     _use_model(monkeypatch, FunctionModel(fn))
 
@@ -742,9 +850,12 @@ def test_run_turn_survives_an_empty_round_via_the_quirk_transport(
     _QuirkTransport retries it silently at the wire level; the turn still
     produces a real answer, exercised end to end through run_turn's real
     openai_compatible branch (only the innermost HTTP call is faked)."""
-    result = _run_turn_openai_compatible(
-        monkeypatch, [_empty_body(), _plan_body([]), _text_body("Here's the real answer.")]
-    )
+    bodies = [
+        _empty_body(),
+        _plan_body([{"tool": "list_optimization_rules"}]),
+        _text_body("Here's the real answer."),
+    ]
+    result = _run_turn_openai_compatible(monkeypatch, bodies)
     assert result.text == "Here's the real answer."
 
 
@@ -761,8 +872,8 @@ def test_run_turn_does_not_let_empty_rounds_starve_real_tool_call_budget(
         + [
             _plan_body(
                 [
-                    {"tool": "describe_metric", "name": "aws.monthly_bill"},
-                    {"tool": "describe_metric", "name": "databricks.monthly_bill"},
+                    {"tool": "list_optimization_rules"},
+                    {"tool": "list_policy_rules"},
                 ]
             )
         ]
@@ -882,7 +993,7 @@ def test_run_turn_survives_a_reasoning_only_round_via_the_quirk_transport(
     is, and a real answer on a later round still comes through."""
     bodies = [
         _reasoning_only_body("still deciding..."),
-        _plan_body([]),
+        _plan_body([{"tool": "list_optimization_rules"}]),
         _text_body("Here's the real answer."),
     ]
     result = _run_turn_openai_compatible(monkeypatch, bodies)
@@ -924,3 +1035,106 @@ def test_run_turn_redacts_the_api_key_from_a_leaky_provider_error(
     assert "[REDACTED]" in result.text
     assert "Incorrect API key provided" in result.text  # the useful part survives
     assert not any("sk-bad-secret" in str(m) for m in messages)
+
+
+def test_run_turn_replans_once_when_every_step_returns_no_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: a live gpt-oss-20b filtered `provider_name: "databricks"`
+    on data that says "Databricks" — exact, case-sensitive, so zero rows — and
+    reported "no records were returned, I'm unable to produce a visualization".
+    The same dead end happened with an errored step. One bounded re-plan gets
+    the real values handed back so it can fix the filter instead."""
+    _ingest_may_aws()
+    instructions: list[str | None] = []
+    plans = [
+        # Wrong case, and redundant on an already-provider-scoped view.
+        _plan_response(
+            [
+                {
+                    "tool": "query_metric",
+                    "name": "aws.monthly_bill",
+                    "filters": {"provider_name": "aws"},
+                }
+            ]
+        ),
+        _plan_response([{"tool": "query_metric", "name": "aws.monthly_bill"}]),
+    ]
+
+    def fn(messages: Any, info: Any) -> ModelResponse:
+        instructions.append(messages[-1].instructions)
+        if not info.output_tools:
+            return _text_response("You spent $10 in May.")
+        return plans.pop(0)
+
+    _use_model(monkeypatch, FunctionModel(fn))
+
+    result = _run_turn([], "what did I spend?", session_id="sdata")
+
+    assert result.text == "You spent $10 in May."
+    # The retry's instructions name the real value, not just "no rows".
+    retry_instructions = instructions[1] or ""
+    assert "produced no usable data" in retry_instructions
+    assert "provider_name actually contains ['AWS']" in retry_instructions
+    # The second plan's rows are what got answered from.
+    assert [s.name for s in result.steps] == ["query_metric"]
+    assert result.steps[0].rows
+
+
+def test_run_turn_does_not_replan_when_some_data_came_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The re-plan is only for a total dead end — a partially useful plan must go
+    straight to the answer rather than paying for another round."""
+    _ingest_may_aws()
+    plan_calls = 0
+
+    def fn(messages: Any, info: Any) -> ModelResponse:
+        nonlocal plan_calls
+        if not info.output_tools:
+            return _text_response("Here you go.")
+        plan_calls += 1
+        return _plan_response(
+            [
+                {"tool": "query_metric", "name": "aws.monthly_bill"},
+                {"tool": "query_metric", "name": "aws.monthly_bill", "filters": {"nope": "x"}},
+            ]
+        )
+
+    _use_model(monkeypatch, FunctionModel(fn))
+    result = _run_turn([], "what did I spend?", session_id="spartial")
+
+    assert result.text == "Here you go."
+    assert plan_calls == 1  # no re-plan: one step returned rows
+    assert len(result.steps) == 2
+    assert any(s.error for s in result.steps)  # the bad filter still surfaces
+
+
+def test_run_turn_accepts_a_second_dead_end_without_looping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounded at one: if the re-planned query is also empty, answer honestly
+    rather than looping and burning the user's tokens."""
+    _ingest_may_aws()
+    plan_calls = 0
+
+    def fn(messages: Any, info: Any) -> ModelResponse:
+        nonlocal plan_calls
+        if not info.output_tools:
+            return _text_response("I couldn't find matching data.")
+        plan_calls += 1
+        return _plan_response(
+            [
+                {
+                    "tool": "query_metric",
+                    "name": "aws.monthly_bill",
+                    "filters": {"charge_month": "1999-01-01"},
+                }
+            ]
+        )
+
+    _use_model(monkeypatch, FunctionModel(fn))
+    result = _run_turn([], "spend in 1999?", session_id="sdead")
+
+    assert result.text == "I couldn't find matching data."
+    assert plan_calls == 2  # the original plus exactly one re-plan

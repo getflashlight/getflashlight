@@ -78,6 +78,25 @@ def _rows(sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
         ]
 
 
+def _split_sort_direction(order_by: str, descending: bool) -> tuple[str, bool]:
+    """Accept a SQL-style ``"net_cost DESC"`` as well as a bare column name.
+
+    ``order_by`` is a column and ``descending`` a separate flag, but an LLM
+    naturally writes the ORDER BY clause it would write in SQL — confirmed live,
+    a Databricks gpt-oss-20b sent ``order_by="net_cost DESC"``, got
+    ``Cannot order by 'net_cost DESC'``, and gave up on the question entirely
+    rather than retrying without it. The direction it asked for is unambiguous,
+    so honour it instead of failing; an explicit ``descending=True`` still wins,
+    since a caller that passed both meant the flag. Anything else (a real
+    unknown column, an expression) still falls through to the catalog check and
+    raises, so this widens the accepted spelling without widening what can run.
+    """
+    column, _, direction = order_by.strip().rpartition(" ")
+    if column and direction.upper() in ("ASC", "DESC"):
+        return column.strip(), descending or direction.upper() == "DESC"
+    return order_by, descending
+
+
 def query_view(
     view_name: str,
     limit: int = 1000,
@@ -133,6 +152,7 @@ def query_view(
                 params.append(value)
         sql += " WHERE " + " AND ".join(conditions)
     if order_by:
+        order_by, descending = _split_sort_direction(order_by, descending)
         if order_by not in allowed:
             raise QueryError(f"Cannot order by {order_by!r} on {view_name}")
         sql += f" ORDER BY {order_by} {'DESC' if descending else 'ASC'}"

@@ -63,17 +63,29 @@ FAVICON_SVG = (
 
 HEAD_CSS = f"""
 <style>
-:root {{ --fl-header-h: 57px; }}  /* header: py-3 + text line + 1px bottom border */
 body, .q-page, .nicegui-content {{
     background: {PAGE} !important;
     color: {INK_PRIMARY};
     font-family: {FONT_STACK};
 }}
-/* A full-height page (chat) needs its own scrolling region, so the page-level
-   wrapper must not add padding or scroll of its own. Scoped to .fl-full-height
-   so every other (report-style, scroll-the-page) view is untouched. */
-.fl-full-height .nicegui-content {{ padding: 0 !important; }}
-.fl-full-height .q-page {{ overflow: hidden; }}
+/* A full-height page (chat) owns its vertical space: nothing above the
+   transcript scrolls or pads, and the transcript itself scrolls instead.
+   Deliberately no hardcoded header height: .q-page-container is border-box and
+   already carries padding-top equal to the *real* header height, so
+   height:100vh on it leaves exactly the space under the header, and .q-page
+   takes 100% of that. Duplicating the header's pixel height here would drift
+   the moment its padding changes.
+   .nicegui-content needs flex:1 explicitly — NiceGUI ships it as a padded flex
+   column that sizes to its content, so without this the transcript's scroll
+   area collapses to zero height and the composer rides up under the top bar.
+   min-height:0 lets these flex children shrink below content so the inner
+   scroll area is actually bounded. Scoped to .fl-full-height so every
+   report-style scroll-the-page view is untouched. */
+.fl-full-height .q-page-container {{ height: 100vh; }}
+.fl-full-height .q-page {{ height: 100%; display: flex; flex-direction: column; overflow: hidden; }}
+.fl-full-height .nicegui-content {{
+    flex: 1; min-height: 0; padding: 0 !important; gap: 0 !important;
+}}
 .fl-table .q-table__card {{ background: transparent !important; box-shadow: none !important; }}
 .fl-table thead th {{
     color: {INK_MUTED} !important; font-size: 12px !important; font-weight: 600 !important;
