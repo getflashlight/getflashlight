@@ -49,13 +49,11 @@ def _aws_label() -> str:
     """``"AWS Redshift"`` while the group holds only Redshift's own services, plain
     ``"AWS"`` once it holds more.
 
-    This is derived rather than a static string because the AWS pull is no longer
-    Redshift-only *by definition*: ``AwsFocusConfig.include_services`` now defaults to
-    Redshift + S3, since the storage behind Unity Catalog is billed by AWS and
-    Databricks' own DBU-only bill can't show it (see docs/design/backing-storage.md). A
-    fixed "AWS Redshift" would then be wrong for the group total on Home, and a fixed
-    "AWS" was already wrong for a Redshift-only install — the honest label depends on
-    what was actually ingested, which only the data knows.
+    Derived from ``aws.spend_by_service_month``, which excludes Amazon S3
+    (``silver.focus_provider_bill``) — S3 stays in bronze and surfaces as Databricks
+    Storage via ``storage.backing_storage_month``, so it must not widen this label.
+    A non-Redshift service that *does* land in aws GOLD (e.g. a widened
+    ``include_services``) still flips the label to plain ``"AWS"``.
 
     Fails toward the **narrower** label on any query problem: claiming less than the
     group holds is a smaller lie than implying the whole account is here.

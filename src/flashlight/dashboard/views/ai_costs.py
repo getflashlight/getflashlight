@@ -434,7 +434,7 @@ def _by_tag(
         return
 
     with chrome.panel():
-        chrome.section_caption("Values for one key:")
+        chrome.panel_title("AI spend by tag")
         body_container = ui.column().classes("w-full gap-2")
 
         @ui.refreshable

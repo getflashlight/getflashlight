@@ -23,13 +23,13 @@ SELECT
     sum(list_cost) - sum(cost)                           AS savings,
     bool_or(is_partial_period)                           AS is_partial_period,
     max(billing_currency)                                AS currency
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 GROUP BY provider_name, charge_month;
 
 
 -- ── "Where is the money going?" — by service / product ──────────────────────────
 -- Carries the same list_cost/savings pair as `monthly_bill` above, deliberately: this is
--- `monthly_bill` at one finer grain, over the same silver.focus_normalized with the same
+-- `monthly_bill` at one finer grain, over the same silver.focus_provider_bill with the same
 -- sum(cost)/sum(list_cost), so the two reconcile by construction. That's what lets a
 -- consumer scoped to a subset of services (the /aws page is scoped to Redshift's own
 -- service names) build a list/savings/realized-discount headline that agrees with the
@@ -49,7 +49,7 @@ SELECT
     bool_or(is_partial_period)                           AS is_partial_period,
     bool_or(x_effective_is_list)                         AS effective_is_list,
     max(billing_currency)                                AS currency
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 GROUP BY provider_name, service_category, service_name, charge_month;
 
 
@@ -95,7 +95,7 @@ SELECT
     sum(consumed_quantity)                               AS consumed_quantity,
     max(consumed_unit)                                   AS consumed_unit,
     bool_or(is_partial_period)                           AS is_partial_period
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 GROUP BY provider_name, service_name, coalesce(sku_id, '(unknown)'), charge_month;
 
 
@@ -112,7 +112,7 @@ SELECT
     charge_month,
     sum(cost)                                            AS net_cost,
     bool_or(is_partial_period)                           AS is_partial_period
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 WHERE x_cost_subcategory IS NOT NULL
 GROUP BY provider_name, service_name, x_cost_subcategory, charge_month;
 
@@ -146,7 +146,7 @@ SELECT
     sum(consumed_quantity)                               AS consumed_quantity,
     max(consumed_unit)                                   AS consumed_unit,
     bool_or(is_partial_period)                           AS is_partial_period
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 GROUP BY provider_name, service_name, coalesce(sku_id, '(unknown)'),
          coalesce(resource_type, '(none)'), coalesce(resource_id, '(none)'),
          coalesce(resource_name, resource_id, '(unattributed)'),
@@ -166,7 +166,7 @@ SELECT
     json_extract_string(f.tags, '$."' || t.tag_key || '"') AS tag_value,
     f.charge_month,
     sum(f.cost)                                          AS net_cost
-FROM silver.focus_normalized f
+FROM silver.focus_provider_bill f
 CROSS JOIN unnest(json_keys(f.tags)) AS t(tag_key)
 GROUP BY f.provider_name, coalesce(f.sku_id, '(unknown)'), t.tag_key, tag_value, f.charge_month;
 
@@ -180,7 +180,7 @@ SELECT
     sum(cost)                                            AS net_cost,
     sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
     bool_or(is_partial_period)                           AS is_partial_period
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 GROUP BY provider_name, coalesce(sub_account_id, '(none)'), charge_month;
 
 
@@ -196,7 +196,7 @@ SELECT
     f.charge_month,
     sum(f.cost)                                          AS net_cost,
     bool_or(f.is_partial_period)                         AS is_partial_period
-FROM silver.focus_normalized f
+FROM silver.focus_provider_bill f
 CROSS JOIN unnest(json_keys(f.tags)) AS t(tag_key)
 GROUP BY tag_key, tag_value, f.provider_name, f.charge_month;
 
@@ -235,8 +235,72 @@ SELECT
               ) / sum(cost) FILTER (WHERE NOT is_credit), 1)
          ELSE NULL END                                   AS tagged_pct,
     bool_or(is_partial_period)                           AS is_partial_period
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 GROUP BY provider_name, charge_month;
+
+
+-- ── "Which services carry untagged spend?" — tag coverage at service grain ──────
+-- spend_tag_coverage_month is provider × month; this is the same charge-only tagged/
+-- untagged split one grain finer, so Attribution can rank *where* tagging is missing
+-- (Jobs Compute vs SQL vs S3) rather than only how much. Fully-tagged services stay
+-- in the view (tagged_pct = 100) so a consumer can see clean coverage; the dashboard
+-- filters to untagged_cost > 0. Same Tags/'{}' honesty as the provider-level view.
+CREATE OR REPLACE VIEW gold.spend_untagged_by_service_month AS
+SELECT
+    provider_name,
+    coalesce(service_name, '(no service)')               AS service_name,
+    charge_month,
+    sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
+    -- coalesce: DuckDB SUM over an empty FILTER is NULL (fully tagged → untagged NULL,
+    -- fully untagged → tagged NULL), which would break "untagged_cost > 0" filters and
+    -- tagged_pct arithmetic.
+    coalesce(sum(cost) FILTER (
+        WHERE NOT is_credit AND json_array_length(json_keys(tags)) > 0
+    ), 0)                                                AS tagged_cost,
+    coalesce(sum(cost) FILTER (
+        WHERE NOT is_credit AND json_array_length(json_keys(tags)) = 0
+    ), 0)                                                AS untagged_cost,
+    CASE WHEN sum(cost) FILTER (WHERE NOT is_credit) > 0
+         THEN round(100 * coalesce(sum(cost) FILTER (
+                  WHERE NOT is_credit AND json_array_length(json_keys(tags)) > 0
+              ), 0) / sum(cost) FILTER (WHERE NOT is_credit), 1)
+         ELSE NULL END                                   AS tagged_pct,
+    bool_or(is_partial_period)                           AS is_partial_period
+FROM silver.focus_provider_bill
+GROUP BY provider_name, coalesce(service_name, '(no service)'), charge_month;
+
+
+-- ── "Which resources are untagged?" — the work queue under a service gap ────────
+-- Attribution's next step after spend_untagged_by_service_month: ranked untagged
+-- *resources* that reconcile to a service's untagged_cost. Only untagged charge rows
+-- (empty Tags, NOT is_credit) — fully-tagged resources are absent by construction.
+-- Identity coalesced like resource_month so account/shared lines without a resource_id
+-- stay visible as '(none)' / '(unattributed)' rather than vanishing.
+CREATE OR REPLACE VIEW gold.spend_untagged_by_resource_month AS
+SELECT
+    provider_name,
+    coalesce(service_name, '(no service)')               AS service_name,
+    coalesce(sku_id, '(unknown)')                        AS sku_id,
+    coalesce(resource_type, '(none)')                    AS resource_type,
+    coalesce(resource_id, '(none)')                      AS resource_id,
+    coalesce(resource_name, resource_id, '(unattributed)') AS resource_name,
+    coalesce(sub_account_id, '(none)')                   AS sub_account_id,
+    coalesce(region_id, '(none)')                        AS region_id,
+    charge_month,
+    sum(cost)                                            AS untagged_cost,
+    bool_or(is_partial_period)                           AS is_partial_period
+FROM silver.focus_provider_bill
+WHERE NOT is_credit
+  AND json_array_length(json_keys(tags)) = 0
+GROUP BY provider_name,
+         coalesce(service_name, '(no service)'),
+         coalesce(sku_id, '(unknown)'),
+         coalesce(resource_type, '(none)'),
+         coalesce(resource_id, '(none)'),
+         coalesce(resource_name, resource_id, '(unattributed)'),
+         coalesce(sub_account_id, '(none)'),
+         coalesce(region_id, '(none)'),
+         charge_month;
 
 
 -- ── "Am I realizing my negotiated discount?" — list vs effective ─────────────────
@@ -252,7 +316,7 @@ SELECT
          ELSE 0 END                                      AS savings_pct,
     bool_or(x_effective_is_list)                         AS effective_is_list,
     bool_or(is_partial_period)                           AS is_partial_period
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 GROUP BY provider_name, charge_month;
 
 
@@ -278,7 +342,7 @@ SELECT
     sum(cost)                                            AS net_cost,
     count(*)                                             AS line_count,
     bool_or(is_partial_period)                           AS is_partial_period
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 WHERE charge_category IN ('Credit', 'Adjustment')
 GROUP BY provider_name, charge_month, charge_category,
          coalesce(service_name, '(account-level)'),
@@ -300,7 +364,7 @@ SELECT
     sum(cost)                                            AS net_cost,
     sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
     bool_or(is_partial_period)                           AS is_partial_period
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 GROUP BY charge_day, provider_name, service_name;
 
 
@@ -320,7 +384,7 @@ WITH base AS (
         sum(cost)                                        AS net_cost,
         sum(consumed_quantity)                           AS consumed_quantity,
         bool_or(is_partial_period)                       AS is_partial_period
-    FROM silver.focus_normalized
+    FROM silver.focus_provider_bill
     GROUP BY provider_name, coalesce(sku_id, '(unknown)'), charge_month
 ),
 lagged AS (

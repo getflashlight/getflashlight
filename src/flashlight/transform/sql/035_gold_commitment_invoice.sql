@@ -19,7 +19,7 @@ SELECT
     sum(cost)                                            AS effective_cost,
     sum(billed_cost)                                      AS billed_cost,
     count(DISTINCT commitment_discount_id)                AS commitment_count
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 WHERE commitment_discount_id IS NOT NULL
 GROUP BY provider_name, charge_month, commitment_discount_type,
     commitment_discount_category, commitment_discount_status;
@@ -35,6 +35,6 @@ SELECT
     invoice_id,
     charge_month,
     sum(billed_cost)                                      AS billed_cost
-FROM silver.focus_normalized
+FROM silver.focus_provider_bill
 WHERE invoice_id IS NOT NULL
 GROUP BY provider_name, billing_account_id, invoice_id, charge_month;

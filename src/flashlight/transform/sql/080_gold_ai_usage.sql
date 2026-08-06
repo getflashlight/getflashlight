@@ -12,7 +12,7 @@
 -- lands rows here with no edit to this file.
 --
 -- FOCUS stays canonical for dollars: metrics.ai_usage carries no cost column at all, and
--- net_cost below is read from silver.focus_normalized, never recomputed from list_prices.
+-- net_cost below is read from silver.focus_provider_bill, never recomputed from list_prices.
 -- That is what makes these views reconcile against <group>.ai_spend_month by construction.
 --
 -- ── THE HONESTY MECHANISM: cost_allocation_basis ─────────────────────────────────
@@ -96,7 +96,7 @@ SELECT
             LIMIT 1
         )
     )                                                    AS endpoint_tag_project
-FROM silver.focus_normalized f
+FROM silver.focus_provider_bill f
 WHERE service_category = 'AI and Machine Learning'
   AND resource_id IS NOT NULL
 GROUP BY provider_name, resource_id, charge_month;

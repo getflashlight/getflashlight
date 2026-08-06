@@ -212,8 +212,11 @@ def test_tag_coverage_keeps_untagged_spend_visible(lake_home) -> None:  # type: 
         "t",
         _WINDOW,
         [
-            _rec(ProviderName.AWS, "AmazonEC2", "30", tags={"team": "data"}),
-            _rec(ProviderName.AWS, "AmazonS3", "10"),  # untagged
+            _rec(
+                ProviderName.AWS, "AmazonEC2", "30", tags={"team": "data"}, resource_id="i-tagged"
+            ),
+            _rec(ProviderName.AWS, "AmazonS3", "7", resource_id="bucket-a"),  # untagged
+            _rec(ProviderName.AWS, "AmazonS3", "3", resource_id="bucket-b"),  # untagged
         ],
         ingest_run_id="r1",
     )
@@ -224,6 +227,23 @@ def test_tag_coverage_keeps_untagged_spend_visible(lake_home) -> None:  # type: 
     assert float(row["tagged_cost"]) == pytest.approx(30.0)
     assert float(row["untagged_cost"]) == pytest.approx(10.0)
     assert float(row["tagged_pct"]) == pytest.approx(75.0)
+
+    # Service grain: S3 is the untagged infra; EC2 is fully tagged (stays in the view).
+    by_svc = {r["service_name"]: r for r in query_view("aws.spend_untagged_by_service_month")}
+    assert float(by_svc["AmazonS3"]["untagged_cost"]) == pytest.approx(10.0)
+    assert float(by_svc["AmazonS3"]["tagged_pct"]) == pytest.approx(0.0)
+    assert float(by_svc["AmazonEC2"]["untagged_cost"]) == pytest.approx(0.0)
+    assert float(by_svc["AmazonEC2"]["tagged_pct"]) == pytest.approx(100.0)
+    assert sum(float(r["untagged_cost"]) for r in by_svc.values()) == pytest.approx(
+        float(row["untagged_cost"])
+    )
+
+    # Resource grain: only untagged rows; dollars reconcile to the service gap.
+    by_res = query_view("aws.spend_untagged_by_resource_month")
+    assert {r["resource_id"] for r in by_res} == {"bucket-a", "bucket-b"}
+    assert "i-tagged" not in {r["resource_id"] for r in by_res}
+    s3_res = sum(float(r["untagged_cost"]) for r in by_res if r["service_name"] == "AmazonS3")
+    assert s3_res == pytest.approx(float(by_svc["AmazonS3"]["untagged_cost"]))
 
     # The breakdown view really does omit that $10 — which is why coverage exists.
     tagged_total = sum(float(r["net_cost"]) for r in query_view("aws.spend_by_tag_month"))
@@ -458,7 +478,7 @@ def _seed_backing_storage() -> None:
 
 def test_backing_storage_accounts_for_every_s3_row(lake_home) -> None:  # type: ignore[no-untyped-def]
     """The honest-denominator contract: summing every `mapping` value reproduces the
-    account's whole S3 bill.
+    seeded S3 bill (aws.* GOLD deliberately excludes S3 — see silver.focus_provider_bill).
 
     This is what makes "X% of your S3 spend is Databricks-managed" a real percentage
     rather than a share of whatever happened to map. If a row could be dropped (or
@@ -471,13 +491,7 @@ def test_backing_storage_accounts_for_every_s3_row(lake_home) -> None:  # type: 
     total = float(
         run_select("SELECT sum(net_cost) AS t FROM storage.backing_storage_month")[0]["t"]
     )
-    s3_line = float(
-        run_select(
-            "SELECT sum(net_cost) AS t FROM aws.spend_by_service_month "
-            f"WHERE service_name = '{_S3}'"
-        )[0]["t"]
-    )
-    assert total == s3_line == 282.0
+    assert total == 282.0
 
     by_mapping = {
         r["mapping"]: float(r["c"])
@@ -488,6 +502,38 @@ def test_backing_storage_accounts_for_every_s3_row(lake_home) -> None:  # type: 
     # managed = acme-uc-root 110 + acme-metastore-prefixed 60 + acme-both 30
     # unmapped = acme-external-lake 50 (external only!) + random-other 25
     assert by_mapping == {"databricks": 200.0, "unmapped": 75.0, "no_resource_id": 7.0}
+
+    mapped_names = {
+        r["service_name"]
+        for r in run_select(
+            "SELECT DISTINCT service_name FROM storage.backing_storage_month "
+            "WHERE mapping = 'databricks'"
+        )
+    }
+    assert mapped_names == {"Databricks Storage"}
+
+
+def test_aws_gold_excludes_amazon_s3(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Amazon S3 stays in bronze/storage GOLD; it must not appear in aws.* provider GOLD."""
+    from flashlight.gold.reader import query_view, run_select
+
+    _seed_backing_storage()
+
+    services = {r["service_name"] for r in query_view("aws.spend_by_service_month")}
+    assert _S3 not in services
+    assert "Databricks Storage" not in services
+    s3_in_aws = run_select(
+        "SELECT coalesce(sum(gross_cost), 0) AS t FROM aws.spend_by_service_month "
+        f"WHERE service_name = '{_S3}'"
+    )
+    assert float(s3_in_aws[0]["t"]) == 0.0
+    storage = float(
+        run_select(
+            "SELECT sum(gross_cost) AS t FROM storage.backing_storage_month "
+            "WHERE mapping = 'databricks'"
+        )[0]["t"]
+    )
+    assert storage == pytest.approx(200.0)
 
 
 def test_backing_storage_does_not_multiply_a_bucket_with_two_uc_locations(lake_home) -> None:  # type: ignore[no-untyped-def]

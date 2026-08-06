@@ -112,7 +112,7 @@ WITH ai_rows AS (
         -- Raw tags JSON so the AI Costs tab can attribute by any cost-allocation key
         -- (team/env/project/…), not only the hardcoded project_tag above.
         f.tags                                           AS tags
-    FROM silver.focus_normalized f
+    FROM silver.focus_provider_bill f
     -- TWO ways in, on purpose.
     --
     -- (1) service_category is the FOCUS-native, provider-authored fact, so any product a

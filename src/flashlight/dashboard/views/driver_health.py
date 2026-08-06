@@ -71,15 +71,18 @@ def _df(sql: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _parse_driver(client_driver: str | None) -> tuple[str, str]:
+def _parse_driver(client_driver: object) -> tuple[str, str]:
     """Split "DatabricksJDBCDriver, 2.7.1" into ("DatabricksJDBCDriver", "2.7.1").
 
     Both halves are already top-level, populated columns in ``system.query.history``
     (see ``databricks_driver_health.sql``) — this just separates them for comparison.
     Falls back to ``(raw, "")`` when there's no ", version" suffix, so an unexpected
-    format degrades to "can't judge" rather than raising.
+    format degrades to "can't judge" rather than raising. ``client_driver`` is a
+    nullable Parquet string column, which pandas surfaces as ``float('nan')`` (not
+    ``None``) for a missing value — and ``nan`` is truthy, so this must check for a
+    string explicitly rather than relying on falsiness.
     """
-    if not client_driver:
+    if not isinstance(client_driver, str):
         return "", ""
     family, _, version = client_driver.partition(",")
     return family.strip(), version.strip()
@@ -143,10 +146,6 @@ def _with_staleness(records: pd.DataFrame) -> pd.DataFrame:
 
 def render() -> None:
     chrome.section_title("Client driver health")
-    chrome.section_caption(
-        "Which JDBC/ODBC driver versions and applications are hitting the warehouse, "
-        "and who's running them. Not a waste signal — no dollar figure."
-    )
 
     records = _df(
         "SELECT * FROM driver_health.driver_health ORDER BY charge_month DESC, query_count DESC"
@@ -160,9 +159,6 @@ def render() -> None:
     months = sorted(records["charge_month"].astype(str).unique())
     month = months[-1]
     month_rows = records[records["charge_month"].astype(str) == month]
-    month_label = pd.Timestamp(month).strftime("%b %Y")
-
-    chrome.section_caption(f"Showing {month_label} — the latest month with telemetry.")
 
     outdated = month_rows[month_rows["status"] == STATUS_BEHIND].sort_values(
         "query_count", ascending=False

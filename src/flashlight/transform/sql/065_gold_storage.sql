@@ -44,6 +44,8 @@
 -- KPIs are untouched. Every row carries both billing_provider_name (who invoices: AWS) and
 -- platform_provider_name (whose metadata claims it: Databricks) precisely so a consumer
 -- can't mistake one for the other. The two bills are reported side by side, never summed.
+-- Provider-facing GOLD (silver.focus_provider_bill → aws.*) excludes Amazon S3 entirely;
+-- mapped rows here are named `Databricks Storage` and are that spend's only GOLD home.
 --
 -- HONESTY: the AWS bill's S3 ResourceId is BUCKET-grained, while a UC external location is
 -- s3://bucket/prefix. A prefix-scoped location therefore shares its bucket with whatever
@@ -148,7 +150,10 @@ s3_cost AS (
 )
 SELECT
     c.provider_name                                    AS billing_provider_name,
-    c.service_name,
+    -- Mapped rows are Databricks Storage at transform time — not Amazon S3 under AWS
+    -- (provider GOLD excludes S3 entirely; this plane is their only GOLD home).
+    CASE WHEN m.bucket_name IS NOT NULL THEN 'Databricks Storage' ELSE c.service_name END
+                                                       AS service_name,
     coalesce(c.bucket_name, '(no resource id)')        AS bucket_name,
     CASE
         WHEN c.bucket_name IS NULL     THEN 'no_resource_id'

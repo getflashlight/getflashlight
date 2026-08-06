@@ -22,12 +22,10 @@ connector only supplies efficiency/waste telemetry. So this page:
   not one service); each says so in its own caption, and they're declared in
   :data:`_ACCOUNT_WIDE` so the scope leaves them alone. Breakdown is also led by this
   page's own :func:`_spend_partition`.
-- **Attribution**: :func:`_attribution_section`, because it's account-wide and has to
-  say so. ``spend_tag_coverage_month``/``spend_by_tag_key_month`` have no
-  ``service_name`` dimension and ``waste_by_owner_month`` keys on
-  ``provider_name='AWS'``; the one panel that *can* be Redshift-scoped is the tag-value
-  drill, which scopes ``spend_by_sku_tag_month`` to the ``sku_id`` set Redshift's own
-  resource rows carry.
+- **Attribution**: :func:`_attribution_section`. Tag-key ranking is account-wide (no
+  ``service_name`` on those views); untagged-by-service (and its resource drill) and
+  the tag-value drill are Redshift-scoped — the former via ``service_name``, the
+  latter via ``sku_id`` on ``spend_by_sku_tag_month``.
 - **Efficiency & Waste**: faceted per cluster (:func:`_waste_section`) — one section per
   Redshift cluster that has efficiency telemetry (``entity_id`` for
   ``entity_type='sql_warehouse'`` under ``provider_name='AWS'`` is the cluster
@@ -67,12 +65,11 @@ import pandas as pd
 from nicegui import ui
 
 from flashlight.dashboard import chrome
-from flashlight.dashboard.data import gold_df, provider_label
+from flashlight.dashboard.data import gold_df, gold_view_published, provider_label
 from flashlight.dashboard.theme import compact_money
 from flashlight.dashboard.views import attribution, efficiency_waste, provider_focus
 from flashlight.dashboard.views.provider_focus import Scope
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
-from flashlight.ingest._s3_service_names import S3_SERVICE_NAMES
 
 _GROUP = "aws"
 _PROVIDER = "AWS"
@@ -150,11 +147,28 @@ def _scope_caption(sm: date, end: date) -> None:
     reflection of what was ingested: widen ``include_services`` in connections.yml and
     the extra spend lands in ``aws.*`` but appears on no page at all. Saying so is the
     difference between a scoped page and a quietly incomplete one.
+
+    Amazon S3 is special: bronze still pulls it for the storage plane, but
+    ``silver.focus_provider_bill`` keeps it out of ``aws.*`` GOLD entirely, so it will
+    never show up in the hidden-services query below. Point at Databricks Storage when
+    the storage plane has dollars for this window.
     """
     chrome.section_caption(
         "Scoped from the AWS bill to Redshift's own FOCUS service names: "
         f"{', '.join(sorted(REDSHIFT_SERVICE_NAMES))}."
     )
+    storage_note = ""
+    if gold_view_published("storage", "backing_storage_month"):
+        s3 = gold_df(
+            "SELECT coalesce(sum(net_cost), 0) AS c FROM storage.backing_storage_month "
+            f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}'"
+        )
+        if not s3.empty and float(s3["c"].iloc[0]):
+            storage_note = (
+                " Amazon S3 is ingested for Databricks Storage "
+                "(see Databricks → Databricks Storage); it is not in aws.* GOLD."
+            )
+
     hidden = gold_df(
         "SELECT service_name, sum(net_cost) AS net_cost "
         f"FROM {_GROUP}.spend_by_service_month "
@@ -163,25 +177,17 @@ def _scope_caption(sm: date, end: date) -> None:
         "GROUP BY service_name HAVING sum(net_cost) <> 0 ORDER BY sum(net_cost) DESC"
     )
     if hidden.empty:
+        if storage_note:
+            chrome.section_caption(storage_note.strip())
         return
     total = float(hidden["net_cost"].sum())
     names = ", ".join(str(s) for s in hidden["service_name"].head(5))
     more = f" and {len(hidden) - 5} more" if len(hidden) > 5 else ""
-    # S3 is the one hidden service that now has somewhere to go: it's in the default
-    # pull precisely so the Databricks page can show the storage behind Unity Catalog,
-    # so point there instead of calling it homeless. Everything else still is.
-    hidden_names = {str(s) for s in hidden["service_name"]}
-    s3_note = (
-        " Amazon S3 is in the default pull so the storage behind Databricks can be "
-        "shown — see Databricks → Databricks Storage."
-        if hidden_names & S3_SERVICE_NAMES
-        else ""
-    )
     chrome.section_caption(
         f"This page hides {compact_money(total)} of other AWS spend in this window "
         f"({names}{more}) — it is outside every figure below. The `aws_focus` connector "
         "ingests only `include_services`, so a widened service list lands in the lake "
-        f"and in Home's AWS total, but not on this page.{s3_note}"
+        f"and in Home's AWS total, but not on this page.{storage_note}"
     )
 
 
@@ -271,23 +277,22 @@ def _spend_partition(sm: date, end: date) -> None:
 def _attribution_section(sm: date, end: date) -> None:
     """Attribution for the AWS account this page's Redshift spend bills to.
 
-    Composed from ``views/attribution.py``'s public panels, except that the tag-value drill
-    is this page's own SKU-scoped :func:`_tags_section` rather than attribution's
-    ``spend_by_tag_month`` one — that's the only tag panel that *can* be Redshift-scoped.
+    Untagged-by-service (and its resource drill) are Redshift-scoped via
+    ``service_name``. Tag-key ranking is account-wide. Tag-value drill is this page's
+    own SKU-scoped :func:`_tags_section`.
     """
     chrome.section_caption(
-        "Account-wide, not Redshift-scoped: tag coverage and the tag-key ranking come from "
-        "views with no service dimension, and owner attribution keys on provider_name='AWS'. "
-        "In practice the whole bill is Redshift anyway — aws_focus ingests only "
-        "include_services, Redshift by default. The tag-value panel is SKU-scoped to "
-        "Redshift, like the rest of the page."
+        "Tag-key ranking is account-wide (no service dimension on that view). "
+        "Untagged-by-service, its resource drill, and the tag-value panel are "
+        "Redshift-scoped. In practice the whole bill is Redshift anyway — aws_focus "
+        "ingests only include_services, Redshift by default."
     )
-    attribution.tag_coverage(_GROUP, end, sm)
+    attribution.untagged_by_service(
+        _GROUP, end, sm, scope_sql=scope().predicate("spend_untagged_by_service_month")
+    )
     attribution.tag_keys(_GROUP, end, sm)
     with chrome.panel():
         _tags_section(sm, end)
-    attribution.owners(provider_label(_GROUP), _PROVIDER)
-    attribution.projects(provider_label(_GROUP), _PROVIDER)
 
 
 def _tags_section(sm: date, end: date) -> None:
@@ -297,12 +302,12 @@ def _tags_section(sm: date, end: date) -> None:
     resource rows use — same trick as ``_invoice_scope`` above, one level up.
 
     Keys are folded (case/separator only, same as ``036_gold_tag_keys.sql`` and
-    ``attribution.tag_breakdown``) rather than grouped on the raw ``tag_key``: this view
+    ``attribution.tag_keys``) rather than grouped on the raw ``tag_key``: this view
     has no normalized-key column of its own to borrow (``spend_by_tag_key_month`` carries
     one but isn't SKU-scoped), so the fold is applied inline instead. Without it, picking
     "team" here could silently miss dollars raw-tagged "Team".
     """
-    chrome.panel_title("Spend by tag")
+    chrome.panel_title("Spend by tag value")
     _in_range = f"charge_month >= '{sm}' AND charge_month <= '{end}'"
     _fold = "replace(lower(trim(tag_key)), '-', '_')"
     keys = gold_df(

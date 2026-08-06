@@ -32,7 +32,7 @@
 CREATE OR REPLACE VIEW gold.spend_forecast_month AS
 WITH daily AS (
     SELECT provider_name, charge_day, sum(cost) AS net_cost
-    FROM silver.focus_normalized
+    FROM silver.focus_provider_bill
     GROUP BY provider_name, charge_day
 ),
 -- The last fully-delivered day per provider; everything downstream fits on days at or

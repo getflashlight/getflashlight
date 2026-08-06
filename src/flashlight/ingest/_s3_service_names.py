@@ -9,8 +9,10 @@ same value (pinned by a drift test, since a static ``.sql`` file can't import).
 
 S3 is in the default pull because the Databricks backing-storage view needs it:
 Databricks' own bill covers DBU compute only, so the storage behind a Unity Catalog
-external location is billed by AWS under this ServiceName and is invisible without
-it. See ``docs/design/backing-storage.md``.
+managed location is billed by AWS under this ServiceName and is invisible without
+it. Transform keeps those rows out of aws.* GOLD (``silver.focus_provider_bill``)
+and surfaces mapped buckets as Databricks Storage in ``storage.backing_storage_month``.
+See ``docs/design/backing-storage.md``.
 
 Lives directly under ``ingest/`` rather than ``ingest/connectors/`` for the same
 reason its Redshift sibling does — so ``config.py`` can import it without triggering

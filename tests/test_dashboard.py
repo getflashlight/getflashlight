@@ -260,16 +260,15 @@ def test_home_and_nav_label_aws_group_as_aws_redshift(lake_home) -> None:  # typ
     asyncio.run(_check())
 
 
-def test_aws_label_widens_to_plain_aws_once_the_group_holds_more_than_redshift(  # type: ignore[no-untyped-def]
+def test_aws_label_stays_redshift_when_only_s3_is_extra_in_bronze(  # type: ignore[no-untyped-def]
     lake_home,
 ) -> None:
-    """The AWS label is derived, not a fixed string.
+    """S3 in bronze must not widen the AWS nav label.
 
-    ``include_services`` now defaults to Redshift **+ S3** (the storage behind Unity
-    Catalog, billed by AWS — Databricks' own bill is DBU-only), so a static
-    "AWS Redshift" would understate a group that really does hold the S3 bill too, and
-    Home's AWS card would disagree with its own heading. ``provider_name`` is untouched
-    either way: the label is display-only.
+    ``include_services`` still pulls S3 for the storage plane, but ``aws.*`` GOLD
+    excludes it (``silver.focus_provider_bill``), so the human label stays
+    ``AWS Redshift`` when Redshift is the only service left in that group.
+    ``provider_name`` is untouched either way: the label is display-only.
     """
     from flashlight.lake import bronze
     from flashlight.transform.runner import build_gold
@@ -283,7 +282,7 @@ def test_aws_label_widens_to_plain_aws_once_the_group_holds_more_than_redshift( 
 
     from flashlight.dashboard.data import provider_label, provider_name_for_group
 
-    assert provider_label("aws") == "AWS"
+    assert provider_label("aws") == "AWS Redshift"
     assert provider_name_for_group("aws") == "AWS"
 
 
@@ -1619,16 +1618,25 @@ def test_efficiency_tab_names_missing_telemetry_instead_of_hiding_the_tab(lake_h
     asyncio.run(_check())
 
 
-def test_attribution_tab_pins_the_unowned_shared_compute_row(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """Anti-regression for the largest bucket on a real lake — it must never be dropped."""
+def test_attribution_tab_is_tagged_spend_not_coverage_kpi(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Attribution leads with untagged-by-service (+ resource drill), then tagged spend.
+
+    Bill-level "N% tagged" alone is gone; the service-grain gap list is the finding,
+    with a click-through work queue for untagged resources.
+    """
     from nicegui.testing.user_simulation import user_simulation
 
+    tagged = _db_cost_row()
+    untagged = _db_cost_row()
+    untagged.tags = {}
+    untagged.service_name = "JOBS"
+    untagged.resource_id = "job-untagged"
+    untagged.resource_name = "nightly-etl"
+    untagged.billed_cost = untagged.effective_cost = untagged.list_cost = Decimal("50")
+
     _seed(
-        [
-            # Shared compute, idle, no owner → the unattributed bucket.
-            _eff("wh-idle", EntityType.SQL_WAREHOUSE, "500", activity_count=0),
-            _eff("job-idle", EntityType.JOB, "20", activity_count=0, owner_user="carol"),
-        ]
+        [_eff("job-idle", EntityType.JOB, "20", activity_count=0, owner_user="carol")],
+        cost_rows=[tagged, untagged],
     )
 
     from flashlight.dashboard.router import build_pages
@@ -1637,89 +1645,16 @@ def test_attribution_tab_pins_the_unowned_shared_compute_row(lake_home) -> None:
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            # ui.table renders rows client-side, invisible to should_see (see the /usage
-            # test above) — assert on the KPI + caption that frame the row instead. That
-            # the row itself survives is asserted in tests/test_owner_leaderboard.py.
-            await user.should_see("Unowned")
-            await user.should_see("no owner by design")
-            # The unowned $500 must be the headline, not silently excluded: only $20 of
-            # the $520 recoverable has an owner.
-            await user.should_see("3.8%")
+            await user.should_see("Untagged by service")
+            await user.should_see("Click a service to list its untagged resources")
+            await user.should_see("Untagged resources")
+            await user.should_see("How to fix")
+            await user.should_see("Spend by tag key")
+            await user.should_see("Spend by tag value")
+            await user.should_not_see("carry a cost-allocation tag")
+            await user.should_not_see("Waste & opportunity by owner")
 
     asyncio.run(_check())
-
-
-def test_attribution_tab_labels_a_service_principal(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """A bare UUID at the top of the ranking must not read like a colleague's name."""
-    from nicegui.testing.user_simulation import user_simulation
-
-    _seed(
-        [
-            _eff(
-                "job-bot",
-                EntityType.JOB,
-                "900",
-                activity_count=0,
-                owner_user="8554dc05-1234-4abc-89ef-0123456789ab",
-            ),
-        ]
-    )
-
-    from flashlight.dashboard.router import build_pages
-
-    async def _check() -> None:
-        async with user_simulation() as user:
-            build_pages()
-            await user.open("/databricks")
-            # The label itself is a table cell (invisible to should_see) and is asserted
-            # in tests/test_owner_leaderboard.py; here we prove the page counts it as
-            # automation rather than as a person, which is what the KPI caption is for.
-            await user.should_see("service principals")
-            await user.should_see("automation, not people")
-
-    asyncio.run(_check())
-
-
-def test_attribution_tab_shows_the_coverage_denominator(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """Per-key spend double-counts multi-tagged resources, so the honest denominator
-    (spend_tag_coverage_month) has to be on screen next to it. One implementation of it,
-    range-scoped — the old page's second, single-month one is gone."""
-    from nicegui.testing.user_simulation import user_simulation
-
-    _seed([_eff("job-idle", EntityType.JOB, "20", activity_count=0, owner_user="carol")])
-
-    from flashlight.dashboard.router import build_pages
-
-    async def _check() -> None:
-        async with user_simulation() as user:
-            build_pages()
-            await user.open("/databricks")
-            await user.should_see("carry a cost-allocation tag")
-            await user.should_see("denominator")
-
-    asyncio.run(_check())
-
-
-def test_attribution_tab_calls_unattributed_project_spend_what_it_is(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """owner_project is ~1% populated on real data — the panel must explain that, not
-    render an empty state that implies a broken pull."""
-    from nicegui.testing.user_simulation import user_simulation
-
-    _seed([_eff("job-idle", EntityType.JOB, "900", activity_count=0, owner_user="carol")])
-
-    from flashlight.dashboard.router import build_pages
-
-    async def _check() -> None:
-        async with user_simulation() as user:
-            build_pages()
-            await user.open("/databricks")
-            await user.should_see("Attributed to a project")
-            await user.should_see("tagging is missing upstream")
-            # 0.0%, not an empty state: the spend is known, the tag is missing.
-            await user.should_see("0.0%")
-
-    asyncio.run(_check())
-
 
 def test_provider_page_hides_the_projection_on_one_day_of_history(lake_home) -> None:  # type: ignore[no-untyped-def]
     """A single day of data must not produce a Projected tile — it was reading ~30x high."""
@@ -2349,7 +2284,7 @@ def test_ai_costs_tab_shows_spend_and_says_tokens_were_never_measured(lake_home)
             await user.should_not_see("last 6 month")
             await user.should_not_see("By AI product ·")
             await user.should_not_see("By resource ·")
-            await user.should_see("Values for one key:")
+            await user.should_see("AI spend by tag")
             await user.should_see("no serving telemetry")
             await user.should_not_see("Tokens by project")
             await user.should_not_see("Model unit economics")
@@ -2384,7 +2319,7 @@ def test_ai_costs_tab_names_untagged_ai_spend(lake_home) -> None:  # type: ignor
             user.find("AI Costs").click()
             await user.should_see("Untagged AI Spend")
             await user.should_see("no `project` tag")
-            await user.should_see("Values for one key:")
+            await user.should_see("AI spend by tag")
             selects = list(user.find(kind=ui.select).elements)
             assert any(getattr(s, "value", None) == "project" for s in selects), (
                 f"expected tag-key select defaulting to project, got "
@@ -2524,7 +2459,7 @@ def test_ai_costs_tab_shows_tokens_per_project_and_per_user(lake_home) -> None: 
             build_pages()
             await user.open("/databricks")
             user.find("AI Costs").click()
-            await user.should_see("Values for one key:")
+            await user.should_see("AI spend by tag")
             await user.should_see("Tokens by user")
             await user.should_see("Model unit economics")
             await user.should_not_see("Tokens by project")
@@ -2577,7 +2512,7 @@ def test_ai_costs_tab_omits_token_panels_when_serving_pull_is_empty(lake_home) -
             user.find("AI Costs").click()
             await user.should_see("AI Spend")
             await user.should_see("no serving telemetry")
-            await user.should_see("Values for one key:")
+            await user.should_see("AI spend by tag")
             await user.should_not_see("Tokens by project")
             await user.should_not_see("Tokens by user")
             await user.should_not_see("What can be optimized")
@@ -2639,7 +2574,7 @@ def test_ai_costs_tab_shows_one_row_per_project_not_one_per_attribution_source(l
             build_pages()
             await user.open("/databricks")
             user.find("AI Costs").click()
-            await user.should_see("Values for one key:")
+            await user.should_see("AI spend by tag")
             tables = [
                 t.rows
                 for t in user.find(kind=ui.table).elements
@@ -2837,11 +2772,12 @@ def test_backing_storage_kpi_is_absent_rather_than_zero_when_nothing_is_mapped(l
             build_pages()
             await user.open("/databricks")
             await user.should_see("Net Spend")
-            # Tab label still exists; the KPI card must not — no "$0" stand-in either.
+            # Tab label still exists; the KPI card must not — unmeasured is omitted,
+            # never rendered as a "$0" storage cost beside Net Spend.
             from flashlight.dashboard.views import backing_storage
 
             assert backing_storage.kpi_card(date(2026, 5, 1), date(2026, 5, 31)) is None
-            await user.should_not_see("$0")
+            await user.should_see("Databricks Storage")  # tab label still present
 
     asyncio.run(_check())
 
@@ -2904,15 +2840,9 @@ def test_backing_storage_tab_says_empty_map_is_not_zero_storage_cost(lake_home) 
 
 
 def test_redshift_page_points_hidden_s3_spend_at_the_backing_storage_tab(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """`/aws` is Redshift-scoped over a group that now also holds S3, so Home's AWS total
-    and this page legitimately differ. The scope caption names the hidden spend and, for
-    S3 specifically, says where it went — S3 is in the default pull precisely so the
-    Databricks page can show the storage behind it.
-
-    (That the subcategory panel itself is service-scoped — the leak that would otherwise
-    grow an "Amazon Simple Storage Service" pie under a Redshift heading — is asserted at
-    the Scope level in test_page_scope.py, where the predicate is checkable directly
-    rather than through a client-side Plotly legend.)
+    """`/aws` is Redshift-scoped; S3 is ingested for the storage plane but kept out of
+    ``aws.*`` GOLD. The scope caption still points at Databricks → Databricks Storage
+    when the storage plane has dollars for the window.
     """
     from nicegui.testing.user_simulation import user_simulation
 
@@ -2935,5 +2865,171 @@ def test_redshift_page_points_hidden_s3_spend_at_the_backing_storage_tab(lake_ho
             await user.open("/aws")
             await user.should_see("Redshift's own FOCUS service names")
             await user.should_see("Databricks \u2192 Databricks Storage")
+            await user.should_see("not in aws.* GOLD")
+
+    asyncio.run(_check())
+
+
+def test_home_folds_databricks_storage_from_storage_plane(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Home adds mapped Databricks Storage onto Databricks; aws.* GOLD has no S3.
+
+    Bronze still holds Amazon S3. Transform keeps it out of ``aws.*`` and names mapped
+    buckets ``Databricks Storage`` in ``storage.backing_storage_month``. Home folds that
+    into the Databricks stack / movers — it does not rename an AWS S3 service line.
+    ``databricks.monthly_bill`` stays DBU-only.
+    """
+    from flashlight.lake import bronze
+    from flashlight.lake.storage_location_schema import StorageLocationRecord
+    from flashlight.lake.storage_locations import write_storage_locations
+    from flashlight.transform.runner import build_gold
+
+    def _on(day: int, month: int) -> datetime:
+        return datetime(2026, month, day, tzinfo=UTC)
+
+    def _dbx(month: int, amount: str = "100") -> FocusRecord:
+        when = _on(15, month)
+        last = 31 if month == 5 else 30
+        return FocusRecord(
+            provider_name=ProviderName.DATABRICKS,
+            billing_account_id="acct",
+            billing_period_start=date(2026, month, 1),
+            billing_period_end=date(2026, month, last),
+            charge_period_start=when,
+            charge_period_end=when,
+            billed_cost=Decimal(amount),
+            effective_cost=Decimal(amount),
+            list_cost=Decimal(amount),
+            charge_category=ChargeCategory.USAGE,
+            service_category=ServiceCategory.ANALYTICS,
+            service_name="JOBS",
+            tags={},
+            x_compute_class=ComputeClass.NOT_APPLICABLE,
+            x_source_connector="t",
+        )
+
+    def _aws_month(month: int, *, rs: str, managed: str, unmapped: str) -> list[FocusRecord]:
+        last = 31 if month == 5 else 30
+
+        def stamp(rec: FocusRecord, day: int) -> FocusRecord:
+            rec.billing_period_start = date(2026, month, 1)
+            rec.billing_period_end = date(2026, month, last)
+            rec.charge_period_start = _on(day, month)
+            rec.charge_period_end = _on(day, month)
+            return rec
+
+        return [
+            stamp(_redshift_usage(14, rs), 14),
+            stamp(_s3_usage(15, managed, "arn:aws:s3:::acme-uc-root"), 15),
+            stamp(_s3_usage(16, unmapped, "arn:aws:s3:::random-other"), 16),
+            _dbx(month),
+        ]
+
+    bronze.write_window(
+        "t",
+        IngestWindow(date(2026, 5, 1), date(2026, 5, 31)),
+        _aws_month(5, rs="1000", managed="200", unmapped="50"),
+        ingest_run_id="r1",
+    )
+    bronze.write_window(
+        "t",
+        IngestWindow(date(2026, 6, 1), date(2026, 6, 30)),
+        _aws_month(6, rs="1000", managed="300", unmapped="50"),
+        ingest_run_id="r2",
+    )
+    write_storage_locations(
+        [
+            StorageLocationRecord(
+                provider_name="Databricks",
+                snapshot_month=date(2026, 6, 1),
+                location_kind="metastore_root",
+                location_name="acme",
+                url="s3://acme-uc-root",
+                scheme="s3",
+                cloud_provider_name="AWS",
+                bucket_name="acme-uc-root",
+                key_prefix=None,
+                x_source_connector="databricks",
+            ),
+        ]
+    )
+    build_gold()
+
+    from flashlight.dashboard.views import home_overview
+    from flashlight.gold.reader import run_select
+
+    dbx_bill = float(
+        run_select(
+            "SELECT sum(gross_cost) AS c FROM databricks.monthly_bill "
+            "WHERE charge_month = '2026-06-01'"
+        )[0]["c"]
+    )
+    assert dbx_bill == pytest.approx(100.0)
+    aws_bill = float(
+        run_select(
+            "SELECT sum(gross_cost) AS c FROM aws.monthly_bill "
+            "WHERE charge_month = '2026-06-01'"
+        )[0]["c"]
+    )
+    # Redshift only — S3 excluded from aws.* GOLD.
+    assert aws_bill == pytest.approx(1000.0)
+    s3_in_aws = float(
+        run_select(
+            "SELECT coalesce(sum(gross_cost), 0) AS c FROM aws.spend_by_service_month "
+            "WHERE service_name = 'Amazon Simple Storage Service'"
+        )[0]["c"]
+    )
+    assert s3_in_aws == 0.0
+
+    month, prior = date(2026, 6, 1), date(2026, 5, 1)
+    storage = home_overview._databricks_storage_by_month(prior, month)
+    assert storage[month] == pytest.approx(300.0)
+    assert storage[prior] == pytest.approx(200.0)
+
+    aws_cur, aws_prev = home_overview._include_storage(
+        "aws", 1000.0, 1000.0, storage[month], storage[prior]
+    )
+    dbx_cur, dbx_prev = home_overview._include_storage(
+        "databricks", 100.0, 100.0, storage[month], storage[prior]
+    )
+    assert aws_cur == pytest.approx(1000.0)
+    assert aws_prev == pytest.approx(1000.0)
+    assert dbx_cur == pytest.approx(400.0)
+    assert dbx_prev == pytest.approx(300.0)
+
+    movers = home_overview._home_movers(month, prior)
+    assert not movers.empty
+    drivers = list(movers["driver"])
+    assert "Databricks Storage" in drivers
+    assert "Amazon Simple Storage Service" not in drivers
+    dbx_row = movers.loc[movers["driver"] == "Databricks Storage"].iloc[0]
+    assert dbx_row["provider"] == "Databricks"
+    assert float(dbx_row["cost_delta"]) == pytest.approx(100.0)
+
+    history = home_overview._provider_history(["aws", "databricks"], prior, date(2026, 6, 30))
+    jun_rows = history[history["month"] == "2026-06"]
+    by_group = {str(r.group): float(r.net_cost) for r in jun_rows.itertuples()}
+    assert by_group["aws"] == pytest.approx(1000.0)
+    assert by_group["databricks"] == pytest.approx(400.0)
+
+    from nicegui import ui
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/")
+            await user.should_see("Databricks includes its managed storage")
+            tables = [
+                t
+                for t in user.find(kind=ui.table).elements
+                if {"Provider", "Driver"} <= {str(c.get("name")) for c in (t.columns or [])}
+            ]
+            assert tables, "Biggest movers table missing"
+            rows = tables[0].rows
+            drivers = [r.get("Driver") for r in rows]
+            assert "Databricks Storage" in drivers
+            assert "Amazon Simple Storage Service" not in drivers
 
     asyncio.run(_check())

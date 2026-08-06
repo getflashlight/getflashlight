@@ -248,7 +248,7 @@ def render(
             if attribution_tab is not None:
                 attribution_tab(sm, end)
             else:
-                attribution.render(group, label, end, sm)
+                attribution.render(group, end, sm)
 
         def _panel_efficiency() -> None:
             if efficiency_tab is not None:

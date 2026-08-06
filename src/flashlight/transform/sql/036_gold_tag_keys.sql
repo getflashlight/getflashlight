@@ -37,7 +37,7 @@ WITH exploded AS (
         replace(lower(trim(t.tag_key)), '-', '_')            AS tag_key_normalized,
         json_extract_string(f.tags, '$."' || t.tag_key || '"') AS tag_value,
         f.cost
-    FROM silver.focus_normalized f
+    FROM silver.focus_provider_bill f
     CROSS JOIN unnest(json_keys(f.tags)) AS t(tag_key)
     WHERE NOT f.is_credit
 ),

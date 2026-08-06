@@ -392,6 +392,42 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
         measures=("net_cost", "gross_cost", "tagged_cost", "untagged_cost", "tagged_pct"),
     ),
     ViewSpec(
+        view="spend_untagged_by_service_month",
+        title="Untagged spend by service / month",
+        description="Charge-only tagged/untagged split per service (same definition as "
+        "spend_tag_coverage_month, one grain finer). Answers 'which services lack "
+        "cost-allocation tags?'. Fully-tagged services remain (tagged_pct=100); filter "
+        "untagged_cost > 0 for the gap list. service_name is coalesced to '(no service)' "
+        "when absent. Summing untagged_cost over services reconciles to "
+        "spend_tag_coverage_month.untagged_cost for the same month.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=("provider_name", "service_name", "charge_month"),
+        measures=("gross_cost", "tagged_cost", "untagged_cost", "tagged_pct"),
+    ),
+    ViewSpec(
+        view="spend_untagged_by_resource_month",
+        title="Untagged spend by resource / month",
+        description="Untagged charges only (empty Tags, credits excluded), ranked per "
+        "resource. Answers 'what do I open and tag?' under a service gap from "
+        "spend_untagged_by_service_month — summing untagged_cost for one service "
+        "reconciles to that service's untagged_cost. resource_id/name/type and "
+        "workspace/region coalesced like resource_month so lines with no resource id "
+        "stay visible as '(none)' / '(unattributed)'.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=(
+            "provider_name",
+            "service_name",
+            "sku_id",
+            "resource_type",
+            "resource_id",
+            "resource_name",
+            "sub_account_id",
+            "region_id",
+            "charge_month",
+        ),
+        measures=("untagged_cost",),
+    ),
+    ViewSpec(
         view="sku_month_over_month",
         title="SKU month-over-month variance",
         description="Per-SKU cost change decomposed into volume_effect (Δusage × prior rate) "
@@ -847,15 +883,15 @@ AI_USAGE_BASE_VIEWS: tuple[ViewSpec, ...] = (
 # Fixed group, fed by metrics.storage_location (Unity Catalog's bucket map) joined to
 # the FOCUS plane's S3 rows.
 #
-# THE ONE RULE EVERY VIEW HERE CARRIES, and the reason the descriptions are this
-# emphatic: these dollars are billed by AWS and are ALREADY counted in aws.monthly_bill.
-# They are not Databricks spend and must never be added to it — Databricks' own bill
-# (system.billing.usage) covers DBU compute only, and summing the two is exactly the
-# TCO join CLAUDE.md removed. MCP and the assistant read these descriptions, so the rule
-# has to live here, not only in the dashboard caption.
+# THE ONE RULE EVERY VIEW HERE CARRIES: these dollars are billed by AWS, live ONLY in
+# this storage GOLD group (aws.* GOLD excludes Amazon S3 via silver.focus_provider_bill),
+# and must never be added to databricks.monthly_bill — Databricks' own bill covers DBU
+# compute only, and summing the two is exactly the TCO join CLAUDE.md removed. MCP and
+# the assistant read these descriptions, so the rule has to live here.
 _TWO_BILLS_RULE = (
-    "This money is billed by AWS and is already counted in aws.monthly_bill. It is NOT "
-    "Databricks spend: Databricks' own bill covers DBU compute only, so these are two "
+    "This money is billed by AWS and is excluded from aws.* GOLD — storage.backing_storage_month "
+    "is its only GOLD home (mapped rows are named Databricks Storage). It is NOT "
+    "Databricks DBU spend: Databricks' own bill covers compute only, so these are two "
     "separate bills and must never be summed into one 'total Databricks cost'. Report "
     "them side by side, never added."
 )
@@ -896,9 +932,12 @@ STORAGE_BASE_VIEWS: tuple[ViewSpec, ...] = (
         view="backing_storage_month",
         title="Backing storage cost / month",
         description="AWS-billed Amazon S3 cost per (bucket, month, subcategory), labelled "
-        "by whether the bucket is Databricks-MANAGED storage. EVERY S3 row is here, mapped "
-        "or not, so mapping='databricks' is a numerator with an honest denominator — sum "
-        "across all mapping values and you get the account's whole S3 bill. "
+        "by whether the bucket is Databricks-MANAGED storage. Mapped rows "
+        "(mapping='databricks') use service_name 'Databricks Storage' — they are excluded "
+        "from aws.* GOLD (silver.focus_provider_bill) and this view is their only GOLD home. "
+        "EVERY S3 row is here, mapped or not, so mapping='databricks' is a numerator with "
+        "an honest denominator — sum across all mapping values and you get the account's "
+        "whole S3 bill. "
         f"{_TWO_BILLS_RULE} "
         "mapping: 'databricks' = the bucket holds Databricks-MANAGED storage — a Unity "
         "Catalog metastore root or a MANAGED_CATALOG's storage root, i.e. storage Databricks "
