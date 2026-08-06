@@ -1248,7 +1248,8 @@ def test_rule_coverage_rows_distinguishes_fired_clean_and_no_data() -> None:
     """
     import pandas as pd
 
-    from flashlight.dashboard.views.redshift_focus import _rule_coverage_rows
+    from flashlight.dashboard.views.efficiency_waste import rule_coverage_rows
+    from flashlight.efficiency.waste_rules import coverage_groups
 
     records = pd.DataFrame(
         [
@@ -1278,7 +1279,13 @@ def test_rule_coverage_rows_distinguishes_fired_clean_and_no_data() -> None:
     # telemetry pull came back completely empty (the real gap seen in production).
     measured_types = {"sql_warehouse", "table"}
 
-    by_category = {r["category"]: r for r in _rule_coverage_rows(records, measured_types)}
+    # The rule→group structure is derived from the pool now (coverage_groups) rather than
+    # restated in the view, so this passes AWS's own set — the same rules the old
+    # hand-maintained map listed, minus the Databricks-only ones it could never fire.
+    by_category = {
+        r["category"]: r
+        for r in rule_coverage_rows(records, measured_types, coverage_groups("AWS"))
+    }
 
     # A single fired entity states what actually fired, not just a count — this is
     # what tells a reader "$1,038 recoverable, for what" right in the coverage row.

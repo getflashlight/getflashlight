@@ -64,13 +64,20 @@ connectors:
     s3_bucket: my-focus-bucket
     s3_prefix: billing/focus
     region: us-east-1
-    include_services: []   # [] = whole account; default is Redshift only
+    include_services: []   # [] = whole account; default is Redshift + S3
 ```
 
 `include_services` is an allow-list of FOCUS `ServiceName` values — AWS Data
 Exports is account-wide and can't be scoped per service at the source, so
-Flashlight narrows here. It defaults to Redshift only; set `[]` to ingest the
-whole account, or list the specific services you want.
+Flashlight narrows here. Set `[]` to ingest the whole account, or list the
+specific services you want.
+
+It defaults to Redshift's own service names **plus `Amazon Simple Storage
+Service`**. S3 is in the default because Databricks' own bill covers DBU compute
+only — the storage behind a Unity Catalog external location is billed by AWS, so
+without S3 here the Databricks → **Backing storage** tab has nothing to show (see
+[Backing storage](design/backing-storage.md)). Narrowing it back to just
+Redshift's names opts out, and the AWS group's totals shrink accordingly.
 
 **5. Ingest.**
 
@@ -106,7 +113,7 @@ connectors:
     name: Prod cost
     cost_source: cost_explorer
     region: us-east-1
-    include_services: []   # [] = whole account; default is Redshift only
+    include_services: []   # [] = whole account; default is Redshift + S3
 ```
 
 Groups Cost Explorer's `get_cost_and_usage` by the `SERVICE` dimension and day,
@@ -116,10 +123,14 @@ Redshift $ breakdown other views rely on needs the FOCUS export's
 `ChargeDescription`/`SkuId`). Needs `ce:GetCostAndUsage` in addition to
 whatever IAM the S3 path would have needed.
 
+This path also **cannot feed the backing-storage view**: Cost Explorer returns
+account-level service totals with no `ResourceId`, so no S3 charge can be
+attributed to a bucket. Those rows land as `mapping='no_resource_id'`.
+
 There's no per-resource/tag scoping here (an earlier `aws_infra` connector did
 this for Databricks classic-compute AWS-infra attribution via a cluster tag;
 it was folded into this Cost Explorer path and that attribution capability was
-not carried over — see `CLAUDE.md`'s TCO double-count guard note).
+not carried over).
 
 ## Databricks mapping
 
@@ -131,7 +142,8 @@ from the Databricks solution accelerator
 The connector executes it on a SQL warehouse, then feeds the FOCUS-columned output
 through the same shared mapper used by the file/S3 connectors. The only field we add
 is `x_compute_class` (classic vs serverless), derived from the SKU — FOCUS doesn't
-carry it, but the TCO double-count guard needs it.
+carry it, and it's how you tell all-in serverless billing from classic compute that
+also shows up as separate cloud infra lines.
 
 **This SQL is repurposable** — that's a feature, not a one-off:
 

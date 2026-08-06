@@ -26,7 +26,7 @@ def _data_dirs() -> Iterator[tuple[str, Path]]:
     yield "gold", paths.gold_dir()
     yield "gold.staging", paths.gold_staging_dir()
     yield "runs", paths.runs_dir()
-    yield "chat_turns", paths.chat_turns_dir()
+    yield "assistant_turns", paths.assistant_turns_dir()
 
 
 def cleanup_targets() -> list[Path]:

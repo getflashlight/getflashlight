@@ -28,6 +28,13 @@ GROUP BY provider_name, charge_month;
 
 
 -- ── "Where is the money going?" — by service / product ──────────────────────────
+-- Carries the same list_cost/savings pair as `monthly_bill` above, deliberately: this is
+-- `monthly_bill` at one finer grain, over the same silver.focus_normalized with the same
+-- sum(cost)/sum(list_cost), so the two reconcile by construction. That's what lets a
+-- consumer scoped to a subset of services (the /aws page is scoped to Redshift's own
+-- service names) build a list/savings/realized-discount headline that agrees with the
+-- provider-wide one, instead of bolting a service dimension onto `monthly_bill` — which
+-- would make the headline view carry a grain nothing else needs.
 CREATE OR REPLACE VIEW gold.spend_by_service_month AS
 SELECT
     provider_name,
@@ -37,6 +44,8 @@ SELECT
     sum(cost)                                            AS net_cost,
     sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
     sum(cost) FILTER (WHERE is_credit)                   AS credit_cost,
+    sum(list_cost)                                       AS list_cost,
+    sum(list_cost) - sum(cost)                           AS savings,
     bool_or(is_partial_period)                           AS is_partial_period,
     bool_or(x_effective_is_list)                         AS effective_is_list,
     max(billing_currency)                                AS currency
@@ -247,81 +256,52 @@ FROM silver.focus_normalized
 GROUP BY provider_name, charge_month;
 
 
+-- ── "Which credits/discounts hit this bill, and when?" — credit detail ───────────
+-- The one view where credits are the subject rather than a `sum(cost)` term. Every
+-- other view nets them into `cost` (FOCUS-correct: EffectiveCost is post-credit), which
+-- is right for a bill but hides a one-off: a single goodwill credit can swing a
+-- provider's month by more than its usage moved, and at month grain that reads as "spend
+-- collapsed". Kept at charge-description grain because that's the credit's identity (AWS
+-- puts the credit name + credit id there), so a headline that excludes credits (the home
+-- page trends charges only) can point at exactly what it excluded.
+--
+-- Credit AND Adjustment: both are non-usage lines that move the invoice (FOCUS
+-- ChargeCategory), and a user asking "what discount did I get?" means either. Tax and
+-- Purchase stay out — they're charges, not reductions.
+CREATE OR REPLACE VIEW gold.credits_month AS
+SELECT
+    provider_name,
+    charge_month,
+    charge_category,
+    coalesce(service_name, '(account-level)')            AS service_name,
+    coalesce(charge_description, '(no description)')     AS charge_description,
+    sum(cost)                                            AS net_cost,
+    count(*)                                             AS line_count,
+    bool_or(is_partial_period)                           AS is_partial_period
+FROM silver.focus_normalized
+WHERE charge_category IN ('Credit', 'Adjustment')
+GROUP BY provider_name, charge_month, charge_category,
+         coalesce(service_name, '(account-level)'),
+         coalesce(charge_description, '(no description)');
+
+
 -- ── Daily spend trend per provider — drives the time-series panels ───────────────
+-- Carries `service_name` so a consumer scoped to a subset of services can still get a
+-- DAILY series. Without it, the only service-dimensioned view is monthly, and a
+-- service-scoped page has no daily trend at all (that was the /aws page's gap). This is
+-- the one view here where the extra dimension genuinely multiplies rows — days ×
+-- providers × services — so every consumer wanting a provider-wide daily series must
+-- now aggregate: `sum(net_cost) ... GROUP BY charge_day`, never one row per day.
 CREATE OR REPLACE VIEW gold.spend_trend_daily AS
 SELECT
     charge_day,
     provider_name,
+    service_name,
     sum(cost)                                            AS net_cost,
     sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
     bool_or(is_partial_period)                           AS is_partial_period
 FROM silver.focus_normalized
-GROUP BY charge_day, provider_name;
-
-
--- ── TCO per Databricks cluster per month (DBU + attributed AWS infra) ────────────
-CREATE OR REPLACE VIEW gold.tco_by_cluster_month AS
-SELECT
-    charge_month,
-    coalesce(sub_account_id, '(none)')                   AS sub_account_id,
-    cluster_id,
-    compute_class,
-    tco_basis,
-    dbu_cost,
-    infra_cost,
-    tco_cost,
-    CASE WHEN tco_cost > 0 THEN round(100 * infra_cost / tco_cost, 1) ELSE 0 END
-                                                         AS infra_pct_of_tco,
-    is_partial_period
-FROM silver.tco_resource_month;
-
-
--- ── EKS TCO per cluster per month (control plane + AWS-attributed node EC2/EBS) ──
--- Node spend is keyed on AWS-generated tags (aws:eks:cluster-name /
--- kubernetes.io/cluster/<name>); the control-plane line carries the cluster ARN.
--- nodes_attributed = false with control_plane_cost > 0 flags clusters whose node
--- tags were not activated as cost-allocation tags upstream (under-attribution
--- surfaced, not hidden).
-CREATE OR REPLACE VIEW gold.tco_eks_by_cluster_month AS
-SELECT
-    charge_month,
-    coalesce(cluster_name, '(unresolved)')               AS cluster_name,
-    control_plane_cost,
-    node_ec2_cost,
-    node_ebs_cost,
-    node_cost,
-    eks_tco,
-    (node_cost > 0)                                      AS nodes_attributed,
-    is_partial_period
-FROM silver.tco_eks_resource_month;
-
-
--- ── Monthly TCO rollup: total DBU vs infra vs the unattributed AWS bucket ────────
-CREATE OR REPLACE VIEW gold.tco_summary_month AS
-WITH attributed AS (
-    SELECT charge_month,
-           sum(dbu_cost)   AS dbu_cost,
-           sum(infra_cost) AS infra_cost,
-           sum(tco_cost)   AS tco_cost,
-           bool_or(is_partial_period) AS is_partial_period
-    FROM silver.tco_resource_month
-    GROUP BY charge_month
-),
-unattributed AS (
-    SELECT charge_month, sum(cost) AS unattributed_infra_cost
-    FROM silver.tco_unattributed
-    GROUP BY charge_month
-)
-SELECT
-    coalesce(a.charge_month, u.charge_month)             AS charge_month,
-    coalesce(a.dbu_cost, 0)                              AS dbu_cost,
-    coalesce(a.infra_cost, 0)                            AS attributed_infra_cost,
-    coalesce(u.unattributed_infra_cost, 0)              AS unattributed_infra_cost,
-    coalesce(a.tco_cost, 0) + coalesce(u.unattributed_infra_cost, 0)
-                                                         AS total_cost,
-    coalesce(a.is_partial_period, false)                AS is_partial_period
-FROM attributed a
-FULL OUTER JOIN unattributed u ON u.charge_month = a.charge_month;
+GROUP BY charge_day, provider_name, service_name;
 
 
 -- ── "What changed month-over-month, and why?" — per-SKU cost variance ────────────

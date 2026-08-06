@@ -47,25 +47,76 @@ from flashlight.focus import sql_mapping
 from flashlight.focus.enums import ChargeCategory, ProviderName, ServiceCategory
 from flashlight.focus.model import FocusRecord
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
+from flashlight.ingest._s3_service_names import S3_SERVICE_NAMES
 from flashlight.ingest.base import Connector, IngestWindow, ProgressCallback
 from flashlight.ingest.config import AwsFocusConfig, aws_client, effective_connector_name, env
 from flashlight.ingest.connectors._coerce import to_decimal
-from flashlight.lake import bronze
+from flashlight.lake import bronze, paths
 from flashlight.lake import duck as lake_duck
 
 logger = get_logger(__name__)
 
-# FOCUS ServiceName for S3, used by fetch_efficiency's intelligent-tiering signal below.
-_S3_SERVICE_NAME = "Amazon Simple Storage Service"
+
+def _sql_str(value: str) -> str:
+    """Single-quote a string literal for inlining into SQL (escapes quotes)."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _services_sql(names: frozenset[str]) -> str:
+    """A ServiceName allow-list as a SQL literal list for an ``IN (...)`` predicate."""
+    return ", ".join(_sql_str(s) for s in sorted(names))
+
+
+def _tune_bulk_connection(con: duckdb.DuckDBPyConnection) -> None:
+    """Settings the vectorized bulk path needs but ``duckdb.connect()`` doesn't give it.
+
+    This connection is deliberately NOT :func:`flashlight.lake.duck.connect` — that one
+    caps ``memory_limit`` low (a laptop running several readers at once) and this is the
+    one write path that genuinely wants the headroom, since ``write_window_sql``
+    materializes the whole mapped window before COPYing it.
+
+    But the bare connection defaults are wrong here in two ways that only show up on a
+    real export:
+
+    * ``temp_directory`` defaults to **``.tmp``, relative to the process's current working
+      directory** — so a backfill large enough to spill writes gigabytes into whatever
+      directory the operator happened to run ``flashlight ingest`` from, ignores
+      ``FLASHLIGHT_DUCKDB_TEMP_DIR`` entirely, and fails outright where the cwd isn't
+      writable (a container run read-only). Point it at the lake's own spill dir, the
+      same one every other connection uses. Best-effort, matching ``duck.connect``: an
+      unwritable spill dir shouldn't fail an ingest that may not need to spill at all.
+    * ``preserve_insertion_order`` defaults to true, which makes the partitioned COPY
+      hold rows back to keep an order BRONZE has no use for — it's Hive-partitioned by
+      (connector, charge_month) and every consumer aggregates. Measured ~12% off the COPY
+      at 2M rows, and it lowers peak memory, which is the binding constraint here.
+    """
+    con.execute("SET preserve_insertion_order = false")
+    temp_dir = paths.duckdb_temp_dir()
+    try:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("aws_focus_temp_dir_unwritable", path=str(temp_dir), error=str(exc))
+        return
+    con.execute(f"SET temp_directory = {_sql_str(str(temp_dir))}")
+
+
+# The two service allow-lists as SQL literal lists, for the predicates below and the
+# x_cost_subcategory classifier further down. Both come from internal constants, never
+# from user input, so inlining is safe — and it's what lets the classifier's expression
+# nest inside sql_mapping's CTEs (see _scan_where_literal's docstring for the same
+# reasoning applied to the ingest window).
+_REDSHIFT_SERVICES_SQL = _services_sql(REDSHIFT_SERVICE_NAMES)
+_S3_SERVICES_SQL = _services_sql(S3_SERVICE_NAMES)
 
 # fetch_efficiency's S3 intelligent-tiering signal — aggregated straight out of this
-# connector's own BRONZE rows (params: x_source_connector, service_name, first/last
-# charge_month in the window, window start, window end-exclusive). Grouping/SUM/bool_or
-# happen in DuckDB; Python only ever sees one row per (bucket, month), not one row per
-# line item. The charge_month bounds are the Hive partition column, so DuckDB prunes
-# whole month directories before opening any file — the charge_period_start bounds
-# alone would still force a read of every month this connector ever wrote.
-_S3_TIERING_SQL = """
+# connector's own BRONZE rows (params: x_source_connector, first/last charge_month in
+# the window, window start, window end-exclusive; the S3 ServiceName list is inlined,
+# see above). Grouping/SUM/bool_or happen in DuckDB; Python only ever sees one row per
+# (bucket, month), not one row per line item. The charge_month bounds are the Hive
+# partition column, so DuckDB prunes whole month directories before opening any file —
+# the charge_period_start bounds alone would still force a read of every month this
+# connector ever wrote.
+_S3_TIERING_SQL = f"""
     SELECT
         resource_id,
         any_value(resource_name) AS name,
@@ -79,7 +130,7 @@ _S3_TIERING_SQL = """
         ) AS on_it
     FROM raw.focus_record
     WHERE x_source_connector = ?
-      AND service_name = ?
+      AND service_name IN ({_S3_SERVICES_SQL})
       AND charge_month >= ?
       AND charge_month <= ?
       AND resource_id IS NOT NULL
@@ -151,13 +202,17 @@ class AwsFocusConnector(Connector):
 
         con = duckdb.connect()
         try:
+            _tune_bulk_connection(con)
             if any(f.startswith("s3://") for f in files):
                 con.execute("INSTALL httpfs; LOAD httpfs;")
                 con.execute("SET http_timeout = 180;")
                 con.execute(self._s3_secret_sql())
             sql_mapping.ensure_helpers(con)
             con.execute(
-                "CREATE OR REPLACE MACRO redshift_charge_text(d, s) AS "
+                # The text every x_cost_subcategory branch matches against, as one
+                # macro so the (long) coalesce isn't repeated per keyword. Shared by
+                # the Redshift and S3 rule families — see _cost_subcategory_sql.
+                "CREATE OR REPLACE MACRO charge_text(d, s) AS "
                 "lower(coalesce(d, '') || ' ' || coalesce(s, ''))"
             )
             source_sql = (
@@ -174,7 +229,7 @@ class AwsFocusConnector(Connector):
                 # which it can't know per-source.
                 focus_version="1.2",
                 present=present,
-                cost_subcategory_sql=_redshift_subcategory_sql(),
+                cost_subcategory_sql=_cost_subcategory_sql(),
             )
             written = bronze.write_window_sql(
                 self.name, window, con, mapped, base_currency=get_settings().base_currency
@@ -312,7 +367,6 @@ class AwsFocusConnector(Connector):
                 _S3_TIERING_SQL,
                 [
                     self.name,
-                    _S3_SERVICE_NAME,
                     window.start.strftime("%Y-%m"),
                     window.end.strftime("%Y-%m"),
                     window.start,
@@ -469,52 +523,122 @@ def _classify_redshift_cost_category(charge_description: str | None, sku_id: str
     signal in ``fetch_efficiency`` above) — AWS FOCUS exports carry no dedicated cost-
     category column, so this reads ChargeDescription/SkuId the same tolerant way.
     """
+    return _classify_cost_category(charge_description, sku_id, _REDSHIFT_CATEGORY_RULES)
+
+
+# ── S3 below-SKU categories ───────────────────────────────────────────────────────
+# The S3 twin of _REDSHIFT_CATEGORY_RULES, same first-match-wins precedence, feeding
+# the same two consumers (_classify_s3_cost_category in Python, the SQL CASE in
+# _cost_subcategory_sql). Exists because Databricks' storage is billed here, not by
+# Databricks: "S3 cost" as one number can't tell a storage-growth problem from a
+# request-volume one, and Databricks drives heavy LIST/GET metadata traffic, so
+# collapsing requests into storage would misdirect every remedy.
+#
+# The ordering is load-bearing, not cosmetic — each of these would be swallowed by a
+# later, broader rule:
+#   * early_delete before storage  — "EarlyDelete-ByteHrs" matches storage's "bytehrs"
+#   * monitoring    before storage — Intelligent-Tiering's "Monitoring and Automation"
+#                                    line mentions storage in its own description
+#   * requests      before storage — "Requests-Tier4" reads "Lifecycle Transition
+#                                    request", and retrieval SKUs mention storage tiers
+# "retrieval" is folded into `requests` deliberately rather than given a sixth bucket:
+# AWS's own console groups "Requests & data retrievals", and a retrieval IS a request
+# with a per-GB component.
+#
+# ponytail: every keyword below is UNVERIFIED against a live FOCUS export. The Redshift
+# table above needed two corrections after meeting real billing text — "instance" and
+# "data scan", without which the single largest line item in the account ($44K) sat
+# silently in "other" — so assume this one needs the same and re-check it before
+# trusting the split. Open question it depends on: AWS's discriminating *usage type*
+# ("TimedStorage-ByteHrs", "Requests-Tier1", "DataTransfer-Out-Bytes") is what these
+# keywords really target, and whether it reaches us in SkuId at all in the FOCUS 1.2
+# export is unconfirmed. If it doesn't, the fix is an x_UsageType column — which means
+# adding to _FOCUS_COLUMNS *and recreating the export* (the FOCUS table version is
+# baked into it), so don't design for that up front. This is the same open question as
+# the `s3_intelligent_tiering` rule's caveat in efficiency/waste_rules.py, over the
+# same text: validating one validates the other.
+_S3_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("early_delete", ("earlydelete", "early delete", "early deletion")),
+    ("monitoring", ("monitoring", "automation")),
+    ("data_transfer", ("datatransfer", "data transfer", "transfer acceleration", "bandwidth")),
+    ("requests", ("request", "put, copy", "retrieval", "lifecycle transition", "select")),
+    ("storage", ("timedstorage", "bytehrs", "storage", "sizeoverhead")),
+)
+
+
+def _classify_s3_cost_category(charge_description: str | None, sku_id: str | None) -> str:
+    """Bucket an S3 charge below SKU granularity: storage / requests / data_transfer /
+    monitoring / early_delete / other. The Python twin of the SQL branch in
+    :func:`_cost_subcategory_sql`, kept in sync by generating both from
+    :data:`_S3_CATEGORY_RULES` (and pinned by a parity test).
+    """
+    return _classify_cost_category(charge_description, sku_id, _S3_CATEGORY_RULES)
+
+
+def _classify_cost_category(
+    charge_description: str | None,
+    sku_id: str | None,
+    rules: tuple[tuple[str, tuple[str, ...]], ...],
+) -> str:
+    """First matching rule's category over ``ChargeDescription`` + ``SkuId``, else
+    ``other`` — the one text-match implementation both service families share."""
     text = f"{charge_description or ''} {sku_id or ''}".lower()
-    for category, keywords in _REDSHIFT_CATEGORY_RULES:
+    for category, keywords in rules:
         if any(keyword in text for keyword in keywords):
             return category
     return "other"
 
 
-def _redshift_category_branch(category: str, keywords: tuple[str, ...]) -> str:
-    text_expr = "redshift_charge_text(nz(ChargeDescription), nz(SkuId))"
+def _category_branch(category: str, keywords: tuple[str, ...]) -> str:
+    """One ``WHEN … THEN '<category>'`` branch over the shared ``charge_text`` macro."""
+    text_expr = "charge_text(nz(ChargeDescription), nz(SkuId))"
     conditions = " OR ".join(f"{text_expr} LIKE '%{keyword}%'" for keyword in keywords)
     return f"WHEN {conditions} THEN '{category}'"
 
 
-def _redshift_subcategory_sql() -> str:
-    """SQL port of :func:`_classify_redshift_cost_category`, generated from
-    :data:`_REDSHIFT_CATEGORY_RULES` — the ``x_cost_subcategory`` expression spliced
-    into :func:`flashlight.focus.sql_mapping.mapping_sql`'s ``cost_subcategory_sql``.
-    Evaluated over the raw ``nz(...)`` source columns, gated to Redshift's own FOCUS
-    ServiceName values (every other row gets NULL, unchanged).
+def _category_case(rules: tuple[tuple[str, tuple[str, ...]], ...]) -> str:
+    """``rules`` as one ``CASE … ELSE 'other' END``, most-specific branch first — the
+    SQL port of :func:`_classify_cost_category`, generated from the same table so the
+    two can never drift the way lake/seed.py's mapping once drifted from _focus_map's.
+    """
+    branches = "\n            ".join(_category_branch(c, k) for c, k in rules)
+    return f"CASE\n            {branches}\n            ELSE 'other'\n        END"
 
-    A ``Credit`` row, or one classified ``committed``, gets NULL (excluded from
+
+def _cost_subcategory_sql() -> str:
+    """The single ``x_cost_subcategory`` expression this connector splices into
+    :func:`flashlight.focus.sql_mapping.mapping_sql` — one CASE with one branch per
+    service family, because ``mapping_sql`` accepts exactly one expression and both
+    classifiers gate on ServiceName. Evaluated over the raw ``nz(...)`` source columns;
+    a row in neither family gets NULL, unchanged.
+
+    ``ChargeCategory = 'Credit'`` is hoisted above both branches because it is NULL
+    under either one anyway, so the rule is stated once instead of per family. A credit
+    gets NULL rather than a real bucket (so it's excluded from
     ``gold.spend_by_cost_subcategory_month`` entirely — see its ``WHERE
-    x_cost_subcategory IS NOT NULL``), not folded into a real bucket: this view is a
-    usage-mix breakdown (compute vs storage vs …), and neither a credit nor an RI/
-    Savings-Plan commitment charge is usage of any kind — text-matching a credit is
-    also a dead end (its own description, e.g. "Acme Corp Goodwill Credits, credit
-    id: …", carries no hint of what it was credited against). ``committed`` still exists
-    as a real :data:`_REDSHIFT_CATEGORY_RULES` category (``_classify_redshift_cost_
-    category`` returns it) — it's excluded only from this one usage-mix view, not
-    reclassified as 'other'; it's already its own KPI on the Redshift dashboard page.
+    x_cost_subcategory IS NOT NULL``) because that view is a usage-mix breakdown and a
+    credit isn't usage of any kind; text-matching one is also a dead end, since its own
+    description ("Acme Corp Goodwill Credits, credit id: …") carries no hint of what it
+    was credited against.
+
+    ``NULLIF(…, 'committed')`` stays on the **Redshift branch only**, for the same
+    usage-mix reason: an RI/Savings-Plan commitment charge isn't usage either.
+    ``committed`` remains a real :data:`_REDSHIFT_CATEGORY_RULES` category that
+    :func:`_classify_redshift_cost_category` still returns — it's excluded from this one
+    view, not reclassified as 'other', and it's already its own KPI on the Redshift
+    page. S3 has no commitment SKUs, so applying the NULLIF globally would buy nothing
+    today and would silently swallow a future S3 category named 'committed'.
     """
-    services = ", ".join(_sql_str(s) for s in sorted(REDSHIFT_SERVICE_NAMES))
-    branches = "\n            ".join(
-        _redshift_category_branch(category, keywords)
-        for category, keywords in _REDSHIFT_CATEGORY_RULES
-    )
-    classified = f"""
-    CASE WHEN coalesce(nz(ServiceName), 'Unknown') IN ({services}) THEN
-        CASE
-            WHEN nz(ChargeCategory) = 'Credit' THEN NULL
-            {branches}
-            ELSE 'other'
-        END
-    ELSE NULL END
+    return f"""
+    CASE
+        WHEN nz(ChargeCategory) = 'Credit' THEN NULL
+        WHEN coalesce(nz(ServiceName), 'Unknown') IN ({_REDSHIFT_SERVICES_SQL})
+            THEN NULLIF(({_category_case(_REDSHIFT_CATEGORY_RULES)}), 'committed')
+        WHEN coalesce(nz(ServiceName), 'Unknown') IN ({_S3_SERVICES_SQL})
+            THEN {_category_case(_S3_CATEGORY_RULES)}
+        ELSE NULL
+    END
     """
-    return f"NULLIF(({classified}), 'committed')"
 
 
 def _period_in_window(period: str, window: IngestWindow) -> bool:
@@ -598,11 +722,5 @@ def _scan_where_literal(allowed: set[str], window: IngestWindow) -> str:
         f'"ChargePeriodStart" < (DATE {_sql_str(window.end.isoformat())} + INTERVAL 1 DAY)',
     ]
     if allowed:
-        services = ", ".join(_sql_str(s) for s in sorted(allowed))
-        clauses.append(f'"ServiceName" IN ({services})')
+        clauses.append(f'"ServiceName" IN ({_services_sql(frozenset(allowed))})')
     return " AND ".join(clauses)
-
-
-def _sql_str(value: str) -> str:
-    """Single-quote a string literal for inlining into SQL (escapes quotes)."""
-    return "'" + value.replace("'", "''") + "'"

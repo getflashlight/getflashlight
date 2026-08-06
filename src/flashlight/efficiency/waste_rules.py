@@ -21,7 +21,7 @@ Some BLOCKED entries are adapted from OptimNow's cloud-finops-skills
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from flashlight.efficiency.policy_config import threshold_values
 
@@ -99,8 +99,24 @@ class WasteRule:
     requires: tuple[str, ...] = ()  # telemetry needed to activate a blocked rule
     source: str = "flashlight"
 
+    # ── Coverage metadata: which scopes this rule can even be evaluated in ──────────
+    # NOT used to build the classification SQL — `where_sql` remains the single source of
+    # truth for what fires. These declare, for a *reader*, the scope in which "this rule
+    # found nothing" is a meaningful statement. A coverage table that lists a rule outside
+    # its scope reports "clean" for a check that never ran, which is a worse lie than
+    # omitting it: see `coverage_groups`.
+    #
+    # `providers` is the FOCUS provider_name values whose connectors populate the fields
+    # `where_sql` tests; () means any provider that supplies them. Getting this wrong is
+    # the dangerous direction — leaving a Databricks-only rule at () puts a false "clean"
+    # on every Redshift cluster.
+    providers: tuple[str, ...] = ()
+    # `entity_types` is the EntityType values `where_sql` restricts to; () means any (or,
+    # for `photon_no_gain`, a *negative* restriction that a tuple can't express).
+    entity_types: tuple[str, ...] = ()
 
-WASTE_RULES: tuple[WasteRule, ...] = (
+
+_RULES_RAW: tuple[WasteRule, ...] = (
     # ── Active: evaluated today from metrics.efficiency_record ─────────────────────
     WasteRule(
         category="underutilized",
@@ -501,6 +517,50 @@ WASTE_RULES: tuple[WasteRule, ...] = (
         "- coalesce(jobs_priced_cost, billed_cost), 0), 2)",
         confidence_sql="'candidate'",
     ),
+    # ── Active: Model Serving endpoint signals (databricks._fetch_endpoint_efficiency) ──
+    # `idle` and `failed` above already fire on endpoint rows with no rule of their own —
+    # both are entity-type-agnostic, which is the whole point of putting serving into this
+    # plane as ROWS rather than building a second findings surface. These two cover what
+    # those can't: always-on capacity that IS being used, just barely.
+    WasteRule(
+        category="endpoint_scale_to_zero_disabled",
+        lens="WASTE",
+        label="Serving endpoint can't scale to zero on low traffic",
+        remedy="Enable scale-to-zero on this endpoint so its provisioned capacity stops "
+        "billing between requests — confirm the cold-start latency is acceptable for its "
+        "callers first.",
+        # Only on a MEASURED false. scale_to_zero_enabled IS NULL means served_entities
+        # wasn't readable (the usage_only degradation rung), and firing on that would invent
+        # a finding from config we never read — the same gate cluster_tagging's tag_count
+        # uses. request_count IS NOT NULL for the same reason.
+        where_sql="entity_type = 'endpoint' AND scale_to_zero_enabled = false "
+        "AND request_count IS NOT NULL "
+        "AND request_count < {low_traffic_endpoint_requests}",
+        detail_sql="request_count || ' request(s), scale-to-zero off'",
+        # Unpriced. The recoverable amount is the idle fraction of the endpoint's provisioned
+        # wall-clock, and nothing we pull carries that: endpoint_usage has request timestamps,
+        # not uptime. Real but unpriced beats a fabricated figure — the
+        # snappy_to_zstd_compression precedent.
+        recoverable_cost_sql="0",
+        confidence_sql="'candidate'",
+    ),
+    WasteRule(
+        category="endpoint_oversized_workload",
+        lens="OPPORTUNITY",
+        label="GPU serving endpoint on low traffic",
+        remedy="Review this endpoint's workload size/GPU class against its actual request "
+        "volume — a smaller class, or a CPU class for a small model, may serve it.",
+        where_sql="entity_type = 'endpoint' "
+        "AND workload_type IN ('GPU_MEDIUM', 'GPU_LARGE') "
+        "AND request_count IS NOT NULL "
+        "AND request_count < {low_traffic_endpoint_requests}",
+        detail_sql="workload_type || ', ' || request_count || ' request(s)'",
+        # Unpriced: no workload_size → SKU mapping exists in any system table we read, so
+        # there is no real rate to re-price a step-down against. Contrast `placement`, which
+        # IS priced precisely because jobs_priced_cost re-prices at a real list rate.
+        recoverable_cost_sql="0",
+        confidence_sql="'candidate'",
+    ),
     # ── Active: AWS S3 storage-tiering signal (aws_focus.fetch_efficiency) ──────────
     WasteRule(
         category="s3_intelligent_tiering",
@@ -781,6 +841,136 @@ WASTE_RULES: tuple[WasteRule, ...] = (
 )
 
 
+_DBX = ("Databricks",)
+_AWS = ("AWS",)
+
+# The evaluability scope of every rule: (providers, entity_types). Applied to the pool
+# below, and a rule missing from here fails at import — so a new WasteRule cannot
+# silently be absent from the coverage tables, which is exactly what the old
+# hand-maintained map in the Redshift view allowed.
+#
+# `()` for providers means "any provider whose connector populates the fields the rule
+# tests". Only four rules genuinely qualify; the dangerous mistake is leaving a rule
+# there by default, because a coverage table then reports "clean" on a provider that
+# never measured the signal. Each `()` below is a deliberate claim, checked against the
+# connectors' own field docs:
+#   underutilized / idle / failed  — utilization_pct / activity_count / failed_cost are
+#       the base EfficiencyRecord fields, populated by any connector.
+#   sql_warehouse_user_concentration — duration_share_pct, which redshift_user_activity.sql
+#       populates for AWS exactly as Databricks does (see WasteRule's own docstring).
+# Everything else names a field only one platform reports. The four sql_warehouse_* rules
+# are the trap: they read cache_hit_pct / spill_query_count / warehouse_type='SERVERLESS',
+# all Databricks-only, on an entity_type Redshift *does* emit — so scoping them by
+# entity_type alone would put a false "clean" on every Redshift cluster.
+_COVERAGE: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    # Cross-provider: base EfficiencyRecord fields, no entity_type restriction.
+    "underutilized": ((), ()),
+    "idle": ((), ()),
+    "failed": ((), ()),
+    "sql_warehouse_user_concentration": ((), ("sql_warehouse_user",)),
+    # Databricks — compute utilization and node_timeline proxies.
+    "job_low_utilization": (_DBX, ("job",)),
+    "possible_memory_pressure": (_DBX, ("job", "interactive")),
+    "possible_heavy_shuffle": (_DBX, ("job", "interactive")),
+    "placement": (_DBX, ("interactive",)),
+    # photon_no_gain's predicate is NEGATIVE (entity_type != 'interactive'), which a
+    # tuple can't express — left open rather than stated wrongly.
+    "photon_no_gain": (_DBX, ()),
+    "photon_on_interactive_cluster": (_DBX, ("interactive",)),
+    # Databricks — cluster configuration.
+    "missing_autotermination": (_DBX, ("interactive",)),
+    "autoscale_misconfigured": (_DBX, ("interactive",)),
+    "oversized_nodes": (_DBX, ("interactive",)),
+    "graviton_price_opportunity": (_DBX, ("interactive",)),
+    "on_demand_only": (_DBX, ("interactive",)),
+    # Databricks — SQL warehouse. Databricks-only by *field*, not by entity_type.
+    "sql_warehouse_low_cache_reuse": (_DBX, ("sql_warehouse",)),  # cache_hit_pct
+    "sql_warehouse_disk_spill": (_DBX, ("sql_warehouse",)),  # spill_query_count
+    "sql_warehouse_serverless_pricing_gap": (_DBX, ("sql_warehouse",)),  # warehouse_type
+    "sql_warehouse_high_frequency_workload": (_DBX, ("sql_warehouse_user",)),  # warehouse_type
+    "notebook_could_move_to_jobs": (_DBX, ("notebook",)),
+    # Databricks — Model Serving endpoint (needs system.serving; see the connector's
+    # _resolve_serving_tables degradation rungs).
+    "endpoint_scale_to_zero_disabled": (_DBX, ("endpoint",)),
+    "endpoint_oversized_workload": (_DBX, ("endpoint",)),
+    "snappy_to_zstd_compression": (_DBX, ("table",)),  # Delta compression_codec
+    # AWS — S3.
+    "s3_intelligent_tiering": (_AWS, ("storage",)),
+    # AWS — Redshift cluster / workgroup.
+    "redshift_concurrency_scaling_overage": (_AWS, ("sql_warehouse",)),
+    "redshift_ri_coverage_gap": (_AWS, ("sql_warehouse",)),
+    "redshift_spectrum_scan_cost": (_AWS, ("sql_warehouse",)),
+    "redshift_disk_spill_queries": (_AWS, ("sql_warehouse",)),
+    "redshift_wlm_queue_wait": (_AWS, ("sql_warehouse",)),
+    # AWS — Redshift query shapes and tables.
+    "redshift_query_pattern_high_spill": (_AWS, ("query_pattern",)),
+    "redshift_query_pattern_skew": (_AWS, ("query_pattern",)),
+    "redshift_stale_compression_encoding": (_AWS, ("table",)),
+    "redshift_table_maintenance_stale": (_AWS, ("table",)),
+    "redshift_table_unused": (_AWS, ("table",)),
+    "redshift_spectrum_table_scan": (_AWS, ("table",)),
+    # Blocked (where_sql is None) — both Databricks patterns awaiting telemetry.
+    "classic_notebook_attribution": (_DBX, ()),
+    "missing_delta_optimization": (_DBX, ("table",)),
+}
+
+
+def _with_coverage(rule: WasteRule) -> WasteRule:
+    """Attach *rule*'s evaluability scope, failing loudly if it was never declared."""
+    try:
+        providers, entity_types = _COVERAGE[rule.category]
+    except KeyError:  # pragma: no cover - import-time guard, asserted by tests
+        raise RuntimeError(
+            f"WasteRule '{rule.category}' has no _COVERAGE entry. Declare which "
+            "provider_name values and entity_types it can be evaluated for — a rule "
+            "shown outside its scope reports 'clean' for a check that never ran."
+        ) from None
+    return replace(rule, providers=providers, entity_types=entity_types)
+
+
+WASTE_RULES: tuple[WasteRule, ...] = tuple(_with_coverage(r) for r in _RULES_RAW)
+
+
+def is_blocked(rule: WasteRule) -> bool:
+    """A rule that isn't evaluated at all — neither 'clean' nor 'no data'."""
+    return rule.where_sql is None
+
+
+def coverage_groups(
+    provider_name: str,
+) -> tuple[tuple[str, tuple[WasteRule, ...]], ...]:
+    """Every ACTIVE rule evaluable for *provider_name*, grouped by the entity_type whose
+    telemetry it needs — the rule-coverage table's own structure.
+
+    Derived from the pool rather than restated, so adding a :class:`WasteRule` puts it in
+    the right coverage table with no second edit (and, via :data:`_COVERAGE`, cannot be
+    forgotten). Rules with no entity_type restriction land under ``""`` — they apply to
+    any measured entity.
+
+    Blocked rules are excluded: they aren't evaluated, so they're neither "clean" nor
+    "no data". See :func:`blocked_rules`.
+    """
+    groups: dict[str, list[WasteRule]] = {}
+    for rule in WASTE_RULES:
+        if is_blocked(rule):
+            continue
+        if rule.providers and provider_name not in rule.providers:
+            continue
+        for entity_type in rule.entity_types or ("",):
+            groups.setdefault(entity_type, []).append(rule)
+    return tuple((et, tuple(rules)) for et, rules in groups.items())
+
+
+def blocked_rules(provider_name: str) -> tuple[WasteRule, ...]:
+    """*provider_name*'s BLOCKED rules — real patterns awaiting telemetry, listed apart
+    from the evaluated ones so "not implemented" never reads as "checked and clean"."""
+    return tuple(
+        r
+        for r in WASTE_RULES
+        if is_blocked(r) and (not r.providers or provider_name in r.providers)
+    )
+
+
 def build_waste_record_sql() -> str:
     """Compile the ACTIVE rules into the ``gold.waste_record`` view SQL.
 
@@ -879,6 +1069,19 @@ WITH e AS (
                                                            AS avg_interval_minutes,
         TRY_CAST(json_extract_string(cause_detail, '$.duration_share_pct') AS DOUBLE)
                                                            AS duration_share_pct,
+        -- Model Serving endpoint keys (databricks._fetch_endpoint_efficiency).
+        json_extract_string(cause_detail, '$.serving_mode')
+                                                           AS serving_mode,
+        TRY_CAST(json_extract_string(cause_detail, '$.scale_to_zero_enabled') AS BOOLEAN)
+                                                           AS scale_to_zero_enabled,
+        json_extract_string(cause_detail, '$.workload_type')
+                                                           AS workload_type,
+        json_extract_string(cause_detail, '$.workload_size')
+                                                           AS workload_size,
+        TRY_CAST(json_extract_string(cause_detail, '$.request_count') AS BIGINT)
+                                                           AS request_count,
+        TRY_CAST(json_extract_string(cause_detail, '$.total_tokens') AS BIGINT)
+                                                           AS total_tokens,
         TRY_CAST(json_extract_string(cause_detail, '$.jobs_priced_cost') AS DOUBLE)
                                                            AS jobs_priced_cost,
         TRY_CAST(json_extract_string(cause_detail, '$.compute_cost') AS DOUBLE)

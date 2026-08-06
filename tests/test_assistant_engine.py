@@ -19,20 +19,20 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.usage import RequestUsage
 
 from flashlight.core.settings import get_settings
-from flashlight.dashboard import chat_engine
-from flashlight.dashboard.chat_engine import ToolStep
+from flashlight.dashboard import assistant_engine
+from flashlight.dashboard.assistant_engine import ToolStep
 from flashlight.focus.enums import ChargeCategory, ComputeClass, ProviderName, ServiceCategory
 from flashlight.focus.model import FocusRecord
 from flashlight.ingest.base import IngestWindow
-from flashlight.lake import duck
+from flashlight.lake import assistant_turns, duck
 
 
 @pytest.fixture(autouse=True)
 def lake_home(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
     monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
     get_settings.cache_clear()
-    chat_engine._tool_schemas_cache = None  # noqa: SLF001 - reset the module-level caches between tests
-    chat_engine._plan_tool_catalog_cache = None  # noqa: SLF001
+    assistant_engine._tool_schemas_cache = None  # noqa: SLF001 - reset the module-level caches between tests
+    assistant_engine._plan_tool_catalog_cache = None  # noqa: SLF001
     yield
     get_settings.cache_clear()
 
@@ -87,10 +87,12 @@ def _use_model(monkeypatch: pytest.MonkeyPatch, model: object) -> None:
     internally (Plan, maybe a retry Plan, Synthesize); all of them get this
     same fixed model, which is why a FunctionModel callable typically branches
     on info.output_tools to tell which node is calling (see _run_turn below)."""
-    monkeypatch.setattr(chat_engine, "_build_model", lambda *args, **kwargs: model)
+    monkeypatch.setattr(assistant_engine, "_build_model", lambda *args, **kwargs: model)
 
 
-def _run_turn(messages: list[Any], question: str, **overrides: Any) -> chat_engine.ChatTurnResult:
+def _run_turn(
+    messages: list[Any], question: str, **overrides: Any
+) -> assistant_engine.AssistantTurnResult:
     kwargs: dict[str, Any] = {
         "provider": "openai",
         "api_key": "sk-test",
@@ -99,7 +101,7 @@ def _run_turn(messages: list[Any], question: str, **overrides: Any) -> chat_engi
         "session_id": "s1",
     }
     kwargs.update(overrides)
-    return asyncio.run(chat_engine.run_turn(messages, question, **kwargs))
+    return asyncio.run(assistant_engine.run_turn(messages, question, **kwargs))
 
 
 def _focus_record(
@@ -135,15 +137,39 @@ def _ingest_may_aws() -> None:
     build_gold()
 
 
-def _chat_turn_rows() -> list[dict[str, object]]:
+def _ingest_two_months_aws() -> None:
+    """Two months of AWS spend — enough for a query narrowed to one measure to be
+    captionable (a varying dimension plus a first-to-last trend)."""
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    window = IngestWindow(date(2026, 4, 1), date(2026, 5, 31))
+    bronze.write_window(
+        "t",
+        window,
+        [_focus_record(15, month=4), _focus_record(15, month=5), _focus_record(16, month=5)],
+        ingest_run_id="r1",
+    )
+    build_gold()
+
+
+def _assistant_turn_rows() -> list[dict[str, object]]:
     con = duck.connect()
     try:
-        duck.register_chat_turns(con)
-        return con.execute("SELECT * FROM telemetry.chat_turn").fetchdf().to_dict(  # type: ignore[no-any-return]
+        duck.register_assistant_turns(con)
+        return con.execute("SELECT * FROM telemetry.assistant_turn").fetchdf().to_dict(  # type: ignore[no-any-return]
             "records"
         )
     finally:
         con.close()
+
+
+def _num(row: dict[str, object], column: str) -> float:
+    """A numeric telemetry column as a number — the rows come back as
+    ``dict[str, object]``, which can't be compared with ``>`` as-is."""
+    value = row[column]
+    assert isinstance(value, int | float), f"{column} is {value!r}, not a number"
+    return float(value)
 
 
 def _openai_style_body(**overrides: Any) -> dict[str, Any]:
@@ -232,7 +258,7 @@ def _openai_compatible_model_over(bodies: list[dict[str, Any]]) -> OpenAIChatMod
     end to end, the same way run_turn's openai_compatible branch does. One
     turn draws from this same queue across every internal Agent.run() call
     (Plan, maybe a retry Plan, Synthesize), in order."""
-    transport = chat_engine._QuirkTransport(inner=_QueueTransport(bodies))  # noqa: SLF001
+    transport = assistant_engine._QuirkTransport(inner=_QueueTransport(bodies))  # noqa: SLF001
     client = AsyncOpenAI(
         api_key="sk-test",
         base_url="http://fake.local/v1",
@@ -243,12 +269,12 @@ def _openai_compatible_model_over(bodies: list[dict[str, Any]]) -> OpenAIChatMod
 
 def _run_turn_openai_compatible(
     monkeypatch: pytest.MonkeyPatch, bodies: list[dict[str, Any]], question: str = "hi"
-) -> chat_engine.ChatTurnResult:
+) -> assistant_engine.AssistantTurnResult:
     _use_model(monkeypatch, _openai_compatible_model_over(bodies))
 
-    async def _check() -> chat_engine.ChatTurnResult:
+    async def _check() -> assistant_engine.AssistantTurnResult:
         messages: list[Any] = []
-        return await chat_engine.run_turn(
+        return await assistant_engine.run_turn(
             messages,
             question,
             provider="openai_compatible",
@@ -262,7 +288,7 @@ def _run_turn_openai_compatible(
 
 
 def test_mcp_tools_exclude_list_metrics_but_cover_the_rest() -> None:
-    schemas = asyncio.run(chat_engine._mcp_tool_schemas())  # noqa: SLF001
+    schemas = asyncio.run(assistant_engine._mcp_tool_schemas())  # noqa: SLF001
     names = {name for name, _description, _schema in schemas}
     assert names == {
         "describe_metric",
@@ -298,9 +324,9 @@ def test_plan_accepts_the_step_shapes_models_actually_emit(label: str, raw: dict
     discriminated union outright ("Unable to extract tag using discriminator
     'tool'") and killed the turn. All of these mean the same call, so parsing is
     liberal while the internal type stays a strict union."""
-    step = chat_engine.Plan(steps=[raw]).steps[0]
+    step = assistant_engine.Plan(steps=[raw]).steps[0]
     assert step.tool == "query_metric"
-    assert isinstance(step, chat_engine.QueryMetricStep)
+    assert isinstance(step, assistant_engine.QueryMetricStep)
     assert step.name == "aws.monthly_bill", label
 
 
@@ -309,15 +335,15 @@ def test_plan_still_rejects_an_unrecognizable_step() -> None:
     one — pydantic's own validation error is the right outcome so the model gets
     told, and retries."""
     with pytest.raises(ValidationError):
-        chat_engine.Plan(steps=[{"not_a_tool": {"foo": 1}}])
+        assistant_engine.Plan(steps=[{"not_a_tool": {"foo": 1}}])
     with pytest.raises(ValidationError):
         # Ambiguous: two tool-named keys, no way to know which was meant.
-        chat_engine.Plan(steps=[{"query_metric": {}, "run_sql": {}}])
+        assistant_engine.Plan(steps=[{"query_metric": {}, "run_sql": {}}])
 
 
 def test_explore_request_accepts_nested_lookups() -> None:
     nested = {"name": "aws.monthly_bill", "dimension": "charge_month"}
-    request = chat_engine.ExploreRequest(lookups=[{"list_dimension_values": nested}])
+    request = assistant_engine.ExploreRequest(lookups=[{"list_dimension_values": nested}])
     assert request.lookups[0].dimension == "charge_month"
 
 
@@ -379,15 +405,15 @@ def test_plan_step_models_match_real_mcp_tool_signatures() -> None:
     signature (see the comment above QueryMetricStep for why) — if a tool's
     params ever change in mcp/server.py, this must fail loudly rather than
     silently leaving the plan schema stale."""
-    tool_schemas = asyncio.run(chat_engine._mcp_tool_schemas())  # noqa: SLF001
+    tool_schemas = asyncio.run(assistant_engine._mcp_tool_schemas())  # noqa: SLF001
     schemas = {name: schema for name, _description, schema in tool_schemas}
-    for model_cls in chat_engine.PLAN_STEP_MODELS:
+    for model_cls in assistant_engine.PLAN_STEP_MODELS:
         tool_name = model_cls.model_fields["tool"].default
         schema_fields = set(schemas[tool_name].get("properties", {}))
-        # `chart` is presentation the model attaches for the UI (see ChartSpec),
-        # not an argument any MCP tool accepts — excluded here for the same
-        # reason _step_args excludes it before dispatch.
-        step_fields = set(model_cls.model_fields) - {"tool", "chart"}
+        # `chart` and `summary` are presentation the model attaches for the UI (see
+        # ChartSpec / SummarySpec), not arguments any MCP tool accepts — excluded
+        # here for the same reason _step_args excludes them before dispatch.
+        step_fields = set(model_cls.model_fields) - {"tool", "chart", "summary"}
         assert step_fields == schema_fields, tool_name
 
 
@@ -398,14 +424,20 @@ def test_connected_providers_and_catalog_lines_ground_in_live_data() -> None:
     two lines (folded into every Plan-phase call's instructions) must name
     only what's actually published, sourced the same live way the nav
     sidebar is (discover_provider_groups)."""
-    assert "No providers are connected yet" in chat_engine._connected_providers_line()  # noqa: SLF001
+    assert "No providers are connected yet" in assistant_engine._connected_providers_line()  # noqa: SLF001
 
     _ingest_may_aws()
 
-    assert chat_engine._connected_providers_line() == (  # noqa: SLF001
-        "Connected providers: AWS. Never mention or offer any other provider."
+    # Display label AND metric group, because the two are not interchangeable: the label
+    # is derived from the services actually ingested (data._aws_label — "AWS Redshift"
+    # for a Redshift-only pull, plain "AWS" once the group holds more, as here, where the
+    # seeded row is AmazonEC2), while the metric names the model has to call stay
+    # group-prefixed ("aws.monthly_bill") whatever the label says.
+    assert assistant_engine._connected_providers_line() == (  # noqa: SLF001
+        'Connected providers: AWS (metric group "aws"). '
+        "Never mention or offer any other provider."
     )
-    catalog_line = chat_engine._catalog_line()  # noqa: SLF001
+    catalog_line = assistant_engine._catalog_line()  # noqa: SLF001
     assert "Available metric views" in catalog_line
     assert "aws.monthly_bill: dimensions=" in catalog_line
 
@@ -446,24 +478,36 @@ def test_run_turn_without_tool_call_logs_one_row(monkeypatch: pytest.MonkeyPatch
 
     assert result.text == "The answer is 42."
     assert result.steps == []
-    rows = _chat_turn_rows()
+    rows = _assistant_turn_rows()
     assert len(rows) == 1
     assert rows[0]["session_id"] == "s1"
     assert rows[0]["model"] == "openai/gpt-4o"
     assert rows[0]["prompt_tokens"] == 30  # summed across both Plan calls + Synthesize
     assert rows[0]["completion_tokens"] == 15
     assert rows[0]["tool_call_count"] == 0
-    # No message text or API key ever land in the telemetry row.
-    assert set(rows[0]) == {
-        "turn_id",
-        "session_id",
-        "model",
-        "prompt_tokens",
-        "completion_tokens",
-        "total_tokens",
-        "tool_call_count",
-        "occurred_at",
-    }
+    # The row is exactly the schema — asserted against the schema itself rather
+    # than a hand-copied column list, so adding a column doesn't fail this test
+    # for the wrong reason.
+    assert set(rows[0]) == set(assistant_turns.ASSISTANT_TURN_SCHEMA.names)
+    # No message text and no API key ever land in the telemetry row — the actual
+    # privacy property, checked against the values rather than the column names.
+    written = " ".join(str(v) for v in rows[0].values())
+    assert "hello" not in written
+    assert "The answer is 42." not in written
+    assert "sk-test" not in written
+
+    # Per-turn latency, the reason those columns exist: two plan passes (the
+    # empty-plan re-ask) plus one synthesis, all inside the turn's duration.
+    assert rows[0]["outcome"] == "answer"
+    assert rows[0]["plan_pass_count"] == 2
+    assert rows[0]["llm_request_count"] == 3
+    assert rows[0]["empty_round_retries"] == 0
+    assert _num(rows[0], "duration_ms") > 0
+    assert _num(rows[0], "plan_ms") > 0
+    assert _num(rows[0], "synthesize_ms") > 0
+    assert _num(rows[0], "plan_ms") + _num(rows[0], "synthesize_ms") <= _num(
+        rows[0], "duration_ms"
+    )
 
 
 def test_run_turn_executes_real_tool_call_in_process(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -485,7 +529,7 @@ def test_run_turn_executes_real_tool_call_in_process(monkeypatch: pytest.MonkeyP
     ]
     assert len(messages) == 2  # only the clean [user question, final answer] pair persists
 
-    rows = _chat_turn_rows()
+    rows = _assistant_turn_rows()
     assert len(rows) == 1
     assert rows[0]["tool_call_count"] == 1
     assert rows[0]["prompt_tokens"] == 30  # accumulated across both LLM calls
@@ -505,13 +549,13 @@ def test_run_turn_dedups_a_repeated_identical_step_in_one_plan(
     parts at all)."""
     _ingest_may_aws()  # so describe_metric resolves; an all-errored plan re-plans
     calls: list[tuple[str, dict[str, Any]]] = []
-    original = chat_engine._call_mcp_tool
+    original = assistant_engine._call_mcp_tool
 
     async def counting(name: str, kwargs: dict[str, Any]) -> Any:
         calls.append((name, kwargs))
         return await original(name, kwargs)
 
-    monkeypatch.setattr(chat_engine, "_call_mcp_tool", counting)
+    monkeypatch.setattr(assistant_engine, "_call_mcp_tool", counting)
 
     step = {"tool": "describe_metric", "name": "aws.monthly_bill"}
     responses = [_plan_response([step, step]), _text_response("done")]
@@ -547,6 +591,185 @@ def test_run_turn_captures_rows_from_a_real_query_metric_call(
     assert step.rows is not None
     assert len(step.rows) == 1
     assert step.rows[0]["net_cost"] == 10.0
+
+
+def test_a_captionable_result_answers_without_the_synthesize_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One query, one measure, one varying dimension: the answer is arithmetic, so
+    the second model call is skipped entirely.
+
+    The model here supplies a plan and nothing else — a second call would raise,
+    which is the assertion that matters. On real captured turns that skipped call
+    was 2.8-7.1s of the turn.
+    """
+    _ingest_two_months_aws()
+
+    responses = [
+        _plan_response(
+            [
+                {
+                    "tool": "query_metric",
+                    "name": "aws.monthly_bill",
+                    "measures": ["net_cost"],
+                    "limit": 10,
+                }
+            ]
+        )
+    ]
+
+    def fn(messages: Any, info: Any) -> ModelResponse:
+        if not responses:
+            raise AssertionError("Synthesize was called — the caption should have ended the turn")
+        return responses.pop(0)
+
+    _use_model(monkeypatch, FunctionModel(fn))
+
+    messages: list[Any] = []
+    turn = _run_turn(messages, "what did I spend by month?", session_id="s-cap")
+
+    # The figures come from the rows, so they agree with the chart drawn above
+    # them: 10 in April + 20 in May (two records), doubling month over month.
+    assert "$30.00 total net cost across 2 charge months" in turn.text
+    assert "2026-04-01 $10.00 -> 2026-05-01 $20.00 (+100%)" in turn.text
+    assert len(turn.steps) == 1
+
+    rows = _assistant_turn_rows()
+    assert rows[0]["answer_source"] == "caption"
+    assert rows[0]["outcome"] == "answer"
+    assert rows[0]["synthesize_ms"] == 0
+    assert rows[0]["llm_request_count"] == 1  # plan only
+
+    # The turn still lands in history as a normal exchange, so a followup works.
+    assert len(messages) == 2
+
+
+def test_the_synthesize_payload_is_bounded_and_states_what_it_omitted() -> None:
+    """A 200-row result used to reach the model as 24k tokens of Python reprs. The
+    cap must shrink it without ever implying the sample is the whole result — the
+    model is summarizing a table the user can already see in full."""
+    rows = [{"charge_month": f"2024-{m:02d}", "net_cost": float(m)} for m in range(1, 121)]
+    step = ToolStep(name="query_metric", arguments={"name": "aws.monthly_bill"}, rows=rows)
+
+    described = assistant_engine._describe_step(step)  # noqa: SLF001
+
+    assert len(described) < len(f"- query_metric({{}}): {rows}") / 4  # far smaller
+    assert "120 rows" in described  # the true count, not the sample size
+    assert f"{120 - assistant_engine._SYNTH_ROW_SAMPLE} more rows not shown" in described  # noqa: SLF001
+    assert "already displayed to the user" in described
+    # Header once, values per row — not the key repeated on every row.
+    assert described.count("charge_month") == 1
+    assert "2024-01\t1.0" in described
+
+
+def test_a_short_result_still_reaches_the_model_whole() -> None:
+    rows = [
+        {"charge_month": "2024-04", "net_cost": 1.0},
+        {"charge_month": "2024-05", "net_cost": 2.0},
+    ]
+    described = assistant_engine._describe_step(  # noqa: SLF001
+        ToolStep(name="query_metric", arguments={}, rows=rows)
+    )
+    assert "more rows not shown" not in described
+    assert "2024-04\t1.0" in described and "2024-05\t2.0" in described
+
+
+def test_a_declared_summary_sentence_answers_in_the_models_own_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SummarySpec rides along on the plan, so the model phrases the answer for the
+    question actually asked — and every figure is still filled in from the rows, so
+    it cannot state a number the data doesn't contain."""
+    _ingest_two_months_aws()
+
+    responses = [
+        _plan_response(
+            [
+                {
+                    "tool": "query_metric",
+                    "name": "aws.monthly_bill",
+                    "measures": ["net_cost"],
+                    "limit": 10,
+                    "summary": {
+                        "sentence": "Spend went from {first_value} in {first_period} to "
+                        "{last_value} in {last_period} ({change_pct})."
+                    },
+                }
+            ]
+        )
+    ]
+
+    def fn(messages: Any, info: Any) -> ModelResponse:
+        if not responses:
+            raise AssertionError("Synthesize was called — the declared sentence should answer")
+        return responses.pop(0)
+
+    _use_model(monkeypatch, FunctionModel(fn))
+
+    messages: list[Any] = []
+    turn = _run_turn(messages, "how did spend change?", session_id="s-summary")
+
+    assert turn.text == "Spend went from $10.00 in 2026-04-01 to $20.00 in 2026-05-01 (+100%)."
+    rows = _assistant_turn_rows()
+    assert rows[0]["answer_source"] == "summary_spec"
+    assert rows[0]["llm_request_count"] == 1
+    assert rows[0]["synthesize_ms"] == 0
+
+
+def test_a_summary_naming_an_unknown_placeholder_degrades_to_the_fixed_assembly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sentence is a model-authored template, so it can name something that
+    isn't a fact. That must lose the wording, never the answer — and it must never
+    evaluate as a Python format expression."""
+    _ingest_two_months_aws()
+
+    responses = [
+        _plan_response(
+            [
+                {
+                    "tool": "query_metric",
+                    "name": "aws.monthly_bill",
+                    "measures": ["net_cost"],
+                    "limit": 10,
+                    "summary": {"sentence": "Spend was {total.__class__} in {nonexistent}."},
+                }
+            ]
+        )
+    ]
+    _use_model(monkeypatch, FunctionModel(lambda messages, info: responses.pop(0)))
+
+    messages: list[Any] = []
+    turn = _run_turn(messages, "what did I spend?", session_id="s-badsummary")
+
+    assert "__class__" not in turn.text
+    assert "$30.00 total net cost across 2 charge months" in turn.text
+    rows = _assistant_turn_rows()
+    # Still no synthesis call: the fixed assembly covered it.
+    assert rows[0]["answer_source"] == "summary_spec"
+    assert rows[0]["llm_request_count"] == 1
+
+
+def test_a_result_the_caption_cannot_state_falls_back_to_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unnarrowed measures leave "which number?" ambiguous, so the model still
+    writes the answer — the caption is an optimization, never a gate."""
+    _ingest_may_aws()
+
+    responses = [
+        _plan_response([{"tool": "query_metric", "name": "aws.monthly_bill", "limit": 10}]),
+        _text_response("You spent $10 in May."),
+    ]
+    _use_model(monkeypatch, FunctionModel(lambda messages, info: responses.pop(0)))
+
+    messages: list[Any] = []
+    turn = _run_turn(messages, "what did I spend in May?", session_id="s-nocap")
+
+    assert turn.text == "You spent $10 in May."
+    rows = _assistant_turn_rows()
+    assert rows[0]["answer_source"] == "model"
+    assert _num(rows[0], "synthesize_ms") > 0
 
 
 def test_run_turn_accepts_order_by_as_a_list(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -769,21 +992,40 @@ def test_plan_instructions_ground_the_model_in_today_and_the_real_month_range() 
     class of question at the root."""
     _ingest_may_aws()
 
-    window_line = chat_engine._data_window_line()  # noqa: SLF001
+    window_line = assistant_engine._data_window_line()  # noqa: SLF001
     assert "Today is" in window_line
     assert "2026-05" in window_line  # the one month the fixture publishes
     assert "never ask the user which month they meant" in window_line
 
-    instructions = chat_engine._plan_instructions(  # noqa: SLF001
+    instructions = assistant_engine._plan_instructions(  # noqa: SLF001
         allow_explore=True, allow_clarify=True, explored={}, tool_catalog=""
     )
     assert window_line in instructions
 
 
+def test_plan_instructions_send_spend_questions_to_gross_cost() -> None:
+    """Regression test: a one-off credit lands entirely in one month and nets
+    against it, so answering "break down last month's spend" with net_cost showed
+    Jul 2026 AWS Redshift as $10K against $68K of actual charges — the same
+    -$58.3K goodwill credit the home page is charges-only to survive
+    (views/home_overview.py). The rule the home page encodes has to reach the
+    planner too, or the two surfaces disagree by the size of the credit."""
+    instructions = assistant_engine._plan_instructions(  # noqa: SLF001
+        allow_explore=True, allow_clarify=True, explored={}, tool_catalog=""
+    )
+    assert "gross_cost is charges only" in instructions
+    # The default for a spend/breakdown/trend question, and the escape hatch for
+    # the question net_cost really does answer.
+    assert "use gross_cost" in instructions
+    assert "what was actually owed or paid" in instructions
+    # Credits are excluded from the spend answer, never dropped.
+    assert "credits_month" in instructions
+
+
 def test_data_window_line_works_before_any_data_is_published() -> None:
     """No GOLD published yet — the date still grounds the model, and the
     month-range sentence is simply absent rather than raising."""
-    line = chat_engine._data_window_line()  # noqa: SLF001
+    line = assistant_engine._data_window_line()  # noqa: SLF001
     assert "Today is" in line
     assert "Charge months present" not in line
 
@@ -838,7 +1080,7 @@ def test_run_turn_stops_at_round_limit_on_a_stalling_model(monkeypatch: pytest.M
 
     assert "round limit" in result.text
     assert result.steps == []
-    rows = _chat_turn_rows()
+    rows = _assistant_turn_rows()
     assert rows[0]["tool_call_count"] == 0
 
 
@@ -894,13 +1136,52 @@ def test_run_turn_gives_up_after_repeated_empty_rounds(monkeypatch: pytest.Monke
     assert "round limit" in result.text
 
 
+def test_empty_rounds_are_counted_in_the_turn_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty round is a real round trip that pydantic-ai never sees, so it
+    shows up nowhere except this counter — and a turn can spend most of its wall
+    clock on them while looking merely slow."""
+    result = _run_turn_openai_compatible(monkeypatch, [_empty_body()] * 20)
+
+    rows = _assistant_turn_rows()
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "no_answer"
+    assert _num(rows[0], "empty_round_retries") >= assistant_engine.EMPTY_ROUND_RETRY_LIMIT
+    assert _num(rows[0], "duration_ms") > 0
+    assert "round limit" in result.text
+
+
+def test_a_failed_request_is_logged_as_such_and_keeps_gathered_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn that dies after ExecuteNode still has real rows — they render, and
+    the log's tool_call_count must reflect the work that actually happened."""
+    responses = [_plan_response([{"tool": "list_optimization_rules"}])]
+
+    def fn(messages: Any, info: Any) -> ModelResponse:
+        if responses:
+            return responses.pop(0)
+        raise httpx.ConnectError("provider went away")
+
+    _use_model(monkeypatch, FunctionModel(fn))
+
+    messages: list[Any] = []
+    result = _run_turn(messages, "what can I optimize?")
+
+    assert result.text.startswith("Request failed")
+    assert [step.name for step in result.steps] == ["list_optimization_rules"]
+    rows = _assistant_turn_rows()
+    assert rows[0]["outcome"] == "error"
+    assert rows[0]["tool_call_count"] == 1
+    assert _num(rows[0], "execute_ms") > 0
+
+
 def test_quirk_transport_strips_leaked_harmony_channel_marker_from_tool_name() -> None:
     """Regression test: Databricks-served gpt-oss has been observed leaking
     Harmony format markers (e.g. "query_metric<|channel|>analysis") into a
     tool call's name — fixed at the wire level before pydantic-ai/the OpenAI
     SDK ever parses the response."""
     body = _tool_call_body("query_metric<|channel|>analysis", {}, "call_1")
-    transport = chat_engine._QuirkTransport(inner=_QueueTransport([body]))  # noqa: SLF001
+    transport = assistant_engine._QuirkTransport(inner=_QueueTransport([body]))  # noqa: SLF001
 
     async def _check() -> httpx.Response:
         return await transport.handle_async_request(
@@ -932,7 +1213,7 @@ def test_quirk_transport_strips_stale_content_encoding_after_rewriting_the_body(
                 request=request,
             )
 
-    transport = chat_engine._QuirkTransport(inner=_GzipTransport())  # noqa: SLF001
+    transport = assistant_engine._QuirkTransport(inner=_GzipTransport())  # noqa: SLF001
 
     async def _check() -> httpx.Response:
         return await transport.handle_async_request(
@@ -948,8 +1229,8 @@ def test_quirk_transport_strips_stale_content_encoding_after_rewriting_the_body(
 def test_quirk_transport_gives_up_and_returns_the_last_empty_response() -> None:
     """Once EMPTY_ROUND_RETRY_LIMIT is exceeded, the transport stops retrying
     and hands back whatever it last got, rather than retrying forever."""
-    bodies = [_empty_body()] * (chat_engine.EMPTY_ROUND_RETRY_LIMIT + 1)
-    transport = chat_engine._QuirkTransport(inner=_QueueTransport(bodies))  # noqa: SLF001
+    bodies = [_empty_body()] * (assistant_engine.EMPTY_ROUND_RETRY_LIMIT + 1)
+    transport = assistant_engine._QuirkTransport(inner=_QueueTransport(bodies))  # noqa: SLF001
 
     async def _check() -> httpx.Response:
         return await transport.handle_async_request(
@@ -971,7 +1252,7 @@ def test_quirk_transport_flattens_reasoning_only_content_parts() -> None:
     reasoning-only part list also isn't a real answer, so it must be treated
     the same as an empty round (retried), not passed through unusable."""
     body = _reasoning_only_body("thinking about it, keep options simple.")
-    transport = chat_engine._QuirkTransport(inner=_QueueTransport([body] * 4))  # noqa: SLF001
+    transport = assistant_engine._QuirkTransport(inner=_QueueTransport([body] * 4))  # noqa: SLF001
 
     async def _check() -> httpx.Response:
         return await transport.handle_async_request(
@@ -1010,7 +1291,7 @@ def test_run_turn_returns_error_text_on_request_failure(monkeypatch: pytest.Monk
     result = _run_turn(messages, "hi", api_key="sk-bad", session_id="s5")
 
     assert "bad api key" in result.text
-    assert len(_chat_turn_rows()) == 1
+    assert len(_assistant_turn_rows()) == 1
 
 
 def test_run_turn_redacts_the_api_key_from_a_leaky_provider_error(
@@ -1018,7 +1299,7 @@ def test_run_turn_redacts_the_api_key_from_a_leaky_provider_error(
 ) -> None:
     """Regression test: OpenAI's real AuthenticationError echoes the submitted
     key back verbatim (e.g. "Incorrect API key provided: sk-bad-secret...").
-    That must never reach the chat UI or the conversation history."""
+    That must never reach the assistant UI or the conversation history."""
 
     def raises(messages: Any, info: Any) -> ModelResponse:
         raise RuntimeError(

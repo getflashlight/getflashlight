@@ -67,7 +67,7 @@ class FocusRecord(BaseModel):
     # ── Costs (one currency per record; never sum across currencies) ────────
     billing_currency: str = "USD"  # FOCUS: BillingCurrency
     billed_cost: Decimal = Decimal("0")  # FOCUS: BilledCost
-    effective_cost: Decimal = Decimal("0")  # FOCUS: EffectiveCost (default for TCO)
+    effective_cost: Decimal = Decimal("0")  # FOCUS: EffectiveCost (the canonical metric)
     list_cost: Decimal = Decimal("0")  # FOCUS: ListCost
     contracted_cost: Decimal = Decimal("0")  # FOCUS: ContractedCost
 
@@ -106,7 +106,7 @@ class FocusRecord(BaseModel):
     invoice_id: str | None = None  # FOCUS: InvoiceId
     invoice_issuer_name: str | None = None  # FOCUS: InvoiceIssuerName
 
-    # ── Tags (used for TCO attribution) ─────────────────────────────────────
+    # ── Tags (drive cost allocation / attribution) ──────────────────────────
     tags: dict[str, str] = Field(default_factory=dict)  # FOCUS: Tags
 
     # ── Flashlight extensions (x_ prefix mirrors FOCUS provider-extension style)

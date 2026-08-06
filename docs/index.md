@@ -6,22 +6,19 @@
 ![Python versions](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-FOCUS-based, multi-cloud Total Cost of Ownership (TCO) spend visualization.
+FOCUS-based, multi-cloud cloud-spend visualization.
 
 Flashlight ingests cloud billing in the [FinOps FOCUS](https://focus.finops.org/focus-specification/)
 format, standardizes it into a layered data model, and serves a bundled NiceGUI
 dashboard plus an MCP server for agents. It answers what you're actually
-spending — including the often-hidden TCO of a Databricks workload (DBU cost
-plus the AWS infra it provisions).
+spending — across every cloud and data platform on one FOCUS-normalized bill,
+plus how much of it is recoverable waste.
 
 ## Why use Flashlight?
 
 - **One binary, no infra.** `pip install getflashlight`. No Docker, no database
   server. State is Parquet under `FLASHLIGHT_HOME`, queried by a throwaway
   in-memory DuckDB in each process.
-- **True TCO, not sticker price.** A Databricks workload's DBU cost is joined
-  with the AWS infra it provisions, without double-counting — classic compute
-  adds the infra; serverless doesn't need to.
 - **FOCUS-native.** Every connector maps its source into one canonical
   `FocusRecord`. One cost metric (`EffectiveCost`) is summed everywhere; nothing
   gets to invent its own column.

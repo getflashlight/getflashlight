@@ -1,5 +1,5 @@
 site_name: Flashlight
-site_description: FOCUS-based, multi-cloud TCO spend visualization. Finds what's burning money in the dark.
+site_description: FOCUS-based, multi-cloud spend visualization. Finds what's burning money in the dark.
 site_url: https://getflashlight.app/
 repo_url: https://github.com/ychaparala/getflashlight
 repo_name: ychaparala/getflashlight
@@ -51,7 +51,7 @@ plugins:
   - search
   - llmstxt:
       markdown_description: >
-        FOCUS-based, multi-cloud TCO spend visualization. Ingests cloud billing
+        FOCUS-based, multi-cloud spend visualization. Ingests cloud billing
         in the FinOps FOCUS format, standardizes it into a BRONZE/SILVER/GOLD
         Parquet lake, and serves a bundled dashboard plus an MCP server for
         agents. Installs with `pip install getflashlight` — no Docker, no
@@ -65,6 +65,7 @@ plugins:
           - cli.md: Every `flashlight` command
         Design:
           - design/efficiency-waste.md: The efficiency/waste GOLD group and its rules
+          - design/ai-costs.md: AI/LLM spend, token attribution per project and user, and why a $/token figure is only honest for pay-per-token serving
 
 nav:
   - Home: index.md
@@ -74,6 +75,8 @@ nav:
   - CLI reference: cli.md
   - Design:
       - Efficiency / waste: design/efficiency-waste.md
+      - AI costs: design/ai-costs.md
+      - Backing storage: design/backing-storage.md
 
 exclude_docs: |
   research/

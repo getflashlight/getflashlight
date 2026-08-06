@@ -1,5 +1,5 @@
 """Ingest connector secrets — OS keychain, same pattern as
-:mod:`flashlight.dashboard.chat_credentials`.
+:mod:`flashlight.dashboard.assistant_credentials`.
 
 Connector configs (``ingest/config.py``) only ever hold an env var *name*
 (``token_env``, ``access_key_env``, ...); the actual secret value entered in the
@@ -16,8 +16,8 @@ defaults every connection's env var name to something derived from its own
 (enforced-unique) ``name``, so this only happens when a user explicitly opts
 into sharing one by hand-setting the same name twice.
 
-Its own keychain service name (``flashlight-ingest``, vs. chat's
-``flashlight-chat``) so a connector token and a chat API key never collide even
+Its own keychain service name (``flashlight-ingest``, vs. assistant's
+``flashlight-assistant``) so a connector token and the assistant's API key never collide even
 if they happened to share a lookup key.
 """
 

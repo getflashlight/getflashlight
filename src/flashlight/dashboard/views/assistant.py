@@ -1,15 +1,16 @@
-"""BYOK chat — ask Flashlight's own GOLD data questions with your own LLM key.
+"""BYOK assistant — ask Flashlight's own GOLD data questions with your own LLM key.
 
 Settings (provider/model/base URL/API key) live behind a gear-icon dialog that
 auto-opens only when nothing is configured yet.
 
-Provider/model/base URL are bound to NiceGUI's ``app.storage.general`` — a
-single JSON file under ``FLASHLIGHT_HOME/meta/dashboard_storage/`` (wired up
-in ``dashboard/launch.py``) — so they survive a process restart and a browser
-cache clear, not just a page reload. Neither of those is a secret, so a plain
-file is fine.
+Provider/model/base URL are persisted to ``FLASHLIGHT_HOME/config/assistant.yml``
+(:mod:`flashlight.dashboard.assistant_config`), beside ``connections.yml`` and
+``policies.yml``. None of the three is a secret, so a plain file is fine. They used to
+be bound to NiceGUI's ``app.storage.general``, which lands wherever
+``NICEGUI_STORAGE_PATH`` points — a tmpfs on a read-only deployment — so a restart
+forgot the model and re-opened this dialog.
 
-The API key is different — see :mod:`flashlight.dashboard.chat_credentials`
+The API key is different — see :mod:`flashlight.dashboard.assistant_credentials`
 for why it goes through the OS keychain (with an env-var fallback) instead of
 sitting in that same file: an app-managed "encrypted at rest" key isn't real
 protection (the decryption key would have to live somewhere the app itself
@@ -41,17 +42,9 @@ import plotly.express as px
 from nicegui import app, ui
 from pydantic_ai.messages import ModelMessage
 
-from flashlight.dashboard import chat_credentials, chrome
-from flashlight.dashboard.chat_engine import ChartSpec, ToolStep, run_turn
-
-_MONEY_HINTS = ("cost", "amount", "spend", "price", "waste", "savings")
-
-
-def _is_money_col(name: str) -> bool:
-    return any(hint in name.lower() for hint in _MONEY_HINTS)
-
-
-_TEMPORAL_HINTS = ("month", "date", "day", "period", "week", "year", "hour")
+from flashlight.dashboard import assistant_config, assistant_credentials, chrome
+from flashlight.dashboard.answer_caption import is_money_column, is_temporal_column
+from flashlight.dashboard.assistant_engine import ChartSpec, ToolStep, run_turn
 
 
 def _informative_dims(df: pd.DataFrame, varying_cols: list[str]) -> list[str]:
@@ -77,7 +70,7 @@ def _informative_dims(df: pd.DataFrame, varying_cols: list[str]) -> list[str]:
         specific label, which the catalog puts further right ("JOBS" over
         "Analytics").
         """
-        is_temporal = any(h in col.lower() for h in _TEMPORAL_HINTS)
+        is_temporal = is_temporal_column(col)
         return is_temporal, df[col].nunique(dropna=False), varying_cols.index(col)
 
     kept: list[str] = []
@@ -119,7 +112,7 @@ def _infer_spec(df: pd.DataFrame, varying_cols: list[str]) -> tuple[str, str | N
     if unique:
         # Prefer a temporal column when one qualifies: "spend by month" should be
         # a time series even if some other column happens to be unique too.
-        temporal = [c for c in unique if any(h in c.lower() for h in _TEMPORAL_HINTS)]
+        temporal = [c for c in unique if is_temporal_column(c)]
         if temporal:
             return temporal[0], None, "bar"
         # Otherwise the most granular label. Several columns are often *equally*
@@ -136,13 +129,6 @@ def _infer_spec(df: pd.DataFrame, varying_cols: list[str]) -> tuple[str, str | N
     # split by 3 months, not 3 months split by 13 services.
     by_width = sorted(varying_cols, key=lambda c: df[c].nunique(dropna=False), reverse=True)
     return by_width[0], by_width[1], "stacked_bar"
-
-
-# The categorical palette has 8 slots, so at most 8 series: 7 named + "Other".
-# More than that is unreadable regardless of colours (see chrome.CATEGORICAL_SLOTS,
-# "color follows identity, never rank").
-_MAX_SERIES = len(chrome.CATEGORICAL_SLOTS)
-_OTHER_SERIES = "Other"
 
 
 def _resolve_chart(
@@ -171,17 +157,6 @@ def _resolve_chart(
     return chart.x, series, chart.kind
 
 
-def _cap_series(df: pd.DataFrame, series: str, y_col: str) -> pd.DataFrame:
-    """Fold all but the top _MAX_SERIES-1 series into one "Other" bucket, so the
-    legend stays readable and every slot keeps a distinct colour. Totals are
-    preserved — nothing is dropped, only grouped."""
-    totals = df.groupby(series)[y_col].sum().sort_values(ascending=False)
-    if len(totals) <= _MAX_SERIES:
-        return df
-    keep = set(totals.index[: _MAX_SERIES - 1])
-    return df.assign(**{series: df[series].where(df[series].isin(keep), _OTHER_SERIES)})
-
-
 def _render_rows(rows: list[dict[str, Any]], *, key: str, chart: ChartSpec | None = None) -> None:
     """Draw the chart the model asked for; fall back to inferring one from the
     row shape; fall back again to a plain table. Never a general auto-viz
@@ -204,18 +179,18 @@ def _render_rows(rows: list[dict[str, Any]], *, key: str, chart: ChartSpec | Non
     if spec is not None:
         _plot(df, spec, numeric_cols[0])
     else:
-        money_cols = [c for c in numeric_cols if _is_money_col(c)]
+        money_cols = [c for c in numeric_cols if is_money_column(c)]
         num_cols = [c for c in numeric_cols if c not in money_cols]
         chrome.flat_table(df, key=key, money_cols=money_cols, num_cols=num_cols)
 
 
 def _plot(df: pd.DataFrame, spec: tuple[str, str | None, str], y_col: str) -> None:
     x_col, series, kind = spec
-    is_money = _is_money_col(y_col)
+    is_money = is_money_column(y_col)
     value_format = "$%{y:,.0f}" if is_money else "%{y:,.0f}"
-    temporal_x = any(hint in x_col.lower() for hint in _TEMPORAL_HINTS)
+    temporal_x = is_temporal_column(x_col)
     if series is not None:
-        df = _cap_series(df, series, y_col)
+        df = chrome.cap_series(df, series, y_col)
     # A category breakdown reads as a ranking, so order it by size; a time axis
     # must keep its own order or the trend is destroyed. With a series, rank by
     # each x value's total rather than by an arbitrary segment.
@@ -318,6 +293,31 @@ _PRESETS: dict[str, dict[str, str]] = {
 }
 _DEFAULT_PROVIDER = "OpenAI"
 
+# FLASHLIGHT_ASSISTANT_* name the internal provider id, not a dialog label — the env
+# var for the settings field, for the readonly notice below.
+_ENV_VARS = {
+    "provider": "FLASHLIGHT_ASSISTANT_PROVIDER",
+    "model": "FLASHLIGHT_ASSISTANT_MODEL",
+    "base_url": "FLASHLIGHT_ASSISTANT_BASE_URL",
+}
+
+
+def _preset_label(cfg: assistant_config.AssistantConfig) -> str:
+    """Which dropdown row to show for a stored config.
+
+    ``cfg.preset`` is the label the user actually picked and is purely cosmetic, so it
+    only wins while it still agrees with the load-bearing ``provider`` id (an env var
+    can pin a different one). Otherwise fall back to the first preset carrying that id
+    — which is also the only thing available when the config came from env vars alone,
+    since those name the id and know nothing about labels.
+    """
+    if cfg.preset in _PRESETS and _PRESETS[cfg.preset]["provider"] == cfg.provider:
+        return cfg.preset
+    for label, preset in _PRESETS.items():
+        if preset["provider"] == cfg.provider:
+            return label
+    return _DEFAULT_PROVIDER
+
 # (headline, detail) — the two are concatenated into the question actually sent,
 # so the detail carries real specificity into the prompt instead of being
 # decorative subtitle text.
@@ -344,9 +344,8 @@ async def render() -> None:
 
     def _load_key_for(provider: str) -> str:
         """Same-tab edits (if a keychain write failed) win over the persisted value."""
-        return app.storage.tab.get(f"chat_api_key:{provider}", "") or chat_credentials.load_api_key(
-            provider
-        ) or ""
+        same_tab = app.storage.tab.get(f"assistant_api_key:{provider}", "")
+        return same_tab or assistant_credentials.load_api_key(provider) or ""
 
     def _apply_preset(label: str | None) -> None:
         preset = _PRESETS.get(label or "")
@@ -358,61 +357,89 @@ async def render() -> None:
         _apply_preset(label)
         api_key_input.value = _load_key_for(label or "")
 
+    cfg = assistant_config.load()
+    pinned = assistant_config.env_overrides()
+
     with ui.dialog() as settings_dialog, ui.card().classes("gap-3 p-5").style("width:420px"):
-        ui.label("Chat settings").classes("text-base font-semibold").style(
+        ui.label("Assistant settings").classes("text-base font-semibold").style(
             f"color:{chrome.INK_PRIMARY}"
         )
         ui.label(
             "Pick a provider to prefill the model, or choose Custom for a "
-            "self-hosted / OpenAI-compatible endpoint. Provider/model/base URL are "
-            "remembered on this machine; the key is stored in your OS keychain."
+            "self-hosted / OpenAI-compatible endpoint. Provider/model/base URL are saved "
+            "to config/assistant.yml; the key is stored in your OS keychain."
         ).classes("text-xs").style(f"color:{chrome.INK_MUTED}")
+        if pinned:
+            # Shown, and the fields locked, rather than letting an edit look like it
+            # took: the env value wins on every load, so a "saved" change to a pinned
+            # field would read as the setting not sticking.
+            ui.label(
+                "Set by environment, so read-only here: "
+                + ", ".join(_ENV_VARS[f] for f in sorted(pinned))
+            ).classes("text-xs").style(f"color:{chrome.SEMANTIC['unattributed']}")
 
         # provider_select's on_change is wired up AFTER model_input/base_url_input/
-        # api_key_input exist (below), not passed as a constructor kwarg here:
-        # bind_value's initial sync (pulling a value already persisted from a prior
-        # run out of app.storage.general) fires on_change synchronously, during
-        # this very statement — while model_input et al. are still unassigned in
-        # this enclosing scope, which crashed with "cannot access free variable
-        # 'model_input'" for anyone with a previously-saved chat_provider.
+        # api_key_input exist (below), not passed as a constructor kwarg here: an
+        # initial value sync fires on_change synchronously, during this very statement
+        # — while model_input et al. are still unassigned in this enclosing scope,
+        # which crashed with "cannot access free variable 'model_input'" for anyone
+        # with a previously-saved provider.
         provider_select = (
             ui.select(
                 list(_PRESETS),
                 label="Provider",
-                value=_DEFAULT_PROVIDER,
+                value=_preset_label(cfg),
             )
             .classes("w-full")
-            .bind_value(app.storage.general, "chat_provider")
-            .mark("chat-provider")
+            .mark("assistant-provider")
         )
         model_input = (
-            ui.input("Model")
-            .classes("w-full")
-            .bind_value(app.storage.general, "chat_model")
-            .mark("chat-model")
+            ui.input("Model", value=cfg.model or "").classes("w-full").mark("assistant-model")
         )
         base_url_input = (
-            ui.input("Base URL (Databricks workspace, or self-hosted/custom)")
+            ui.input(
+                "Base URL (Databricks workspace, or self-hosted/custom)",
+                value=cfg.base_url or "",
+            )
             .classes("w-full")
-            .bind_value(app.storage.general, "chat_base_url")
-            .mark("chat-base-url")
+            .mark("assistant-base-url")
         )
         api_key_input = (
-            ui.input("API key").props("type=password").classes("w-full").mark("chat-api-key")
+            ui.input("API key").props("type=password").classes("w-full").mark("assistant-api-key")
         )
+        for field, widget in (
+            ("provider", provider_select),
+            ("model", model_input),
+            ("base_url", base_url_input),
+        ):
+            if field in pinned:
+                widget.props("readonly")
         provider_select.on_value_change(lambda e: _on_provider_change(e.value))
-        if not model_input.value:  # first time anything has been configured — prefill
+        if not model_input.value:  # nothing configured yet — prefill from the preset
             _apply_preset(provider_select.value)
         api_key_input.value = _load_key_for(provider_select.value)
 
         def _save_settings() -> None:
-            provider, key = provider_select.value, api_key_input.value
+            label = provider_select.value or _DEFAULT_PROVIDER
+            preset = _PRESETS.get(label, _PRESETS[_DEFAULT_PROVIDER])
+            assistant_config.save(
+                assistant_config.AssistantConfig(
+                    provider=preset["provider"],
+                    model=model_input.value or None,
+                    base_url=base_url_input.value or None,
+                    preset=label,
+                )
+            )
+            key = api_key_input.value
             if key:
-                app.storage.tab[f"chat_api_key:{provider}"] = key
-                if not chat_credentials.save_api_key(provider, key):
+                # Keyed by the dialog label, not the internal provider id: three presets
+                # share `openai_compatible` (Ollama, Databricks, Custom), so keying by id
+                # would make one key serve three different endpoints.
+                app.storage.tab[f"assistant_api_key:{label}"] = key
+                if not assistant_credentials.save_api_key(label, key):
                     ui.notify(
                         "Couldn't reach your OS keychain — your key will only last this "
-                        f"browser tab. Set {chat_credentials.ENV_VAR} to persist it instead.",
+                        f"browser tab. Set {assistant_credentials.ENV_VAR} to persist it instead.",
                         type="warning",
                         timeout=8000,
                     )
@@ -421,11 +448,11 @@ async def render() -> None:
         with ui.row().classes("w-full justify-end"):
             ui.button("Done", on_click=_save_settings).props(
                 "flat no-caps color=primary"
-            ).mark("chat-settings-done")
+            ).mark("assistant-settings-done")
 
     # A compact top bar (model name + actions) instead of a page title/caption
-    # block: this page is a chat surface, so the vertical space goes to the
-    # transcript, the way every chat app spends it.
+    # block: this page is a conversational surface, so the vertical space goes to
+    # the transcript, the way every chat app spends it.
     with ui.row().classes("w-full items-center justify-between px-5 py-2 shrink-0").style(
         f"border-bottom:1px solid {chrome.BORDER};"
     ):
@@ -433,10 +460,10 @@ async def render() -> None:
         with ui.row().classes("items-center gap-1"):
             ui.button(icon="insights", on_click=lambda: ui.navigate.to("/usage")).props(
                 "flat round dense"
-            ).tooltip("Usage").mark("chat-usage-button")
+            ).tooltip("Usage").mark("assistant-usage-button")
             ui.button(icon="settings", on_click=settings_dialog.open).props(
                 "flat round dense"
-            ).mark("chat-settings-button")
+            ).mark("assistant-settings-button")
 
     def _refresh_status() -> None:
         status_label.text = (
@@ -483,7 +510,7 @@ async def render() -> None:
                     row = (
                         ui.column()
                         .classes("w-full gap-0 py-2 px-2 rounded-lg cursor-pointer")
-                        .mark(f"chat-suggestion-{i}")
+                        .mark(f"assistant-suggestion-{i}")
                     )
                     with row:
                         ui.label(headline).classes("text-base").style(
@@ -562,14 +589,14 @@ async def render() -> None:
                         f"{'s' if len(result.reasoning) > 1 else ''})",
                         icon="psychology",
                     ).classes("w-full").style(f"color:{chrome.INK_MUTED}").mark(
-                        f"chat-reasoning-{turn_counter}"
+                        f"assistant-reasoning-{turn_counter}"
                     ):
                         for trace in result.reasoning:
                             ui.label(trace).classes("text-xs whitespace-pre-wrap").style(
                                 f"color:{chrome.INK_MUTED}"
                             )
                 for i, step in enumerate(result.steps):
-                    _render_tool_step(step, key=f"chat-step-{turn_counter}-{i}")
+                    _render_tool_step(step, key=f"assistant-step-{turn_counter}-{i}")
                 ui.markdown(result.text, extras=["fenced-code-blocks", "tables"]).style(
                     f"color:{chrome.INK_PRIMARY}; line-height:1.6;"
                 )
@@ -584,7 +611,7 @@ async def render() -> None:
                         for i, option in enumerate(result.options):
                             ui.item(option, on_click=lambda o=option: _send_option(o)).style(
                                 f"color:{chrome.INK_SECONDARY}"
-                            ).mark(f"chat-option-{turn_counter}-{i}")
+                            ).mark(f"assistant-option-{turn_counter}-{i}")
             _scroll_down()
 
         async def _send_option(option: str) -> None:
@@ -620,10 +647,10 @@ async def render() -> None:
                     .classes("flex-1 text-base")
                     .style("font-size:15px;")
                     .on("keydown.enter", send)
-                    .mark("chat-question")
+                    .mark("assistant-question")
                 )
                 send_button = (
                     ui.button(icon="arrow_upward", on_click=send)
                     .props("round dense color=primary")
-                    .mark("chat-send")
+                    .mark("assistant-send")
                 )

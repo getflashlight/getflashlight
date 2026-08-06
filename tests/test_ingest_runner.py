@@ -43,6 +43,8 @@ def _stub(monkeypatch, outcomes: list[ConnectorOutcome], built: list[bool], ran:
     monkeypatch.setattr(runner, "build_gold", _build_gold)
     monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c, _p=None: 0)
     monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_ai_usage", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_storage_locations", lambda _w, _c: 0)
 
 
 def test_all_connectors_run_even_after_a_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -106,6 +108,8 @@ def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatc
     monkeypatch.setattr(runner, "build_gold", _build_gold)
     monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c, _p=None: 0)
     monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_ai_usage", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_storage_locations", lambda _w, _c: 0)
 
     rows = run_ingest(connector="redshift")
     assert ran == ["redshift"]
@@ -163,6 +167,7 @@ def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  
     )
     efficiency_configs: list[list[object]] = []
     driver_health_configs: list[list[object]] = []
+    ai_usage_configs: list[list[object]] = []
 
     def _record_efficiency(_w: object, configs: list[object], _p: object = None) -> int:
         efficiency_configs.append(configs)
@@ -172,12 +177,18 @@ def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  
         driver_health_configs.append(configs)
         return 0
 
+    def _record_ai_usage(_w: object, configs: list[object]) -> int:
+        ai_usage_configs.append(configs)
+        return 0
+
     monkeypatch.setattr(runner, "_run_efficiency", _record_efficiency)
     monkeypatch.setattr(runner, "_run_driver_health", _record_driver_health)
+    monkeypatch.setattr(runner, "_run_ai_usage", _record_ai_usage)
     with pytest.raises(IngestError):
         run_ingest()
     assert len(efficiency_configs[0]) == 1  # only the one connector that succeeded
     assert len(driver_health_configs[0]) == 1
+    assert len(ai_usage_configs[0]) == 1
 
 
 def test_cost_pull_gold_publish_survives_a_later_phase_dying(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -218,6 +229,8 @@ def test_run_ingest_threads_progress_callback_to_every_connector(monkeypatch) ->
     monkeypatch.setattr(runner, "build_gold", lambda: 0)
     monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c, _p=None: 0)
     monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_ai_usage", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_storage_locations", lambda _w, _c: 0)
 
     received: list[object] = []
 

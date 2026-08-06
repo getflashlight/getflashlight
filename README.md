@@ -13,13 +13,13 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/ychaparala/getflashlight" alt="License"></a>
 </p>
 
-**FOCUS-based, multi-cloud Total Cost of Ownership (TCO) spend visualization.**
+**FOCUS-based, multi-cloud cloud-spend visualization.**
 
 Flashlight ingests cloud billing in the [FinOps FOCUS](https://focus.finops.org/focus-specification/)
 format, standardizes it into a layered data model, and serves a bundled
 **NiceGUI** dashboard plus an **MCP server** for agents. It answers one question
-well: *what are we actually spending* — including the often-hidden TCO of a
-Databricks workload (DBU cost **plus** the AWS infra it provisions).
+well: *what are we actually spending* — across every cloud and data platform on
+one FOCUS-normalized bill, plus how much of it is recoverable waste.
 
 It installs with `pip install getflashlight` — **no Docker, no database server**.
 Persistence is Parquet under `FLASHLIGHT_HOME`, queried by an in-memory **DuckDB**.
@@ -48,8 +48,9 @@ Parquet, publish by atomic per-file rename" — no locks, no server.
 
 * **BRONZE** `bronze/` — canonical FOCUS records, Hive-partitioned by connector +
   charge month; partition-replace makes re-ingest idempotent and self-purging.
-* **SILVER** (in-memory only) — cleaned view + the Databricks↔AWS **TCO join** with
-  the double-count guard (classic compute adds infra; serverless does not).
+* **SILVER** (in-memory only) — the cleaned, normalized view every GOLD metric is
+  derived from: one canonical `cost` column (EffectiveCost), charge-period grain.
+  Never persisted.
 * **GOLD** `gold/*.parquet` — the metrics contract the dashboard and MCP both read,
   so a chart and an agent never disagree. Built by `transform` via DuckDB `COPY`.
 
@@ -66,13 +67,17 @@ with real data — it loads the CSV straight into Parquet via a vectorized DuckD
 projection (no per-row Python). For your own sources instead:
 
 ```bash
-flashlight init                 # scaffold the lake home + a connections.yml
+flashlight init                 # scaffold the lake home + config/*.yml
 flashlight ingest               # pull configured connectors → BRONZE, rebuild GOLD
 ```
 
 * Dashboard: `http://127.0.0.1:8501` (NiceGUI; consumer surface for humans)
-* MCP: `http://localhost:8002` (`flashlight mcp serve`; streamable-http, for agents)
+* MCP: `http://localhost:8002` (`flashlight mcp serve`; streamable-http, for agents) —
+  also startable and watchable from the dashboard's **MCP server** page. The port has no
+  authentication, so keep `FLASHLIGHT_MCP_HOST` on `127.0.0.1` unless you mean to expose it.
 * CLI: `flashlight init | ingest | transform | mcp serve | dashboard serve | aws create-export`
+* Config: `<home>/config/{connections,policies,assistant}.yml` — never any secrets; those
+  go to your OS keychain or the env vars the config names.
 
 ## Try the live demo (self-hosted)
 
@@ -95,7 +100,7 @@ services:
     restart: unless-stopped
 ```
 
-Runs with `FLASHLIGHT_DEMO=1` (disables the BYOK chat and connections pages —
+Runs with `FLASHLIGHT_DEMO=1` (disables the BYOK assistant and connections pages —
 the dashboard's only write/mutation surfaces) and mocked data baked in from
 the committed `demo/lake/` dataset — nothing downloaded or written at
 runtime, safe to expose publicly. The full docs site is bundled too — click
@@ -130,7 +135,8 @@ from the Databricks solution accelerator
 The connector executes it on a SQL warehouse, then feeds the FOCUS-columned output
 through the same shared mapper used by the file/S3 connectors. The only field we add
 is `x_compute_class` (classic vs serverless), derived from the SKU — FOCUS doesn't
-carry it, but the TCO double-count guard needs it.
+carry it, and it's how you tell all-in serverless billing from classic compute that
+also shows up as separate cloud infra lines.
 
 **This SQL is repurposable** — that's a feature, not a one-off:
 

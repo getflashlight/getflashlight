@@ -2,7 +2,7 @@
 
 Shared by the MCP server and the dashboard. A single cached in-memory DuckDB
 registers ``<group>.<view>`` over each ``gold/<group>/<view>.parquet`` — a schema
-per provider group, plus ``shared`` for TCO (see
+per provider group, plus the fixed cross-provider groups (see
 :func:`flashlight.lake.duck.register_gold`); the connection is rebuilt whenever a
 publish changes the GOLD files, so reads are always fresh. Only GOLD is
 registered, so raw/silver are simply not reachable.
@@ -214,6 +214,38 @@ def run_select(sql: str, limit: int = 1000) -> list[dict[str, Any]]:
     )
     if any(re.search(rf"\b{kw}\b", lowered) for kw in forbidden):
         raise QueryError("Mutating keywords are not permitted")
+    # DuckDB's table functions read the local filesystem, and a SELECT that only *reads*
+    # slips past every keyword above. Verified before this list existed:
+    # `select * from read_csv_auto('/etc/hosts')` and `select * from glob('/some/dir/*')`
+    # both returned data. `enable_external_access` has to stay on (the GOLD views are
+    # themselves read_parquet over disk paths — see connect() above), so the block is here.
+    #
+    # Blocking read_parquet in *user* SQL is safe: this check only ever sees the caller's
+    # query string, never a view definition, so the views' own read_parquet calls are
+    # untouched. Network egress is already closed by autoinstall/autoload=false +
+    # lock_configuration=true, which keeps httpfs unloadable.
+    file_readers = (
+        "read_csv",
+        "read_csv_auto",
+        "sniff_csv",
+        "read_text",
+        "read_blob",
+        "read_json",
+        "read_json_auto",
+        "read_ndjson",
+        "read_ndjson_auto",
+        "read_parquet",
+        "parquet_scan",
+        "parquet_metadata",
+        "parquet_schema",
+        "glob",
+        "delta_scan",
+        "iceberg_scan",
+    )
+    if any(re.search(rf"\b{fn}\b", lowered) for fn in file_readers):
+        raise QueryError(
+            "Filesystem-reading functions are not permitted; query the metric views instead"
+        )
     # Only the published GOLD groups are registered; reject raw/silver/meta (and the
     # old flat `gold.` schema) with a clear pointer to the per-provider schemas.
     for schema in re.findall(r"\b(raw|silver|meta|gold)\.", lowered):

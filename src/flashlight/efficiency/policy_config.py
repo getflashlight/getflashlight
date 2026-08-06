@@ -54,6 +54,14 @@ class PolicyThresholds(BaseModel):
         description="A SQL warehouse's auto-stop timeout must be set and no longer than "
         "this to count as compliant.",
     )
+    low_traffic_endpoint_requests: int = Field(
+        default=100,
+        gt=0,
+        description="A model serving endpoint below this many requests in a month counts as "
+        "low-traffic, which is what makes always-on provisioned capacity (scale-to-zero off, "
+        "or a large GPU class) worth reviewing.",
+    )
+
     underutilized_pct: int = Field(
         default=20,
         ge=0,

@@ -1,4 +1,4 @@
-"""Flashlight MCP server — lets agents discover and query FOCUS/TCO metrics.
+"""Flashlight MCP server — lets agents discover and query the FOCUS metrics.
 
 Exposes the same GOLD views the dashboard uses, so an agent and a chart
 never disagree. All tools are read-only and scoped to the published views.
@@ -48,7 +48,7 @@ def list_metrics() -> list[dict[str, Any]]:
 
 @mcp.tool()
 def describe_metric(name: str) -> dict[str, Any]:
-    """Describe a metric view by its group-qualified name (e.g. 'shared.tco_summary_month')."""
+    """Describe a metric view by its group-qualified name (e.g. 'aws.monthly_bill')."""
     catalog = current_catalog_by_name()
     view = catalog.get(name)
     if view is None:
@@ -182,7 +182,21 @@ def serve_mcp() -> None:
     Reads the published GOLD Parquet read-only — no database, no migrations. If
     GOLD hasn't been built yet (no ``flashlight ingest`` run), the metric views are
     simply empty.
+
+    Refuses to start in demo mode. This is defence in depth, not a security boundary:
+    the actual reason the public demo has no MCP surface is that its image only ever runs
+    ``dashboard serve``. But the server binds ``0.0.0.0`` with no authentication of any
+    kind and exposes ``run_sql``, so anyone who gets far enough to run this command inside
+    a demo container should hit a wall rather than a listening socket.
     """
+    if _settings.demo:
+        raise SystemExit(
+            "Refusing to start the MCP server: FLASHLIGHT_DEMO=1.\n"
+            "  The server listens on "
+            f"{_settings.mcp_host}:{_settings.mcp_port} with no authentication and exposes "
+            "ad-hoc SQL over the lake (run_sql).\n"
+            "  Unset FLASHLIGHT_DEMO to run it on a lake you control."
+        )
     mcp.run(transport="streamable-http", host=_settings.mcp_host, port=_settings.mcp_port)
 
 

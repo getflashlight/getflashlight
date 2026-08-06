@@ -487,3 +487,79 @@ def test_paginate_follows_next_page_token() -> None:
     results = connector._paginate(TimePeriod={"Start": "2026-06-01", "End": "2026-06-30"})
     assert len(results) == 2
     assert connector._ce.get_cost_and_usage.call_count == 2
+
+
+def test_ingest_classifies_s3_subcategory(lake_home, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """S3 rows reach BRONZE with x_cost_subcategory stamped per charge type.
+
+    "S3 cost" as one number can't tell a storage-growth problem from a request-volume
+    one, and Databricks drives heavy LIST/GET metadata traffic — so the split is what
+    makes the backing-storage figure actionable. Redshift rows keep their own
+    classification in the same pass (see test_ingest_classifies_redshift_subcategory),
+    which is the regression proof that composing the two classifiers into one CASE was
+    behaviour-preserving.
+    """
+    rows = [
+        ("TimedStorage-ByteHrs", "bkt-a", "storage"),
+        ("Requests-Tier1", "bkt-b", "requests"),
+        ("DataTransfer-Out-Bytes", "bkt-c", "data_transfer"),
+        ("Monitoring-Automation-INT", "bkt-d", "monitoring"),
+        ("EarlyDelete-ByteHrs", "bkt-e", "early_delete"),
+        ("some unrecognized S3 line", "bkt-f", "other"),
+    ]
+    path = _write_parquet(
+        tmp_path / "focus.parquet",
+        [
+            {
+                "ProviderName": "AWS",
+                "BillingAccountId": "acct-1",
+                "ChargePeriodStart": date(2026, 6, 10),
+                "ChargePeriodEnd": date(2026, 6, 10),
+                "BillingCurrency": "USD",
+                "ChargeCategory": "Usage",
+                "ServiceCategory": "Storage",
+                "ServiceName": "Amazon Simple Storage Service",
+                "ChargeDescription": description,
+                "ResourceId": resource,
+                "EffectiveCost": 1.0,
+                "BilledCost": 1.0,
+            }
+            for description, resource, _ in rows
+        ]
+        # An EC2 row must still get NULL — neither classifier claims it.
+        + [
+            {
+                "ProviderName": "AWS",
+                "BillingAccountId": "acct-1",
+                "ChargePeriodStart": date(2026, 6, 11),
+                "ChargePeriodEnd": date(2026, 6, 11),
+                "BillingCurrency": "USD",
+                "ChargeCategory": "Usage",
+                "ServiceCategory": "Compute",
+                "ServiceName": "AmazonEC2",
+                "ChargeDescription": "BoxUsage:m5.large storage optimized",
+                "ResourceId": "i-1",
+                "EffectiveCost": 9.0,
+                "BilledCost": 9.0,
+            }
+        ],
+    )
+    connector = _connector(monkeypatch, tmp_path, [path], include_services=[])
+    assert connector.ingest(_WINDOW, run_id="r1") == len(rows) + 1
+
+    from flashlight.lake import duck
+
+    con = duck.connect()
+    try:
+        duck.register_bronze(con)
+        got = dict(
+            con.execute(
+                "SELECT resource_id, x_cost_subcategory FROM raw.focus_record"
+            ).fetchall()
+        )
+    finally:
+        con.close()
+
+    for _, resource, expected in rows:
+        assert got[resource] == expected, f"{resource} should classify as {expected}"
+    assert got["i-1"] is None  # EC2 is in neither service family

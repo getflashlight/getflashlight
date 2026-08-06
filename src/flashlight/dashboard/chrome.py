@@ -38,6 +38,11 @@ CATEGORICAL_SLOTS: tuple[str, ...] = (
     ACCENT, OPPORTUNITY, "#c98500", "#008300", "#9085e9", WASTE, "#d55181", "#d95926",
 )
 
+# Cool slate for projected (unmeasured) series — sits off the categorical palette so a
+# forecast bar can't be mistaken for a service segment, and reads clearer than muted ink
+# against the dark surface (hatched grey was disappearing into the panel).
+FORECAST = "#8fa3b8"
+
 # Semantic hues — dark-mode counterpart of theme.SEMANTIC, same keys.
 SEMANTIC: dict[str, str] = {
     "increase": WASTE,
@@ -49,6 +54,7 @@ SEMANTIC: dict[str, str] = {
     "volume": "#9085e9",
     "rate": "#c98500",
     "partial": INK_MUTED,
+    "forecast": FORECAST,
 }
 
 # A plain vector monogram, not NiceGUI's emoji-to-SVG-text favicon helper — that
@@ -61,6 +67,14 @@ FAVICON_SVG = (
     f'font-weight="700" fill="#ffffff" text-anchor="middle">F</text></svg>'
 )
 
+# Declared so Safari (and iOS "Add to Home Screen") uses this instead of probing
+# /apple-touch-icon.png at the site root on spec. Both point at the same route —
+# see router.register_icon_routes, which is what stops those probes 404ing.
+HEAD_ICONS = (
+    '<link rel="apple-touch-icon" href="/apple-touch-icon.png">'
+    '<link rel="icon" type="image/svg+xml" href="/favicon.ico">'
+)
+
 HEAD_CSS = f"""
 <style>
 body, .q-page, .nicegui-content {{
@@ -68,7 +82,7 @@ body, .q-page, .nicegui-content {{
     color: {INK_PRIMARY};
     font-family: {FONT_STACK};
 }}
-/* A full-height page (chat) owns its vertical space: nothing above the
+/* A full-height page (assistant) owns its vertical space: nothing above the
    transcript scrolls or pads, and the transcript itself scrolls instead.
    Deliberately no hardcoded header height: .q-page-container is border-box and
    already carries padding-top equal to the *real* header height, so
@@ -130,13 +144,31 @@ def section_caption(text: str) -> None:
     ui.label(text).classes("text-xs").style(f"color:{INK_MUTED}")
 
 
+def info_icon(tooltip: str) -> None:
+    """A small hoverable (i) carrying a methodology note — *why*/*how computed*, not the
+    finding itself. Use next to a title or caption so the finding stays a one-line scan
+    and the reasoning behind it is one hover away instead of permanent paragraph text.
+    """
+    ui.icon("info", size="14px").style(f"color:{DEEMPHASIS};cursor:help;").tooltip(tooltip)
+
+
+def caption_info(text: str, tooltip: str) -> None:
+    """A :func:`section_caption` with a trailing :func:`info_icon` for supporting detail
+    (definitions, edge cases, "why this number") that doesn't need to be read every time.
+    """
+    with ui.row().classes("items-center gap-1"):
+        section_caption(text)
+        info_icon(tooltip)
+
+
 def kpi(title: str, value: str, sub: str, *, color: str = INK_PRIMARY) -> None:
     with panel():
         ui.label(title).classes("text-sm").style(f"color:{INK_MUTED}")
         ui.label(value).classes("text-3xl font-semibold").style(
             f"color:{color};line-height:1.2;margin:4px 0 2px;"
         )
-        ui.label(sub).classes("text-xs").style(f"color:{INK_MUTED}")
+        if sub:
+            ui.label(sub).classes("text-xs").style(f"color:{INK_MUTED}")
 
 
 KpiCard = tuple[str, str, str] | tuple[str, str, str, str]
@@ -155,6 +187,37 @@ def kpi_row(cards: Sequence[KpiCard], *, columns: int | None = None) -> None:
                 variant or "", INK_PRIMARY
             )
             kpi(title, value, sub, color=color)
+
+
+def stat(title: str, value: str, sub: str, *, color: str = INK_PRIMARY) -> None:
+    """One ``(title, value, sub)`` block, same content shape as :func:`kpi` but with no
+    card chrome of its own — for grouping several numbers *inside* an existing
+    :func:`panel` (e.g. as a table's header strip) instead of giving each its own
+    bordered container. Use :func:`kpi_row` when the numbers are the whole panel;
+    use :func:`stat_row` when they're context for a table that follows in the same card.
+    """
+    with ui.column().classes("gap-0"):
+        ui.label(title).classes("text-xs").style(f"color:{INK_MUTED}")
+        ui.label(value).classes("text-2xl font-semibold").style(
+            f"color:{color};line-height:1.2;margin:2px 0;"
+        )
+        if sub:
+            ui.label(sub).classes("text-xs").style(f"color:{INK_MUTED};max-width:220px;")
+
+
+def stat_row(cards: Sequence[KpiCard]) -> None:
+    """A row of undecorated :func:`stat` blocks — the same ``(title, value, sub[,
+    variant])`` tuple shape as :func:`kpi_row`, for a panel where the table is the
+    point and these numbers are its header, not a KPI section of their own.
+    """
+    with ui.row().classes("w-full gap-8 flex-wrap mb-1"):
+        for card in cards:
+            title, value, sub = card[0], card[1], card[2]
+            variant = card[3] if len(card) > 3 else None
+            color = variant if variant and variant.startswith("#") else SEMANTIC.get(
+                variant or "", INK_PRIMARY
+            )
+            stat(title, value, sub, color=color)
 
 
 def empty_state(
@@ -180,16 +243,21 @@ def empty_state(
             ).classes("mt-1")
 
 
-def status_badge(enabled: bool) -> None:
-    """A colored-dot + label pill — Enabled/Disabled — instead of plain colored
-    text, so status reads as a status at a glance (same dot-plus-label shape as
-    most connector/integration lists elsewhere)."""
+def status_badge(enabled: bool, *, labels: tuple[str, str] = ("Enabled", "Disabled")) -> None:
+    """A colored-dot + label pill instead of plain colored text, so status reads as a
+    status at a glance (same dot-plus-label shape as most connector/integration lists
+    elsewhere).
+
+    *labels* is ``(on, off)`` — Enabled/Disabled for a configured thing, Running/Stopped
+    for a process (see ``views/mcp_server.py``). Only the wording varies: green-for-on
+    and muted-for-off stay put, so the dot means the same thing on every page.
+    """
     color = OPPORTUNITY if enabled else INK_MUTED
     with ui.row().classes("items-center gap-1.5"):
         ui.element("div").style(
             f"width:6px;height:6px;border-radius:50%;background:{color};flex:none;"
         )
-        ui.label("Enabled" if enabled else "Disabled").classes("text-xs").style(f"color:{color}")
+        ui.label(labels[0] if enabled else labels[1]).classes("text-xs").style(f"color:{color}")
 
 
 def provider_card(
@@ -216,6 +284,27 @@ def provider_card(
 
 
 # ── Plotly ───────────────────────────────────────────────────────────────────
+MAX_SERIES = len(CATEGORICAL_SLOTS)
+OTHER_SERIES = "Other"
+
+
+def cap_series(df: pd.DataFrame, series: str, y_col: str) -> pd.DataFrame:
+    """Fold all but the top ``MAX_SERIES - 1`` values of *series* into one "Other"
+    bucket, so the legend stays readable and every slot keeps a distinct colour.
+    Totals are preserved — nothing is dropped, only grouped.
+
+    Shared by every stacked chart whose series count is data-driven (an Assistant
+    reply's arbitrary result set, a provider's service list): there are only
+    ``len(CATEGORICAL_SLOTS)`` hues, and past that Plotly starts recycling them,
+    which reads as two segments being the same thing.
+    """
+    totals = df.groupby(series)[y_col].sum().sort_values(ascending=False)
+    if len(totals) <= MAX_SERIES:
+        return df
+    keep = set(totals.index[: MAX_SERIES - 1])
+    return df.assign(**{series: df[series].where(df[series].isin(keep), OTHER_SERIES)})
+
+
 def style_fig(
     fig: go.Figure,
     *,
@@ -236,7 +325,7 @@ def style_fig(
 
     ``title`` names what's plotted directly on the chart — every other chart in
     this dashboard sits under a section heading that already says so, but a chart
-    with no surrounding heading (e.g. one dropped into a chat reply) needs its own.
+    with no surrounding heading (e.g. one dropped into an Assistant reply) needs its own.
     """
     fig.update_layout(
         template="plotly_dark",
@@ -294,6 +383,16 @@ def months_back(end: date, months: int) -> date:
     return date(ts.year, ts.month, 1)
 
 
+def year_start(end: date) -> date:
+    """Jan 1 of *end*'s year — the YTD anchor.
+
+    One definition shared by the ``YTD`` quick range and the pages' *default* window, so
+    the two can't drift. Keyed off the data's last month, not today: a lake whose latest
+    bill is December of last year should open on that year, not on an empty January.
+    """
+    return date(end.year, 1, 1)
+
+
 def _format_range(state: DateState) -> str:
     s, e = state["start"], state["end"]
     if s.year == e.year:
@@ -323,7 +422,7 @@ def date_range_control(date_state: DateState, on_change: Callable[[], object]) -
                     def _quick(months: int | str | None = months) -> None:
                         end = date_state["bounds_max"]
                         if isinstance(months, str):
-                            start = max(date_state["bounds_min"], date(end.year, 1, 1))
+                            start = max(date_state["bounds_min"], year_start(end))
                         elif months is None:
                             start = date_state["bounds_min"]
                         else:

@@ -3,6 +3,15 @@
 Reads the one GOLD view (``policy.policy_record``): one row per (entity, month,
 policy_category), status compliant/non_compliant/not_applicable. No dollar figure —
 see ``efficiency_waste.py`` for recoverable spend.
+
+A **core tab on every provider page**, filtered to that provider — it used to be a
+Databricks-only extra tab, which hid real rows: ``policy_record`` is generated from
+``metrics.efficiency_record`` with no provider filter (``efficiency/policy_rules.py``),
+and two of its rules key on ``entity_type = 'sql_warehouse'``, which the Redshift
+connector emits. So every Redshift cluster-month has been contributing rows to this view
+all along with nowhere to display them. Providers with no rows get a named empty state
+rather than a hidden tab, for the same reason Efficiency & Waste does: "never measured"
+must not look like "nothing to find".
 """
 
 from __future__ import annotations
@@ -11,15 +20,14 @@ import pandas as pd
 from nicegui import ui
 
 from flashlight.dashboard import chrome
-from flashlight.dashboard.data import gold_df
+from flashlight.dashboard.data import gold_df, gold_view_published
 from flashlight.efficiency.policy_config import get_thresholds
 from flashlight.efficiency.policy_rules import POLICY_RULES
 from flashlight.lake import paths
 
-_EMPTY_MSG = (
-    "No policy-compliance data yet. This view needs the Databricks system-table pull "
-    "(cluster/warehouse config) — run `flashlight ingest` with a Databricks connector "
-    "configured."
+_STALE_MSG = (
+    "Policy compliance isn't published in this lake yet — run `flashlight transform` "
+    "to build it from the telemetry already ingested."
 )
 
 _COLS = [
@@ -54,16 +62,33 @@ def _df(sql: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def render() -> None:
-    chrome.section_title("Policy compliance")
+def render(provider_name: str, label: str) -> None:
+    """*provider_name* is the raw FOCUS value (``"AWS"``), never the display label —
+    ``policy_record`` rows carry the former, and "AWS Redshift" matches nothing."""
+    chrome.section_title(f"{label} policy compliance")
     chrome.section_caption(
         "Are the right cost/attribution guardrails in place — auto-terminate, "
         "autoscaling, cluster policy, tagging? Not a waste signal — no dollar figure."
     )
 
-    records = _df("SELECT * FROM policy.policy_record ORDER BY charge_month DESC")
+    if not gold_view_published("policy", "policy_record"):
+        ui.label(_STALE_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+        return
+
+    records = _df(
+        "SELECT * FROM policy.policy_record "
+        f"WHERE provider_name = '{provider_name.replace(chr(39), chr(39) * 2)}' "
+        "ORDER BY charge_month DESC"
+    )
     if records.empty:
-        ui.label(_EMPTY_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+        chrome.empty_state(
+            "policy",
+            f"No policy signals for {label}",
+            "Policy compliance is evaluated from the config telemetry a connector "
+            f"reports for its entities (cluster auto-termination, warehouse tagging, and "
+            f"so on). {label}'s connector doesn't report any yet, so there is nothing to "
+            "judge here — that's a coverage gap, not a clean bill of health.",
+        )
         return
 
     months = sorted(records["charge_month"].astype(str).unique())
@@ -72,6 +97,7 @@ def render() -> None:
     month_label = pd.Timestamp(month).strftime("%b %Y")
 
     measured = month_rows[month_rows["status"] != "not_applicable"]
+    not_evaluated = len(month_rows) - len(measured)
     compliant = int((measured["status"] == "compliant").sum())
     total = len(measured)
     compliance_pct = f"{round(100 * compliant / total)}%" if total else "—"
@@ -82,9 +108,35 @@ def render() -> None:
         [
             ("Compliant", compliance_pct, f"{compliant:,} of {total:,} measured"),
             ("Non-compliant", f"{non_compliant:,}", month_label),
+            # Previously invisible on every provider, Databricks included: cluster_tagging
+            # is not_applicable whenever tag_count is NULL, and a compliance percentage
+            # over a shrunken denominator reads as a verdict on entities never checked.
+            (
+                "Not evaluated",
+                f"{not_evaluated:,}",
+                "no telemetry for the check",
+                "unattributed",
+            ),
             ("Policies tracked", f"{month_rows['policy_category'].nunique():,}", "categories"),
         ],
     )
+
+    if total == 0:
+        # Rows exist but not one was evaluable. Without saying so, the KPIs above read
+        # "— compliant · 0 non-compliant" — indistinguishable from a clean bill of health.
+        # This is exactly Redshift's case: the connector emits sql_warehouse entities, so
+        # the warehouse_tagging/warehouse_auto_stop rules match them, but it reports
+        # neither tag counts nor auto-stop timeouts, so every row is not_applicable.
+        with chrome.panel():
+            chrome.panel_title("Nothing could be evaluated")
+            chrome.section_caption(
+                f"{len(month_rows):,} policy checks apply to {label}'s entities this month "
+                f"but none could be evaluated — its connector reports none of the config "
+                f"fields they test. Every row is 'not applicable'. This is a telemetry "
+                "coverage gap, not compliance."
+            )
+        _thresholds_panel()
+        return
 
     rows = month_rows[month_rows["status"] == "non_compliant"].assign(
         remedy=month_rows["policy_category"].map(_REMEDY_BY_CATEGORY)
@@ -92,7 +144,8 @@ def render() -> None:
     with chrome.panel():
         chrome.panel_title("Non-compliant entities")
         chrome.section_caption(
-            "Ranked by policy category. not_applicable rows (telemetry unmeasured) are excluded."
+            "Ranked by policy category. not_applicable rows (telemetry unmeasured) are "
+            "excluded — see the 'Not evaluated' count above for how many."
         )
         if rows.empty:
             ui.label("Nothing non-compliant this month.").classes("text-sm").style(

@@ -1,4 +1,4 @@
-"""In-process BYOK chat engine backing the dashboard's ``/chat`` page.
+"""In-process BYOK assistant engine backing the dashboard's ``/assistant`` page.
 
 Reuses the exact same tool definitions and tool functions the MCP server
 (``mcp/server.py``) already exposes — :func:`_mcp_tool_schemas` sources its
@@ -32,8 +32,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -41,7 +43,7 @@ from typing import Annotated, Any, Literal, cast
 
 import httpx
 from mcp.types import CallToolResult
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, TextPart
@@ -56,9 +58,10 @@ from pydantic_ai.usage import RunUsage
 from pydantic_graph import BaseNode, End, Graph, GraphBuilder, GraphRunContext
 
 from flashlight.core.logging import get_logger
+from flashlight.dashboard.answer_caption import caption_for
 from flashlight.dashboard.data import provider_label
 from flashlight.gold.reader import distinct_values
-from flashlight.lake.chat_turns import record_chat_turn
+from flashlight.lake.assistant_turns import record_assistant_turn
 from flashlight.mcp.server import mcp
 from flashlight.transform.catalog import current_catalog, discover_provider_groups
 
@@ -94,11 +97,16 @@ def _connected_providers_line() -> str:
     it pattern-matches on common cloud names from training data (confirmed:
     offering "GCP"/"Azure" as clarifying-question options in an instance that
     only has AWS and Databricks). Sourced the same way the nav sidebar is
-    (discover_provider_groups reads gold/ live), so it can't drift out of date."""
+    (discover_provider_groups reads gold/ live), so it can't drift out of date.
+
+    Each name is paired with its metric group, because the two aren't always the same
+    string (data.provider_label overrides "AWS" to "AWS Redshift" — the bill Flashlight
+    ingests is Redshift-scoped) and the metric names the model must call are group-
+    prefixed: it needs "AWS Redshift" for prose and "aws" for `aws.monthly_bill`."""
     groups = discover_provider_groups()
     if not groups:
         return "No providers are connected yet — say so if asked about spend."
-    names = ", ".join(provider_label(g) for g in groups)
+    names = ", ".join(f'{provider_label(g)} (metric group "{g}")' for g in groups)
     return f"Connected providers: {names}. Never mention or offer any other provider."
 
 
@@ -125,10 +133,10 @@ def _data_window_line() -> str:
             months = [str(m) for m in distinct_values(view.name, "charge_month") if m is not None]
         except Exception:  # noqa: BLE001,S112 - see below
             # A view can be in the catalog but not queryable: the fixed groups
-            # (shared/efficiency/...) are always catalogued, yet only published
-            # once their data exists, so DuckDB raises a CatalogException for a
-            # missing schema. Keep trying later views rather than giving up on
-            # the first one — with only AWS ingested, shared.tco_by_cluster_month
+            # (see catalog.FIXED_GROUPS) are always catalogued, yet only
+            # published once their data exists, so DuckDB raises a CatalogException
+            # for a missing schema. Keep trying later views rather than giving up on
+            # the first one — with only AWS cost ingested, efficiency.waste_record
             # fails but aws.monthly_bill has the real range. This whole line is
             # best-effort grounding: it must never break a turn, hence the broad
             # catch.
@@ -179,7 +187,7 @@ class ToolStep:
 
 
 @dataclass(frozen=True)
-class ChatTurnResult:
+class AssistantTurnResult:
     text: str
     steps: list[ToolStep] = field(default_factory=list)
     options: list[str] = field(default_factory=list)  # from a ClarifyingQuestion, if asked
@@ -245,6 +253,61 @@ class ChartSpec(BaseModel):
     )
 
 
+# The placeholders a SummarySpec may reference. Every one is computed from the rows
+# by answer_caption.facts_for, so the model chooses wording and code supplies every
+# figure. Kept as a literal list in the field description because that description is
+# the only place the model learns the vocabulary.
+_SUMMARY_PLACEHOLDERS = (
+    "{total} {measure} {count} {dimension} {rows} "
+    "{first_period} {last_period} {first_value} {last_value} {periods} {change_pct} "
+    "{top_name} {top_value} {top_share}"
+)
+
+
+class SummarySpec(BaseModel):
+    """One sentence answering the question, with every number left to code.
+
+    Same bargain as ChartSpec, for prose instead of a chart: the model knows the
+    intent and the view's columns, so it says how to phrase the answer while it's
+    emitting the plan anyway — and the *figures* are filled in afterwards from the
+    rows by ``answer_caption``. That removes the entire Synthesize round trip, which
+    on real captured turns was 2.8-7.1s spent restating a table the UI had already
+    drawn (and the single largest share of a turn's wall clock).
+
+    The reason this is worth a schema rather than just letting the model write the
+    answer: a sentence assembled from ``facts_for`` **cannot contain a figure that
+    isn't summed from the returned rows**. A model restating 200 rows of currency
+    can transpose a digit; a template can't. So this keeps the one thing synthesis
+    was good at (wording that fits the question asked) and drops the one thing it
+    was bad at (being trusted with the numbers).
+
+    Optional and self-correcting: no spec, an unknown placeholder, or a result the
+    facts don't cover, and the answer falls back to a fixed assembly and then to
+    real synthesis — the ChartSpec -> shape-inference -> table ladder again.
+    """
+
+    sentence: str = Field(
+        description="One sentence answering the user's question, using only these "
+        f"placeholders: {_SUMMARY_PLACEHOLDERS}. They are substituted with figures "
+        "computed from the rows, so never write a number yourself. Example: "
+        "'Spend rose from {first_value} in {first_period} to {last_value} in "
+        "{last_period}, with {top_name} the largest at {top_share} of the total.' "
+        "Set this whenever one query_metric step answers the question on its own; "
+        "leave it unset for a multi-step comparison."
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_a_bare_sentence(cls, value: Any) -> Any:
+        """Take ``summary: "..."`` as well as ``summary: {"sentence": "..."}``.
+
+        A single-field object is the shape a weak model most often flattens — the
+        same liberality, for the same reason, as ``_normalize_step`` below. Rejecting
+        it would cost the whole optimization on exactly the models that need it most.
+        """
+        return {"sentence": value} if isinstance(value, str) else value
+
+
 class QueryMetricStep(BaseModel):
     tool: Literal["query_metric"] = "query_metric"
     name: str = Field(description="Provider-scoped view name, e.g. 'aws.monthly_bill'.")
@@ -253,6 +316,12 @@ class QueryMetricStep(BaseModel):
         description="How to visualise these rows. Set it whenever the user asks "
         "to see, chart, graph, plot or visualise something, or asks for a trend "
         "or breakdown; leave null when the answer is prose or a single number.",
+    )
+    summary: SummarySpec | None = Field(
+        default=None,
+        description="How to word the answer, with the figures filled in from the "
+        "rows. Set it whenever this one step answers the question; leave null when "
+        "several steps have to be compared.",
     )
     limit: int = 200
     order_by: str | list[str] | None = None
@@ -417,11 +486,80 @@ EMPTY_ROUND_RETRY_LIMIT = 3
 
 _HARMONY_MARKER = re.compile(r"<\|.*$", re.DOTALL)
 
+
+@dataclass
+class TurnTiming:
+    """Where one turn spent its wall clock, for the ``meta/assistant_turns/`` log.
+
+    Timed at the graph-node boundary rather than around the HTTP call: a Plan or
+    Synthesize node does nothing but build a prompt and await the model, so
+    ``plan_ms``/``synthesize_ms`` *are* the LLM cost to within the prompt-building
+    time, and measuring there needs no extra layer in the request path. (For a
+    finer breakdown — per-HTTP-round-trip timings, the provider SDK's own retry
+    backoff — use ``scripts/profile_assistant_turn.py``, which wraps the
+    transport for a one-off profiling run.)
+
+    Nodes can run more than once in a turn (the empty-plan re-ask, the
+    post-explore re-plan, the data-failure re-plan), so node times accumulate and
+    ``plan_passes`` records how many.
+    """
+
+    node_ms: dict[str, float] = field(default_factory=dict)
+    plan_passes: int = 0
+    # Rounds _QuirkTransport re-issued because the provider returned neither
+    # content nor a tool call. Invisible everywhere else — pydantic-ai never sees
+    # them — yet each is a full round trip, so a turn can spend most of its life
+    # here and look merely slow.
+    empty_round_retries: int = 0
+    outcome: str = "error"  # overwritten wherever a real result is built
+    # "caption" when the answer was computed from the rows and the Synthesize LLM
+    # call was skipped entirely, "model" when it wasn't. The column that makes the
+    # saving measurable on /usage rather than asserted.
+    answer_source: str | None = None
+
+    def add(self, node: str, ms: float) -> None:
+        self.node_ms[node] = self.node_ms.get(node, 0.0) + ms
+
+    def columns(
+        self, *, duration_ms: float, llm_requests: int
+    ) -> dict[str, float | int | str | None]:
+        """The latency columns of :data:`ASSISTANT_TURN_SCHEMA` for this turn."""
+        return {
+            "duration_ms": round(duration_ms, 1),
+            "plan_ms": round(self.node_ms.get("PlanNode", 0.0), 1),
+            "explore_ms": round(self.node_ms.get("ExploreNode", 0.0), 1),
+            "execute_ms": round(self.node_ms.get("ExecuteNode", 0.0), 1),
+            "synthesize_ms": round(self.node_ms.get("SynthesizeNode", 0.0), 1),
+            "llm_request_count": llm_requests,
+            "plan_pass_count": self.plan_passes,
+            "empty_round_retries": self.empty_round_retries,
+            "outcome": self.outcome,
+            "answer_source": self.answer_source,
+        }
+
+
+# The current turn's timing, for the one place that can't reach AssistantState:
+# _QuirkTransport, which is constructed per turn by _build_model and has no
+# access to the graph's state. Same per-task ContextVar reasoning as
+# _reasoning_sink below — concurrent turns from different browser tabs must not
+# share a counter.
+_turn_timing: ContextVar[TurnTiming | None] = ContextVar("_turn_timing", default=None)
+
+
+@contextmanager
+def _timed(timing: TurnTiming, node: str) -> Iterator[None]:
+    """Accumulate the wall clock of one node run into *timing*."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        timing.add(node, (time.perf_counter() - start) * 1000)
+
 # The model's own reasoning for the current turn, collected off the wire by
 # _QuirkTransport (see _split_content_parts) and drained by run_turn.
 # A ContextVar rather than a parameter because _build_model — the one seam a
 # turn has into transport construction — is called per graph node with no
-# access to ChatState, and a ContextVar is per-task, so concurrent turns from
+# access to AssistantState, and a ContextVar is per-task, so concurrent turns from
 # different browser tabs can't cross-contaminate.
 _reasoning_sink: ContextVar[list[str] | None] = ContextVar("_reasoning_sink", default=None)
 
@@ -516,6 +654,9 @@ class _QuirkTransport(httpx.AsyncBaseTransport):
                 _record_reasoning(message["reasoning_content"])
             is_empty = not message.get("content") and not message.get("tool_calls")
             if is_empty and attempt < EMPTY_ROUND_RETRY_LIMIT:
+                timing = _turn_timing.get()
+                if timing is not None:
+                    timing.empty_round_retries += 1
                 continue
             for call in message.get("tool_calls") or []:
                 name = call["function"]["name"]
@@ -547,6 +688,25 @@ class _QuirkTransport(httpx.AsyncBaseTransport):
         await self._inner.aclose()
 
 
+def _client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClient:
+    """An HTTP client for this turn, registered so run_turn can close it.
+
+    Every provider branch goes through here. An AsyncClient holds a keep-alive
+    connection pool open, and pydantic-ai's providers build one per model when
+    they aren't given one (``create_async_http_client()`` — a fresh client, not a
+    shared cached one), so leaving the native branches to do that leaked one pool
+    per turn for the life of the dashboard process.
+
+    Registered out-of-band rather than returned because _build_model is the seam
+    tests monkeypatch, so its signature stays "provider config in, Model out".
+    """
+    client = httpx.AsyncClient(transport=transport) if transport else httpx.AsyncClient()
+    clients = _http_clients.get()
+    if clients is not None:
+        clients.append(client)
+    return client
+
+
 def _build_model(provider: str, model: str, api_key: str, base_url: str | None) -> Model:
     """Construct the right pydantic-ai Model/Provider pair for a BYOK
     provider+model+api_key+base_url combination typed into the settings
@@ -557,20 +717,21 @@ def _build_model(provider: str, model: str, api_key: str, base_url: str | None) 
     that gets the Databricks-quirk transport wired in, harmlessly for
     providers that never trigger it."""
     if provider == "openai":
-        return OpenAIChatModel(model, provider=OpenAIProvider(api_key=api_key, base_url=base_url))
+        return OpenAIChatModel(
+            model,
+            provider=OpenAIProvider(api_key=api_key, base_url=base_url, http_client=_client()),
+        )
     if provider == "anthropic":
-        return AnthropicModel(model, provider=AnthropicProvider(api_key=api_key, base_url=base_url))
+        return AnthropicModel(
+            model,
+            provider=AnthropicProvider(api_key=api_key, base_url=base_url, http_client=_client()),
+        )
     if provider == "google":
-        return GoogleModel(model, provider=GoogleProvider(api_key=api_key, base_url=base_url))
-    client = httpx.AsyncClient(transport=_QuirkTransport())
-    # Registered so run_turn can close it when the turn ends — an AsyncClient
-    # holds a keep-alive connection pool open, and one per turn adds up over a
-    # long-lived dashboard process. Tracked out-of-band rather than returned
-    # because _build_model is the seam tests monkeypatch, so its signature
-    # stays "provider config in, Model out".
-    clients = _http_clients.get()
-    if clients is not None:
-        clients.append(client)
+        return GoogleModel(
+            model,
+            provider=GoogleProvider(api_key=api_key, base_url=base_url, http_client=_client()),
+        )
+    client = _client(transport=_QuirkTransport())
     return OpenAIChatModel(
         model,
         provider=OpenAIProvider(api_key=api_key, base_url=base_url, http_client=client),
@@ -594,13 +755,13 @@ async def _call_mcp_tool(name: str, kwargs: dict[str, Any]) -> Any:
     if not isinstance(result, CallToolResult):
         # None of Flashlight's tools ask for elicited input — this branch is
         # unreachable in practice, but the SDK's return type isn't narrowed for us.
-        return {"error": "tool requires interactive input, which chat cannot provide"}
+        return {"error": "tool requires interactive input, which assistant cannot provide"}
     if result.structured_content is not None:
         return result.structured_content
     return "\n".join(getattr(block, "text", "") for block in result.content)
 
 
-def _agent_model(state: ChatState) -> Model:
+def _agent_model(state: AssistantState) -> Model:
     """One Model per turn, shared by every node.
 
     Each node used to build its own, which meant a fresh httpx.AsyncClient and
@@ -614,12 +775,12 @@ def _agent_model(state: ChatState) -> Model:
 
 
 def _step_args(step: PlanStep) -> dict[str, Any]:
-    """The step's real MCP arguments — everything except the discriminator and
-    ``chart``, which is presentation the model attaches for the UI and not a
-    parameter any tool accepts. Also what the dedup key is built from, so two
-    otherwise-identical queries don't both run just because one asked to be
-    drawn differently."""
-    return step.model_dump(exclude={"tool", "chart"})
+    """The step's real MCP arguments — everything except the discriminator,
+    ``chart`` and ``summary``, which are presentation the model attaches for the UI
+    and not parameters any tool accepts. Also what the dedup key is built from, so
+    two otherwise-identical queries don't both run just because one asked to be
+    drawn or worded differently."""
+    return step.model_dump(exclude={"tool", "chart", "summary"})
 
 
 async def _execute_step(step: PlanStep) -> Any:
@@ -720,8 +881,24 @@ _PLAN_INSTRUCTIONS = (
     "one provider, never filter it by provider_name: every row is that provider "
     "already, and a guessed value simply matches nothing — filters are exact and "
     "case-sensitive, so \"databricks\" finds none of the \"Databricks\" rows. "
-    "The \"shared\" group is Databricks TCO "
-    "only (DBU vs. attributed AWS infra), not a general cross-provider total. "
+    "The fixed \"efficiency\", \"driver_health\", \"policy\", \"ai_usage\" and "
+    "\"storage\" groups are the exception — they span providers and carry "
+    "provider_name as a real column, so filtering those by provider_name is "
+    "correct. None of them is a cross-provider spend total. "
+    "\"storage.backing_storage_month\" in particular is AWS-billed S3 cost that is "
+    "ALREADY counted in aws.monthly_bill: it is the storage behind Databricks, not "
+    "Databricks spend. Never add it to a Databricks figure or present a combined "
+    "\"total Databricks cost\" — Databricks' own bill covers DBU compute only, and "
+    "those are two separate bills. It carries two provider columns for that reason: "
+    "billing_provider_name (who invoices it) and platform_provider_name (whose "
+    "metadata claims the bucket). Only mapping='databricks' counts as Databricks "
+    "storage (the Unity Catalog metastore root); 'unmapped' includes external-location "
+    "buckets that are deliberately excluded because that data isn't Databricks-owned, so "
+    "never add unmapped buckets back in to make the number look complete. It is a FLOOR, "
+    "not a total — workspace DBFS roots and per-catalog storage roots are Databricks-managed "
+    "but not counted — so describe it as at-least, never as the full figure. Where "
+    "mapping_confidence = 'prefix_scoped', the cost is an upper bound for that bucket, so "
+    "say so rather than quoting it as exact. "
     "For \"across all providers\"/\"total\" spend, or a computed comparison "
     "(month-over-month growth, which grew the most), plan one query_metric "
     "step per provider/period — the arithmetic happens in the final answer, "
@@ -731,9 +908,21 @@ _PLAN_INSTRUCTIONS = (
     "plausible-looking result that's silently wrong. Only plan a run_sql step "
     "when query_metric genuinely can't express the question (e.g. no view has "
     "the dimension you need), and keep it as simple as possible.\n\n"
+    "Choosing between net_cost and gross_cost, on any view that offers both: "
+    "gross_cost is charges only; net_cost also applies credits and adjustments. "
+    "A \"where is the money going\" question — spend, a breakdown, a trend, a "
+    "mover, what grew — asks about charges, so use gross_cost. Use net_cost only "
+    "when the question is what was actually owed or paid (the bill, the invoice). "
+    "This matters because a single one-off credit lands entirely in one month and "
+    "nets against it, so net_cost shows that month as a spend collapse when "
+    "nothing about the spend changed — a real AWS Redshift goodwill credit turns "
+    "$68K of July charges into $10K net. Credits are never dropped, just kept out "
+    "of the spend answer: they are itemized per credit line in the provider's own "
+    "credits_month view, so plan a second step against it when the user asks about "
+    "credits, discounts or the difference between the two figures.\n\n"
     "When the user asks to see, chart, graph, plot or visualise something, or "
     "asks for a trend or a breakdown, set two things on the query_metric step: "
-    "measures=[the one relevant measure] (e.g. [\"net_cost\"] — leaving it unset "
+    "measures=[the one relevant measure] (e.g. [\"gross_cost\"] — leaving it unset "
     "returns every measure on the view, which is too wide to chart), and "
     "chart={...} saying how to draw it. You choose the axis, because only you "
     "know which breakdown was asked for: \"spend by service\" means "
@@ -742,7 +931,14 @@ _PLAN_INSTRUCTIONS = (
     "in the rows (e.g. you asked for several months of per-service spend), name "
     "it as series so each bar is split by it, rather than leaving the two "
     "dimensions to collide on one axis. Only the dimensions of the view you "
-    "query are available as x/series."
+    "query are available as x/series.\n\n"
+    "Whenever a single query_metric step answers the question on its own, also "
+    "set summary={\"sentence\": ...} on it: one sentence answering the question, "
+    "written with placeholders instead of numbers. The figures are computed from "
+    "the rows and substituted in, so you never write a figure yourself and the "
+    "answer needs no second round trip. Leave summary unset when the answer needs "
+    "several steps compared against each other — that genuinely needs reasoning "
+    "over the results, and you'll be asked to write it once the data is in."
 )
 
 _EXPLORE_INSTRUCTIONS = (
@@ -774,10 +970,19 @@ _SYNTHESIZE_INSTRUCTIONS = (
     "silently. For a cross-provider or computed comparison (total, "
     "month-over-month growth, which grew the most), do the arithmetic "
     "yourself on the rows gathered per provider/period.\n\n"
+    "Say which cost metric the figures are: gross_cost is charges only, net_cost "
+    "has credits and adjustments applied. If the rows carry both and they differ "
+    "materially for a period, that gap is a credit — name it rather than quoting "
+    "one figure as though it were the whole story.\n\n"
     "Never draw a chart yourself: no ASCII art, no code block pretending to "
     "be a plot, no chart described in a markdown table — a chart renders "
     "automatically above your reply when the gathered data is one dimension "
-    "+ one measure. State any other result in prose or a real markdown table."
+    "+ one measure. State any other result in prose or a real markdown table.\n\n"
+    "The full table and chart are already on screen above your reply, and the rows "
+    "below may be a sample of a larger result (the row count is stated). So "
+    "summarize — the totals, the movement, the outliers, what it means — rather "
+    "than transcribing rows the user can already see, and never imply the sample is "
+    "the whole result."
 )
 
 
@@ -865,17 +1070,53 @@ def _step_failure(step: ToolStep) -> str | None:
     return detail
 
 
+# How many rows of a step's result reach the Synthesize prompt. Every row used to,
+# as a Python repr: with QueryMetricStep.limit defaulting to 200 and MAX_PLAN_STEPS
+# at 12, one ordinary query measured **24,348 tokens** of prompt — which is what
+# produced the observed prompt-token p90 of 20.8k and max of 59.7k, not the 4.5k
+# instruction prefix. Nothing user-visible is lost by capping it: ToolStep.rows is
+# untouched, so the table and chart still render every row, and the model is told the
+# count it didn't see (it's summarizing, not transcribing).
+_SYNTH_ROW_SAMPLE = 30
+
+
 def _describe_step(step: ToolStep) -> str:
+    """One step's outcome, as compact text for the Synthesize prompt.
+
+    Rows go out as header-plus-values lines rather than a list of dicts: a repr
+    repeats every key on every row, which for 200 rows is most of the payload and
+    none of the information.
+    """
     if step.error:
         return f"- {step.name}({step.arguments}): error: {step.error}"
-    return f"- {step.name}({step.arguments}): {step.rows if step.rows is not None else 'ok'}"
+    rows = step.rows
+    if rows is None:
+        return f"- {step.name}({step.arguments}): ok"
+    if not rows:
+        return f"- {step.name}({step.arguments}): no rows"
+    columns = list(rows[0])
+    shown = rows[:_SYNTH_ROW_SAMPLE]
+    lines = ["\t".join(columns)]
+    lines += [
+        "\t".join("" if row.get(c) is None else str(row.get(c)) for c in columns)
+        for row in shown
+    ]
+    omitted = len(rows) - len(shown)
+    tail = (
+        f"\n  ... {omitted} more row{'s' if omitted != 1 else ''} not shown "
+        f"(all {len(rows)} are already displayed to the user)"
+        if omitted
+        else ""
+    )
+    body = "\n  ".join(lines)
+    return f"- {step.name}({step.arguments}): {len(rows)} rows\n  {body}{tail}"
 
 
 # --- Graph --------------------------------------------------------------
 
 
 @dataclass
-class ChatState:
+class AssistantState:
     """Mutable state threaded through one turn's Plan -> [Explore -> re-Plan]
     -> Execute -> Synthesize graph run."""
 
@@ -895,15 +1136,16 @@ class ChatState:
     plan: Plan | None = None
     steps: list[ToolStep] = field(default_factory=list)
     usage: RunUsage = field(default_factory=RunUsage)
+    timing: TurnTiming = field(default_factory=TurnTiming)
 
 
 @dataclass
-class PlanNode(BaseNode[ChatState, None, ChatTurnResult]):
+class PlanNode(BaseNode[AssistantState, None, AssistantTurnResult]):
     """One structured-output Agent.run(), no tools. Commits to a ClarifyingQuestion,
     an ExploreRequest (first pass only), or a Plan.
 
     ClarifyingQuestion is dropped from the offered output types entirely when
-    ``ChatState.allow_clarify`` is False (the user's message is them clicking an
+    ``AssistantState.allow_clarify`` is False (the user's message is them clicking an
     option from our own last clarifying question). Enforced structurally, not
     just asked for in the prompt: a weak model was confirmed re-asking "which
     month?" right after the user picked "...for the previous month (default)",
@@ -913,37 +1155,43 @@ class PlanNode(BaseNode[ChatState, None, ChatTurnResult]):
     allow_explore: bool = True
 
     async def run(
-        self, ctx: GraphRunContext[ChatState, None]
-    ) -> ExploreNode | ExecuteNode | End[ChatTurnResult]:
-        tool_catalog = await _plan_tool_catalog()
-        instructions = _plan_instructions(
-            allow_explore=self.allow_explore,
-            allow_clarify=ctx.state.allow_clarify,
-            explored=ctx.state.explored,
-            tool_catalog=tool_catalog,
-            empty_plan_retry=ctx.state.empty_plan_retried,
-            data_failures=ctx.state.data_failures,
-        )
-        output_types: list[type[BaseModel]] = [Plan]
-        if self.allow_explore:
-            output_types.insert(0, ExploreRequest)
-        if ctx.state.allow_clarify:
-            output_types.insert(0, ClarifyingQuestion)
-        agent = Agent(
-            _agent_model(ctx.state),
-            instructions=instructions,
-            output_type=output_types,
-            retries={"output": _OUTPUT_RETRIES},
-        )
-        result = await agent.run(
-            ctx.state.question,
-            message_history=ctx.state.history,
-            usage_limits=UsageLimits(request_limit=_OUTPUT_REQUEST_LIMIT),
-        )
+        self, ctx: GraphRunContext[AssistantState, None]
+    ) -> ExploreNode | ExecuteNode | End[AssistantTurnResult]:
+        # Timed around the prompt build and the model round only — dispatching on
+        # the output below is free, and this keeps plan_ms comparable across the
+        # branches it can take.
+        with _timed(ctx.state.timing, "PlanNode"):
+            ctx.state.timing.plan_passes += 1
+            tool_catalog = await _plan_tool_catalog()
+            instructions = _plan_instructions(
+                allow_explore=self.allow_explore,
+                allow_clarify=ctx.state.allow_clarify,
+                explored=ctx.state.explored,
+                tool_catalog=tool_catalog,
+                empty_plan_retry=ctx.state.empty_plan_retried,
+                data_failures=ctx.state.data_failures,
+            )
+            output_types: list[type[BaseModel]] = [Plan]
+            if self.allow_explore:
+                output_types.insert(0, ExploreRequest)
+            if ctx.state.allow_clarify:
+                output_types.insert(0, ClarifyingQuestion)
+            agent = Agent(
+                _agent_model(ctx.state),
+                instructions=instructions,
+                output_type=output_types,
+                retries={"output": _OUTPUT_RETRIES},
+            )
+            result = await agent.run(
+                ctx.state.question,
+                message_history=ctx.state.history,
+                usage_limits=UsageLimits(request_limit=_OUTPUT_REQUEST_LIMIT),
+            )
         ctx.state.usage.incr(result.usage)
         match result.output:
             case ClarifyingQuestion() as cq:
-                return End(ChatTurnResult(text=cq.question, options=cq.options))
+                ctx.state.timing.outcome = "clarify"
+                return End(AssistantTurnResult(text=cq.question, options=cq.options))
             case ExploreRequest() as request:
                 ctx.state.pending_lookups = request.lookups
                 return ExploreNode()
@@ -956,7 +1204,7 @@ class PlanNode(BaseNode[ChatState, None, ChatTurnResult]):
                     # perfectly answerable question. One bounded re-ask (the flag
                     # makes it exactly one, so a real greeting still settles) is
                     # cheaper than shipping that non-answer.
-                    logger.info("chat_plan_empty_retry", model=ctx.state.model)
+                    logger.info("assistant_plan_empty_retry", model=ctx.state.model)
                     ctx.state.empty_plan_retried = True
                     return PlanNode(allow_explore=False)
                 ctx.state.plan = plan
@@ -970,33 +1218,67 @@ class PlanNode(BaseNode[ChatState, None, ChatTurnResult]):
 
 
 @dataclass
-class ExploreNode(BaseNode[ChatState, None, ChatTurnResult]):
+class ExploreNode(BaseNode[AssistantState, None, AssistantTurnResult]):
     """No LLM call. Dedupes and runs the requested list_dimension_values
     lookups concurrently, then hands back to a must-commit PlanNode."""
 
-    async def run(self, ctx: GraphRunContext[ChatState, None]) -> PlanNode:
+    async def run(self, ctx: GraphRunContext[AssistantState, None]) -> PlanNode:
         assert ctx.state.pending_lookups is not None
-        by_key: dict[str, ListDimensionValuesStep] = {}
-        for lookup in ctx.state.pending_lookups:
-            by_key.setdefault(_dedup_key(lookup.tool, _step_args(lookup)), lookup)
-        keys = list(by_key)
-        outcomes = await asyncio.gather(*(_execute_step(by_key[key]) for key in keys))
-        ctx.state.explored = {
-            key: (by_key[key], outcome) for key, outcome in zip(keys, outcomes, strict=True)
-        }
-        ctx.state.pending_lookups = None
+        with _timed(ctx.state.timing, "ExploreNode"):
+            by_key: dict[str, ListDimensionValuesStep] = {}
+            for lookup in ctx.state.pending_lookups:
+                by_key.setdefault(_dedup_key(lookup.tool, _step_args(lookup)), lookup)
+            keys = list(by_key)
+            outcomes = await asyncio.gather(*(_execute_step(by_key[key]) for key in keys))
+            ctx.state.explored = {
+                key: (by_key[key], outcome) for key, outcome in zip(keys, outcomes, strict=True)
+            }
+            ctx.state.pending_lookups = None
         return PlanNode(allow_explore=False)
 
 
 @dataclass
-class ExecuteNode(BaseNode[ChatState, None, ChatTurnResult]):
+class ExecuteNode(BaseNode[AssistantState, None, AssistantTurnResult]):
     """No LLM call. Dedupes Plan.steps by (tool, args) — reusing anything
     already fetched during an explore round — and runs the rest concurrently.
     This is the root-cause dedup: a repeated step in the committed plan never
     reaches DuckDB twice, dedeuped in code before execution rather than
     reactively after a duplicate call already happened."""
 
-    async def run(self, ctx: GraphRunContext[ChatState, None]) -> SynthesizeNode | PlanNode:
+    async def run(
+        self, ctx: GraphRunContext[AssistantState, None]
+    ) -> SynthesizeNode | PlanNode | End[AssistantTurnResult]:
+        assert ctx.state.plan is not None
+        with _timed(ctx.state.timing, "ExecuteNode"):
+            outcome = await self._execute(ctx)
+        if not isinstance(outcome, SynthesizeNode):
+            return outcome
+        # The rows are in, so the answer is arithmetic — skip the Synthesize model
+        # call, which on real turns cost 2.8-7.1s to narrate a chart the UI had
+        # already drawn. The model's own SummarySpec supplies the wording (it rode
+        # along on the plan, costing nothing); answer_caption fills every figure from
+        # the rows and returns None for anything it can't state honestly, which
+        # falls through to real synthesis.
+        plan_summary = next(
+            (
+                step.summary
+                for step in ctx.state.plan.steps
+                if isinstance(step, QueryMetricStep) and step.summary
+            ),
+            None,
+        )
+        caption = caption_for(ctx.state.steps, plan_summary.sentence if plan_summary else None)
+        if caption is None:
+            return outcome
+        ctx.state.timing.outcome = "answer"
+        ctx.state.timing.answer_source = "caption" if plan_summary is None else "summary_spec"
+        return End(AssistantTurnResult(text=caption, steps=ctx.state.steps))
+
+    async def _execute(
+        self, ctx: GraphRunContext[AssistantState, None]
+    ) -> SynthesizeNode | PlanNode:
+        """Split out so run() can time the whole thing without indenting it —
+        this node has two exits and both need to be inside the timer."""
         assert ctx.state.plan is not None
         by_key: dict[str, PlanStep] = {}
         results: dict[str, Any] = {}
@@ -1026,30 +1308,36 @@ class ExecuteNode(BaseNode[ChatState, None, ChatTurnResult]):
                 # more plan rather than reporting a dead end.
                 ctx.state.data_retried = True
                 ctx.state.data_failures = [f for f in failures if f]
-                logger.info("chat_data_empty_retry", model=ctx.state.model, steps=len(failures))
+                logger.info(
+                    "assistant_data_empty_retry", model=ctx.state.model, steps=len(failures)
+                )
                 return PlanNode(allow_explore=False)
         return SynthesizeNode()
 
 
 @dataclass
-class SynthesizeNode(BaseNode[ChatState, None, ChatTurnResult]):
+class SynthesizeNode(BaseNode[AssistantState, None, AssistantTurnResult]):
     """One Agent.run(), no tools, output_type=str. Writes the final answer
     from the gathered ToolStep rows/errors — charting is already decided at
     Plan time, this node only writes prose."""
 
-    async def run(self, ctx: GraphRunContext[ChatState, None]) -> End[ChatTurnResult]:
-        agent = Agent(_agent_model(ctx.state), instructions=_SYNTHESIZE_INSTRUCTIONS)
-        gathered = (
-            "\n".join(_describe_step(step) for step in ctx.state.steps) or "(no data was gathered)"
-        )
-        prompt = f"User question: {ctx.state.question}\n\nData gathered:\n{gathered}"
-        result = await agent.run(
-            prompt,
-            message_history=ctx.state.history,
-            usage_limits=UsageLimits(request_limit=_OUTPUT_REQUEST_LIMIT),
-        )
+    async def run(self, ctx: GraphRunContext[AssistantState, None]) -> End[AssistantTurnResult]:
+        with _timed(ctx.state.timing, "SynthesizeNode"):
+            agent = Agent(_agent_model(ctx.state), instructions=_SYNTHESIZE_INSTRUCTIONS)
+            gathered = (
+                "\n".join(_describe_step(step) for step in ctx.state.steps)
+                or "(no data was gathered)"
+            )
+            prompt = f"User question: {ctx.state.question}\n\nData gathered:\n{gathered}"
+            result = await agent.run(
+                prompt,
+                message_history=ctx.state.history,
+                usage_limits=UsageLimits(request_limit=_OUTPUT_REQUEST_LIMIT),
+            )
         ctx.state.usage.incr(result.usage)
-        return End(ChatTurnResult(text=result.output, steps=ctx.state.steps))
+        ctx.state.timing.outcome = "answer"
+        ctx.state.timing.answer_source = "model"
+        return End(AssistantTurnResult(text=result.output, steps=ctx.state.steps))
 
 
 # ponytail: Graph/GraphBuilder are runtime-Generic (pydantic_graph.graph_builder
@@ -1059,10 +1347,10 @@ class SynthesizeNode(BaseNode[ChatState, None, ChatTurnResult]):
 # output_type below still give GraphBuilder everything it needs at runtime.
 def _build_graph() -> Graph:
     g = GraphBuilder(
-        name="chat_turn",
-        state_type=ChatState,
+        name="assistant_turn",
+        state_type=AssistantState,
         input_type=PlanNode,
-        output_type=ChatTurnResult,
+        output_type=AssistantTurnResult,
     )
     g.add(
         g.edge_from(g.start_node).to(PlanNode),
@@ -1087,7 +1375,7 @@ async def run_turn(
     base_url: str | None,
     session_id: str,
     answering_clarification: bool = False,
-) -> ChatTurnResult:
+) -> AssistantTurnResult:
     """Run one user turn to completion: Plan -> [Explore -> re-Plan, at most
     once] -> Execute -> Synthesize.
 
@@ -1098,7 +1386,7 @@ async def run_turn(
     final assistant text (or clarifying question) plus every tool call made
     along the way (so the UI can show what was actually queried, not just
     the model's prose summary of it), and logs exactly one row to
-    ``meta/chat_turns/`` per call, with token usage summed across every LLM
+    ``meta/assistant_turns/`` per call, with token usage summed across every LLM
     call this turn made.
 
     Set *answering_clarification* when *question* is the user picking one of the
@@ -1106,7 +1394,7 @@ async def run_turn(
     the ambiguity by construction, so this turn may not ask another one (see
     PlanNode).
     """
-    state = ChatState(
+    state = AssistantState(
         question=question,
         history=list(messages),
         provider=provider,
@@ -1119,9 +1407,17 @@ async def run_turn(
     _reasoning_sink.set(reasoning)
     http_clients: list[httpx.AsyncClient] = []
     _http_clients.set(http_clients)
+    _turn_timing.set(state.timing)
+    started = time.perf_counter()
 
-    def _log(result: ChatTurnResult) -> ChatTurnResult:
-        record_chat_turn(
+    def _log(result: AssistantTurnResult) -> AssistantTurnResult:
+        timings = state.timing.columns(
+            duration_ms=(time.perf_counter() - started) * 1000,
+            # pydantic-ai's own count, so a structured-output retry shows up as
+            # the extra request it really is.
+            llm_requests=state.usage.requests,
+        )
+        record_assistant_turn(
             turn_id=str(uuid.uuid4()),
             session_id=session_id,
             model=model,
@@ -1130,7 +1426,9 @@ async def run_turn(
             total_tokens=state.usage.total_tokens or None,
             tool_call_count=len(result.steps),
             occurred_at=datetime.now(UTC),
+            timings=timings,
         )
+        logger.info("assistant_turn_timing", model=model, **timings)
         return result
 
     try:
@@ -1141,21 +1439,21 @@ async def run_turn(
 
 
 async def _run_graph(
-    state: ChatState,
+    state: AssistantState,
     messages: list[ModelMessage],
     question: str,
     api_key: str,
     reasoning: list[str],
-    _log: Callable[[ChatTurnResult], ChatTurnResult],
-) -> ChatTurnResult:
+    _log: Callable[[AssistantTurnResult], AssistantTurnResult],
+) -> AssistantTurnResult:
     """The turn itself, split out so run_turn's ``finally`` can close the HTTP
     clients the turn built regardless of how it ended."""
     model = state.model
     try:
         # cast: _graph is left unparameterized (see _build_graph) so mypy can't
-        # resolve .run()'s OutputT on its own — GraphBuilder(output_type=ChatTurnResult)
+        # resolve .run()'s OutputT on its own — GraphBuilder(output_type=AssistantTurnResult)
         # already pins this at runtime.
-        result = cast(ChatTurnResult, await _graph.run(inputs=PlanNode(), state=state))
+        result = cast(AssistantTurnResult, await _graph.run(inputs=PlanNode(), state=state))
     except (UsageLimitExceeded, UnexpectedModelBehavior) as exc:
         # ponytail: two distinct pydantic-ai exceptions both mean "didn't get
         # a real structured output within budget" — UsageLimitExceeded is
@@ -1167,24 +1465,33 @@ async def _run_graph(
         # the actual cause (and the model's own reasoning) thrown away, making
         # a real, reproducible failure impossible to diagnose from the UI.
         logger.warning(
-            "chat_turn_no_final_answer",
+            "assistant_turn_no_final_answer",
             model=model,
             error_type=type(exc).__name__,
             error=_redact(_root_cause(exc), api_key),
             reasoning_traces=len(reasoning),
         )
+        state.timing.outcome = "no_answer"
         return _log(
-            ChatTurnResult(
+            AssistantTurnResult(
                 text=f"{_ROUND_LIMIT_MESSAGE}\n\n_{type(exc).__name__}: "
                 f"{_redact(str(exc), api_key)}_",
+                # Whatever ExecuteNode already gathered before the turn fell over
+                # is still real data — the tables and charts render, so a failed
+                # synthesis costs the prose, not the answer. It also keeps the
+                # turn log's tool_call_count honest for exactly the turns whose
+                # cost most needs explaining.
+                steps=state.steps,
                 reasoning=reasoning,
             )
         )
     except Exception as exc:  # noqa: BLE001 - bad key/base_url/network: expected, not exceptional
-        logger.warning("chat_turn_request_failed", model=model, error=type(exc).__name__)
+        logger.warning("assistant_turn_request_failed", model=model, error=type(exc).__name__)
         return _log(
-            ChatTurnResult(
-                text=f"Request failed: {_redact(_root_cause(exc), api_key)}", reasoning=reasoning
+            AssistantTurnResult(
+                text=f"Request failed: {_redact(_root_cause(exc), api_key)}",
+                steps=state.steps,
+                reasoning=reasoning,
             )
         )
 

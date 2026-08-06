@@ -18,8 +18,15 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from flashlight.core.exceptions import ConfigError
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
+from flashlight.ingest._s3_service_names import S3_SERVICE_NAMES
 from flashlight.ingest.connection_credentials import load_secret
 from flashlight.lake import paths
+
+# The default AWS FOCUS pull: Redshift's own services (the cost the /aws page reports)
+# plus S3 (the storage behind Unity Catalog, which Databricks' own DBU-only bill can't
+# show — see docs/design/backing-storage.md). One constant so the model default, the
+# scaffolded connections.yml template and the tests can't disagree about it.
+DEFAULT_INCLUDE_SERVICES: tuple[str, ...] = tuple(sorted(REDSHIFT_SERVICE_NAMES | S3_SERVICE_NAMES))
 
 
 def scoped_env_name(base: str, *, name: str | None, ctype: str) -> str:
@@ -63,10 +70,11 @@ class AwsFocusConfig(BaseModel):
     # Allow-list of FOCUS ServiceName values to ingest (also used as the Cost
     # Explorer SERVICE-dimension filter when cost_source="cost_explorer"). AWS
     # Data Exports is account-wide and cannot be scoped per service at the
-    # source, so Flashlight narrows here. Defaults to Redshift only — set
-    # explicitly (e.g. `[]` for the whole account) to widen.
+    # source, so Flashlight narrows here. Defaults to Redshift + S3 (see
+    # DEFAULT_INCLUDE_SERVICES) — set explicitly (e.g. `[]` for the whole
+    # account) to widen, or to just Redshift's names to opt out of S3.
     include_services: list[str] = Field(
-        default_factory=lambda: sorted(REDSHIFT_SERVICE_NAMES)
+        default_factory=lambda: list(DEFAULT_INCLUDE_SERVICES)
     )
 
     @field_validator("s3_prefix")
@@ -107,6 +115,13 @@ class DatabricksConfig(BaseModel):
     host: str
     token_env: str = "DATABRICKS_TOKEN"
     sql_warehouse_id: str | None = None
+    # Which custom-tag key on system.billing.usage the efficiency/waste plane reads as
+    # EfficiencyRecord.owner_project (databricks_efficiency.sql). Literal key match, not
+    # a fold across spellings like the FOCUS Tags views — an org whose project-equivalent
+    # tag is named e.g. "team" or "cost_center" instead of "project" would otherwise see
+    # the Attribution tab's Projects panel read as ~100% Unattributed despite tagging
+    # consistently. Case-sensitive: Databricks custom tag keys are, too.
+    project_tag_key: str = "project"
 
     @model_validator(mode="after")
     def _scope_default_secret_env_name(self) -> DatabricksConfig:

@@ -4,9 +4,10 @@ Backs ``flashlight transform`` and the tail of ``flashlight ingest``. One in-mem
 DuckDB reads the BRONZE Parquet as ``raw.focus_record``, applies the SILVER and
 GOLD view SQL (``sql/*.sql``), then materializes GOLD **per provider**: each
 provider-scoped view is sliced by ``provider_name`` into
-``gold/<group>/<view>.parquet`` and the cross-provider TCO views into
-``gold/shared/``. The files are written to a staging tree and swapped into
-``gold/`` atomically per file (:func:`flashlight.lake.publish.atomic_publish`).
+``gold/<group>/<view>.parquet``, and the cross-provider views (efficiency/waste,
+driver health, policy) go into their own fixed groups. The files are written to a
+staging tree and swapped into ``gold/`` atomically per file
+(:func:`flashlight.lake.publish.atomic_publish`).
 
 SILVER is never persisted — it lives only as views inside this connection. GOLD
 matviews + ``REFRESH … CONCURRENTLY`` are gone: a full rebuild via ``COPY`` is the
@@ -27,6 +28,8 @@ from flashlight.efficiency.waste_rules import build_waste_record_sql
 from flashlight.lake import duck, paths
 from flashlight.lake.publish import atomic_publish
 from flashlight.transform.catalog import (
+    AI_USAGE_BASE_VIEWS,
+    AI_USAGE_GROUP,
     DRIVER_HEALTH_BASE_VIEWS,
     DRIVER_HEALTH_GROUP,
     EFFICIENCY_BASE_VIEWS,
@@ -34,8 +37,8 @@ from flashlight.transform.catalog import (
     POLICY_BASE_VIEWS,
     POLICY_GROUP,
     PROVIDER_BASE_VIEWS,
-    SHARED_BASE_VIEWS,
-    SHARED_GROUP,
+    STORAGE_BASE_VIEWS,
+    STORAGE_GROUP,
     provider_group,
 )
 
@@ -88,6 +91,8 @@ def _materialize_sources(con: duckdb.DuckDBPyConnection) -> None:
         ("raw.focus_record", "_bronze_mat"),
         ("metrics.efficiency_record", "_efficiency_mat"),
         ("metrics.driver_health", "_driver_health_mat"),
+        ("metrics.ai_usage", "_ai_usage_mat"),
+        ("metrics.storage_location", "_storage_location_mat"),
     ):
         con.execute(f"CREATE TEMP TABLE {temp} AS SELECT * FROM {schema_view}")  # noqa: S608
         con.execute(f"CREATE OR REPLACE VIEW {schema_view} AS SELECT * FROM {temp}")  # noqa: S608
@@ -112,7 +117,7 @@ def build_gold() -> int:
 
     GOLD is materialized per provider: each provider-scoped view is sliced by
     ``provider_name`` into ``gold/<group>/<view>.parquet`` (one group per provider),
-    and the cross-provider TCO views go into ``gold/shared/``. The in-memory
+    and the cross-provider views go into the fixed groups below. The in-memory
     ``gold.<view>`` SQL is the shared source for the per-provider COPY slices.
     """
     con = duck.connect()
@@ -122,6 +127,8 @@ def build_gold() -> int:
         duck.register_bronze(con)  # creates schema raw + raw.focus_record
         duck.register_metrics(con)  # creates schema metrics + metrics.efficiency_record
         duck.register_driver_health(con)  # creates metrics.driver_health
+        duck.register_ai_usage(con)  # creates metrics.ai_usage
+        duck.register_storage_locations(con)  # creates metrics.storage_location
         _materialize_sources(con)
 
         # gold.waste_record is config-driven (flashlight.efficiency.waste_rules), not a
@@ -159,13 +166,14 @@ def build_gold() -> int:
                 )
                 published += 1
 
-        # Fixed cross-provider groups: TCO (shared) + efficiency/waste + driver health +
-        # policy compliance, unfiltered.
+        # Fixed cross-provider groups: efficiency/waste + driver health + policy
+        # compliance + AI serving usage, unfiltered.
         fixed_groups = (
-            (SHARED_GROUP, SHARED_BASE_VIEWS),
             (EFFICIENCY_GROUP, EFFICIENCY_BASE_VIEWS),
             (DRIVER_HEALTH_GROUP, DRIVER_HEALTH_BASE_VIEWS),
             (POLICY_GROUP, POLICY_BASE_VIEWS),
+            (AI_USAGE_GROUP, AI_USAGE_BASE_VIEWS),
+            (STORAGE_GROUP, STORAGE_BASE_VIEWS),
         )
         for group, specs in fixed_groups:
             group_dir = staging / group

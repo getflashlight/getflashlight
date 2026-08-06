@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 from flashlight.core.logging import setup_logging
 
 app = typer.Typer(
-    help="Flashlight — FOCUS-based multi-cloud TCO spend visualization",
+    help="Flashlight — FOCUS-based multi-cloud spend visualization",
     no_args_is_help=True,
 )
 aws_app = typer.Typer(help="AWS Data Exports setup", no_args_is_help=True)

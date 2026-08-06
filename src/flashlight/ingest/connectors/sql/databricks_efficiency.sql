@@ -4,7 +4,9 @@
 -- GOLD view. Reuses the same warehouse + account-prices table as the FOCUS pull, so
 -- billed_cost reconciles to FOCUS. Run as a single statement (no internal `;`).
 --
--- Substituted by the connector: :account_prices (price table), :start_date, :end_date.
+-- Substituted by the connector: :account_prices (price table), :start_date, :end_date,
+-- :project_tag_key (DatabricksConfig.project_tag_key, default 'project' — the custom-tag
+-- key read as owner_project; literal match, case-sensitive, no fold across spellings).
 --
 -- VALIDATED against a live warehouse 2026-06-28: all columns/struct fields below confirmed
 -- (pricing.default, usage_metadata.*, identity_metadata.run_as, job_run_timeline.result_state,
@@ -74,7 +76,7 @@
 --     attribution, not a join into an existing branch — job_id on these REFRESH rows
 --     does NOT match usage_metadata.job_id (checked, zero matches). Deferred: 30 days
 --     of this billing line showed zero spill, zero shuffle — revisit if that changes.
---     FOCUS/TCO cost is unaffected (databricks_focus_1_3.sql sums billing.usage
+--     FOCUS cost is unaffected (databricks_focus_1_3.sql sums billing.usage
 --     unconditionally) — only waste classification can't see this compute class.
 --
 -- ADDED 2026-07-12, VALIDATED against a live warehouse (30-day percentile scan, see
@@ -211,7 +213,7 @@ usage AS (
     u.identity_metadata.run_as                               AS run_as,
     u.billing_origin_product                                 AS product,
     u.sku_name                                               AS sku_name,
-    element_at(u.custom_tags, 'project')                     AS project,
+    element_at(u.custom_tags, :project_tag_key)              AS project,
     date_trunc('MONTH', u.usage_date)                        AS charge_month,
     u.usage_quantity                                         AS usage_quantity,
     u.usage_quantity * COALESCE(p.unit_price, 0)             AS cost,

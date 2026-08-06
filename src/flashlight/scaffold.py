@@ -10,6 +10,8 @@ sample on demand, so the wheel stays lean and there's one seeding path.
 
 from __future__ import annotations
 
+import textwrap
+
 import typer
 
 from flashlight.core.logging import get_logger
@@ -36,7 +38,9 @@ connectors: []
   #   # cost_explorer instead to query Cost Explorer directly (coarser, no
   #   # export needed, but needs ce:GetCostAndUsage) — pick one, no fallback.
   #   # cost_source: cost_explorer
-  #   # include_services defaults to Redshift only; set explicitly to widen, e.g.:
+  #   # include_services defaults to Redshift's services + Amazon S3 (S3 is what
+  #   # backs Databricks storage, which its own DBU-only bill can't show). Set
+  #   # explicitly to widen or narrow, e.g.:
   #   # include_services: []   # [] = every service (the whole account)
 
   # - type: databricks
@@ -76,8 +80,36 @@ def _policies_template() -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _assistant_template() -> str:
+    """The starter assistant.yml, documented from the model's own field descriptions
+    so the file can't drift from the shape the loader validates."""
+    from flashlight.dashboard.assistant_config import AssistantConfig
+
+    lines = [
+        "# BYOK assistant — which model answers questions on the /assistant page.",
+        "# Normally written for you by that page's gear dialog; edit it by hand to",
+        "# configure a headless install without clicking through the UI.",
+        "#",
+        "# No API key here, ever. The key lives in your OS keychain, or in",
+        "# FLASHLIGHT_ASSISTANT_API_KEY — so this file is safe to commit or mount.",
+        "#",
+        "# FLASHLIGHT_ASSISTANT_PROVIDER / _MODEL / _BASE_URL override these values.",
+        "",
+        "assistant:",
+    ]
+    for name, field in AssistantConfig.model_fields.items():
+        if field.description:
+            # Wrapped, unlike policies.yml's one-line descriptions: these run long
+            # enough that an unwrapped comment would need horizontal scrolling.
+            lines.extend(f"  # {ln}" for ln in textwrap.wrap(field.description, width=76))
+        lines.append(f"  # {name}:")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def scaffold(force: bool = False) -> None:
-    """Create ``<home>/{config,bronze,gold,meta}`` plus starter connections/policies YAML."""
+    """Create ``<home>/{config,bronze,gold,meta}`` plus starter connections/policies/
+    assistant YAML."""
     paths.ensure_layout()
 
     conn = paths.connections_path()
@@ -90,9 +122,15 @@ def scaffold(force: bool = False) -> None:
         policies.write_text(_policies_template())
         logger.info("policies_written", path=str(policies))
 
+    assistant = paths.assistant_config_path()
+    if force or not assistant.exists():
+        assistant.write_text(_assistant_template())
+        logger.info("assistant_config_written", path=str(assistant))
+
     typer.echo(f"\nFlashlight initialized at {paths.home()}")
     typer.echo("\nNext steps:")
     typer.echo("  flashlight sample            # download the FOCUS sample + seed it (no config)")
     typer.echo(f"  # or edit {conn} to add your sources, then: flashlight ingest")
     typer.echo(f"  # cost-policy thresholds (optional): {policies}")
+    typer.echo(f"  # assistant model (optional, or use the dashboard's gear icon): {assistant}")
     typer.echo("  flashlight dashboard serve   # dashboard → http://127.0.0.1:8501")

@@ -12,8 +12,9 @@ from flashlight.dashboard import chrome
 from flashlight.dashboard.chrome import DateState
 from flashlight.dashboard.data import (
     gold_df,
-    gold_last_updated,
+    gold_view_published,
     provider_label,
+    provider_name_for_group,
 )
 from flashlight.dashboard.data import to_date as _d
 from flashlight.dashboard.summary import cross_provider_movers
@@ -44,13 +45,45 @@ def _headline_month(start: date, end: date) -> date | None:
     return max(months) if months else None
 
 
+# Every figure on this page is `gross_cost` — sum(cost) over non-credit rows — not
+# `net_cost`. A one-off credit (a negotiated goodwill credit, a refund) lands in a single
+# month and nets against it, so at this altitude net reads as "spend collapsed" when
+# nothing about the usage changed: an AWS Redshift goodwill credit made Jul 2026 look
+# like a −$46K drop. Credits are real money and are NOT dropped — the note under the KPI
+# row labels this page charges-only, and each credit line is itemized on the provider's own
+# page (gold.credits_month).
+# The provider pages still show net, which is the correct number for "what did I owe?".
+_COST = "gross_cost"
+
+
 def _provider_months(group: str, month: date, prior: date) -> tuple[float, float]:
     row = gold_df(
-        f"SELECT coalesce(sum(net_cost) FILTER (WHERE charge_month = '{month}'), 0) AS cur, "
-        f"coalesce(sum(net_cost) FILTER (WHERE charge_month = '{prior}'), 0) AS prev "
+        f"SELECT coalesce(sum({_COST}) FILTER (WHERE charge_month = '{month}'), 0) AS cur, "
+        f"coalesce(sum({_COST}) FILTER (WHERE charge_month = '{prior}'), 0) AS prev "
         f'FROM "{group}".monthly_bill'
     ).iloc[0]
     return float(row["cur"]), float(row["prev"])
+
+
+def _credits_by_group(month: date) -> dict[str, float]:
+    """group → credits/adjustments applied in *month* (negative), for groups with any.
+
+    Skips a group whose lake predates ``gold.credits_month`` (published but never
+    re-transformed) rather than taking the page down — same guard as every other
+    newer-view read.
+    """
+    out: dict[str, float] = {}
+    for group in discover_provider_groups():
+        if not gold_view_published(group, "credits_month"):
+            continue
+        df = gold_df(
+            f'SELECT coalesce(sum(net_cost), 0) AS credits FROM "{group}".credits_month '
+            f"WHERE charge_month = '{month}'"
+        )
+        credits = float(df["credits"].iloc[0]) if not df.empty else 0.0
+        if credits:
+            out[group] = credits
+    return out
 
 
 def _provider_history(groups: list[str], start: date, end: date) -> pd.DataFrame:
@@ -61,7 +94,7 @@ def _provider_history(groups: list[str], start: date, end: date) -> pd.DataFrame
     for group in groups:
         label = provider_label(group)
         df = gold_df(
-            f'SELECT charge_month, net_cost FROM "{group}".monthly_bill '
+            f'SELECT charge_month, {_COST} AS net_cost FROM "{group}".monthly_bill '
             f"WHERE charge_month >= '{sm}' AND charge_month <= '{cap}' ORDER BY charge_month"
         )
         if df.empty:
@@ -90,6 +123,19 @@ def _recoverable_by_provider(month: date) -> pd.Series:
     return df.set_index("provider_name")["recoverable"]
 
 
+def _credits_note(month: date) -> None:
+    """Label the KPIs above for what they leave out — rendered only when there are
+    credits, so a bill with no credits carries no extra chrome.
+
+    Deliberately generic: no totals, month or provider names. Those belong to the
+    line items on each provider's own page (``gold.credits_month``), and restating
+    them here made the label longer than the figures it qualifies.
+    """
+    if not _credits_by_group(month):
+        return
+    chrome.section_caption("Charges only — credits excluded.")
+
+
 def render() -> None:
     groups = discover_provider_groups()
     bounds_df = None
@@ -100,27 +146,23 @@ def render() -> None:
         if not b.empty and pd.notna(b["lo"].iloc[0]):
             bounds_df = b if bounds_df is None else bounds_df
     if not groups or bounds_df is None:
-        chrome.section_title("Cloud spend overview")
+        chrome.section_title("Data Cloud Spend overview")
         ui.label("No billing data yet.").classes("text-sm").style(f"color:{chrome.INK_MUTED}")
         return
 
     lo, hi = _d(bounds_df["lo"].iloc[0]), _d(bounds_df["hi"].iloc[0])
     date_state: DateState = {
-        "start": max(lo, chrome.months_back(hi, 6)),
+        # YTD, matching every provider page's default (see provider_focus.render for why) —
+        # the two surfaces are compared constantly, so they must open on the same window.
+        "start": max(lo, chrome.year_start(hi)),
         "end": hi,
         "bounds_min": lo,
         "bounds_max": hi,
     }
 
     with ui.row().classes("items-center justify-between w-full"):
-        chrome.section_title("Cloud spend overview")
+        chrome.section_title("Data Cloud Spend overview")
         chrome.date_range_control(date_state, lambda: body.refresh())
-
-    updated = gold_last_updated()
-    cap = "Total spend across your connected cloud providers."
-    if updated:
-        cap += f" Data updated · {updated:%Y-%m-%d %H:%M} UTC."
-    chrome.section_caption(cap)
 
     @ui.refreshable
     def body() -> None:
@@ -133,11 +175,6 @@ def render() -> None:
             ).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
             return
 
-        chrome.section_caption(
-            f"Headline KPIs and charts use the latest complete month in your range: "
-            f"{month:%b %Y} (range: {start:%b %d, %Y} → {end:%b %d, %Y})."
-        )
-
         prior = (pd.Timestamp(month) - pd.DateOffset(months=1)).date()
         rows: list[dict[str, object]] = []
         total_cur = total_prev = 0.0
@@ -149,7 +186,17 @@ def render() -> None:
             delta = cur - prev
             pct = 100 * delta / prev if prev else None
             rows.append(
-                {"group": group, "provider": label, "net_cost": cur, "delta": delta, "pct": pct}
+                {
+                    "group": group,
+                    "provider": label,
+                    # The raw provider_name too: `provider` is a display label and no
+                    # longer always equals it (see data._GROUP_LABEL_OVERRIDES), so it
+                    # can't be used to look a provider up in another view's rows.
+                    "provider_name": provider_name_for_group(group),
+                    "net_cost": cur,
+                    "delta": delta,
+                    "pct": pct,
+                }
             )
             total_cur += cur
             total_prev += prev
@@ -169,7 +216,11 @@ def render() -> None:
         total_recoverable = float(recoverable.sum()) if not recoverable.empty else 0.0
         chrome.kpi_row(
             [
-                (f"Total · {month:%b %Y}", compact_money(total_cur), "net across providers"),
+                (
+                    f"Total · {month:%b %Y}",
+                    compact_money(total_cur),
+                    "charges across providers",
+                ),
                 (
                     "Change vs prior month",
                     f"{'+' if total_delta >= 0 else '−'}{compact_money(abs(total_delta))}",
@@ -187,6 +238,8 @@ def render() -> None:
             ],
         )
 
+        _credits_note(month)
+
         history = _provider_history(groups, start, end)
         with ui.row().classes("w-full gap-4 items-stretch"):
             with ui.column().classes("gap-0").style("flex:2;min-width:0;"):
@@ -194,7 +247,7 @@ def render() -> None:
                     with chrome.panel():
                         chrome.panel_title("Spend trend by provider")
                         chrome.section_caption(
-                            "Stacked net cost per month — each color is a cloud provider."
+                            "Stacked monthly charges — each color is a cloud provider."
                         )
                         colors = provider_color_map(
                             history["provider"].unique(), groups=history["group"].unique()
@@ -212,7 +265,7 @@ def render() -> None:
             with ui.column().classes("gap-0").style("flex:1;min-width:0;"):
                 with chrome.panel():
                     chrome.panel_title("Provider share")
-                    chrome.section_caption(f"{month:%b %Y} net cost mix")
+                    chrome.section_caption(f"{month:%b %Y} charge mix")
                     colors = provider_color_map(breakdown["provider"], groups=breakdown["group"])
                     pie = px.pie(
                         breakdown,
@@ -227,7 +280,7 @@ def render() -> None:
 
         with chrome.panel():
             chrome.panel_title("Biggest movers")
-            movers = cross_provider_movers(month, prior)
+            movers = cross_provider_movers(month, prior, exclude_credits=True)
             if movers.empty:
                 ui.label("No month-over-month movers in this range.").classes(
                     "text-sm"
@@ -277,7 +330,7 @@ def render() -> None:
                         if delta
                         else f"Flat vs {prior:%b %Y}"
                     )
-                    rec = float(recoverable.get(row.provider, 0.0))
+                    rec = float(recoverable.get(row.provider_name, 0.0))
                     with ui.column().style("min-width:220px;flex:1;"):
                         chrome.provider_card(
                             name=f"{row.provider} · {month:%b %Y}",

@@ -148,6 +148,28 @@ POLICY_RULES: tuple[PolicyRule, ...] = (
         "ELSE 'auto-stop after ' || auto_stop_minutes "
         "|| ' min, over the {max_warehouse_auto_stop_minutes} min policy' END",
     ),
+    # Endpoint tag_count comes from size(u.custom_tags) on the endpoint's MODEL_SERVING
+    # billing rows (databricks_ai_usage.sql's endpoint_cost CTE), NOT from a resource config
+    # table the way cluster/warehouse tag_count does — serving has no counterpart to
+    # system.compute.clusters here. That means it is the billing-propagated tag set and can
+    # include account-level default tags, so a "tagged" endpoint is not proof of a *useful*
+    # tag. It is still the honest answer to "has this been tagged at all", which is what the
+    # AI Costs tab's project attribution depends on.
+    PolicyRule(
+        category="endpoint_tagging",
+        label="Model serving endpoint tagged",
+        remedy="Add cost-allocation tags (e.g. team, project, environment) to this model "
+        "serving endpoint so its AI spend — and the tokens it serves — can be attributed to "
+        "a project. Until an endpoint is tagged, its spend lands in the (untagged) bucket on "
+        "the AI Costs tab, which is why this check exists.",
+        applies_sql="entity_type = 'endpoint'",
+        # NULL = the serving pull didn't run or the billing join found nothing (unmeasured),
+        # not a confirmed-empty tag map — the same honesty gate as cluster_tagging.
+        not_applicable_sql="tag_count IS NULL",
+        compliant_sql="tag_count > 0",
+        detail_sql="CASE WHEN tag_count IS NULL THEN 'tag telemetry unavailable' "
+        "WHEN tag_count = 0 THEN 'no tags set' ELSE tag_count || ' tag(s) set' END",
+    ),
     # ── Blocked: needs telemetry this connector doesn't pull yet ────────────────────
     PolicyRule(
         category="query_tagging",

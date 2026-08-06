@@ -26,8 +26,8 @@ dashboard with real data.
 ## Connect your own sources
 
 ```bash
-flashlight init                 # scaffold the lake home + a connections.yml
-# edit connections.yml, put credentials in .env
+flashlight init                 # scaffold the lake home + config/*.yml
+# edit config/connections.yml, put credentials in .env
 flashlight ingest               # pull configured connectors → BRONZE, rebuild GOLD
 ```
 
@@ -41,9 +41,28 @@ flashlight ingest               # pull configured connectors → BRONZE, rebuild
 Both are independent read-only processes over the published GOLD Parquet —
 `ingest` is the only writer.
 
+You can also start, stop and watch the MCP server from the dashboard's **MCP server**
+page, which shows its status, the endpoint to paste into a client, and the tools it
+exposes. A server started there is a child of the dashboard, so it exits with it — use
+the CLI (or a service manager) for one that outlives it. Either way the port has **no
+authentication** and serves ad-hoc read-only SQL over your lake, so keep
+`FLASHLIGHT_MCP_HOST` on `127.0.0.1` unless you mean to expose it.
+
 ## Configuration
 
-Everything is optional; defaults shown:
+Your config lives in `<home>/config/`, all of it optional and all scaffolded with
+comments by `flashlight init`:
+
+| File | What it holds |
+|---|---|
+| `connections.yml` | the billing sources to ingest |
+| `policies.yml` | cost-policy threshold overrides |
+| `assistant.yml` | which LLM the BYOK assistant uses (provider / model / base URL) |
+
+None of them ever holds a secret — credentials go to your OS keychain, or to the env
+vars the config names.
+
+Environment overrides, defaults shown:
 
 ```bash
 FLASHLIGHT_HOME=                          # lake root; default: platform user-data dir
@@ -55,4 +74,8 @@ FLASHLIGHT_MCP_HOST=0.0.0.0
 FLASHLIGHT_MCP_PORT=8002
 FLASHLIGHT_DASHBOARD_HOST=127.0.0.1
 FLASHLIGHT_DASHBOARD_PORT=8501
+FLASHLIGHT_ASSISTANT_PROVIDER=            # overrides config/assistant.yml
+FLASHLIGHT_ASSISTANT_MODEL=
+FLASHLIGHT_ASSISTANT_BASE_URL=
+FLASHLIGHT_ASSISTANT_API_KEY=             # only if no OS keychain is reachable
 ```

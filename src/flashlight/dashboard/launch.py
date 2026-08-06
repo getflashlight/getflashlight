@@ -19,8 +19,13 @@ from flashlight.lake import paths
 logger = get_logger(__name__)
 
 
-def _port_in_use(host: str, port: int) -> bool:
-    """True if something is already listening on *host:port*."""
+def port_in_use(host: str, port: int) -> bool:
+    """True if something is already listening on *host:port*.
+
+    Public because ``dashboard/mcp_runner.py`` asks the same question of the MCP port —
+    a server started in a terminal has to read as up on the dashboard's MCP page, and
+    the port is the only evidence that crosses process boundaries.
+    """
     connect_host = "127.0.0.1" if host in ("", "0.0.0.0") else host
     try:
         with socket.create_connection((connect_host, port), timeout=0.5):
@@ -29,13 +34,52 @@ def _port_in_use(host: str, port: int) -> bool:
         return False
 
 
+def prepare_storage_path() -> None:
+    """Point ``NICEGUI_STORAGE_PATH`` at the lake, best-effort, before NiceGUI imports.
+
+    NiceGUI reads that env var once at import time and only mkdir's one level itself — so
+    the directory has to exist up front. It lives under ``FLASHLIGHT_HOME`` rather than
+    NiceGUI's CWD-relative ``.nicegui/`` default so it travels with the lake instead of
+    with whatever directory the CLI happened to run from.
+
+    Nothing durable depends on this any more: the assistant's provider/model/base URL moved
+    to ``<home>/config/assistant.yml``
+    (:mod:`flashlight.dashboard.assistant_config`) precisely because a container points
+    ``NICEGUI_STORAGE_PATH`` at /tmp, which forgot them on every restart. What's left here is
+    per-tab scratch (``app.storage.tab``, e.g. a key whose keychain write failed), so a
+    degraded path costs a tab's worth of state, not a setting.
+
+    Two deliberate escape hatches for a read-only lake home:
+
+    * a caller-set ``NICEGUI_STORAGE_PATH`` wins outright (a container points it at /tmp);
+    * the mkdir is best-effort. It used to run unconditionally, so an unwritable lake home
+      failed the dashboard at boot, before it served anything.
+    """
+    if "NICEGUI_STORAGE_PATH" in os.environ:
+        return
+    storage_dir = paths.meta_dir() / "dashboard_storage"
+    try:
+        storage_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "dashboard_storage_unwritable",
+            path=str(storage_dir),
+            error=str(exc),
+            hint="set NICEGUI_STORAGE_PATH to a writable path; per-tab dashboard state "
+            "won't be kept until then (assistant settings live in config/assistant.yml "
+            "and are unaffected)",
+        )
+    else:
+        os.environ["NICEGUI_STORAGE_PATH"] = str(storage_dir)
+
+
 def serve_dashboard() -> None:
     """Run the dashboard on the configured host/port (blocks until stopped)."""
     settings = get_settings()
 
     # Preflight: a busy port otherwise surfaces as an opaque "address already in
     # use" traceback from uvicorn. Fail fast with an actionable message instead.
-    if _port_in_use(settings.dashboard_host, settings.dashboard_port):
+    if port_in_use(settings.dashboard_host, settings.dashboard_port):
         port = settings.dashboard_port
         logger.error("dashboard_port_in_use", host=settings.dashboard_host, port=port)
         raise SystemExit(
@@ -45,15 +89,7 @@ def serve_dashboard() -> None:
             f"  • Or pick another port:  FLASHLIGHT_DASHBOARD_PORT=8502 flashlight dashboard serve"
         )
 
-    # NiceGUI's app.storage.general (used to persist chat provider/model/base_url
-    # across restarts) reads this env var once, at import time — must be set
-    # before the first `nicegui` import, and it only mkdir's one level itself, so
-    # the directory needs to exist up front too. Falls under FLASHLIGHT_HOME
-    # rather than NiceGUI's own CWD-relative `.nicegui/` default so it moves with
-    # the rest of the lake, not with whatever directory the CLI was launched from.
-    storage_dir = paths.meta_dir() / "dashboard_storage"
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("NICEGUI_STORAGE_PATH", str(storage_dir))
+    prepare_storage_path()
 
     from nicegui import ui
 
@@ -74,5 +110,8 @@ def serve_dashboard() -> None:
         favicon=FAVICON_SVG,
         dark=True,
         reload=False,
-        show=True,
+        # Opening a browser only makes sense when we're on the same machine as the
+        # user's browser. Binding a non-loopback host means we aren't (a container, a
+        # remote box), where `show=True` just tries and fails to launch a browser.
+        show=settings.dashboard_host in ("127.0.0.1", "localhost", "::1"),
     )

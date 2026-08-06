@@ -79,11 +79,15 @@ class CommitmentDiscountStatus(StrEnum):
 
 
 class ComputeClass(StrEnum):
-    """Flashlight extension — drives the TCO double-count guard.
+    """Flashlight extension — how a lakehouse charge is billed against cloud infra.
 
     ``CLASSIC`` compute (customer-managed VMs) is billed by the lakehouse vendor
-    in DBUs *and* by the cloud in separate infra lines → infra is additive.
-    ``SERVERLESS`` compute is billed all-in by the vendor → never add cloud infra.
+    in DBUs *and* by the cloud in separate infra lines. ``SERVERLESS`` compute is
+    billed all-in by the vendor, with no separate cloud infra line.
+
+    Stamped on every Databricks record at ingest (see
+    ``connectors/databricks.py::compute_class_for_sku``) and carried through
+    ``silver.focus_normalized``. Descriptive only — no GOLD view keys off it today.
     """
 
     CLASSIC = "classic"

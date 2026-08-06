@@ -37,8 +37,10 @@ from flashlight.ingest.connectors import (
     DatabricksConnector,
     RedshiftConnector,
 )
-from flashlight.lake import bronze, driver_health, metrics, runlog
+from flashlight.lake import ai_usage, bronze, driver_health, metrics, runlog, storage_locations
+from flashlight.lake.ai_usage_schema import AiUsageRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
+from flashlight.lake.storage_location_schema import StorageLocationRecord
 from flashlight.transform.runner import build_gold
 
 logger = get_logger(__name__)
@@ -250,9 +252,20 @@ def run_ingest(
     # DriverHealthRecords. Same never-block-cost-ingest guarantee as efficiency.
     _run_driver_health(window, succeeded_connectors)
 
+    # Best-effort AI serving-usage pull (token/model/requester measurement). Same
+    # never-block-cost-ingest guarantee; a connector whose serving system tables aren't
+    # enabled yields nothing at all rather than partial or guessed rows.
+    _run_ai_usage(window, succeeded_connectors)
+
+    # Best-effort storage-location pull (Unity Catalog's bucket map — metadata, no cost).
+    # Must run before the final build_gold() below so the very first sync publishes a map
+    # rather than a backing-storage tab that reads "never measured" until the next run.
+    _run_storage_locations(window, succeeded_connectors)
+
     # Final holistic rebuild — same idempotent build_gold() as above, now
-    # picking up whatever fresh efficiency/waste and driver-health data those
-    # two phases just wrote (the earlier publish above ran before either had a
+    # picking up whatever fresh efficiency/waste, driver-health, AI-usage and
+    # storage-location data those phases just wrote (the earlier publish above ran
+    # before any had a
     # chance to). A failed connector's own window is left as it was before this
     # run (bronze.write_window re-purges on error, never leaving a partial
     # write), so GOLD never reflects a half-written pull.
@@ -351,4 +364,70 @@ def _run_driver_health(window: IngestWindow, connectors: list[Connector]) -> int
         return 0
     written = driver_health.write_driver_health(window, all_records)
     logger.info("driver_health_written", rows=written)
+    return written
+
+
+def _run_ai_usage(window: IngestWindow, connectors: list[Connector]) -> int:
+    """Pull AI serving-usage records for every connector that exposes them (concurrently,
+    bounded), then write them all in one call. Best-effort, same never-block-cost-ingest
+    guarantee and the same single-write merge as :func:`_run_driver_health` (the writer
+    purges partitions wholesale, so two writes would have the second erase the first).
+
+    Measurement only: these rows carry token/request counts and no dollar figure — the
+    endpoint's spend stays canonical in the FOCUS plane and is joined in GOLD.
+    """
+
+    def _pull(connector: Connector) -> list[AiUsageRecord]:
+        name = connector.name
+        try:
+            records = list(connector.fetch_ai_usage(window))
+        except Exception as exc:  # noqa: BLE001 - secondary signal; never block ingest
+            logger.warning("ai_usage_pull_failed", connector=name, error=str(exc))
+            return []
+        if records:
+            logger.info("ai_usage_fetched", connector=name, rows=len(records))
+        return records
+
+    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+        all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
+
+    if not all_records:
+        return 0
+    written = ai_usage.write_ai_usage(window, all_records)
+    logger.info("ai_usage_written", rows=written)
+    return written
+
+
+def _run_storage_locations(window: IngestWindow, connectors: list[Connector]) -> int:
+    """Pull each platform's cloud object-storage location map (concurrently, bounded),
+    then write it all in one call. Best-effort, same never-block-cost-ingest guarantee
+    and the same single-write merge as :func:`_run_driver_health`.
+
+    Metadata only — no cost. This is what lets the AWS S3 bill be labelled with the
+    Databricks storage behind it (see ``docs/design/backing-storage.md``); the two are
+    never summed into one figure.
+
+    ``window`` is passed through for hook uniformity but the hook ignores it (Unity
+    Catalog exposes only current state), and the writer is window-free for the same
+    reason — see ``lake.storage_locations.write_storage_locations``.
+    """
+
+    def _pull(connector: Connector) -> list[StorageLocationRecord]:
+        name = connector.name
+        try:
+            records = list(connector.fetch_storage_locations(window))
+        except Exception as exc:  # noqa: BLE001 - secondary signal; never block ingest
+            logger.warning("storage_locations_pull_failed", connector=name, error=str(exc))
+            return []
+        if records:
+            logger.info("storage_locations_fetched", connector=name, rows=len(records))
+        return records
+
+    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+        all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
+
+    if not all_records:
+        return 0
+    written = storage_locations.write_storage_locations(all_records)
+    logger.info("storage_locations_written", rows=written)
     return written
