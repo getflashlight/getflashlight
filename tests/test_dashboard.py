@@ -310,7 +310,7 @@ def test_redshift_page_itemizes_credits(lake_home) -> None:  # type: ignore[no-u
         async with user_simulation() as user:
             build_pages()
             await user.open("/aws")
-            await user.should_see("Credits & discounts")  # KPI card
+            await user.should_see("Credits & Discounts")  # KPI card
             await user.should_see("Discounts & credits")  # the table's own panel
             # ui.table rows are data, not text nodes should_see can match.
             rows = " ".join(str(t.rows) for t in user.find(kind=ui.table).elements)
@@ -389,8 +389,9 @@ def test_provider_page_renders_when_lake_predates_a_catalogued_view(lake_home) -
     ``duck.register_gold`` only registers files that exist, so a view added to the
     catalog after the last ``flashlight transform`` is absent from the DuckDB catalog
     entirely and querying it raises — which took down the whole provider route when
-    ``spend_tag_coverage_month``/``spend_forecast_month`` shipped. The panels reading
-    them now check ``gold_view_published`` first (see provider_focus.py).
+    ``spend_untagged_by_service_month``/``spend_forecast_month`` shipped. The panels
+    reading them now check ``gold_view_published`` first (see provider_focus.py,
+    attribution.py).
     """
     from flashlight.lake import bronze, paths
     from flashlight.transform.runner import build_gold
@@ -404,7 +405,7 @@ def test_provider_page_renders_when_lake_predates_a_catalogued_view(lake_home) -
     build_gold()
 
     # Roll the published lake back to what an older transform would have left behind.
-    for view in ("spend_tag_coverage_month", "spend_forecast_month"):
+    for view in ("spend_untagged_by_service_month", "spend_forecast_month"):
         (paths.gold_dir() / "gcp" / f"{view}.parquet").unlink()
 
     from nicegui.testing.user_simulation import user_simulation
@@ -416,6 +417,7 @@ def test_provider_page_renders_when_lake_predates_a_catalogued_view(lake_home) -
             build_pages()
             await user.open("/gcp")
             await user.should_see("GCP spend")
+            await user.should_see("Untagged-by-service isn't published yet")
             await user.should_see("run `flashlight transform`")
 
     asyncio.run(_check())
@@ -1114,9 +1116,10 @@ def test_usage_page_reports_how_often_an_answer_skipped_the_llm(lake_home) -> No
     asyncio.run(_check())
 
 
-def test_policy_page_shows_effective_thresholds(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """A compliance verdict is only meaningful next to the threshold it was judged
-    against — and the file where a user changes it."""
+def test_policy_page_scopes_to_the_page_date_range(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Policy Compliance has no date picker of its own — it reads the page's shared
+    range, same as every other tab, so a non-compliant finding outside the selected
+    window must not show, and one inside it must."""
     from datetime import date as _date
     from decimal import Decimal as _Decimal
 
@@ -1175,9 +1178,13 @@ def test_policy_page_shows_effective_thresholds(lake_home) -> None:  # type: ign
             await user.open("/databricks")
             await user.should_see("Policy Compliance")
             user.find("Policy Compliance").click()
-            await user.should_see("Policy thresholds")
-            # The default ceiling, shown so the verdict above is interpretable.
-            await user.should_see("60")
+            # Default range is YTD, which covers May 2026 — the finding is visible.
+            # (Table cell contents render client-side and aren't visible to
+            # user_simulation — the KPI row is, so that's what's asserted on.)
+            await user.should_see("Non-compliant entities")
+            await user.should_see("0 of 3 measured")
+            # No static thresholds panel — that config lives in policies.yml, not here.
+            await user.should_not_see("Policy thresholds")
 
     asyncio.run(_check())
 
@@ -1618,11 +1625,40 @@ def test_efficiency_tab_names_missing_telemetry_instead_of_hiding_the_tab(lake_h
     asyncio.run(_check())
 
 
-def test_attribution_tab_is_tagged_spend_not_coverage_kpi(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """Attribution leads with untagged-by-service (+ resource drill), then tagged spend.
+def test_attribution_tier_for_service_matches_real_billing_grain() -> None:
+    """The billing-granularity tier a service falls into (attribution.py's module
+    docstring): dedicated (resource_id IS the billed unit), shared+sub-metered (a SQL
+    warehouse/Redshift cluster — a per-user estimate exists), shared with no sub-grain
+    (all-purpose/interactive clusters), or unclassified (fall back to the generic
+    remedy rather than guess). Pinned directly against ``billing_origin_product``
+    strings (see ``databricks_focus_1_3.sql``'s ``ServiceName`` — verbatim, not a
+    human label) and :data:`REDSHIFT_SERVICE_NAMES`, so a real Databricks/Redshift bill
+    lands where the module docstring claims.
+    """
+    from flashlight.dashboard.views import attribution
 
-    Bill-level "N% tagged" alone is gone; the service-grain gap list is the finding,
-    with a click-through work queue for untagged resources.
+    for service in ("JOBS", "DLT", "MODEL_SERVING", "NOTEBOOKS"):
+        assert attribution._tier_for_service(service) == "dedicated", service  # noqa: SLF001
+    for service in ("SQL", "Amazon Redshift", "Amazon Redshift Spectrum"):
+        assert attribution._tier_for_service(service) == "shared_subgrain", service  # noqa: SLF001
+    for service in ("ALL_PURPOSE", "INTERACTIVE", "SHARED_SERVERLESS_COMPUTE"):
+        assert (
+            attribution._tier_for_service(service) == "shared_no_subgrain"  # noqa: SLF001
+        ), service
+    for service in ("DATABASE", "NETWORKING", "AmazonS3"):
+        assert attribution._tier_for_service(service) == "unclassified", service  # noqa: SLF001
+
+
+def test_attribution_tab_leads_with_untagged_infrastructure(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Attribution's one drill-through panel — the service level, on first render.
+
+    Replaces the old two-stacked-panels design (a standing "Untagged resources" table
+    below the service table): now there's exactly one panel, and the resource/driver
+    levels only render after a service is clicked — not testable through
+    ``user_simulation`` (``ui.table`` row clicks are a client-side Quasar event; see the
+    "renders rows client-side, invisible to should_see" note elsewhere in this file).
+    The resource-level query and the driver-level join are pinned directly against GOLD
+    in :func:`test_attribution_untagged_resource_and_driver_views_reconcile` instead.
     """
     from nicegui.testing.user_simulation import user_simulation
 
@@ -1645,16 +1681,124 @@ def test_attribution_tab_is_tagged_spend_not_coverage_kpi(lake_home) -> None:  #
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            await user.should_see("Untagged by service")
-            await user.should_see("Click a service to list its untagged resources")
-            await user.should_see("Untagged resources")
-            await user.should_see("How to fix")
+            await user.should_see("Untagged infrastructure")
+            await user.should_see("Click a service to see the resources behind it.")
+            # Tag key/value are one drill-through panel now too — the value level
+            # (and its old "Spend by tag value" title/dropdown) only appears after a
+            # key row is clicked, same client-side-only limitation as above.
             await user.should_see("Spend by tag key")
-            await user.should_see("Spend by tag value")
+            await user.should_see("Click a key to see its values.")
+            # Removed with the tiered redesign — no bill-level coverage KPI standing
+            # caption, no auto-opened second "Untagged resources" panel/title, no
+            # single generic remedy shown before any service is even picked, and no
+            # standing "Spend by tag value" panel/dropdown before a key is picked.
             await user.should_not_see("carry a cost-allocation tag")
+            await user.should_not_see("Untagged resources —")
             await user.should_not_see("Waste & opportunity by owner")
+            await user.should_not_see("Spend by tag value")
 
     asyncio.run(_check())
+
+
+def test_attribution_untagged_resource_and_driver_views_reconcile(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The two GOLD queries the resource and driver levels read, without a browser click.
+
+    A shared+sub-metered resource (SQL warehouse) drills to its estimated per-user
+    drivers via ``entity_id LIKE '<resource_id>:%'`` on
+    ``efficiency.utilization_entity_month`` — this pins that join actually matches on
+    real data, and that a *different* warehouse's driver rows are excluded (a bare
+    substring match would also catch "wh-shared-2:...").
+    """
+    from flashlight.dashboard.data import gold_df
+    from flashlight.lake import bronze, metrics
+    from flashlight.transform.runner import build_gold
+
+    untagged = _db_cost_row()
+    untagged.tags = {}
+    untagged.service_name = "SQL"
+    untagged.resource_id = "wh-shared"
+    untagged.resource_name = "Shared Warehouse"
+    untagged.billed_cost = untagged.effective_cost = untagged.list_cost = Decimal("80")
+
+    window = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
+    bronze.write_window("t", window, [untagged], ingest_run_id="r1")
+    metrics.write_efficiency(
+        window,
+        [
+            EfficiencyRecord(
+                provider_name="Databricks",
+                charge_month=date(2026, 5, 1),
+                entity_type=EntityType.SQL_WAREHOUSE_USER,
+                entity_id="wh-shared:carol",
+                owner_user="carol",
+                billed_cost=Decimal("60"),
+                cause_detail={"duration_share_pct": 75.0, "query_count": 12},
+                x_source_connector="databricks",
+            ),
+            # A different warehouse — must NOT show up under "wh-shared"'s drivers
+            # (a bare substring LIKE '%wh-shared%' would wrongly catch this one).
+            EfficiencyRecord(
+                provider_name="Databricks",
+                charge_month=date(2026, 5, 1),
+                entity_type=EntityType.SQL_WAREHOUSE_USER,
+                entity_id="wh-shared-2:dave",
+                owner_user="dave",
+                billed_cost=Decimal("99"),
+                cause_detail={"duration_share_pct": 90.0},
+                x_source_connector="databricks",
+            ),
+        ],
+    )
+    build_gold()
+
+    res = gold_df(
+        "SELECT resource_id, sum(untagged_cost) AS untagged_cost "
+        'FROM "databricks".spend_untagged_by_resource_month '
+        "WHERE service_name = 'SQL' GROUP BY resource_id"
+    )
+    assert res.loc[res["resource_id"] == "wh-shared", "untagged_cost"].iloc[0] == pytest.approx(
+        80.0
+    )
+
+    drivers = gold_df(
+        "SELECT owner_user, billed_cost, primary_signal_value AS duration_share_pct "
+        "FROM efficiency.utilization_entity_month "
+        "WHERE provider_name = 'Databricks' AND entity_type = 'sql_warehouse_user' "
+        "AND entity_id LIKE 'wh-shared:%'"
+    )
+    assert list(drivers["owner_user"]) == ["carol"]
+    assert float(drivers["billed_cost"].iloc[0]) == pytest.approx(60.0)
+    assert float(drivers["duration_share_pct"].iloc[0]) == pytest.approx(75.0)
+
+
+def test_attribution_tag_value_level_reads_the_folded_key(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The GOLD query :func:`attribution._render_tag_value_level` runs, without a
+    browser click: picking the *folded* key ("Epic") must still surface dollars raw-
+    tagged with a case/separator variant ("epic"), the same fold
+    ``spend_by_tag_key_month`` already applied to rank it.
+    """
+    from flashlight.dashboard.data import gold_df
+
+    growth = _db_cost_row()
+    growth.tags = {"Epic": "growth"}
+    growth.billed_cost = growth.effective_cost = growth.list_cost = Decimal("30")
+    platform = _db_cost_row()
+    platform.tags = {"epic": "platform"}
+    platform.billed_cost = platform.effective_cost = platform.list_cost = Decimal("10")
+
+    _seed([], cost_rows=[growth, platform])
+
+    values = gold_df(
+        "SELECT tag_value, sum(net_cost) AS net_cost FROM "
+        '"databricks".spend_by_tag_month '
+        "WHERE replace(lower(trim(tag_key)), '-', '_') = 'epic' "
+        "GROUP BY tag_value ORDER BY net_cost DESC"
+    )
+    assert set(values["tag_value"]) == {"growth", "platform"}
+    assert float(values.loc[values["tag_value"] == "growth", "net_cost"].iloc[0]) == (
+        pytest.approx(30.0)
+    )
+
 
 def test_provider_page_hides_the_projection_on_one_day_of_history(lake_home) -> None:  # type: ignore[no-untyped-def]
     """A single day of data must not produce a Projected tile — it was reading ~30x high."""

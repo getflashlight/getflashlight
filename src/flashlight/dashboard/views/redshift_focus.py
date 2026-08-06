@@ -23,8 +23,8 @@ connector only supplies efficiency/waste telemetry. So this page:
   :data:`_ACCOUNT_WIDE` so the scope leaves them alone. Breakdown is also led by this
   page's own :func:`_spend_partition`.
 - **Attribution**: :func:`_attribution_section`. Tag-key ranking is account-wide (no
-  ``service_name`` on those views); untagged-by-service (and its resource drill) and
-  the tag-value drill are Redshift-scoped — the former via ``service_name``, the
+  ``service_name`` on those views); untagged infrastructure (service→resource→driver)
+  and the tag-value drill are Redshift-scoped — the former via ``service_name``, the
   latter via ``sku_id`` on ``spend_by_sku_tag_month``.
 - **Efficiency & Waste**: faceted per cluster (:func:`_waste_section`) — one section per
   Redshift cluster that has efficiency telemetry (``entity_id`` for
@@ -277,17 +277,19 @@ def _spend_partition(sm: date, end: date) -> None:
 def _attribution_section(sm: date, end: date) -> None:
     """Attribution for the AWS account this page's Redshift spend bills to.
 
-    Untagged-by-service (and its resource drill) are Redshift-scoped via
-    ``service_name``. Tag-key ranking is account-wide. Tag-value drill is this page's
-    own SKU-scoped :func:`_tags_section`.
+    Untagged infrastructure (the service→resource→driver drill) is Redshift-scoped via
+    ``service_name`` — Redshift's own service names are in ``attribution``'s
+    ``shared_subgrain`` tier, so a cluster's untagged spend still drills into its
+    estimated per-user drivers. Tag-key ranking is account-wide. Tag-value drill is
+    this page's own SKU-scoped :func:`_tags_section`.
     """
     chrome.section_caption(
         "Tag-key ranking is account-wide (no service dimension on that view). "
-        "Untagged-by-service, its resource drill, and the tag-value panel are "
-        "Redshift-scoped. In practice the whole bill is Redshift anyway — aws_focus "
-        "ingests only include_services, Redshift by default."
+        "Untagged infrastructure and the tag-value panel are Redshift-scoped. "
+        "In practice the whole bill is Redshift anyway — aws_focus ingests only "
+        "include_services, Redshift by default."
     )
-    attribution.untagged_by_service(
+    attribution.untagged_infrastructure(
         _GROUP, end, sm, scope_sql=scope().predicate("spend_untagged_by_service_month")
     )
     attribution.tag_keys(_GROUP, end, sm)

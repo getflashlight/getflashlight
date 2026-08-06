@@ -12,18 +12,22 @@ connector emits. So every Redshift cluster-month has been contributing rows to t
 all along with nowhere to display them. Providers with no rows get a named empty state
 rather than a hidden tab, for the same reason Efficiency & Waste does: "never measured"
 must not look like "nothing to find".
+
+Driven by the page's own date range (*end*/*sm*), same as every other tab on
+``provider_focus`` — the KPIs and the non-compliant table both sum every entity-month
+in the selected window rather than freezing on "the latest month with telemetry", so
+narrowing the range up top narrows what's shown here too.
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 import pandas as pd
 from nicegui import ui
 
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import gold_df, gold_view_published
-from flashlight.efficiency.policy_config import get_thresholds
-from flashlight.efficiency.policy_rules import POLICY_RULES
-from flashlight.lake import paths
 
 _STALE_MSG = (
     "Policy compliance isn't published in this lake yet — run `flashlight transform` "
@@ -37,7 +41,6 @@ _COLS = [
     "policy_category",
     "status",
     "detail",
-    "remedy",
 ]
 _RENAME = {
     "entity_name": "Entity",
@@ -46,12 +49,13 @@ _RENAME = {
     "policy_category": "Policy",
     "status": "Status",
     "detail": "Detail",
-    "remedy": "How to fix it",
 }
-# policy_category -> its rule's actionable fix text — policy_record (SQL) has no room
-# for free text this long, same join pattern as efficiency_waste.py's remedy column.
-_REMEDY_BY_CATEGORY = {r.category: r.remedy for r in POLICY_RULES}
 _MAX_ROWS = 40
+
+
+def _q(value: str) -> str:
+    """Escape a string for inlining as a single-quoted SQL literal."""
+    return value.replace("'", "''")
 
 
 def _df(sql: str) -> pd.DataFrame:
@@ -62,14 +66,13 @@ def _df(sql: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def render(provider_name: str, label: str) -> None:
+def render(provider_name: str, label: str, end: date, sm: date) -> None:
     """*provider_name* is the raw FOCUS value (``"AWS"``), never the display label —
-    ``policy_record`` rows carry the former, and "AWS Redshift" matches nothing."""
+    ``policy_record`` rows carry the former, and "AWS Redshift" matches nothing.
+
+    *end*/*sm* are the page's own date range — every number below is scoped to it.
+    """
     chrome.section_title(f"{label} policy compliance")
-    chrome.section_caption(
-        "Are the right cost/attribution guardrails in place — auto-terminate, "
-        "autoscaling, cluster policy, tagging? Not a waste signal — no dollar figure."
-    )
 
     if not gold_view_published("policy", "policy_record"):
         ui.label(_STALE_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
@@ -77,8 +80,8 @@ def render(provider_name: str, label: str) -> None:
 
     records = _df(
         "SELECT * FROM policy.policy_record "
-        f"WHERE provider_name = '{provider_name.replace(chr(39), chr(39) * 2)}' "
-        "ORDER BY charge_month DESC"
+        f"WHERE provider_name = '{_q(provider_name)}' "
+        f"AND charge_month >= '{sm}' AND charge_month <= '{end}'"
     )
     if records.empty:
         chrome.empty_state(
@@ -86,28 +89,23 @@ def render(provider_name: str, label: str) -> None:
             f"No policy signals for {label}",
             "Policy compliance is evaluated from the config telemetry a connector "
             f"reports for its entities (cluster auto-termination, warehouse tagging, and "
-            f"so on). {label}'s connector doesn't report any yet, so there is nothing to "
-            "judge here — that's a coverage gap, not a clean bill of health.",
+            f"so on). {label}'s connector doesn't report any yet in the selected range, "
+            "so there is nothing to judge here — that's a coverage gap, not a clean bill "
+            "of health.",
         )
         return
 
-    months = sorted(records["charge_month"].astype(str).unique())
-    month = months[-1]
-    month_rows = records[records["charge_month"].astype(str) == month]
-    month_label = pd.Timestamp(month).strftime("%b %Y")
-
-    measured = month_rows[month_rows["status"] != "not_applicable"]
-    not_evaluated = len(month_rows) - len(measured)
+    measured = records[records["status"] != "not_applicable"]
+    not_evaluated = len(records) - len(measured)
     compliant = int((measured["status"] == "compliant").sum())
     total = len(measured)
     compliance_pct = f"{round(100 * compliant / total)}%" if total else "—"
     non_compliant = total - compliant
 
-    chrome.section_caption(f"Showing {month_label} — the latest month with telemetry.")
     chrome.kpi_row(
         [
             ("Compliant", compliance_pct, f"{compliant:,} of {total:,} measured"),
-            ("Non-compliant", f"{non_compliant:,}", month_label),
+            ("Non-compliant", f"{non_compliant:,}", "in range"),
             # Previously invisible on every provider, Databricks included: cluster_tagging
             # is not_applicable whenever tag_count is NULL, and a compliance percentage
             # over a shrunken denominator reads as a verdict on entities never checked.
@@ -117,7 +115,7 @@ def render(provider_name: str, label: str) -> None:
                 "no telemetry for the check",
                 "unattributed",
             ),
-            ("Policies tracked", f"{month_rows['policy_category'].nunique():,}", "categories"),
+            ("Policies tracked", f"{records['policy_category'].nunique():,}", "categories"),
         ],
     )
 
@@ -130,25 +128,18 @@ def render(provider_name: str, label: str) -> None:
         with chrome.panel():
             chrome.panel_title("Nothing could be evaluated")
             chrome.section_caption(
-                f"{len(month_rows):,} policy checks apply to {label}'s entities this month "
+                f"{len(records):,} policy checks apply to {label}'s entities in this range "
                 f"but none could be evaluated — its connector reports none of the config "
                 f"fields they test. Every row is 'not applicable'. This is a telemetry "
                 "coverage gap, not compliance."
             )
-        _thresholds_panel()
         return
 
-    rows = month_rows[month_rows["status"] == "non_compliant"].assign(
-        remedy=month_rows["policy_category"].map(_REMEDY_BY_CATEGORY)
-    )
+    rows = records[records["status"] == "non_compliant"]
     with chrome.panel():
         chrome.panel_title("Non-compliant entities")
-        chrome.section_caption(
-            "Ranked by policy category. not_applicable rows (telemetry unmeasured) are "
-            "excluded — see the 'Not evaluated' count above for how many."
-        )
         if rows.empty:
-            ui.label("Nothing non-compliant this month.").classes("text-sm").style(
+            ui.label("Nothing non-compliant in this range.").classes("text-sm").style(
                 f"color:{chrome.INK_MUTED}"
             )
         else:
@@ -159,27 +150,3 @@ def render(provider_name: str, label: str) -> None:
                 rename=_RENAME,
                 max_rows=_MAX_ROWS,
             )
-
-    _thresholds_panel()
-
-
-def _thresholds_panel() -> None:
-    """The numbers behind the pass/fail verdicts, and where to change them.
-
-    Compliance is only meaningful if you can see the threshold it was judged against
-    — and edit it when your org's policy differs from Flashlight's default.
-    """
-    thresholds = get_thresholds()
-    with chrome.panel():
-        chrome.panel_title("Policy thresholds")
-        chrome.section_caption(
-            f"The values these verdicts were measured against. Edit {paths.policies_path()} "
-            "and re-run `flashlight transform` to change them — thresholds are baked into "
-            "the published data, so the dashboard and any agent always agree."
-        )
-        for name, field in type(thresholds).model_fields.items():
-            with ui.row().classes("items-baseline gap-2"):
-                ui.label(f"{getattr(thresholds, name)}").classes("text-sm font-medium")
-                ui.label(field.description or name).classes("text-sm").style(
-                    f"color:{chrome.INK_MUTED}"
-                )

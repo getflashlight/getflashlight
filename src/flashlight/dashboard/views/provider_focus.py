@@ -257,7 +257,7 @@ def render(
                 efficiency_waste.render(provider_name_for_group(group), label)
 
         def _panel_policy() -> None:
-            policy.render(provider_name_for_group(group), label)
+            policy.render(provider_name_for_group(group), label, end, sm)
 
         def _panel_alerts() -> None:
             # monthly_bill has no service dimension, so a narrowed page reads its
