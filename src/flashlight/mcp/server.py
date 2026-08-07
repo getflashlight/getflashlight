@@ -26,7 +26,6 @@ from flashlight.efficiency.waste_rules import WASTE_RULES
 from flashlight.gold.reader import QueryError, distinct_values, query_view, run_select
 from flashlight.transform.catalog import current_catalog, current_catalog_by_name
 
-_settings = get_settings()
 mcp = MCPServer("flashlight")
 
 
@@ -189,15 +188,16 @@ def serve_mcp() -> None:
     kind and exposes ``run_sql``, so anyone who gets far enough to run this command inside
     a demo container should hit a wall rather than a listening socket.
     """
-    if _settings.demo:
+    settings = get_settings()
+    if settings.demo:
         raise SystemExit(
             "Refusing to start the MCP server: FLASHLIGHT_DEMO=1.\n"
             "  The server listens on "
-            f"{_settings.mcp_host}:{_settings.mcp_port} with no authentication and exposes "
+            f"{settings.mcp_host}:{settings.mcp_port} with no authentication and exposes "
             "ad-hoc SQL over the lake (run_sql).\n"
             "  Unset FLASHLIGHT_DEMO to run it on a lake you control."
         )
-    mcp.run(transport="streamable-http", host=_settings.mcp_host, port=_settings.mcp_port)
+    mcp.run(transport="streamable-http", host=settings.mcp_host, port=settings.mcp_port)
 
 
 if __name__ == "__main__":
