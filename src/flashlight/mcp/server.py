@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from flashlight.core.settings import get_settings
 from flashlight.efficiency.waste_rules import WASTE_RULES
@@ -24,7 +24,7 @@ from flashlight.gold.reader import QueryError, distinct_values, query_view, run_
 from flashlight.transform.catalog import current_catalog, current_catalog_by_name
 
 _settings = get_settings()
-mcp = FastMCP("flashlight", host=_settings.mcp_host, port=_settings.mcp_port)
+mcp = MCPServer("flashlight")
 
 
 @mcp.tool()
@@ -135,7 +135,7 @@ def serve_mcp() -> None:
     GOLD hasn't been built yet (no ``flashlight ingest`` run), the metric views are
     simply empty.
     """
-    mcp.run(transport="streamable-http")
+    mcp.run(transport="streamable-http", host=_settings.mcp_host, port=_settings.mcp_port)
 
 
 if __name__ == "__main__":
