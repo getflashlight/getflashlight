@@ -259,19 +259,27 @@ def _credits_note(month: date) -> None:
 
 def render() -> None:
     groups = discover_provider_groups()
-    bounds_df = None
+    # The union across every provider's own span, not whichever group happens to be
+    # first alphabetically (discover_provider_groups() sorts by name) — this page is
+    # the cross-provider one, so its date bounds (and therefore its YTD default, which
+    # anchors off `hi`) must reflect the latest/earliest date ANY provider has, not just
+    # the first one iterated. Picking one group's bounds silently narrowed the range
+    # (or anchored YTD on a stale year) whenever a later-sorted provider had newer data.
+    lo: date | None = None
+    hi: date | None = None
     for group in groups:
         b = gold_df(
             f'SELECT min(charge_day) AS lo, max(charge_day) AS hi FROM "{group}".spend_trend_daily'
         )
-        if not b.empty and pd.notna(b["lo"].iloc[0]):
-            bounds_df = b if bounds_df is None else bounds_df
-    if not groups or bounds_df is None:
+        if b.empty or pd.isna(b["lo"].iloc[0]):
+            continue
+        g_lo, g_hi = _d(b["lo"].iloc[0]), _d(b["hi"].iloc[0])
+        lo = g_lo if lo is None else min(lo, g_lo)
+        hi = g_hi if hi is None else max(hi, g_hi)
+    if not groups or lo is None or hi is None:
         chrome.section_title("Data Cloud Spend overview")
         ui.label("No billing data yet.").classes("text-sm").style(f"color:{chrome.INK_MUTED}")
         return
-
-    lo, hi = _d(bounds_df["lo"].iloc[0]), _d(bounds_df["hi"].iloc[0])
     date_state: DateState = {
         # YTD, matching every provider page's default (see provider_focus.render for why) —
         # the two surfaces are compared constantly, so they must open on the same window.

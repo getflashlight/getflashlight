@@ -162,10 +162,9 @@ def test_endpoint_reports_a_connectable_host(monkeypatch: pytest.MonkeyPatch) ->
     assert mcp_runner.endpoint() == "http://127.0.0.1:8002/mcp"
 
 
-def test_the_page_shows_the_endpoint_tools_and_the_no_auth_warning(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """The page's job is to answer "is it up, what do I point at it, and what does it
-    expose" — including that the port has no auth, which is the one thing a user has to
-    know before binding it anywhere but localhost."""
+def test_the_page_shows_the_endpoint_and_tools(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The page's job is to answer "is it up, and what do I point at it": the status
+    badge, the endpoint, and the live tool inventory."""
     from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
@@ -180,7 +179,7 @@ def test_the_page_shows_the_endpoint_tools_and_the_no_auth_warning(monkeypatch) 
             await user.open("/mcp-server")
             await user.should_see("Stopped")
             await user.should_see("http://127.0.0.1:58002/mcp")
-            await user.should_see("No authentication")
+            await user.should_see("Connect to an agent")
             await user.should_see(marker="mcp-start")
             # Read from mcp.list_tools(), so this can't drift from what the server serves.
             # ui.table rows are data, not text nodes should_see can match.

@@ -226,6 +226,48 @@ def test_home_headline_excludes_one_off_credits(lake_home) -> None:  # type: ign
     asyncio.run(_check())
 
 
+def test_home_page_date_bounds_union_across_every_provider(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The home page's default range (its YTD anchor included) must reflect the UNION
+    of every provider's own span, not just one of them.
+
+    Regression: ``discover_provider_groups()`` sorts by name ('aws' < 'gcp'), and the
+    old code kept whichever group's ``(min charge_day, max charge_day)`` it saw *first*
+    and silently ignored every other group's — so a later-sorted provider with an
+    earlier start date (or a later end date) never widened ``bounds_min``/``bounds_max``
+    at all. Here AWS (May) sorts first but GCP (March) has the true earlier bound; the
+    default start must be GCP's, not AWS's own.
+    """
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    aws = _rec(20)  # AWS, May 2026 — the alphabetically-first group
+    gcp = _rec(1)
+    gcp.provider_name = ProviderName.GCP
+    gcp.billing_period_start = date(2026, 3, 1)
+    gcp.billing_period_end = date(2026, 3, 31)
+    gcp.charge_period_start = datetime(2026, 3, 1, tzinfo=UTC)
+    gcp.charge_period_end = datetime(2026, 3, 1, tzinfo=UTC)
+
+    bronze.write_window(
+        "t", IngestWindow(date(2026, 3, 1), date(2026, 5, 31)), [aws, gcp], ingest_run_id="r1"
+    )
+    build_gold()
+
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/")
+            # Fixed: the default start is GCP's Mar 1 (the true union minimum). The bug
+            # would show "May 20" here — AWS's own span, with GCP's dropped entirely.
+            await user.should_see("Mar 1")
+
+    asyncio.run(_check())
+
+
 def test_home_and_nav_label_aws_group_as_aws_redshift(lake_home) -> None:  # type: ignore[no-untyped-def]
     """The AWS group is labelled for what it holds. ``aws_focus`` ingests a
     service-scoped slice of the AWS bill (Redshift by default) and /aws is a
@@ -1185,6 +1227,193 @@ def test_policy_page_scopes_to_the_page_date_range(lake_home) -> None:  # type: 
             await user.should_see("0 of 3 measured")
             # No static thresholds panel — that config lives in policies.yml, not here.
             await user.should_not_see("Policy thresholds")
+
+    asyncio.run(_check())
+
+
+def test_policy_summary_aggregates_to_the_policy_grain() -> None:
+    """`_policy_summary` — the pure computation behind the "Non-compliant entities"
+    drill-through's first level. Not testable through `user_simulation` (`ui.table` row
+    clicks are a client-side Quasar event, same caveat as `attribution.py`'s drill-through),
+    so it's pinned directly here instead.
+
+    Two entities, two categories: `auto_terminate` has one non-compliant and one
+    compliant (50%); `cluster_tagging` is entirely `not_applicable` (tag telemetry
+    unmeasured), so it must show 0 measured and a NaN — never a 0% — compliance rate.
+    """
+    import pandas as pd
+
+    from flashlight.dashboard.views import policy
+
+    records = pd.DataFrame(
+        [
+            {"policy_category": "auto_terminate", "status": "non_compliant"},
+            {"policy_category": "auto_terminate", "status": "compliant"},
+            {"policy_category": "cluster_tagging", "status": "not_applicable"},
+        ]
+    )
+    summary = policy._policy_summary(records).set_index("policy_category")  # noqa: SLF001
+
+    auto_terminate = summary.loc["auto_terminate"]
+    assert auto_terminate["policy_label"] == "Auto-termination policy"
+    assert (auto_terminate["non_compliant"], auto_terminate["compliant"]) == (1, 1)
+    assert auto_terminate["not_evaluated"] == 0
+    assert auto_terminate["compliance_pct"] == 50.0
+
+    tagging = summary.loc["cluster_tagging"]
+    assert (tagging["non_compliant"], tagging["compliant"], tagging["not_evaluated"]) == (0, 0, 1)
+    assert pd.isna(tagging["compliance_pct"]), "no measured entities ⇒ no rate, not 0%"
+
+    # Ranked by non_compliant descending — the worse policy leads.
+    ranked = policy._policy_summary(records)  # noqa: SLF001
+    assert ranked.iloc[0]["policy_category"] == "auto_terminate"
+
+
+def test_policy_latest_per_entity_collapses_repeat_months() -> None:
+    """Regression test: a cluster non-compliant for 6 straight months must show up as
+    ONE row, not 6 — real data on a YTD range showed the same cluster/detail repeated
+    once per month it had been misconfigured, which read as duplicate rows rather than
+    a single distinct finding.
+
+    `_latest_per_entity` keeps each (entity_id, policy_category)'s most recent row —
+    pinned here by checking it keeps May's (not January's) detail for the entity that
+    appears in both months, and never inflates the entity count.
+    """
+    import pandas as pd
+
+    from flashlight.dashboard.views import policy
+
+    records = pd.DataFrame(
+        [
+            {
+                "entity_id": "cl-1",
+                "policy_category": "auto_terminate",
+                "charge_month": "2026-01-01",
+                "status": "non_compliant",
+                "detail": "auto-terminate after 600 min, over the 60 min policy",
+            },
+            {
+                "entity_id": "cl-1",
+                "policy_category": "auto_terminate",
+                "charge_month": "2026-05-01",
+                "status": "non_compliant",
+                "detail": "auto-terminate after 600 min, over the 60 min policy",
+            },
+            {
+                "entity_id": "cl-2",
+                "policy_category": "auto_terminate",
+                "charge_month": "2026-03-01",
+                "status": "compliant",
+                "detail": "auto-terminate after 30 min",
+            },
+        ]
+    )
+    latest = policy._latest_per_entity(records)  # noqa: SLF001
+
+    assert len(latest) == 2, "cl-1's two monthly rows collapse into one"
+    assert set(latest["entity_id"]) == {"cl-1", "cl-2"}
+    cl1 = latest[latest["entity_id"] == "cl-1"].iloc[0]
+    assert cl1["charge_month"] == "2026-05-01", "keeps the most recent month, not the first"
+
+
+def test_policy_row_click_recovers_category_without_the_raw_column() -> None:
+    """Regression test for a dashboard crash (`KeyError: 'policy_category'`) on every
+    click of the policy-grain table in a real `dashboard serve` run.
+
+    `chrome.searchable_table`'s `on_row_click` hands the handler a dict built from
+    exactly the DataFrame that was passed in — here, `summary[_POLICY_COLS]` — which
+    carries `policy_label` (the displayed text) but never the raw `policy_category`
+    (it isn't one of `_POLICY_COLS`). Reading `row["policy_category"]` in the click
+    handler therefore always raised; recovering the category has to go through the
+    label instead.
+    """
+    from flashlight.dashboard.views import policy
+
+    for category, label in policy._CATEGORY_LABEL.items():  # noqa: SLF001
+        # Exactly the shape a real click hands the handler: only `_POLICY_COLS` keys.
+        row: dict[str, object] = {
+            "policy_label": label,
+            "non_compliant": 1,
+            "compliant": 0,
+            "not_evaluated": 0,
+            "compliance_pct": 0.0,
+        }
+        assert "policy_category" not in row
+        assert policy._category_from_label(str(row["policy_label"])) == category  # noqa: SLF001
+
+
+def test_policy_rule_labels_are_unique() -> None:
+    """The row-click reverse lookup (`_category_from_label`) is only safe if no two
+    policy rules share a label — otherwise clicking one would silently drill into the
+    other's entities."""
+    from flashlight.efficiency.policy_rules import POLICY_RULES
+
+    labels = [r.label for r in POLICY_RULES]
+    assert len(labels) == len(set(labels))
+
+
+def test_policy_non_compliant_panel_opens_at_the_policy_grain(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The drill-through opens on the policy summary, not a flat entity list — matching
+    Attribution's "Untagged infrastructure" pattern of leading with the coarser grain."""
+    from datetime import date as _date
+    from decimal import Decimal as _Decimal
+
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.efficiency.model import EfficiencyRecord, EntityType
+    from flashlight.lake import bronze, metrics
+    from flashlight.transform.runner import build_gold
+
+    window = IngestWindow(_date(2026, 5, 1), _date(2026, 5, 31))
+    bronze.write_window(
+        "t",
+        window,
+        [
+            FocusRecord(
+                provider_name=ProviderName.DATABRICKS,
+                billing_account_id="acct",
+                billing_period_start=_date(2026, 5, 1),
+                billing_period_end=_date(2026, 5, 31),
+                charge_period_start=datetime(2026, 5, 15, tzinfo=UTC),
+                charge_period_end=datetime(2026, 5, 15, 1, tzinfo=UTC),
+                billed_cost=_Decimal("100"),
+                effective_cost=_Decimal("100"),
+                list_cost=_Decimal("100"),
+                charge_category=ChargeCategory.USAGE,
+                service_category=ServiceCategory.ANALYTICS,
+                service_name="Databricks SQL",
+                x_source_connector="t",
+            )
+        ],
+        ingest_run_id="r1",
+    )
+    metrics.write_efficiency(
+        window,
+        [
+            EfficiencyRecord(
+                provider_name="Databricks",
+                charge_month=_date(2026, 5, 1),
+                entity_type=EntityType.INTERACTIVE,
+                entity_id="cl-sluggish",
+                billed_cost=_Decimal("100"),
+                cause_detail={"auto_termination_minutes": 600},
+                x_source_connector="databricks",
+            )
+        ],
+    )
+    build_gold()
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/databricks")
+            user.find("Policy Compliance").click()
+            await user.should_see("Click a policy to see the entities behind it.")
+            # Entity-level breadcrumb text must NOT be showing yet — confirms the
+            # panel opened at the policy grain, not already drilled in.
+            await user.should_not_see("← All policies")
 
     asyncio.run(_check())
 

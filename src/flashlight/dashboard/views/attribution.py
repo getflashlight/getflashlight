@@ -19,12 +19,11 @@ Panels, top to bottom:
   that key's values (breadcrumbed back), instead of a ranking table sitting above a
   second panel with its own key-picker dropdown.
 
-Billing granularity is NOT one fact ("tag the resource") — it is three, and the remedy
-at level 2 differs by which is true for a row's ``service_name`` (:func:`_tier_for_service`):
+Billing granularity is NOT one fact ("tag the resource") — it is three
+(:func:`_tier_for_service`), and only one of them can drill to level 3:
 
 * **dedicated** — ``resource_id`` on the bill already IS the billed unit (a Databricks
-  job/notebook, a serving endpoint). The resource-level row is already the finest real
-  grain; "tag it directly" is a complete answer.
+  job/notebook, a serving endpoint). Already the finest real grain; no level 3.
 * **shared, sub-metered** — a SQL warehouse (Databricks) or a Redshift cluster. The bill
   metres the *warehouse*, never a query (DBUs/slot-seconds aren't billed per-query — see
   ``efficiency/model.py``'s ``EntityType`` docstring and ``policy_rules.py``'s blocked
@@ -32,17 +31,12 @@ at level 2 differs by which is true for a row's ``service_name`` (:func:`_tier_f
   per-user *estimate* already exists — ``entity_type='sql_warehouse_user'`` allocates the
   warehouse's real ``billed_cost`` by each user's share of query duration that month,
   always ``candidate`` confidence, computed by both the Databricks and Redshift efficiency
-  pulls. That's level 3 here: "tag the warehouse" alone hides who actually drove it, so a
-  shared/sub-metered row drills one level further into that estimate instead of stopping
-  at one generic sentence.
+  pulls. That's level 3: a row in this tier drills one level further into that estimate.
 * **shared, no sub-grain** — an all-purpose/interactive cluster. Also billed as one shared
   unit, but nothing pulls a per-user split for it today (only SQL warehouses get
-  ``sql_warehouse_user``). Named as shared rather than silently treated as dedicated, but
-  there is no level 3 to drill into — inventing one would be exactly the fabricated
-  per-query split the codebase already refuses to build.
+  ``sql_warehouse_user``), so there is no level 3 to drill into — inventing one would be
+  exactly the fabricated per-query split the codebase already refuses to build.
 * **unclassified** — every other ``service_name`` (storage, networking, AI products, …).
-  Falls back to the pre-existing generic tag remedy rather than guessing a tier wrong in
-  either direction.
 
 Tier boundaries live in Python (:data:`_DEDICATED_SERVICES` etc.), duplicating —
 deliberately, not by oversight — ``gold.compute_family`` in ``030_gold_metrics.sql``: that
@@ -53,9 +47,12 @@ serverless notebooks into its coarse "interactive" bucket for a *cost rollup*; n
 bill at a real per-notebook grain (see ``databricks_efficiency.sql``'s ``notebook`` branch)
 so they're **dedicated** here, not shared.
 
-A resource row's remedy is the tier default UNLESS ``resource_id`` matches a non-compliant
-Policy tagging finding (``cluster_tagging``/``warehouse_tagging``/``endpoint_tagging``),
-which is always more specific and wins.
+None of this is narrated on screen as prose — the tier only decides whether a resource
+row drills further, silently. A tier caption, a "$X across N resources" recap, a
+"click a row for drivers" hint and a Policy-override count used to sit above the
+resource table; four lines of prose that mostly repeated what the table and breadcrumb
+already show, removed. Policy Compliance still owns entity-level tagging rules and its
+own, separate remedy text.
 
 ``spend_tag_coverage_month`` remains the provider-level denominator for agents. Policy
 Compliance still owns entity-level tagging rules; this tab does not send users *only*
@@ -78,7 +75,6 @@ from nicegui import ui
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import gold_df, gold_view_published, provider_name_for_group
 from flashlight.dashboard.theme import compact_money
-from flashlight.efficiency.policy_rules import POLICY_RULES
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 
 _TAG_COLS = ["tag_key_normalized", "tag_key_variants", "net_cost", "tag_value_count"]
@@ -104,7 +100,6 @@ _RESOURCE_COLS = [
     "sub_account_id",
     "region_id",
     "untagged_cost",
-    "remedy",
 ]
 _RESOURCE_RENAME = {
     "resource_name": "Resource",
@@ -113,7 +108,6 @@ _RESOURCE_RENAME = {
     "sub_account_id": "Workspace",
     "region_id": "Region",
     "untagged_cost": "Untagged",
-    "remedy": "How to fix it",
 }
 
 _DRIVER_COLS = ["owner_user", "billed_cost", "duration_share_pct", "secondary_signals"]
@@ -133,59 +127,10 @@ _SHARED_NO_SUBGRAIN_SERVICES = frozenset(
     {"ALL_PURPOSE", "INTERACTIVE", "SHARED_SERVERLESS_COMPUTE"}
 )
 
-_TIER_SCOPE_LABEL = {
-    "dedicated": "Dedicated",
-    "shared_subgrain": "Shared compute",
-    "shared_no_subgrain": "Shared compute",
-    "unclassified": "—",
-}
-
-_TIER_HEADLINE = {
-    "dedicated": "already the finest billed grain.",
-    "shared_subgrain": "billed as one meter; a per-user estimate exists below.",
-    "shared_no_subgrain": "billed as one meter; no per-user split exists for it.",
-    "unclassified": "grain not classified for this service.",
-}
-
-_TIER_REMEDY = {
-    "dedicated": (
-        "This is billed as its own resource — add cost-allocation tags on it directly "
-        "(job/notebook/endpoint config) so its spend is attributed."
-    ),
-    "shared_subgrain": (
-        "Shared compute — it isn't billed per query, so tagging it attributes ALL of it "
-        "as one bucket. Click this row for the estimated per-user drivers, then isolate "
-        "the heaviest user (a dedicated/right-sized warehouse) or tag work at submission "
-        "time."
-    ),
-    "shared_no_subgrain": (
-        "Shared cluster — no per-user billing split exists for it today, so tagging it "
-        "still attributes all of it as one bucket. Tag the cluster/cluster policy, or "
-        "move scheduled work onto Jobs compute, which bills — and can be tagged — per job."
-    ),
-    "unclassified": (
-        "Add cost-allocation tags (e.g. team, project, environment) on this resource in "
-        "the cloud console or as code so its spend can be attributed."
-    ),
-}
-
-_TAGGING_POLICY_CATEGORIES = frozenset(
-    {"cluster_tagging", "warehouse_tagging", "endpoint_tagging"}
-)
-_REMEDY_BY_CATEGORY = {
-    r.category: r.remedy for r in POLICY_RULES if r.category in _TAGGING_POLICY_CATEGORIES
-}
-
 _TAG_KEY_INFO = (
     "Tagged charges only; don't sum Spend (multi-tagged resources count twice). "
     "Case/separator variants fold into one row — Spelled as lists the raw forms."
 )
-
-_UNTAGGED_INFO = (
-    "Charges with no cost-allocation tag. Credits excluded. Click a service to see the "
-    "resources behind it, and a shared warehouse's row for its estimated drivers."
-)
-
 
 def _tier_for_service(service_name: str) -> str:
     """Which billing-granularity tier a ``service_name`` falls into. See module docstring."""
@@ -273,7 +218,6 @@ def untagged_infrastructure(
                     assert state.service is not None
                     _render_resource_level(
                         group,
-                        provider,
                         state.service,
                         end,
                         sm,
@@ -336,8 +280,6 @@ def _render_service_level(
     n_gap = len(gaps)
     share = f"{100 * untagged / gross:.0f}% of charges" if gross > 0 else "—"
 
-    with ui.row().classes("items-center gap-1"):
-        chrome.info_icon(_UNTAGGED_INFO)
     chrome.stat_row(
         [
             ("Untagged", compact_money(untagged), share, "unattributed"),
@@ -372,38 +314,8 @@ def _render_service_level(
     )
 
 
-def _policy_tagging_remedies(provider_name: str) -> dict[str, str]:
-    """entity_id → Policy tagging remedy for non-compliant rows (latest month).
-
-    Empty when policy GOLD is missing or this provider has no tagging findings — the
-    resource panel then uses the tier's default remedy for every row.
-    """
-    if not gold_view_published("policy", "policy_record"):
-        return {}
-    cats = ", ".join(f"'{c}'" for c in sorted(_TAGGING_POLICY_CATEGORIES))
-    rows = _df(
-        "SELECT entity_id, policy_category FROM policy.policy_record "
-        f"WHERE provider_name = '{_q(provider_name)}' "
-        f"AND policy_category IN ({cats}) "
-        "AND status = 'non_compliant' "
-        "AND charge_month = ("
-        "SELECT max(charge_month) FROM policy.policy_record "
-        f"WHERE provider_name = '{_q(provider_name)}')"
-    )
-    if rows.empty:
-        return {}
-    out: dict[str, str] = {}
-    for _, row in rows.iterrows():
-        entity_id = str(row["entity_id"])
-        remedy = _REMEDY_BY_CATEGORY.get(str(row["policy_category"]))
-        if remedy and entity_id not in out:
-            out[entity_id] = remedy
-    return out
-
-
 def _render_resource_level(
     group: str,
-    provider: str,
     service_name: str,
     end: date,
     sm: date,
@@ -411,7 +323,13 @@ def _render_resource_level(
     scope_sql: str,
     refresh: Callable[[_Drill], object],
 ) -> None:
-    """Level 2: ranked untagged resources for one service, with a tier-specific remedy."""
+    """Level 2: ranked untagged resources for one service.
+
+    Used to carry a tier caption, a "$X across N resources" recap, a "click a row for
+    drivers" hint and a Policy-override count above the table — four lines of prose
+    for what the table and its breadcrumb already show. Removed; the tier still gates
+    whether a row drills to level 3 (see *on_click* below), it just isn't narrated.
+    """
     _breadcrumb(
         ("← All services", _Drill()),
         (service_name, None),
@@ -419,9 +337,6 @@ def _render_resource_level(
     )
 
     tier = _tier_for_service(service_name)
-    chrome.caption_info(
-        f"{_TIER_SCOPE_LABEL[tier]} — {_TIER_HEADLINE[tier]}", _TIER_REMEDY[tier]
-    )
 
     if not gold_view_published(group, "spend_untagged_by_resource_month"):
         chrome.section_caption(
@@ -447,18 +362,7 @@ def _render_resource_level(
         )
         return
 
-    total = float(rows["untagged_cost"].sum())
-    chrome.section_caption(
-        f"{compact_money(total)} untagged across {len(rows):,} resource(s) — "
-        "reconciles to this service's gap."
-    )
-    if tier == "shared_subgrain":
-        chrome.section_caption("Click a row for its estimated per-user drivers.")
-
-    remedies = _policy_tagging_remedies(provider)
-    tier_remedy = _TIER_REMEDY[tier]
     display = rows.assign(
-        remedy=rows["resource_id"].map(lambda rid: remedies.get(str(rid), tier_remedy)),
         resource_name=rows.apply(
             lambda r: (
                 "(no resource id on the bill)"
@@ -518,8 +422,7 @@ def _render_driver_level(
         refresh=refresh,
     )
     chrome.caption_info(
-        "Estimated by query-duration share, latest month with telemetry in range — "
-        "not an exact per-query split.",
+        "Estimated by query-duration share, latest month with telemetry in range.",
         "DBUs/slot-seconds aren't billed per query, so this allocates the resource's real "
         "billed cost by each user's share of measured query duration that month. Always "
         "an estimate under concurrency (candidate confidence), never claimed exact.",
@@ -676,8 +579,6 @@ def _render_tag_key_level(
 ) -> None:
     """Level 1: the folded key ranking — content unchanged from the old standalone
     panel, just with a row click instead of feeding a separate dropdown."""
-    with ui.row().classes("items-center gap-1"):
-        chrome.info_icon(_TAG_KEY_INFO)
     chrome.section_caption("Click a key to see its values.")
     cols = [c for c in _TAG_COLS if c in rows]
 

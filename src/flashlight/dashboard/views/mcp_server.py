@@ -57,10 +57,6 @@ async def render() -> None:
     endpoint = mcp_runner.endpoint()
 
     chrome.section_title("MCP server")
-    chrome.section_caption(
-        "Serves the published GOLD views to agents over MCP (streamable HTTP). Read-only: "
-        "it queries the same Parquet the dashboard does and never writes to the lake."
-    )
 
     @ui.refreshable
     def status_body() -> None:
@@ -94,18 +90,6 @@ async def render() -> None:
                     "`flashlight mcp serve` in a terminal (or under a service manager) for a "
                     "server that outlives it."
                 )
-            else:
-                chrome.section_caption(
-                    "Not running. Anything pointed at the endpoint above will fail to connect "
-                    "until you start it."
-                )
-            # Stated on the page, not just in the docs: this is the one Flashlight
-            # process that opens a port, and mcp_host defaults to 0.0.0.0.
-            chrome.section_caption(
-                "No authentication: the server exposes ad-hoc read-only SQL over your lake to "
-                f"anything that can reach it. FLASHLIGHT_MCP_HOST is {settings.mcp_host!r} — "
-                "bind it to 127.0.0.1 unless you mean to expose it."
-            )
 
     # Both refresh `log_body`, which is defined further down: safe because a click can only
     # happen after this whole function has run, but it is a free variable — don't call
@@ -127,13 +111,16 @@ async def render() -> None:
 
     status_body()
 
-    with chrome.panel():
-        chrome.panel_title("Connect a client")
-        chrome.section_caption(
-            "Add this to your MCP client's server config (Claude Code: `claude mcp add "
-            f"--transport http flashlight {endpoint}`)."
-        )
-        ui.code(_client_config(endpoint), language="json").classes("w-full")
+    with chrome.panel(), ui.column().classes("w-full gap-3"):
+        chrome.panel_title("Connect to an agent")
+        with ui.column().classes("w-full gap-1"):
+            chrome.section_caption("Quick add — Claude Code:")
+            ui.code(
+                f"claude mcp add --transport http flashlight {endpoint}", language="bash"
+            ).classes("w-full fl-code-oneline")
+        with ui.column().classes("w-full gap-1"):
+            chrome.section_caption("Manual config — any MCP-compatible client:")
+            ui.code(_client_config(endpoint), language="json").classes("w-full")
 
     @ui.refreshable
     def log_body() -> None:

@@ -110,6 +110,11 @@ body, .q-page, .nicegui-content {{
 }}
 .fl-table-clickable tbody tr {{ cursor: pointer; }}
 .fl-table tbody tr:hover td {{ background: rgba(255,255,255,0.03) !important; }}
+/* ui.code's copy button is CSS-positioned `top: 0.5rem` (nicegui.css), which reads fine
+   against a multi-line block but sits visibly above-center on a single-line one (see
+   mcp_server.py's "quick add" command). Center it vertically for that one shape only —
+   untouched everywhere else. */
+.fl-code-oneline .nicegui-code-copy {{ top: 50%; transform: translateY(-50%); }}
 </style>
 """
 
