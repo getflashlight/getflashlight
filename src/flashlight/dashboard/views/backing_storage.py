@@ -160,8 +160,8 @@ def render(sm: date | None = None, end: date | None = None) -> None:
         _denominator_caption(rows)
         return
 
-    _managed_storage(mapped)
     _subcategory_trend(mapped)
+    _managed_storage(mapped)
 
 
 #: Metastore roots first, then catalogs — the root is the broader container, so it reads
@@ -273,6 +273,19 @@ def _subcategory_trend(mapped: pd.DataFrame) -> None:
         barmode="stack",
         labels={"month": "", "net_cost": "", "Charge type": ""},
     )
+    # One text label per bar — the full stack height — same pattern as
+    # provider_focus._monthly_drill: a stack answers "what made up the month?", not "how
+    # big was the month?", and a reader shouldn't have to sum 3-4 segments by eye for that.
+    totals: dict[str, float] = by_month.groupby("month")["net_cost"].sum().to_dict()
+    for month, total in totals.items():
+        fig.add_annotation(
+            x=month,
+            y=total,
+            text=compact_money(total),
+            showarrow=False,
+            yshift=10,
+            font=dict(size=11, color=chrome.INK_SECONDARY),
+        )
     chrome.plot(chrome.style_fig(fig, currency_axis="y", has_legend=True, category_x=True))
 
 

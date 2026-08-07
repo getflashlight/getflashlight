@@ -955,6 +955,16 @@ def _drilldown(scope: Scope, month_label: str) -> None:
             labels={"component": "", "effect": ""},
         )
         fig.update_layout(showlegend=False)
+        for _, r in effects.iterrows():
+            fig.add_annotation(
+                x=r["component"],
+                y=r["effect"],
+                text=_signed(float(r["effect"])),
+                showarrow=False,
+                yshift=10 if r["effect"] >= 0 else -10,
+                yanchor="bottom" if r["effect"] >= 0 else "top",
+                font=dict(size=11, color=chrome.INK_SECONDARY),
+            )
         chrome.panel_title(f"What drove the change · {m:%b %Y}")
         chrome.plot(chrome.style_fig(fig, has_legend=False))
 
@@ -1314,6 +1324,15 @@ def _commitment(group: str, end: date, sm: date) -> None:
         labels={"commitment_discount_status": "", "cost": ""},
     )
     fig.update_layout(showlegend=False)
+    for _, r in plot_rows.iterrows():
+        fig.add_annotation(
+            x=r["commitment_discount_status"],
+            y=r["cost"],
+            text=compact_money(float(r["cost"])),
+            showarrow=False,
+            yshift=10,
+            font=dict(size=11, color=chrome.INK_SECONDARY),
+        )
     with chrome.panel():
         chrome.panel_title("Commitment coverage")
         chrome.section_caption(caption)

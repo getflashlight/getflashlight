@@ -112,22 +112,25 @@ def register_metrics(con: duckdb.DuckDBPyConnection) -> None:
 
     The waste-plane sibling of :func:`register_bronze`: reads with
     ``hive_partitioning`` so ``provider_name`` and ``charge_month`` come back as
-    columns, with the same typed-empty fallback before the first efficiency pull so
-    the GOLD waste SQL resolves either way.
+    columns, unioned onto the typed empty table so the view's schema is always the
+    *current* one regardless of what's on disk — see :func:`register_assistant_turns`'s
+    docstring for why ``UNION ALL BY NAME`` against the empty table (not just an
+    if/else fallback) matters: a column added to :mod:`flashlight.lake.metrics_schema`
+    after older EfficiencyRecord Parquet was written would otherwise make every GOLD
+    waste SQL statement referencing it fail outright, for every provider, until a fresh
+    pull happens to write at least one new-schema file.
     """
     con.execute("CREATE SCHEMA IF NOT EXISTS metrics")
+    con.register("_metrics_empty", empty_metrics_table())
+    select = "SELECT * FROM _metrics_empty"
     files = list(paths.metrics_dir().glob("**/*.parquet"))
     if files:
         glob = str(paths.metrics_dir() / "**" / "*.parquet").replace("'", "''")
-        con.execute(
-            f"CREATE OR REPLACE VIEW metrics.efficiency_record AS SELECT * FROM "
+        select += (
+            " UNION ALL BY NAME SELECT * FROM "
             f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
         )
-    else:
-        con.register("_metrics_empty", empty_metrics_table())
-        con.execute(
-            "CREATE OR REPLACE VIEW metrics.efficiency_record AS SELECT * FROM _metrics_empty"
-        )
+    con.execute(f"CREATE OR REPLACE VIEW metrics.efficiency_record AS {select}")
 
 
 def register_driver_health(con: duckdb.DuckDBPyConnection) -> None:
@@ -136,42 +139,41 @@ def register_driver_health(con: duckdb.DuckDBPyConnection) -> None:
     Same ``metrics`` DuckDB schema as :func:`register_metrics`, but a distinct Parquet
     root (:func:`~flashlight.lake.paths.driver_health_dir`) and view name — kept out of
     ``metrics_dir()``'s own recursive glob so the two differently-shaped datasets never
-    collide (see that function's docstring).
+    collide (see that function's docstring). Unioned onto the typed empty table for the
+    same schema-evolution reason as :func:`register_metrics` — see its docstring.
     """
     con.execute("CREATE SCHEMA IF NOT EXISTS metrics")
+    con.register("_driver_health_empty", empty_driver_health_table())
+    select = "SELECT * FROM _driver_health_empty"
     files = list(paths.driver_health_dir().glob("**/*.parquet"))
     if files:
         glob = str(paths.driver_health_dir() / "**" / "*.parquet").replace("'", "''")
-        con.execute(
-            f"CREATE OR REPLACE VIEW metrics.driver_health AS SELECT * FROM "
+        select += (
+            " UNION ALL BY NAME SELECT * FROM "
             f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
         )
-    else:
-        con.register("_driver_health_empty", empty_driver_health_table())
-        con.execute(
-            "CREATE OR REPLACE VIEW metrics.driver_health AS SELECT * FROM _driver_health_empty"
-        )
+    con.execute(f"CREATE OR REPLACE VIEW metrics.driver_health AS {select}")
 
 
 def register_ai_usage(con: duckdb.DuckDBPyConnection) -> None:
     """Expose ``metrics.ai_usage`` over the partitioned AI serving-usage Parquet.
 
-    Same ``metrics`` DuckDB schema and typed-empty fallback as
+    Same ``metrics`` DuckDB schema and typed-empty-union fallback as
     :func:`register_driver_health`, over its own Parquet root
     (:func:`~flashlight.lake.paths.ai_usage_dir`) for the same
     keep-out-of-the-recursive-glob reason.
     """
     con.execute("CREATE SCHEMA IF NOT EXISTS metrics")
+    con.register("_ai_usage_empty", empty_ai_usage_table())
+    select = "SELECT * FROM _ai_usage_empty"
     files = list(paths.ai_usage_dir().glob("**/*.parquet"))
     if files:
         glob = str(paths.ai_usage_dir() / "**" / "*.parquet").replace("'", "''")
-        con.execute(
-            f"CREATE OR REPLACE VIEW metrics.ai_usage AS SELECT * FROM "
+        select += (
+            " UNION ALL BY NAME SELECT * FROM "
             f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
         )
-    else:
-        con.register("_ai_usage_empty", empty_ai_usage_table())
-        con.execute("CREATE OR REPLACE VIEW metrics.ai_usage AS SELECT * FROM _ai_usage_empty")
+    con.execute(f"CREATE OR REPLACE VIEW metrics.ai_usage AS {select}")
 
 
 def register_storage_locations(con: duckdb.DuckDBPyConnection) -> None:
@@ -184,24 +186,26 @@ def register_storage_locations(con: duckdb.DuckDBPyConnection) -> None:
     ``provider_name``/``snapshot_month`` — the second is deliberately not a charge
     period (see :mod:`flashlight.lake.storage_location_schema`).
 
-    The typed-empty fallback is what lets ``065_gold_storage.sql`` resolve before any
-    Databricks connection has ever run: without it, an AWS-only lake would fail the
-    whole transform rather than publishing an empty map.
+    The typed-empty-union fallback is what lets ``065_gold_storage.sql`` resolve before
+    any Databricks connection has ever run: without it, an AWS-only lake would fail the
+    whole transform rather than publishing an empty map — and, per
+    :func:`register_metrics`'s docstring, unioning (not if/else-ing) it also means a
+    column added to :mod:`flashlight.lake.storage_location_schema` after older Parquet
+    was written doesn't fail every SQL statement after it until a fresh pull happens to
+    land at least one new-schema file (see ``cluster_name``/``owner_user`` landing in
+    :mod:`flashlight.lake.compute_instance_schema` for the real incident this guards).
     """
     con.execute("CREATE SCHEMA IF NOT EXISTS metrics")
+    con.register("_storage_location_empty", empty_storage_location_table())
+    select = "SELECT * FROM _storage_location_empty"
     files = list(paths.storage_locations_dir().glob("**/*.parquet"))
     if files:
         glob = str(paths.storage_locations_dir() / "**" / "*.parquet").replace("'", "''")
-        con.execute(
-            f"CREATE OR REPLACE VIEW metrics.storage_location AS SELECT * FROM "
+        select += (
+            " UNION ALL BY NAME SELECT * FROM "
             f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
         )
-    else:
-        con.register("_storage_location_empty", empty_storage_location_table())
-        con.execute(
-            "CREATE OR REPLACE VIEW metrics.storage_location AS "
-            "SELECT * FROM _storage_location_empty"
-        )
+    con.execute(f"CREATE OR REPLACE VIEW metrics.storage_location AS {select}")
 
 
 def register_compute_instances(con: duckdb.DuckDBPyConnection) -> None:
@@ -215,24 +219,30 @@ def register_compute_instances(con: duckdb.DuckDBPyConnection) -> None:
     :func:`register_storage_locations`'s snapshot (see
     :mod:`flashlight.lake.compute_instance_schema`).
 
-    The typed-empty fallback is what lets ``066_gold_compute.sql`` resolve before any
-    Databricks connection has ever run: without it, an AWS-only lake would fail the whole
-    transform rather than publishing an empty map.
+    The typed-empty-union fallback is what lets ``066_gold_compute.sql`` resolve before
+    any Databricks connection has ever run: without it, an AWS-only lake would fail the
+    whole transform rather than publishing an empty map. It's ``UNION ALL BY NAME``
+    against the empty table, not an if/else on it, for the same reason
+    :func:`register_metrics` gives — this is in fact the exact plane that motivated
+    that fix: ``cluster_name``/``owner_user`` were added to
+    :mod:`flashlight.lake.compute_instance_schema` after real Parquet had already been
+    written without them, and an if/else fallback (only used when there are *zero*
+    files) doesn't help once there's *some* real, older-schema data on disk — every SQL
+    statement referencing the new columns failed, not just the compute ones, because
+    ``flashlight transform`` applies every ``.sql`` file in one connection and a bad
+    statement aborts the run before later files ever get a chance to run.
     """
     con.execute("CREATE SCHEMA IF NOT EXISTS metrics")
+    con.register("_compute_instance_empty", empty_compute_instance_table())
+    select = "SELECT * FROM _compute_instance_empty"
     files = list(paths.compute_instances_dir().glob("**/*.parquet"))
     if files:
         glob = str(paths.compute_instances_dir() / "**" / "*.parquet").replace("'", "''")
-        con.execute(
-            f"CREATE OR REPLACE VIEW metrics.compute_instance AS SELECT * FROM "
+        select += (
+            " UNION ALL BY NAME SELECT * FROM "
             f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
         )
-    else:
-        con.register("_compute_instance_empty", empty_compute_instance_table())
-        con.execute(
-            "CREATE OR REPLACE VIEW metrics.compute_instance AS "
-            "SELECT * FROM _compute_instance_empty"
-        )
+    con.execute(f"CREATE OR REPLACE VIEW metrics.compute_instance AS {select}")
 
 
 def register_assistant_turns(con: duckdb.DuckDBPyConnection) -> None:

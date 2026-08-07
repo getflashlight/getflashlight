@@ -28,21 +28,40 @@
 -- of system.compute.clusters (or one the token can't read) must not drop its cost rows
 -- here — it just loses the readable name/owner, falling back to the bare id downstream
 -- (066_gold_compute.sql).
+--
+-- job_meta reuses databricks_efficiency.sql's own owner-resolution logic verbatim:
+-- run_as_user_name resolves run_as (human OR service principal) to a readable name in one
+-- column — no separate service-principal directory exists in Databricks. A JOB-triggered
+-- cluster's cluster_name follows Databricks' own "job-<job_id>-run-<run_id>[-name]"
+-- convention (confirmed against live data), so the job_id needed to join job_meta is
+-- already sitting in a column this query selects anyway — no extra system-table read.
+-- COALESCE prefers the resolved name and falls back to the cluster's raw owned_by (itself
+-- often just a user/service-principal ID, not an email — system.compute.clusters has no
+-- richer field) only when no job_id parses (a non-job/interactive cluster) or job_meta has
+-- no match: confirmed live that run_as_user_name is genuinely NULL for rows Databricks
+-- emitted before ~November 2025, so this is a best-effort upgrade, not a guaranteed name.
 WITH cluster_meta AS (
   SELECT cluster_id, cluster_name, owned_by
   FROM system.compute.clusters
   QUALIFY ROW_NUMBER() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) = 1
+),
+job_meta AS (
+  SELECT job_id, run_as_user_name
+  FROM system.lakeflow.jobs
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY change_time DESC) = 1
 )
 SELECT
   'Databricks'                                AS provider_name,
   date_trunc('MONTH', nt.start_time)          AS charge_month,
   nt.cluster_id,
   ANY_VALUE(cm.cluster_name)                  AS cluster_name,
-  ANY_VALUE(cm.owned_by)                      AS owner_user,
+  ANY_VALUE(COALESCE(jm.run_as_user_name, cm.owned_by)) AS owner_user,
   nt.instance_id,
   ANY_VALUE(nt.driver)                        AS is_driver,
   ANY_VALUE(nt.node_type)                     AS node_type
 FROM system.compute.node_timeline nt
 LEFT JOIN cluster_meta cm ON cm.cluster_id = nt.cluster_id
+LEFT JOIN job_meta jm
+  ON jm.job_id = regexp_extract(cm.cluster_name, '^job-([0-9]+)-run-', 1)
 WHERE nt.start_time >= :start_date AND nt.start_time < :end_date + INTERVAL 1 DAY
 GROUP BY nt.cluster_id, nt.instance_id, date_trunc('MONTH', nt.start_time)

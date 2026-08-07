@@ -234,6 +234,20 @@ def _plot(df: pd.DataFrame, spec: tuple[str, str | None, str], y_col: str) -> No
         else:
             styling |= {"marker_color": chrome.ACCENT, "textposition": "outside"}
         fig.update_traces(**styling)
+    elif kind != "line":
+        # A stack's per-segment labels would collide, but the stack's own total is
+        # exactly the number a reader wants above it — same pattern as every other
+        # stacked chart in the dashboard.
+        totals = df.groupby(x_col)[y_col].sum()
+        for xval, total in totals.items():
+            fig.add_annotation(
+                x=xval,
+                y=total,
+                text=(f"${total:,.0f}" if is_money else f"{total:,.0f}"),
+                showarrow=False,
+                yshift=10,
+                font=dict(size=11, color=chrome.INK_SECONDARY),
+            )
     fig.update_traces(hovertemplate=f"%{{x}}<br>{value_format}<extra></extra>")
     chrome.plot(
         chrome.style_fig(

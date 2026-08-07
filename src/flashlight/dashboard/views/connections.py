@@ -33,8 +33,7 @@ from nicegui import run, ui
 from pydantic import BaseModel, ValidationError
 
 from flashlight import scaffold
-from flashlight.dashboard import chrome
-from flashlight.dashboard.ingest_runner import stream_sync
+from flashlight.dashboard import chrome, ingest_runner
 from flashlight.ingest.config import (
     AwsFocusConfig,
     DatabricksConfig,
@@ -570,6 +569,33 @@ def render() -> None:
             ui.space()
             sync_button = ui.button("Sync now", icon="sync").props("no-caps color=primary")
 
+    # A sync that's already running — started from this tab, another tab, or before
+    # this page load happened at all — keeps going in the background regardless of
+    # what this render does (see ingest_runner's module docstring); this banner is
+    # purely so a tab that lands here mid-sync doesn't look like nothing is happening.
+    # ``ui.refreshable`` rather than a one-shot check because closing the dialog below
+    # (or the sync finishing while this tab watches) needs to bring it back down.
+    @ui.refreshable
+    def sync_status_row() -> None:
+        running = ingest_runner.current_run()
+        if running is None:
+            return
+        with chrome.panel():
+            with ui.row().classes("w-full items-center gap-3"):
+                ui.spinner(size="1.2rem").style(f"color:{chrome.ACCENT}")
+                ui.label(
+                    f"Sync in progress — {running.connector or 'all connections'} "
+                    f"(started {running.started_at.strftime('%H:%M UTC')})"
+                ).classes("text-sm").style(f"color:{chrome.INK_PRIMARY}")
+                ui.space()
+                ui.button(
+                    "View log",
+                    icon="visibility",
+                    on_click=lambda: _watch(running.total, running.connector),
+                ).props("flat no-caps")
+
+    sync_status_row()
+
     @ui.refreshable
     def connections_body() -> None:
         all_connections = load_all_connections(str(paths.connections_path()))
@@ -618,10 +644,10 @@ def render() -> None:
                     sync_row_button = (
                         ui.button(icon="sync").props("flat dense round").tooltip(f"Sync {cfg_name}")
                     )
-                    sync_row_button.on_click(
-                        lambda cfg_name=cfg_name, b=sync_row_button: _sync(b, cfg_name)
-                    )
-                    if not cfg_enabled:
+                    sync_row_button.on_click(lambda cfg_name=cfg_name: _sync(cfg_name))
+                    # Disabled during any sync, not just one this row started — this
+                    # dashboard runs one sync at a time (see ingest_runner.start_sync).
+                    if not cfg_enabled or ingest_runner.is_running():
                         sync_row_button.disable()
                     with ui.button(icon="more_vert").props("flat dense round"):
                         with ui.menu():
@@ -896,39 +922,42 @@ def render() -> None:
 
     connector_filter.on_value_change(history_body.refresh)
 
-    async def _sync(button: ui.button, connector: str | None = None) -> None:
-        """Runs both "Sync now" (``connector=None``, every enabled connector) and
-        each row's own Sync button (``connector=<its effective name>``) — same
-        subprocess call, same "Full refresh" checkbox, same start/end date range.
+    async def _watch(total: int, connector: str | None) -> None:
+        """Open the live-tail dialog and follow the current sync to completion —
+        whether *this* call is what just started it, or it's already running
+        from an earlier click and this is the "Sync in progress" banner's "View
+        log" button reattaching to it. Either way the dialog opens immediately
+        and tails the subprocess live instead of showing a bare spinner and
+        dumping everything at the end — a sync can run for minutes, and "is it
+        doing anything?" was the whole complaint. A "N of M cost pulls done"
+        counter (parsed from the same progress lines the tail already shows —
+        see _CONNECTOR_DONE_RE's own comment for why it's phrased around the
+        cost pull specifically, not the whole sync) and a "Download log" button
+        (the accumulated text, client-side — no server route or on-disk log
+        file needed) ride along for free.
 
-        The output dialog opens immediately and tails the subprocess live (via
-        :func:`stream_sync`) instead of showing a bare spinner and dumping
-        everything at the end — a sync can run for minutes, and "is it doing
-        anything?" was the whole complaint. A "N of M cost pulls done" counter
-        (parsed from the same progress lines the tail already shows — see
-        _CONNECTOR_DONE_RE's own comment for why it's phrased around the cost pull
-        specifically, not the whole sync) and a
-        "Download log" button (the accumulated text, client-side — no server
-        route or on-disk log file needed) ride along for free.
+        Cancelling this coroutine (dialog closed, tab navigated away) only
+        detaches this one viewer — the sync itself runs in ingest_runner's own
+        module-level background task and keeps going either way; see its
+        module docstring for why that split exists.
         """
-        start, end = range_state["start"], range_state["end"]
-
-        total = 1 if connector is not None else len(load_connections(str(paths.connections_path())))
-        lines: list[str] = []
-        done = 0
+        lines: list[str] = list(ingest_runner.recent_lines())
+        done = sum(1 for line in lines if _CONNECTOR_DONE_RE.match(line))
 
         with ui.dialog() as log_dialog, ui.card().style("width:700px; max-width:95vw;"):
             ui.label(f"Syncing {connector or 'all connections'}...").classes(
                 "text-sm font-semibold"
             ).style(f"color:{chrome.INK_PRIMARY}")
             progress_label = (
-                ui.label(f"0 / {total} cost pulls done")
+                ui.label(f"{done} / {total} cost pulls done")
                 .classes("text-xs")
                 .style(f"color:{chrome.INK_SECONDARY}")
             )
             log_widget = (
                 ui.log(max_lines=2000).classes("w-full").style("height:50vh; font-size:12px;")
             )
+            for line in lines:
+                log_widget.push(line)
             with ui.row().classes("w-full justify-end gap-2"):
                 ui.button(
                     "Download log",
@@ -960,36 +989,57 @@ def render() -> None:
             except RuntimeError:
                 client_gone = True
 
-        button.props("loading")
+        unsubscribe = ingest_runner.subscribe(_on_line)
         try:
-            returncode, _run_id = await stream_sync(
-                paths.connections_path(),
-                _on_line,
-                full_refresh=full_refresh_checkbox.value,
-                connector=connector,
-                start=start,
-                end=end,
-            )
-        except Exception as exc:  # noqa: BLE001 - surface a launch failure in the dialog, not a crash
-            _on_line(f"sync failed to start: {exc}")
-            returncode = 1
+            result = await ingest_runner.wait_for_current()
         finally:
-            try:
-                button.props(remove="loading")
-            except RuntimeError:
-                client_gone = True
+            unsubscribe()
 
-        if client_gone:
+        if client_gone or result is None:
             return
 
         # Unlike the interim per-line updates above, this fires only once the
         # subprocess has actually exited — so unlike those, "done" here really does
         # mean the whole sync (cost + efficiency + driver-health + GOLD rebuild).
+        returncode, _run_id = result
         progress_label.set_text(f"Sync finished — exit code {returncode}")
         ui.notify(
             "Sync completed" if returncode == 0 else "Sync failed — see output above",
             type="positive" if returncode == 0 else "negative",
         )
         history_body.refresh()
+        connections_body.refresh()
+        sync_status_row.refresh()
 
-    sync_button.on_click(lambda: _sync(sync_button))
+    async def _sync(connector: str | None = None) -> None:
+        """Starts a sync — "Sync now" (``connector=None``, every enabled
+        connector) or a row's own Sync button (``connector=<its effective
+        name>``) — then watches it via :func:`_watch`.
+
+        Starting and watching are deliberately two separate steps:
+        :func:`ingest_runner.start_sync`'s own background task is what keeps the
+        sync alive independent of this coroutine (see its module docstring);
+        :func:`_watch` merely observes it, and stops observing — not stops it —
+        if this tab goes away.
+        """
+        if ingest_runner.is_running():
+            ui.notify("A sync is already running", type="warning")
+            return
+        start, end = range_state["start"], range_state["end"]
+        total = 1 if connector is not None else len(load_connections(str(paths.connections_path())))
+        try:
+            await ingest_runner.start_sync(
+                paths.connections_path(),
+                full_refresh=full_refresh_checkbox.value,
+                connector=connector,
+                start=start,
+                end=end,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface a launch failure, not a crash
+            ui.notify(f"Sync failed to start: {exc}", type="negative")
+            return
+        sync_status_row.refresh()
+        connections_body.refresh()
+        await _watch(total, connector)
+
+    sync_button.on_click(lambda: _sync())

@@ -349,6 +349,16 @@ def _trend(rows: pd.DataFrame) -> None:
         chrome.panel_title("AI Spend by product")
         capped = chrome.cap_series(by_month, "product", "net_cost")
         fig = px.bar(capped, x="month", y="net_cost", color="product")
+        totals = capped.groupby("month")["net_cost"].sum()
+        for bar_month, total in totals.items():
+            fig.add_annotation(
+                x=bar_month,
+                y=total,
+                text=compact_money(float(total)),
+                showarrow=False,
+                yshift=10,
+                font=dict(size=11, color=chrome.INK_SECONDARY),
+            )
         chrome.plot(chrome.style_fig(fig, has_legend=True, category_x=True))
 
 

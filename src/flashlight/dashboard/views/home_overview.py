@@ -448,6 +448,16 @@ def render() -> None:
                             labels={"month": "", "net_cost": "", "provider": ""},
                         )
                         fig.update_layout(barmode="stack")
+                        month_totals = history.groupby("month")["net_cost"].sum()
+                        for bar_month, total in month_totals.items():
+                            fig.add_annotation(
+                                x=bar_month,
+                                y=total,
+                                text=compact_money(float(total)),
+                                showarrow=False,
+                                yshift=10,
+                                font=dict(size=11, color=chrome.INK_SECONDARY),
+                            )
                         chrome.plot(chrome.style_fig(fig, has_legend=True, category_x=True))
             with ui.column().classes("gap-0").style("flex:1;min-width:0;"):
                 with chrome.panel():
