@@ -20,6 +20,7 @@ from flashlight.focus.enums import (
     CommitmentDiscountCategory,
     CommitmentDiscountStatus,
     ComputeClass,
+    PricingCategory,
     ServiceCategory,
 )
 
@@ -81,6 +82,10 @@ class FocusRecord(BaseModel):
     service_name: str  # FOCUS: ServiceName
     sku_id: str | None = None  # FOCUS: SkuId
     region_id: str | None = None  # FOCUS: RegionId
+    # Conditional — null wherever a source has no pricing model to report (e.g.
+    # Tax rows, per spec, MUST be null here). DYNAMIC is FOCUS's own term for Spot/
+    # other provider-variable pricing; there is no separate "spot" value.
+    pricing_category: PricingCategory | None = None  # FOCUS: PricingCategory
 
     # ── Resource ────────────────────────────────────────────────────────────
     resource_id: str | None = None  # FOCUS: ResourceId

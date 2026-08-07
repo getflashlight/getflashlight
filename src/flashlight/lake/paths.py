@@ -101,6 +101,21 @@ def storage_locations_dir() -> Path:
     return home() / "storage_locations"
 
 
+def compute_instances_dir() -> Path:
+    """Compute-instance telemetry root, Hive-partitioned
+    ``provider_name=…/charge_month=…/``.
+
+    A sibling of :func:`metrics_dir` for the same reason :func:`driver_health_dir` is —
+    ``duck.register_metrics`` globs ``metrics_dir()/**/*.parquet`` recursively with
+    ``union_by_name=true``, so a differently-shaped dataset nested in that tree would
+    silently corrupt that view. Unlike :func:`storage_locations_dir`, the partition key
+    is ``charge_month`` (a real charge period, not a snapshot): the source
+    (``system.compute.node_timeline``) reports bounded historical activity, not
+    present-tense state — see :mod:`flashlight.lake.compute_instance_schema`.
+    """
+    return home() / "compute_instances"
+
+
 def gold_dir() -> Path:
     """GOLD root — one ``<view>.parquet`` per catalogued metric (consumer surface)."""
     return home() / "gold"
@@ -200,6 +215,7 @@ def ensure_layout() -> None:
         driver_health_dir(),
         ai_usage_dir(),
         storage_locations_dir(),
+        compute_instances_dir(),
         gold_dir(),
         runs_dir(),
         sync_logs_dir(),

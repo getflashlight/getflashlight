@@ -9,6 +9,7 @@ import duckdb
 import pytest
 
 from flashlight.focus import sql_mapping
+from flashlight.ingest._ec2_service_names import EC2_SERVICE_NAMES
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 from flashlight.ingest._s3_service_names import S3_SERVICE_NAMES
 from flashlight.ingest.base import IngestWindow
@@ -186,11 +187,15 @@ def test_scan_where_literal_omits_service_filter_when_allow_list_empty() -> None
 
 
 def test_aws_focus_config_defaults_to_redshift_and_s3() -> None:
-    # S3 is in the default pull because the Databricks backing-storage view needs it:
-    # Databricks' own bill is DBU-only, so the storage behind a Unity Catalog external
-    # location is billed by AWS under S3's ServiceName and is invisible without it.
+    # S3 and EC2 are in the default pull because the Databricks backing-storage/
+    # backing-compute views need them: Databricks' own bill is DBU-only, so the storage
+    # behind a Unity Catalog external location and the cloud VM behind a classic cluster
+    # are both billed by AWS and invisible without their ServiceNames included.
     config = AwsFocusConfig.model_validate({"s3_bucket": "b"})
-    assert set(config.include_services) == REDSHIFT_SERVICE_NAMES | S3_SERVICE_NAMES
+    assert (
+        set(config.include_services)
+        == REDSHIFT_SERVICE_NAMES | S3_SERVICE_NAMES | EC2_SERVICE_NAMES
+    )
 
 
 def test_aws_focus_config_include_services_can_be_narrowed_back_to_redshift() -> None:

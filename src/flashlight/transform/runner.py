@@ -30,6 +30,8 @@ from flashlight.lake.publish import atomic_publish
 from flashlight.transform.catalog import (
     AI_USAGE_BASE_VIEWS,
     AI_USAGE_GROUP,
+    COMPUTE_BASE_VIEWS,
+    COMPUTE_GROUP,
     DRIVER_HEALTH_BASE_VIEWS,
     DRIVER_HEALTH_GROUP,
     EFFICIENCY_BASE_VIEWS,
@@ -93,6 +95,7 @@ def _materialize_sources(con: duckdb.DuckDBPyConnection) -> None:
         ("metrics.driver_health", "_driver_health_mat"),
         ("metrics.ai_usage", "_ai_usage_mat"),
         ("metrics.storage_location", "_storage_location_mat"),
+        ("metrics.compute_instance", "_compute_instance_mat"),
     ):
         con.execute(f"CREATE TEMP TABLE {temp} AS SELECT * FROM {schema_view}")  # noqa: S608
         con.execute(f"CREATE OR REPLACE VIEW {schema_view} AS SELECT * FROM {temp}")  # noqa: S608
@@ -129,6 +132,7 @@ def build_gold() -> int:
         duck.register_driver_health(con)  # creates metrics.driver_health
         duck.register_ai_usage(con)  # creates metrics.ai_usage
         duck.register_storage_locations(con)  # creates metrics.storage_location
+        duck.register_compute_instances(con)  # creates metrics.compute_instance
         _materialize_sources(con)
 
         # gold.waste_record is config-driven (flashlight.efficiency.waste_rules), not a
@@ -167,13 +171,14 @@ def build_gold() -> int:
                 published += 1
 
         # Fixed cross-provider groups: efficiency/waste + driver health + policy
-        # compliance + AI serving usage, unfiltered.
+        # compliance + AI serving usage + backing storage/compute, unfiltered.
         fixed_groups = (
             (EFFICIENCY_GROUP, EFFICIENCY_BASE_VIEWS),
             (DRIVER_HEALTH_GROUP, DRIVER_HEALTH_BASE_VIEWS),
             (POLICY_GROUP, POLICY_BASE_VIEWS),
             (AI_USAGE_GROUP, AI_USAGE_BASE_VIEWS),
             (STORAGE_GROUP, STORAGE_BASE_VIEWS),
+            (COMPUTE_GROUP, COMPUTE_BASE_VIEWS),
         )
         for group, specs in fixed_groups:
             group_dir = staging / group

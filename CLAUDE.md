@@ -70,9 +70,11 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   Data Export, default) or `"cost_explorer"` (a coarser Cost Explorer fallback, no
   export needed but needs `ce:GetCostAndUsage`) explicitly; there's no automatic
   detection between them. `include_services` defaults to Redshift's own FOCUS service names
-  **+ Amazon S3** (`DEFAULT_INCLUDE_SERVICES`) — S3 is in the default because the storage
-  behind Unity Catalog is billed by AWS and Databricks' DBU-only bill can't show it (see
-  `docs/design/backing-storage.md`); it's a pushed-down `ServiceName IN (...)` predicate, and
+  **+ Amazon S3 + Amazon EC2** (`DEFAULT_INCLUDE_SERVICES`) — S3 and EC2 are in the default
+  because the storage and cloud-VM cost behind Unity Catalog / a classic Databricks
+  cluster are billed by AWS and Databricks' DBU-only bill can't show either (see
+  `docs/design/backing-storage.md`, `docs/design/backing-compute.md`); it's a pushed-down
+  `ServiceName IN (...)` predicate, and
   `[]` means the whole account. FOCUS-shaped sources share `connectors/_focus_map.py`.
   The **databricks** connector runs the vendored
   Databricks→FOCUS 1.3 query (`connectors/sql/databricks_focus_1_3.sql`, from
@@ -103,7 +105,8 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   provider page carries the **same five core tabs** — Trend & changes, Breakdown,
   Attribution (`views/attribution.py`), Efficiency & Waste (`views/efficiency_waste.py`) and
   Policy Compliance (`views/policy.py`) — plus per-provider extras (Databricks: AI Costs
-  (`views/ai_costs.py`) and Client Driver Health, its only producer). Home is
+  (`views/ai_costs.py`), Backing storage (`views/backing_storage.py`), Backing compute
+  (`views/backing_compute.py`) and Client Driver Health, its only producer). Home is
   the only cross-provider page; the old `/utilization` and `/leaderboard` pages are gone
   (`router._RETIRED_ROUTES` 307s them to Home). Redshift
   has no GOLD group of its own (its cost flows into `aws.*`; only its efficiency/waste
@@ -152,9 +155,11 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   signals, not spend/waste — `ai_usage` for the AI token views
   (`ai_usage.project_month`, `.requester_month`, `.model_month`, `.endpoint_month`), and
   `storage` for the backing-storage views (`storage.backing_storage_month`,
-  `storage.storage_location`) — that last one cross-provider **by construction**, since
-  every row carries two provider columns: `billing_provider_name` (who invoices it, AWS)
-  and `platform_provider_name` (whose metadata claims the bucket, Databricks).
+  `storage.storage_location`) and `compute` for the backing-compute views
+  (`compute.backing_compute_month`, `compute.compute_instance`) — those last two
+  cross-provider **by construction**, since every row carries two provider columns:
+  `billing_provider_name` (who invoices it, AWS) and `platform_provider_name` (whose
+  metadata claims the bucket/instance, Databricks).
   **Every fixed group must be in `catalog.FIXED_GROUPS`** — one missing from that set
   becomes a *phantom provider*: `discover_provider_groups()` hands it to the nav and
   `router._provider_page` renders `provider_focus` against a `<group>.monthly_bill` that
@@ -164,12 +169,13 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   its own dashboard page, and efficiency/waste is a **core tab on every one of them** —
   including providers with no telemetry, which get a named empty state rather than a
   hidden tab ("never measured" must not look like "nothing to find"). Only AI Costs,
-  Backing storage and driver health are Databricks-only extras — the first and last
-  because Databricks is their sole *producer*, Backing storage because it has two
-  producers (`aws_focus` for the S3 cost, `databricks` for the Unity Catalog bucket map)
-  but a single *subject*, which serves the same purpose: keep a page-specific tab off
-  every other provider page (see `router.py`). Policy compliance is a core tab.
-  See `transform/catalog.py`.
+  Backing storage, Backing compute and driver health are Databricks-only extras — the
+  first and last because Databricks is their sole *producer*, Backing storage/Backing
+  compute because each has two producers (`aws_focus` for the AWS cost, `databricks` for
+  the Databricks-side map — Unity Catalog's bucket map, or `system.compute.node_timeline`'s
+  instance/cluster map) but a single *subject*, which serves the same purpose: keep a
+  page-specific tab off every other provider page (see `router.py`). Policy compliance
+  is a core tab. See `transform/catalog.py`.
 - **The efficiency views are one plane at three stages, shown per provider.**
   `metrics.efficiency_record` → `efficiency.utilization_entity_month` (measurement: how
   hard was it working?) → `efficiency.waste_record` (verdict: what's recoverable?) →
@@ -221,13 +227,19 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   classes / platforms add **rows** (a connector emitting `EfficiencyRecord`), not views.
   Its siblings follow the identical pattern with their own model + Parquet root + optional
   best-effort `Connector` hook: `DriverHealthRecord` (`driver_health/`), `AiUsageRecord`
-  (`ai_usage/`), and `StorageLocationRecord` (`storage_locations/` →
-  `metrics.storage_location`, via `Connector.fetch_storage_locations`). Each root is a
+  (`ai_usage/`), `StorageLocationRecord` (`storage_locations/` →
+  `metrics.storage_location`, via `Connector.fetch_storage_locations`), and
+  `ComputeInstanceRecord` (`compute_instances/` → `metrics.compute_instance`, via
+  `Connector.fetch_compute_instances`). Each root is a
   **sibling** of `metrics_dir()`, never nested inside it — `duck.register_metrics` globs
   `metrics_dir()/**/*.parquet` with `union_by_name`, so a differently-shaped dataset in
   that tree would silently corrupt the view. The storage plane is partitioned by
   `snapshot_month`, **not** `charge_month`: Unity Catalog exposes only current state, so
   it's a point-in-time inventory, not a charge period (and so not in `PERIOD_DIMENSIONS`).
+  The compute-instance plane, unlike storage, IS partitioned by `charge_month` and
+  partition-replaced by window like `DriverHealthRecord` — `system.compute.node_timeline`
+  reports bounded historical activity, not present-tense state (see
+  `docs/design/backing-compute.md`).
 - **`spend_trend_daily` is one row per (day, service), NOT per day.** It carries
   `service_name` so a service-scoped page (`/aws`) can have a daily series at all. Any
   provider-wide daily consumer must `sum(net_cost) ... GROUP BY charge_day` — forgetting
@@ -299,8 +311,8 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
 - **Display label ≠ `provider_name`.** `data.provider_label` is what a human reads and is
   **derived, not a constant**: `_GROUP_LABEL_RESOLVERS`/`data._aws_label` reads "AWS
   Redshift" while every `service_name` in the `aws` group is one of Redshift's own, and
-  plain "AWS" once it holds more (`include_services` now defaults to Redshift **+ S3**, so
-  a static string was wrong in one direction or the other). It fails toward the *narrower*
+  plain "AWS" once it holds more (`include_services` now defaults to Redshift **+ S3 +
+  EC2**, so a static string was wrong in one direction or the other). It fails toward the *narrower*
   label on any query problem — under-claiming beats implying the whole account is there.
   `data.provider_name_for_group` is the value to filter or join on. Never put a label in a
   SQL predicate or use it as a lookup key into another view's rows.
@@ -310,11 +322,14 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   keys off it. `provider_name` is the top-level split; a "total across providers" is
   the consumer's arithmetic over per-provider views, never a GOLD column.
   The line, sharply: joining AWS **cost** to Databricks **metadata** is allowed and is
-  exactly what `storage.backing_storage_month` does (S3 rows labelled by Unity Catalog's
-  bucket list). Joining AWS cost to Databricks *cost* is the removed TCO capability. The
-  storage views live in their own GOLD group so nothing writes into `gold/databricks/` —
-  `databricks.monthly_bill` and the Databricks KPIs are untouched *by construction*, not
-  by discipline (pinned by `test_backing_storage_never_changes_databricks_spend`).
+  exactly what `storage.backing_storage_month` and `compute.backing_compute_month` do
+  (S3 rows labelled by Unity Catalog's bucket list; EC2 rows labelled by
+  `system.compute.node_timeline`'s instance/cluster map). Joining AWS cost to Databricks
+  *cost* is the removed TCO capability. Both views live in their own GOLD groups so
+  nothing writes into `gold/databricks/` — `databricks.monthly_bill` and the Databricks
+  KPIs are untouched *by construction*, not by discipline (pinned by
+  `test_backing_storage_never_changes_databricks_spend` /
+  `test_backing_compute_never_changes_databricks_spend`).
 - **Backing storage counts MANAGED storage only, and is a floor not a total**
   (`065_gold_storage.sql`, `views/backing_storage.py`, see
   `docs/design/backing-storage.md`). `mapping='databricks'` requires
@@ -351,6 +366,34 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   a bucket (no `resource_id`). An empty metadata pull is a **no-op, not a purge**.
   The tab deliberately shows **no per-bucket list of unmanaged buckets**: on a real account
   (2,008 buckets, one metastore root) it buried the one number the tab exists to report.
+- **Backing compute is the identical shape as backing storage, for a CLASSIC cluster's
+  cloud VM instead of its storage bucket** (`066_gold_compute.sql`,
+  `views/backing_compute.py`, see `docs/design/backing-compute.md`). The map comes from
+  Databricks' own `system.compute.node_timeline` (`instance_id`, `cluster_id`, `driver`,
+  `node_type`), pulled by `DatabricksConnector.fetch_compute_instances` on a SQL
+  warehouse — unlike storage's pure-REST bucket pull. `mapping='databricks'` means the
+  EC2 instance's id AND charge_month matched a row there; `unmapped` deliberately
+  includes non-instance EC2-service resources (EBS volumes, Elastic IPs) that carry a
+  ResourceId but never match an instance. **CLASSIC COMPUTE ONLY, so the figure is a
+  floor, not a total** — `node_timeline` has zero rows for serverless SQL
+  warehouses/jobs/DLT pipelines (no customer-visible instance exists at all), and that
+  gap grows as serverless adoption grows; there is no equivalent of storage's deferred
+  `AccountClient.storage.list()` fix here, because there is genuinely nothing to list.
+  One structural improvement over storage: `system.compute.node_timeline` reports
+  **bounded historical activity** (rows carry `start_time`/`end_time`), not present-tense
+  state, so `ComputeInstanceRecord` partition-replaces by real `charge_month` (like
+  `DriverHealthRecord`) instead of storage's present-tense-snapshot-applied-to-history
+  hack, and the GOLD join matches `(instance_id, charge_month)` rather than one snapshot
+  against every month of cost. The cost is `system.compute.node_timeline`'s ~90-day
+  retention: an instance's activity before that window at the time of a given ingest can
+  never be recovered after the fact. EC2 joined the S3-era default
+  `DEFAULT_INCLUDE_SERVICES` (`ingest/_ec2_service_names.py`) for the same reason S3 did
+  — the mapped figure needs a denominator by default — and is excluded from `aws.*`
+  GOLD via `silver.focus_provider_bill` the same way S3 is. The KPI card
+  (`backing_compute.kpi_card`) shares Backing storage's hue (both are "a satellite AWS
+  bill, not a slice of net") and is **omitted, never rendered as $0**, when nothing is
+  mapped. ⚠ The exact FOCUS `ServiceName` for EC2 is UNVALIDATED against a live export —
+  same caveat class as the S3/Redshift keyword tables.
 - **Partition-replace ingest**: each run is authoritative for the (connector,
   charge-period window) it pulls — `lake.bronze.write_window` removes that
   connector's `x_source_connector=…/charge_month=…/` partition dirs across the

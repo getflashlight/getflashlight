@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from flashlight.transform.catalog import (
     AI_USAGE_BASE_VIEWS,
+    COMPUTE_BASE_VIEWS,
     DRIVER_HEALTH_BASE_VIEWS,
     EFFICIENCY_BASE_VIEWS,
     MEASURE_UNITS,
@@ -22,6 +23,7 @@ _ALL_SPECS = (
     *POLICY_BASE_VIEWS,
     *AI_USAGE_BASE_VIEWS,
     *STORAGE_BASE_VIEWS,
+    *COMPUTE_BASE_VIEWS,
 )
 
 
@@ -63,6 +65,7 @@ def test_build_catalog_expands_per_group() -> None:
         + len(POLICY_BASE_VIEWS)
         + len(AI_USAGE_BASE_VIEWS)
         + len(STORAGE_BASE_VIEWS)
+        + len(COMPUTE_BASE_VIEWS)
     )
 
     names = {v.name for v in cat}
@@ -73,6 +76,7 @@ def test_build_catalog_expands_per_group() -> None:
     assert "policy.policy_record" in names
     assert "ai_usage.project_month" in names
     assert "storage.backing_storage_month" in names
+    assert "compute.backing_compute_month" in names
     assert "aws.ai_spend_month" in names
     assert "aws.commitment_summary_month" in names
     assert "aws.invoice_reconciliation_month" in names
@@ -101,6 +105,7 @@ def test_empty_provider_set_still_has_fixed_groups() -> None:
         | {f"policy.{s.view}" for s in POLICY_BASE_VIEWS}
         | {f"ai_usage.{s.view}" for s in AI_USAGE_BASE_VIEWS}
         | {f"storage.{s.view}" for s in STORAGE_BASE_VIEWS}
+        | {f"compute.{s.view}" for s in COMPUTE_BASE_VIEWS}
     )
     assert {v.name for v in cat} == expected
 
@@ -117,6 +122,7 @@ def test_fixed_groups_covers_every_non_provider_group() -> None:
     """
     from flashlight.transform.catalog import (
         AI_USAGE_GROUP,
+        COMPUTE_GROUP,
         DRIVER_HEALTH_GROUP,
         EFFICIENCY_GROUP,
         FIXED_GROUPS,
@@ -130,6 +136,7 @@ def test_fixed_groups_covers_every_non_provider_group() -> None:
         POLICY_GROUP,
         AI_USAGE_GROUP,
         STORAGE_GROUP,
+        COMPUTE_GROUP,
     }
 
 
@@ -143,7 +150,7 @@ def test_storage_group_is_not_discovered_as_a_provider(tmp_path, monkeypatch) ->
 
     monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
     gold = tmp_path / "gold"
-    for group in ("aws", "databricks", "storage", "efficiency", "ai_usage"):
+    for group in ("aws", "databricks", "storage", "compute", "efficiency", "ai_usage"):
         (gold / group).mkdir(parents=True)
         (gold / group / "some_view.parquet").touch()
 

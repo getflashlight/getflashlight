@@ -55,27 +55,35 @@ def _headline_month(start: date, end: date) -> date | None:
 # The provider pages still show net, which is the correct number for "what did I owe?".
 _COST = "gross_cost"
 
-# Home-page presentation: ``aws.*`` GOLD excludes Amazon S3 (see
-# ``silver.focus_provider_bill``). Databricks-backing buckets live only in
-# ``storage.backing_storage_month`` as ``Databricks Storage``. This page folds that
-# mapped storage into the Databricks stack so data-cloud spend isn't missing it.
-# ``databricks.monthly_bill`` / Net Spend stay DBU-only.
+# Home-page presentation: ``aws.*`` GOLD excludes Amazon S3 and Amazon EC2 (see
+# ``silver.focus_provider_bill``). Databricks-backing buckets/instances live only in
+# ``storage.backing_storage_month`` / ``compute.backing_compute_month`` as
+# ``Databricks Storage`` / ``Databricks Compute``. This page folds that mapped spend
+# into the Databricks stack so data-cloud spend isn't missing it.
+# ``databricks.monthly_bill`` / Net Spend stay DBU-only — see
+# ``views/provider_focus.py``'s ``footprint_card`` for the analogous, explicitly-labelled
+# combined figure on the Databricks page itself.
 _DBX_STORAGE_DRIVER = "Databricks Storage"
 _STORAGE_GROUP = "storage"
 _STORAGE_VIEW = "backing_storage_month"
+_DBX_COMPUTE_DRIVER = "Databricks Compute"
+_COMPUTE_GROUP = "compute"
+_COMPUTE_VIEW = "backing_compute_month"
 
 
-def _databricks_storage_by_month(sm: date, cap: date) -> dict[date, float]:
-    """``charge_month → gross_cost`` for ``mapping='databricks'`` storage rows.
+def _mapped_databricks_by_month(group: str, view: str, sm: date, cap: date) -> dict[date, float]:
+    """``charge_month → gross_cost`` for ``mapping='databricks'`` rows in a backing-* view.
 
-    Empty when the storage view is unpublished or has no managed rows — callers treat
-    that as a no-op so a lake without the UC map keeps the raw provider split.
+    Empty when the view is unpublished or has no managed rows — callers treat that as a
+    no-op so a lake without the map keeps the raw provider split. Shared by
+    ``_databricks_storage_by_month``/``_databricks_compute_by_month``: same shape
+    (``mapping``/``gross_cost``/``charge_month``), different GOLD group.
     """
-    if not gold_view_published(_STORAGE_GROUP, _STORAGE_VIEW):
+    if not gold_view_published(group, view):
         return {}
     try:
         df = gold_df(
-            f"SELECT charge_month, sum(gross_cost) AS c FROM {_STORAGE_GROUP}.{_STORAGE_VIEW} "
+            f"SELECT charge_month, sum(gross_cost) AS c FROM {group}.{view} "
             f"WHERE mapping = 'databricks' "
             f"AND charge_month >= '{sm}' AND charge_month <= '{cap}' "
             "GROUP BY charge_month"
@@ -92,24 +100,45 @@ def _databricks_storage_by_month(sm: date, cap: date) -> dict[date, float]:
     return out
 
 
+def _databricks_storage_by_month(sm: date, cap: date) -> dict[date, float]:
+    return _mapped_databricks_by_month(_STORAGE_GROUP, _STORAGE_VIEW, sm, cap)
+
+
+def _databricks_compute_by_month(sm: date, cap: date) -> dict[date, float]:
+    return _mapped_databricks_by_month(_COMPUTE_GROUP, _COMPUTE_VIEW, sm, cap)
+
+
+def _sum_by_month(*monthly: dict[date, float]) -> dict[date, float]:
+    """Sum several ``charge_month → amount`` dicts (e.g. storage + compute) into one."""
+    out: dict[date, float] = {}
+    for d in monthly:
+        for cm, amount in d.items():
+            out[cm] = out.get(cm, 0.0) + amount
+    return out
+
+
 def _include_storage(
     group: str, cur: float, prev: float, storage_cur: float, storage_prev: float
 ) -> tuple[float, float]:
-    """Add Databricks Storage onto the Databricks totals (aws.* already excludes S3)."""
+    """Add mapped backing spend (storage, compute, or both combined by the caller) onto
+    the Databricks totals (aws.* already excludes the AWS-billed services behind it)."""
     if group == "databricks":
         return cur + storage_cur, prev + storage_prev
     return cur, prev
 
 
-def _with_storage_history(history: pd.DataFrame, storage: dict[date, float]) -> pd.DataFrame:
-    """Fold Databricks Storage into the Databricks stack of the spend-trend chart."""
-    if history.empty or not storage:
+def _with_extra_databricks(history: pd.DataFrame, extra: dict[date, float]) -> pd.DataFrame:
+    """Fold extra mapped spend (storage or compute) into the Databricks stack of the
+    spend-trend chart. Called once per backing-* plane — each call only ever touches
+    the ``databricks`` rows, so calling it twice (storage, then compute) composes
+    correctly without a combined-dict merge step."""
+    if history.empty or not extra:
         return history
     hist = history.copy()
     hist["_cm"] = pd.to_datetime(hist["charge_month"]).dt.date
     extras: list[dict[str, object]] = []
     dbx_label = provider_label("databricks")
-    for cm, amount in storage.items():
+    for cm, amount in extra.items():
         dbx_mask = (hist["group"] == "databricks") & (hist["_cm"] == cm)
         if dbx_mask.any():
             hist.loc[dbx_mask, "net_cost"] = hist.loc[dbx_mask, "net_cost"] + amount
@@ -131,37 +160,44 @@ def _with_storage_history(history: pd.DataFrame, storage: dict[date, float]) -> 
 
 
 def _home_movers(month: date, prior: date, *, limit: int = 8) -> pd.DataFrame:
-    """Biggest movers plus Databricks Storage MoM from the storage GOLD plane.
+    """Biggest movers plus Databricks Storage/Compute MoM from their backing-* GOLD planes.
 
-    ``aws.*`` no longer carries Amazon S3, so there is nothing to rename or residual-
-    split — only inject the mapped storage delta under Databricks.
+    ``aws.*`` no longer carries Amazon S3 or Amazon EC2, so there is nothing to rename or
+    residual-split — only inject each mapped delta under Databricks, as its own driver row
+    (never combined into one "Databricks backing spend" row — a reader asking "what moved"
+    needs to know whether it was the storage bill or the compute bill that moved).
     """
     movers = cross_provider_movers(month, prior, exclude_credits=True, limit=max(limit, 32))
     if "databricks" not in discover_provider_groups():
         return movers.head(limit) if not movers.empty else movers
-    storage = _databricks_storage_by_month(prior, month)
-    mapped_cur = storage.get(month, 0.0)
-    mapped_prev = storage.get(prior, 0.0)
-    mapped_delta = mapped_cur - mapped_prev
     frames: list[pd.DataFrame] = []
     if not movers.empty:
         frames.append(movers)
-    if abs(mapped_delta) > 1e-9:
-        frames.append(
-            pd.DataFrame(
-                [
-                    {
-                        "provider": provider_label("databricks"),
-                        "driver": _DBX_STORAGE_DRIVER,
-                        "cost_delta": mapped_delta,
-                        "cost_pct_change": (
-                            round(100 * mapped_delta / mapped_prev, 1) if mapped_prev else None
-                        ),
-                        "type": "Storage",
-                    }
-                ]
+    for by_month, driver, kind in (
+        (_databricks_storage_by_month(prior, month), _DBX_STORAGE_DRIVER, "Storage"),
+        (_databricks_compute_by_month(prior, month), _DBX_COMPUTE_DRIVER, "Compute"),
+    ):
+        mapped_cur = by_month.get(month, 0.0)
+        mapped_prev = by_month.get(prior, 0.0)
+        mapped_delta = mapped_cur - mapped_prev
+        if abs(mapped_delta) > 1e-9:
+            frames.append(
+                pd.DataFrame(
+                    [
+                        {
+                            "provider": provider_label("databricks"),
+                            "driver": driver,
+                            "cost_delta": mapped_delta,
+                            "cost_pct_change": (
+                                round(100 * mapped_delta / mapped_prev, 1)
+                                if mapped_prev
+                                else None
+                            ),
+                            "type": kind,
+                        }
+                    ]
+                )
             )
-        )
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
@@ -226,7 +262,8 @@ def _provider_history(groups: list[str], start: date, end: date) -> pd.DataFrame
     history = pd.concat(frames, ignore_index=True).sort_values("charge_month")
     if "databricks" not in groups:
         return history
-    return _with_storage_history(history, _databricks_storage_by_month(sm, cap))
+    history = _with_extra_databricks(history, _databricks_storage_by_month(sm, cap))
+    return _with_extra_databricks(history, _databricks_compute_by_month(sm, cap))
 
 
 def _recoverable_by_provider(month: date) -> pd.Series:
@@ -305,13 +342,16 @@ def render() -> None:
             return
 
         prior = (pd.Timestamp(month) - pd.DateOffset(months=1)).date()
-        # Fold storage-plane Databricks Storage into Databricks totals (aws.* already
-        # excludes S3 — see silver.focus_provider_bill).
-        storage = (
-            _databricks_storage_by_month(prior, month) if "databricks" in groups else {}
-        )
-        storage_cur = storage.get(month, 0.0)
-        storage_prev = storage.get(prior, 0.0)
+        # Fold Databricks Storage + Databricks Compute into Databricks totals (aws.*
+        # already excludes S3/EC2 — see silver.focus_provider_bill). Combined into one
+        # amount here (unlike _home_movers, which keeps them as separate driver rows) —
+        # the KPI row is a single "Databricks" total, not a per-source breakdown.
+        backing = _sum_by_month(
+            _databricks_storage_by_month(prior, month),
+            _databricks_compute_by_month(prior, month),
+        ) if "databricks" in groups else {}
+        storage_cur = backing.get(month, 0.0)
+        storage_prev = backing.get(prior, 0.0)
         rows: list[dict[str, object]] = []
         total_cur = total_prev = 0.0
         for group in groups:
@@ -378,11 +418,13 @@ def render() -> None:
         _credits_note(month)
 
         history = _provider_history(groups, start, end)
-        trend_storage = (
-            bool(_databricks_storage_by_month(start.replace(day=1), end.replace(day=1)))
-            if "databricks" in groups
-            else False
-        )
+        sm, cap = start.replace(day=1), end.replace(day=1)
+        trend_extras: list[str] = []
+        if "databricks" in groups:
+            if _databricks_storage_by_month(sm, cap):
+                trend_extras.append("storage (AWS-billed S3)")
+            if _databricks_compute_by_month(sm, cap):
+                trend_extras.append("compute (AWS-billed EC2)")
         with ui.row().classes("w-full gap-4 items-stretch"):
             with ui.column().classes("gap-0").style("flex:2;min-width:0;"):
                 if not history.empty:
@@ -390,8 +432,8 @@ def render() -> None:
                         chrome.panel_title("Spend trend by provider")
                         chrome.section_caption(
                             "Stacked monthly charges — Databricks includes its managed "
-                            "storage (AWS-billed S3)."
-                            if trend_storage
+                            + " and ".join(trend_extras) + "."
+                            if trend_extras
                             else "Stacked monthly charges — each color is a cloud provider."
                         )
                         colors = provider_color_map(

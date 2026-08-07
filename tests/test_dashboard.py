@@ -1640,6 +1640,7 @@ _DATABRICKS_TABS = (
     "Breakdown",
     "AI Costs",
     "Databricks Storage",
+    "Databricks Compute",
     "Attribution",
     "Efficiency & Waste",
     "Policy Compliance",
@@ -3406,3 +3407,308 @@ def test_home_folds_databricks_storage_from_storage_plane(lake_home) -> None:  #
             assert "Amazon Simple Storage Service" not in drivers
 
     asyncio.run(_check())
+
+
+def test_home_folds_databricks_compute_from_compute_plane(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Home adds mapped Databricks Compute onto Databricks; aws.* GOLD has no EC2.
+
+    The identical shape as ``test_home_folds_databricks_storage_from_storage_plane``,
+    for EC2/backing-compute instead of S3/backing-storage — Home folds mapped EC2 into
+    the Databricks stack / movers, never renames an AWS EC2 service line.
+    ``databricks.monthly_bill`` stays DBU-only.
+    """
+    from flashlight.lake import bronze
+    from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
+    from flashlight.lake.compute_instances import write_compute_instances
+    from flashlight.transform.runner import build_gold
+
+    def _on(day: int, month: int) -> datetime:
+        return datetime(2026, month, day, tzinfo=UTC)
+
+    def _dbx(month: int, amount: str = "100") -> FocusRecord:
+        when = _on(15, month)
+        last = 31 if month == 5 else 30
+        return FocusRecord(
+            provider_name=ProviderName.DATABRICKS,
+            billing_account_id="acct",
+            billing_period_start=date(2026, month, 1),
+            billing_period_end=date(2026, month, last),
+            charge_period_start=when,
+            charge_period_end=when,
+            billed_cost=Decimal(amount),
+            effective_cost=Decimal(amount),
+            list_cost=Decimal(amount),
+            charge_category=ChargeCategory.USAGE,
+            service_category=ServiceCategory.ANALYTICS,
+            service_name="JOBS",
+            tags={},
+            x_compute_class=ComputeClass.NOT_APPLICABLE,
+            x_source_connector="t",
+        )
+
+    def _ec2_usage(day: int, month: int, amount: str, resource_id: str | None) -> FocusRecord:
+        last = 31 if month == 5 else 30
+        when = _on(day, month)
+        return FocusRecord(
+            provider_name=ProviderName.AWS,
+            billing_account_id="acct",
+            billing_period_start=date(2026, month, 1),
+            billing_period_end=date(2026, month, last),
+            charge_period_start=when,
+            charge_period_end=when,
+            billed_cost=Decimal(amount),
+            effective_cost=Decimal(amount),
+            list_cost=Decimal(amount),
+            charge_category=ChargeCategory.USAGE,
+            service_category=ServiceCategory.COMPUTE,
+            service_name="Amazon Elastic Compute Cloud",
+            resource_id=resource_id,
+            tags={},
+            x_compute_class=ComputeClass.NOT_APPLICABLE,
+            x_source_connector="t",
+        )
+
+    def _aws_month(month: int, *, rs: str, managed: str, unmapped: str) -> list[FocusRecord]:
+        last = 31 if month == 5 else 30
+
+        def stamp(rec: FocusRecord, day: int) -> FocusRecord:
+            rec.billing_period_start = date(2026, month, 1)
+            rec.billing_period_end = date(2026, month, last)
+            rec.charge_period_start = _on(day, month)
+            rec.charge_period_end = _on(day, month)
+            return rec
+
+        return [
+            stamp(_redshift_usage(14, rs), 14),
+            _ec2_usage(15, month, managed, "i-managed1"),
+            _ec2_usage(16, month, unmapped, "i-unmapped9"),
+            _dbx(month),
+        ]
+
+    bronze.write_window(
+        "t",
+        IngestWindow(date(2026, 5, 1), date(2026, 5, 31)),
+        _aws_month(5, rs="1000", managed="200", unmapped="50"),
+        ingest_run_id="r1",
+    )
+    bronze.write_window(
+        "t",
+        IngestWindow(date(2026, 6, 1), date(2026, 6, 30)),
+        _aws_month(6, rs="1000", managed="300", unmapped="50"),
+        ingest_run_id="r2",
+    )
+    write_compute_instances(
+        IngestWindow(date(2026, 5, 1), date(2026, 6, 30)),
+        [
+            ComputeInstanceRecord(
+                provider_name="Databricks",
+                charge_month=date(2026, 5, 1),
+                cluster_id="c1",
+                instance_id="i-managed1",
+                is_driver=True,
+                x_source_connector="databricks",
+            ),
+            ComputeInstanceRecord(
+                provider_name="Databricks",
+                charge_month=date(2026, 6, 1),
+                cluster_id="c1",
+                instance_id="i-managed1",
+                is_driver=True,
+                x_source_connector="databricks",
+            ),
+        ],
+    )
+    build_gold()
+
+    from flashlight.dashboard.views import home_overview
+    from flashlight.gold.reader import run_select
+
+    dbx_bill = float(
+        run_select(
+            "SELECT sum(gross_cost) AS c FROM databricks.monthly_bill "
+            "WHERE charge_month = '2026-06-01'"
+        )[0]["c"]
+    )
+    assert dbx_bill == pytest.approx(100.0)
+    aws_bill = float(
+        run_select(
+            "SELECT sum(gross_cost) AS c FROM aws.monthly_bill "
+            "WHERE charge_month = '2026-06-01'"
+        )[0]["c"]
+    )
+    # Redshift only — EC2 excluded from aws.* GOLD.
+    assert aws_bill == pytest.approx(1000.0)
+    ec2_in_aws = float(
+        run_select(
+            "SELECT coalesce(sum(gross_cost), 0) AS c FROM aws.spend_by_service_month "
+            "WHERE service_name = 'Amazon Elastic Compute Cloud'"
+        )[0]["c"]
+    )
+    assert ec2_in_aws == 0.0
+
+    month, prior = date(2026, 6, 1), date(2026, 5, 1)
+    compute = home_overview._databricks_compute_by_month(prior, month)
+    assert compute[month] == pytest.approx(300.0)
+    assert compute[prior] == pytest.approx(200.0)
+
+    aws_cur, aws_prev = home_overview._include_storage(
+        "aws", 1000.0, 1000.0, compute[month], compute[prior]
+    )
+    dbx_cur, dbx_prev = home_overview._include_storage(
+        "databricks", 100.0, 100.0, compute[month], compute[prior]
+    )
+    assert aws_cur == pytest.approx(1000.0)
+    assert aws_prev == pytest.approx(1000.0)
+    assert dbx_cur == pytest.approx(400.0)
+    assert dbx_prev == pytest.approx(300.0)
+
+    movers = home_overview._home_movers(month, prior)
+    assert not movers.empty
+    drivers = list(movers["driver"])
+    assert "Databricks Compute" in drivers
+    assert "Amazon Elastic Compute Cloud" not in drivers
+    dbx_row = movers.loc[movers["driver"] == "Databricks Compute"].iloc[0]
+    assert dbx_row["provider"] == "Databricks"
+    assert float(dbx_row["cost_delta"]) == pytest.approx(100.0)
+
+    history = home_overview._provider_history(["aws", "databricks"], prior, date(2026, 6, 30))
+    jun_rows = history[history["month"] == "2026-06"]
+    by_group = {str(r.group): float(r.net_cost) for r in jun_rows.itertuples()}
+    assert by_group["aws"] == pytest.approx(1000.0)
+    assert by_group["databricks"] == pytest.approx(400.0)
+
+
+# ── Total Databricks footprint card (databricks_footprint.py) ────────────────────
+def test_footprint_card_omitted_when_no_backing_spend(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """A Databricks-only lake (no S3/EC2 mapped anywhere) must not get a footprint
+    card identical to Net Spend — that would just be visual noise beside it."""
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    bronze.write_window(
+        "t",
+        IngestWindow(date(2026, 5, 1), date(2026, 5, 31)),
+        [_dbx_rec(5, "100")],
+        ingest_run_id="r1",
+    )
+    build_gold()
+
+    from flashlight.dashboard.views.databricks_footprint import footprint_card
+
+    assert footprint_card(date(2026, 5, 1), date(2026, 5, 31)) is None
+
+
+def _dbx_rec(day: int, amount: str) -> FocusRecord:
+    when = datetime(2026, 5, day, tzinfo=UTC)
+    return FocusRecord(
+        provider_name=ProviderName.DATABRICKS,
+        billing_account_id="acct",
+        billing_period_start=date(2026, 5, 1),
+        billing_period_end=date(2026, 5, 31),
+        charge_period_start=when,
+        charge_period_end=when,
+        billed_cost=Decimal(amount),
+        effective_cost=Decimal(amount),
+        list_cost=Decimal(amount),
+        charge_category=ChargeCategory.USAGE,
+        service_category=ServiceCategory.ANALYTICS,
+        service_name="JOBS",
+        tags={},
+        x_compute_class=ComputeClass.NOT_APPLICABLE,
+        x_source_connector="t",
+    )
+
+
+def test_footprint_card_combines_dbu_storage_and_compute(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Net Spend (DBU) + Backing storage + Backing compute, in one clearly-labelled
+    card — and ``databricks.monthly_bill`` itself is untouched by any of it."""
+    from flashlight.lake import bronze
+    from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
+    from flashlight.lake.compute_instances import write_compute_instances
+    from flashlight.lake.storage_location_schema import StorageLocationRecord
+    from flashlight.lake.storage_locations import write_storage_locations
+    from flashlight.transform.runner import build_gold
+
+    def _s3(day: int, amount: str) -> FocusRecord:
+        rec = _dbx_rec(day, "0")
+        rec.provider_name = ProviderName.AWS
+        rec.service_name = "Amazon Simple Storage Service"
+        rec.service_category = ServiceCategory.STORAGE
+        rec.resource_id = "arn:aws:s3:::acme-uc-root"
+        rec.effective_cost = rec.billed_cost = rec.list_cost = Decimal(amount)
+        return rec
+
+    def _ec2(day: int, amount: str) -> FocusRecord:
+        rec = _dbx_rec(day, "0")
+        rec.provider_name = ProviderName.AWS
+        rec.service_name = "Amazon Elastic Compute Cloud"
+        rec.service_category = ServiceCategory.COMPUTE
+        rec.resource_id = "i-managed1"
+        rec.effective_cost = rec.billed_cost = rec.list_cost = Decimal(amount)
+        return rec
+
+    bronze.write_window(
+        "t",
+        IngestWindow(date(2026, 5, 1), date(2026, 5, 31)),
+        [_dbx_rec(15, "100"), _s3(16, "40"), _ec2(17, "60")],
+        ingest_run_id="r1",
+    )
+    write_storage_locations(
+        [
+            StorageLocationRecord(
+                provider_name="Databricks",
+                snapshot_month=date(2026, 5, 1),
+                location_kind="metastore_root",
+                location_name="acme",
+                url="s3://acme-uc-root",
+                scheme="s3",
+                cloud_provider_name="AWS",
+                bucket_name="acme-uc-root",
+                key_prefix=None,
+                x_source_connector="databricks",
+            ),
+        ]
+    )
+    write_compute_instances(
+        IngestWindow(date(2026, 5, 1), date(2026, 5, 31)),
+        [
+            ComputeInstanceRecord(
+                provider_name="Databricks",
+                charge_month=date(2026, 5, 1),
+                cluster_id="c1",
+                instance_id="i-managed1",
+                is_driver=True,
+                x_source_connector="databricks",
+            ),
+        ],
+    )
+    build_gold()
+
+    from flashlight.dashboard.views.databricks_footprint import footprint_card
+    from flashlight.gold.reader import run_select
+
+    card = footprint_card(date(2026, 5, 1), date(2026, 5, 31))
+    assert card is not None
+    title, value, sub = card[0], card[1], card[2]
+    assert title == "Total Databricks footprint"
+    assert value == "$200"  # 100 DBU + 40 storage + 60 compute
+    assert "DBU" in sub and "AWS infra" in sub
+
+    # Net Spend itself must be exactly the DBU figure, untouched.
+    dbu = float(
+        run_select(
+            "SELECT sum(net_cost) AS c FROM databricks.monthly_bill "
+            "WHERE charge_month = '2026-05-01'"
+        )[0]["c"]
+    )
+    assert dbu == pytest.approx(100.0)
+
+    # Trend & changes' stacked bar gets the identical two extra segments, shaped so they
+    # concatenate straight onto _monthly_by_service's own output.
+    from flashlight.dashboard.views.provider_focus import _databricks_backing_monthly
+
+    backing = _databricks_backing_monthly(date(2026, 5, 31), date(2026, 5, 1))
+    by_service = {
+        str(r.service_name): float(r.net_cost) for r in backing.itertuples(index=False)
+    }
+    assert by_service == {"Databricks Storage": 40.0, "Databricks Compute": 60.0}

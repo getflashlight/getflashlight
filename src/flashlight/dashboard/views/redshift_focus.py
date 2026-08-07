@@ -148,10 +148,11 @@ def _scope_caption(sm: date, end: date) -> None:
     the extra spend lands in ``aws.*`` but appears on no page at all. Saying so is the
     difference between a scoped page and a quietly incomplete one.
 
-    Amazon S3 is special: bronze still pulls it for the storage plane, but
-    ``silver.focus_provider_bill`` keeps it out of ``aws.*`` GOLD entirely, so it will
-    never show up in the hidden-services query below. Point at Databricks Storage when
-    the storage plane has dollars for this window.
+    Amazon S3 and Amazon Elastic Compute Cloud are special: bronze still pulls them for
+    the storage/compute planes, but ``silver.focus_provider_bill`` keeps both out of
+    ``aws.*`` GOLD entirely, so neither will ever show up in the hidden-services query
+    below. Point at Databricks Storage / Databricks Compute when those planes have
+    dollars for this window.
     """
     chrome.section_caption(
         "Scoped from the AWS bill to Redshift's own FOCUS service names: "
@@ -168,6 +169,17 @@ def _scope_caption(sm: date, end: date) -> None:
                 " Amazon S3 is ingested for Databricks Storage "
                 "(see Databricks → Databricks Storage); it is not in aws.* GOLD."
             )
+    compute_note = ""
+    if gold_view_published("compute", "backing_compute_month"):
+        ec2 = gold_df(
+            "SELECT coalesce(sum(net_cost), 0) AS c FROM compute.backing_compute_month "
+            f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}'"
+        )
+        if not ec2.empty and float(ec2["c"].iloc[0]):
+            compute_note = (
+                " Amazon EC2 is ingested for Databricks Compute "
+                "(see Databricks → Databricks Compute); it is not in aws.* GOLD."
+            )
 
     hidden = gold_df(
         "SELECT service_name, sum(net_cost) AS net_cost "
@@ -177,8 +189,9 @@ def _scope_caption(sm: date, end: date) -> None:
         "GROUP BY service_name HAVING sum(net_cost) <> 0 ORDER BY sum(net_cost) DESC"
     )
     if hidden.empty:
-        if storage_note:
-            chrome.section_caption(storage_note.strip())
+        note = (storage_note + compute_note).strip()
+        if note:
+            chrome.section_caption(note)
         return
     total = float(hidden["net_cost"].sum())
     names = ", ".join(str(s) for s in hidden["service_name"].head(5))
@@ -187,7 +200,7 @@ def _scope_caption(sm: date, end: date) -> None:
         f"This page hides {compact_money(total)} of other AWS spend in this window "
         f"({names}{more}) — it is outside every figure below. The `aws_focus` connector "
         "ingests only `include_services`, so a widened service list lands in the lake "
-        f"and in Home's AWS total, but not on this page.{storage_note}"
+        f"and in Home's AWS total, but not on this page.{storage_note}{compute_note}"
     )
 
 

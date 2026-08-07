@@ -600,6 +600,42 @@ def _monthly_by_service(scope: Scope, end: date, sm: date) -> pd.DataFrame:
     return df if df.empty else chrome.cap_series(df, "service_name", "net_cost")
 
 
+#: Same driver names home_overview.py folds into the Home stack — kept identical so a
+#: reader comparing the two pages sees the same label for the same AWS-billed spend.
+_DBX_STORAGE_SERVICE = "Databricks Storage"
+_DBX_COMPUTE_SERVICE = "Databricks Compute"
+
+
+def _databricks_backing_monthly(end: date, sm: date) -> pd.DataFrame:
+    """Databricks-managed Backing storage + Backing compute, monthly — shaped like
+    ``_monthly_by_service``'s own output so it can be concatenated straight onto it.
+
+    Databricks-only (callers gate on ``scope.group == "databricks"``): these are AWS
+    bills, not Databricks' own service breakdown, so appearing in this stack is a
+    deliberate exception, not something every provider's Trend & changes gets. Net
+    Spend (``databricks.monthly_bill``) is unaffected — this only changes what this one
+    chart draws, the same "beside, never inside" rule the KPI cards keep (see
+    ``databricks_footprint.py``, ``backing_storage.py``, ``backing_compute.py``).
+    """
+    frames: list[pd.DataFrame] = []
+    for group, view, service in (
+        ("storage", "backing_storage_month", _DBX_STORAGE_SERVICE),
+        ("compute", "backing_compute_month", _DBX_COMPUTE_SERVICE),
+    ):
+        if not gold_view_published(group, view):
+            continue
+        df = gold_df(
+            f"SELECT charge_month, sum(net_cost) AS net_cost FROM {group}.{view} "
+            f"WHERE mapping = 'databricks' AND charge_month >= '{sm}' AND charge_month <= '{end}' "
+            "GROUP BY charge_month"
+        )
+        if df.empty:
+            continue
+        df["service_name"] = service
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def _forecast_marker() -> dict[str, object]:
     """The hatched, cool-slate marker shared by every projected bar segment — a whole
     forecast month or a partial-month remainder alike — so "not yet real" always reads
@@ -672,6 +708,21 @@ def _monthly_drill(scope: Scope, label: str, end: date, sm: date, *, accent: str
     stacked = not bills.empty
     if not stacked:
         bills = _bill_months(scope, sm, end)[["charge_month", "net_cost"]]
+    backing = pd.DataFrame()
+    if scope.group == "databricks":
+        backing = _databricks_backing_monthly(end, sm)
+        if not backing.empty:
+            if not stacked and not bills.empty:
+                # The non-stacked fallback carries no service_name at all (see
+                # _bill_months) — give the DBU segment one now that Storage/Compute are
+                # about to join it as their own segments, so it doesn't render unlabelled.
+                bills = bills.assign(service_name=f"{label} (DBU)")
+            # A DBU-only chart with nothing else to stack still needs `stacked=True` once
+            # Storage/Compute join it — otherwise the trace-styling branch below treats
+            # this as the single-colour, non-stacked case and every segment renders as
+            # one unlabelled slice of "accent".
+            stacked = True
+            bills = pd.concat([bills, backing], ignore_index=True)
     if bills.empty:
         return
     bills["month"] = pd.to_datetime(bills["charge_month"]).dt.strftime("%Y-%m")
@@ -696,6 +747,17 @@ def _monthly_drill(scope: Scope, label: str, end: date, sm: date, *, accent: str
     else:
         title = "Monthly net cost"
     chrome.panel_title(title)
+    if not backing.empty:
+        # Named here, not just left implicit in the legend: the forecast trace (when
+        # present) only ever projects DBU — spend_forecast_month is built on
+        # silver.focus_provider_bill, which has no Storage/Compute planes of its own to
+        # forecast — so a reader comparing an actual bar's height to the projected bar
+        # right after it must know the two aren't the same quantity.
+        chrome.section_caption(
+            "Includes Databricks-managed Backing storage (AWS-billed S3) and Backing "
+            "compute (AWS-billed EC2)."
+            + (" The forecast bars project DBU only." if not forecast.empty else "")
+        )
     if forecast_note:
         # Only the "why there's no forecast" states (unpublished / not scopable / <3 months).
         chrome.section_caption(forecast_note)

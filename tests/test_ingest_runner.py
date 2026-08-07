@@ -45,6 +45,7 @@ def _stub(monkeypatch, outcomes: list[ConnectorOutcome], built: list[bool], ran:
     monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
     monkeypatch.setattr(runner, "_run_ai_usage", lambda _w, _c: 0)
     monkeypatch.setattr(runner, "_run_storage_locations", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_compute_instances", lambda _w, _c: 0)
 
 
 def test_all_connectors_run_even_after_a_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -110,6 +111,7 @@ def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatc
     monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
     monkeypatch.setattr(runner, "_run_ai_usage", lambda _w, _c: 0)
     monkeypatch.setattr(runner, "_run_storage_locations", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_compute_instances", lambda _w, _c: 0)
 
     rows = run_ingest(connector="redshift")
     assert ran == ["redshift"]
@@ -231,6 +233,7 @@ def test_run_ingest_threads_progress_callback_to_every_connector(monkeypatch) ->
     monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
     monkeypatch.setattr(runner, "_run_ai_usage", lambda _w, _c: 0)
     monkeypatch.setattr(runner, "_run_storage_locations", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_compute_instances", lambda _w, _c: 0)
 
     received: list[object] = []
 

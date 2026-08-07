@@ -19,6 +19,12 @@ objects it owns or holds a privilege on — so an under-privileged token produce
 Backing storage tab, never as a failure, which is why it must be verified against the
 account rather than assumed: compare `storage.storage_location` against the metastore's
 real external locations. Metastore-admin (or an account admin) sees all of them.
+
+``fetch_compute_instances`` runs its own small vendored query
+(``sql/databricks_compute_instances.sql``) against ``system.compute.node_timeline`` on a
+SQL warehouse — the cluster/instance-id map that lets the AWS EC2 bill be labelled with
+the Databricks cluster behind it. Classic compute only (see that module for the scope
+caveat).
 """
 
 from __future__ import annotations
@@ -47,6 +53,7 @@ from flashlight.ingest.config import DatabricksConfig, effective_connector_name,
 from flashlight.ingest.connectors._coerce import to_decimal
 from flashlight.lake import bronze
 from flashlight.lake.ai_usage_schema import AiUsageRecord
+from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
 from flashlight.lake.storage_location_schema import StorageLocationRecord
 
@@ -56,6 +63,9 @@ _QUERY_PATH = Path(__file__).parent / "sql" / "databricks_focus_1_3.sql"
 _EFFICIENCY_QUERY_PATH = Path(__file__).parent / "sql" / "databricks_efficiency.sql"
 _DRIVER_HEALTH_QUERY_PATH = Path(__file__).parent / "sql" / "databricks_driver_health.sql"
 _AI_USAGE_QUERY_PATH = Path(__file__).parent / "sql" / "databricks_ai_usage.sql"
+_COMPUTE_INSTANCES_QUERY_PATH = (
+    Path(__file__).parent / "sql" / "databricks_compute_instances.sql"
+)
 _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELED", "CLOSED"}
 
 # SQL-warehouse cluster sizes, smallest → largest. Auto-pick prefers the smallest
@@ -580,6 +590,55 @@ class DatabricksConnector(Connector):
             client_application=row.get("client_application") or None,
             executed_by=row.get("executed_by") or None,
             query_count=_opt_int(row.get("query_count")) or 0,
+            x_source_connector="databricks",
+        )
+
+    # ── Compute instances (the backing-compute plane) ────────────────────────
+    def fetch_compute_instances(self, window: IngestWindow) -> Iterator[ComputeInstanceRecord]:
+        """Yield aggregated ComputeInstanceRecord rows (cluster × instance × month).
+
+        Own vendored query (``sql/databricks_compute_instances.sql``) against
+        ``system.compute.node_timeline`` — pure metadata, no cost/waste semantics. This is
+        what lets the AWS EC2 bill be labelled with the Databricks cluster behind it (see
+        docs/design/backing-compute.md). Classic compute only: node_timeline has no rows
+        for serverless SQL warehouses, serverless jobs or DLT serverless pipelines.
+        """
+        sql = self._render_compute_instances_query(window)
+        fetched = mapped = 0
+        for row in self._execute(sql):
+            fetched += 1
+            record = self._to_compute_instance(row)
+            if record is not None:
+                mapped += 1
+                yield record
+        logger.info(
+            "databricks_compute_instances_done", rows_fetched=fetched, rows_mapped=mapped
+        )
+
+    def _render_compute_instances_query(self, window: IngestWindow) -> str:
+        sql = _COMPUTE_INSTANCES_QUERY_PATH.read_text()
+        return (
+            sql.replace(":start_date", f"'{window.start}'")
+            .replace(":end_date", f"'{window.end}'")
+        )
+
+    @staticmethod
+    def _to_compute_instance(row: dict[str, Any]) -> ComputeInstanceRecord | None:
+        """Map one aggregation row → ComputeInstanceRecord (values arrive as strings/None)."""
+        charge_month = row.get("charge_month")
+        cluster_id = row.get("cluster_id")
+        instance_id = row.get("instance_id")
+        if not charge_month or not cluster_id or not instance_id:
+            return None
+        return ComputeInstanceRecord(
+            provider_name="Databricks",
+            charge_month=date.fromisoformat(str(charge_month)[:10]),
+            cluster_id=str(cluster_id),
+            cluster_name=row.get("cluster_name") or None,
+            owner_user=row.get("owner_user") or None,
+            instance_id=str(instance_id),
+            is_driver=_opt_bool(row.get("is_driver")),
+            node_type=row.get("node_type") or None,
             x_source_connector="databricks",
         )
 

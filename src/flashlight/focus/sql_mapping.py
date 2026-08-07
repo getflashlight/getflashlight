@@ -32,6 +32,7 @@ from flashlight.focus.enums import (
     ChargeCategory,
     CommitmentDiscountCategory,
     CommitmentDiscountStatus,
+    PricingCategory,
     ServiceCategory,
 )
 from flashlight.focus.model import FOCUS_VERSION
@@ -43,8 +44,8 @@ FOCUS_COLUMNS: tuple[str, ...] = (
     "SubAccountName", "BillingPeriodStart", "BillingPeriodEnd", "ChargePeriodStart",
     "ChargePeriodEnd", "BillingCurrency", "BilledCost", "EffectiveCost", "ListCost",
     "ContractedCost", "ChargeCategory", "ChargeClass", "ChargeDescription",
-    "ServiceCategory", "ServiceName", "SkuId", "RegionId", "ResourceId",
-    "ResourceName", "ResourceType", "ConsumedQuantity", "ConsumedUnit", "Tags",
+    "ServiceCategory", "ServiceName", "SkuId", "RegionId", "PricingCategory",
+    "ResourceId", "ResourceName", "ResourceType", "ConsumedQuantity", "ConsumedUnit", "Tags",
     "CommitmentDiscountId", "CommitmentDiscountType", "CommitmentDiscountCategory",
     "CommitmentDiscountName", "CommitmentDiscountStatus", "CommitmentDiscountQuantity",
     "CommitmentDiscountUnit", "InvoiceId", "InvoiceIssuerName",
@@ -56,6 +57,7 @@ _CHARGE_CATEGORIES_SQL = ", ".join(f"'{c.value}'" for c in ChargeCategory)
 _SERVICE_CATEGORIES_SQL = ", ".join(f"'{c.value}'" for c in ServiceCategory)
 _COMMITMENT_CATEGORIES_SQL = ", ".join(f"'{c.value}'" for c in CommitmentDiscountCategory)
 _COMMITMENT_STATUSES_SQL = ", ".join(f"'{c.value}'" for c in CommitmentDiscountStatus)
+_PRICING_CATEGORIES_SQL = ", ".join(f"'{c.value}'" for c in PricingCategory)
 
 # Passthrough identity columns a connector's FOCUS-shaped source may additionally
 # carry beyond the FOCUS spec itself (Databricks: the physical usage record's id +
@@ -211,6 +213,8 @@ def mapping_sql(
             coalesce(nz(ServiceName), 'Unknown')                    AS service_name,
             nz(SkuId)                                               AS sku_id,
             nz(RegionId)                                            AS region_id,
+            CASE WHEN nz(PricingCategory) IN ({_PRICING_CATEGORIES_SQL})
+                 THEN nz(PricingCategory) ELSE NULL END              AS pricing_category,
             nz(ResourceId)                                          AS resource_id,
             nz(ResourceName)                                        AS resource_name,
             nz(ResourceType)                                        AS resource_type,

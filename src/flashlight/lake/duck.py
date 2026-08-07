@@ -23,6 +23,7 @@ from flashlight.core.settings import get_settings
 from flashlight.lake import paths
 from flashlight.lake.ai_usage_schema import empty_table as empty_ai_usage_table
 from flashlight.lake.assistant_turns import empty_table as empty_assistant_turn_table
+from flashlight.lake.compute_instance_schema import empty_table as empty_compute_instance_table
 from flashlight.lake.driver_health_schema import empty_table as empty_driver_health_table
 from flashlight.lake.metrics_schema import empty_table as empty_metrics_table
 from flashlight.lake.schema import empty_table
@@ -200,6 +201,37 @@ def register_storage_locations(con: duckdb.DuckDBPyConnection) -> None:
         con.execute(
             "CREATE OR REPLACE VIEW metrics.storage_location AS "
             "SELECT * FROM _storage_location_empty"
+        )
+
+
+def register_compute_instances(con: duckdb.DuckDBPyConnection) -> None:
+    """Expose ``metrics.compute_instance`` over the partitioned compute-instance Parquet.
+
+    Same ``metrics`` DuckDB schema and typed-empty fallback as
+    :func:`register_driver_health`, over its own Parquet root
+    (:func:`~flashlight.lake.paths.compute_instances_dir`) for the same
+    keep-out-of-the-recursive-glob reason. Its partition keys are
+    ``provider_name``/``charge_month`` — a real charge period, unlike
+    :func:`register_storage_locations`'s snapshot (see
+    :mod:`flashlight.lake.compute_instance_schema`).
+
+    The typed-empty fallback is what lets ``066_gold_compute.sql`` resolve before any
+    Databricks connection has ever run: without it, an AWS-only lake would fail the whole
+    transform rather than publishing an empty map.
+    """
+    con.execute("CREATE SCHEMA IF NOT EXISTS metrics")
+    files = list(paths.compute_instances_dir().glob("**/*.parquet"))
+    if files:
+        glob = str(paths.compute_instances_dir() / "**" / "*.parquet").replace("'", "''")
+        con.execute(
+            f"CREATE OR REPLACE VIEW metrics.compute_instance AS SELECT * FROM "
+            f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
+        )
+    else:
+        con.register("_compute_instance_empty", empty_compute_instance_table())
+        con.execute(
+            "CREATE OR REPLACE VIEW metrics.compute_instance AS "
+            "SELECT * FROM _compute_instance_empty"
         )
 
 

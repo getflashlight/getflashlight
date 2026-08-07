@@ -23,6 +23,7 @@ from flashlight.ingest.connectors._coerce import (
     to_commitment_status,
     to_datetime,
     to_decimal,
+    to_pricing_category,
     to_service_category,
 )
 
@@ -97,6 +98,7 @@ def map_focus_row(row: dict[str, Any], source_connector: str) -> FocusRecord | N
         service_name=_s(row.get("ServiceName")) or "Unknown",
         sku_id=_s(row.get("SkuId")),
         region_id=_s(row.get("RegionId")),
+        pricing_category=to_pricing_category(_s(row.get("PricingCategory"))),
         resource_id=_s(row.get("ResourceId")),
         resource_name=_s(row.get("ResourceName")),
         resource_type=_s(row.get("ResourceType")),

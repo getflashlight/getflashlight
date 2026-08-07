@@ -36,6 +36,23 @@ class ChargeClass(StrEnum):
     CORRECTION = "Correction"
 
 
+class PricingCategory(StrEnum):
+    """FOCUS PricingCategory — the pricing model behind a charge.
+
+    ``DYNAMIC`` is the FOCUS spec's term for provider-variable pricing the customer
+    can't lock in — on AWS that's exactly Spot (and other interruptible/low-priority
+    pricing); there is no separate "spot" value in FOCUS, this is it. ``COMMITTED``
+    means the charge itself is discounted by an existing commitment (a Reserved
+    Instance/Savings Plan covering it) — distinct from ``STANDARD``, which is the
+    on-demand/negotiated-rate case with no such discount applied.
+    """
+
+    STANDARD = "Standard"
+    DYNAMIC = "Dynamic"
+    COMMITTED = "Committed"
+    OTHER = "Other"
+
+
 class ServiceCategory(StrEnum):
     """FOCUS ServiceCategory — the highest-level grouping of a service."""
 

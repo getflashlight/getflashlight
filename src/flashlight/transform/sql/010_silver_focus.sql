@@ -26,6 +26,7 @@ SELECT
     f.service_name,
     f.sku_id,
     f.region_id,
+    f.pricing_category,
     f.resource_id,
     f.resource_name,
     f.resource_type,
@@ -58,15 +59,17 @@ SELECT
 FROM raw.focus_record f;
 
 
--- Provider-facing GOLD metrics read this, not focus_normalized. Amazon S3 stays in
--- bronze/silver (and in gold.backing_storage_month) because Databricks' DBU bill has no
--- storage line — but it must not inflate aws.* GOLD. Mapped buckets surface as
--- Databricks Storage via the storage plane; unmapped S3 is audit-only there.
--- ServiceName is hard-coded to match ingest/_s3_service_names.py (static SQL can't import).
+-- Provider-facing GOLD metrics read this, not focus_normalized. Amazon S3 and Amazon EC2
+-- stay in bronze/silver (and in gold.backing_storage_month / gold.backing_compute_month)
+-- because Databricks' DBU bill has no storage or infra line — but neither must inflate
+-- aws.* GOLD. Mapped buckets/instances surface as Databricks Storage / Databricks Compute
+-- via their own planes; unmapped S3/EC2 is audit-only there.
+-- ServiceName values are hard-coded to match ingest/_s3_service_names.py and
+-- ingest/_ec2_service_names.py (static SQL can't import).
 CREATE OR REPLACE VIEW silver.focus_provider_bill AS
 SELECT *
 FROM silver.focus_normalized
 WHERE NOT (
     provider_name = 'AWS'
-    AND service_name = 'Amazon Simple Storage Service'
+    AND service_name IN ('Amazon Simple Storage Service', 'Amazon Elastic Compute Cloud')
 );

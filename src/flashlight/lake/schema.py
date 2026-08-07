@@ -64,6 +64,7 @@ BRONZE_SCHEMA: pa.Schema = pa.schema(
         ("service_name", pa.string()),
         ("sku_id", pa.string()),
         ("region_id", pa.string()),
+        ("pricing_category", pa.string()),
         # ── Resource ────────────────────────────────────────────────────────
         ("resource_id", pa.string()),
         ("resource_name", pa.string()),
@@ -137,6 +138,7 @@ def record_to_row(
         "service_name": record.service_name,
         "sku_id": record.sku_id,
         "region_id": record.region_id,
+        "pricing_category": record.pricing_category.value if record.pricing_category else None,
         "resource_id": record.resource_id,
         "resource_name": record.resource_name,
         "resource_type": record.resource_type,

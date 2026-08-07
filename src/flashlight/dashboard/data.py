@@ -49,9 +49,10 @@ def _aws_label() -> str:
     """``"AWS Redshift"`` while the group holds only Redshift's own services, plain
     ``"AWS"`` once it holds more.
 
-    Derived from ``aws.spend_by_service_month``, which excludes Amazon S3
-    (``silver.focus_provider_bill``) — S3 stays in bronze and surfaces as Databricks
-    Storage via ``storage.backing_storage_month``, so it must not widen this label.
+    Derived from ``aws.spend_by_service_month``, which excludes Amazon S3 and Amazon EC2
+    (``silver.focus_provider_bill``) — both stay in bronze and surface as Databricks
+    Storage / Databricks Compute via ``storage.backing_storage_month`` /
+    ``compute.backing_compute_month``, so they must not widen this label.
     A non-Redshift service that *does* land in aws GOLD (e.g. a widened
     ``include_services``) still flips the label to plain ``"AWS"``.
 

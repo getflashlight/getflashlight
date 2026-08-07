@@ -17,11 +17,13 @@ from flashlight.core.settings import get_settings
 from flashlight.focus.enums import (
     ChargeCategory,
     ComputeClass,
+    PricingCategory,
     ProviderName,
     ServiceCategory,
 )
 from flashlight.focus.model import FocusRecord
 from flashlight.ingest.base import IngestWindow
+from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.storage_location_schema import StorageLocationRecord
 
 _WINDOW = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
@@ -45,6 +47,7 @@ def _rec(
     compute: ComputeClass = ComputeClass.NOT_APPLICABLE,
     list_cost: str | None = None,
     day: int = 15,
+    pricing_category: PricingCategory | None = None,
 ) -> FocusRecord:
     amount = Decimal(cost)
     return FocusRecord(
@@ -61,6 +64,7 @@ def _rec(
         service_category=ServiceCategory.COMPUTE,
         service_name=service,
         resource_id=resource_id,
+        pricing_category=pricing_category,
         tags=tags or {},
         x_compute_class=compute,
         x_source_connector="t",
@@ -685,3 +689,290 @@ def test_backing_storage_attributes_cost_per_catalog(lake_home) -> None:  # type
     # Shared bucket: no single catalog is named, and the cost is NOT multiplied by 2.
     assert by_object["(shared by 2 catalogs)"] == ("catalog", 70.0)
     assert "cat_a" not in by_object and "cat_b" not in by_object
+
+
+# ── Backing compute (066_gold_compute.sql) ────────────────────────────────────────
+
+_EC2 = "Amazon Elastic Compute Cloud"
+
+
+def _ec2_rec(
+    cost: str,
+    resource_id: str | None,
+    *,
+    day: int = 15,
+    pricing_category: PricingCategory | None = None,
+) -> FocusRecord:
+    return _rec(
+        ProviderName.AWS, _EC2, cost, resource_id=resource_id, day=day,
+        pricing_category=pricing_category,
+    )
+
+
+def _inst(
+    cluster_id: str,
+    instance_id: str,
+    *,
+    is_driver: bool | None = None,
+    node_type: str | None = "i3.xlarge",
+    month: date = date(2026, 5, 1),
+    cluster_name: str | None = None,
+    owner_user: str | None = None,
+) -> ComputeInstanceRecord:
+    return ComputeInstanceRecord(
+        provider_name="Databricks",
+        charge_month=month,
+        cluster_id=cluster_id,
+        cluster_name=cluster_name,
+        owner_user=owner_user,
+        instance_id=instance_id,
+        is_driver=is_driver,
+        node_type=node_type,
+        x_source_connector="databricks",
+    )
+
+
+def _seed_backing_compute() -> None:
+    """One EC2 bill covering every mapping case, plus a node_timeline-derived
+    instance/cluster map over it.
+
+    Mirrors ``_seed_backing_storage``'s shape: an ARN-form ResourceId and a bare-id
+    ResourceId both map (the two forms 066_gold_compute.sql's parser must handle
+    identically), a non-instance EC2 resource (an EBS volume) and an instance the map
+    never saw both read as ``unmapped``, and a NULL ResourceId reads as
+    ``no_resource_id``.
+    """
+    from flashlight.lake import bronze
+    from flashlight.lake.compute_instances import write_compute_instances
+    from flashlight.transform.runner import build_gold
+
+    bronze.write_window(
+        "t",
+        _WINDOW,
+        [
+            # ARN-form ResourceId, the real FOCUS export shape → databricks, driver. Spot
+            # (FOCUS: Dynamic) — the pricing-category dimension has real variety to assert.
+            _ec2_rec(
+                "100", "arn:aws:ec2:us-east-1:123456789012:instance/i-driver1", day=2,
+                pricing_category=PricingCategory.DYNAMIC,
+            ),
+            # Bare instance id, the fixture/older-export fallback shape → databricks, worker.
+            # On-demand (FOCUS: Standard).
+            _ec2_rec("10", "i-worker1", day=3, pricing_category=PricingCategory.STANDARD),
+            # A non-instance EC2-service resource (an EBS volume) → unmapped, never
+            # "no_resource_id" — it genuinely carries a ResourceId, it just never
+            # matches an instance.
+            _ec2_rec("25", "vol-abc123", day=4),
+            # An instance-shaped id the map never saw → unmapped.
+            _ec2_rec("50", "i-unmapped9", day=5),
+            # No ResourceId at all → attributable to no instance. No pricing_category
+            # either (an older export, or a row FOCUS itself allows to be null).
+            _ec2_rec("7", None, day=6),
+            # Databricks' own DBU spend, so the invariant assertion has something to guard.
+            _rec(ProviderName.DATABRICKS, "jobs", "40", resource_id="c1"),
+        ],
+        ingest_run_id="r1",
+    )
+    write_compute_instances(
+        _WINDOW,
+        [
+            # c1 has a name/owner in system.compute.clusters — the happy path.
+            _inst(
+                "c1", "i-driver1", is_driver=True,
+                cluster_name="etl-prod", owner_user="alice@example.com",
+            ),
+            _inst(
+                "c1", "i-worker1", is_driver=False,
+                cluster_name="etl-prod", owner_user="alice@example.com",
+            ),
+        ],
+    )
+    build_gold()
+
+
+def test_backing_compute_accounts_for_every_ec2_row(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The honest-denominator contract: summing every `mapping` value reproduces the
+    seeded EC2 bill (aws.* GOLD deliberately excludes EC2 — see silver.focus_provider_bill).
+    """
+    from flashlight.gold.reader import run_select
+
+    _seed_backing_compute()
+
+    total = float(
+        run_select("SELECT sum(net_cost) AS t FROM compute.backing_compute_month")[0]["t"]
+    )
+    assert total == 192.0
+
+    by_mapping = {
+        r["mapping"]: float(r["c"])
+        for r in run_select(
+            "SELECT mapping, sum(net_cost) AS c FROM compute.backing_compute_month "
+            "GROUP BY mapping"
+        )
+    }
+    # databricks = i-driver1 100 + i-worker1 10
+    # unmapped = vol-abc123 25 (EBS, non-instance) + i-unmapped9 50 (unmatched instance)
+    assert by_mapping == {"databricks": 110.0, "unmapped": 75.0, "no_resource_id": 7.0}
+
+    mapped_names = {
+        r["service_name"]
+        for r in run_select(
+            "SELECT DISTINCT service_name FROM compute.backing_compute_month "
+            "WHERE mapping = 'databricks'"
+        )
+    }
+    assert mapped_names == {"Databricks Compute"}
+
+    roles = {
+        r["instance_id"]: r["instance_role"]
+        for r in run_select(
+            "SELECT instance_id, instance_role FROM compute.backing_compute_month "
+            "WHERE mapping = 'databricks'"
+        )
+    }
+    assert roles == {"i-driver1": "driver", "i-worker1": "worker"}
+
+    # cluster_name/owner_user: the happy path (system.compute.clusters had a row for c1).
+    names = {
+        (r["cluster_name"], r["owner_user"])
+        for r in run_select(
+            "SELECT DISTINCT cluster_name, owner_user FROM compute.backing_compute_month "
+            "WHERE mapping = 'databricks'"
+        )
+    }
+    assert names == {("etl-prod", "alice@example.com")}
+
+    # pricing_category: FOCUS's own column, carried straight through — Dynamic (Spot) for
+    # the driver, Standard (on-demand) for the worker, '(unknown)' where the AWS bill
+    # carried none at all (the no_resource_id row).
+    pricing = {
+        r["instance_id"]: r["pricing_category"]
+        for r in run_select(
+            "SELECT instance_id, pricing_category FROM compute.backing_compute_month"
+        )
+    }
+    assert pricing["i-driver1"] == "Dynamic"
+    assert pricing["i-worker1"] == "Standard"
+    assert pricing["(no resource id)"] == "(unknown)"
+
+
+def test_aws_gold_excludes_amazon_ec2(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Amazon EC2 stays in bronze/compute GOLD; it must not appear in aws.* provider GOLD."""
+    from flashlight.gold.reader import query_view, run_select
+
+    _seed_backing_compute()
+
+    services = {r["service_name"] for r in query_view("aws.spend_by_service_month")}
+    assert _EC2 not in services
+    assert "Databricks Compute" not in services
+    ec2_in_aws = run_select(
+        "SELECT coalesce(sum(gross_cost), 0) AS t FROM aws.spend_by_service_month "
+        f"WHERE service_name = '{_EC2}'"
+    )
+    assert float(ec2_in_aws[0]["t"]) == 0.0
+    compute = float(
+        run_select(
+            "SELECT sum(gross_cost) AS t FROM compute.backing_compute_month "
+            "WHERE mapping = 'databricks'"
+        )[0]["t"]
+    )
+    assert compute == pytest.approx(110.0)
+
+
+def test_backing_compute_never_changes_databricks_spend(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The invariant guard: `databricks.monthly_bill` is identical with and without the
+    compute plane.
+
+    CLAUDE.md forbids joining Databricks DBU cost to the AWS infra behind it. The
+    backing-compute views join AWS cost to Databricks *metadata*, and live in their own
+    GOLD group precisely so nothing can leak into gold/databricks/. This asserts that
+    structurally rather than trusting the SQL to stay well-behaved.
+    """
+    from flashlight.gold.reader import run_select
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    # First: the same cost rows, with NO compute-instance map at all.
+    bronze.write_window(
+        "t",
+        _WINDOW,
+        [
+            _ec2_rec("100", "arn:aws:ec2:us-east-1:123456789012:instance/i-driver1", day=2),
+            _rec(ProviderName.DATABRICKS, "jobs", "40", resource_id="c1"),
+        ],
+        ingest_run_id="r1",
+    )
+    build_gold()
+    before = run_select("SELECT * FROM databricks.monthly_bill ORDER BY charge_month")
+
+    # Then add the map and rebuild.
+    from flashlight.lake.compute_instances import write_compute_instances
+
+    write_compute_instances(_WINDOW, [_inst("c1", "i-driver1", is_driver=True)])
+    build_gold()
+    after = run_select("SELECT * FROM databricks.monthly_bill ORDER BY charge_month")
+
+    assert before == after
+    # And the Databricks bill is its DBU spend alone — the EC2 dollars are not in it.
+    assert float(after[0]["net_cost"]) == 40.0
+
+    # cluster_name/owner_user fall back to the bare cluster_id/'(unknown)' rather than a
+    # blank when system.compute.clusters had no row for this cluster (this fixture never
+    # set them) — a row that's mapped must still be readable, just less so.
+    fallback = run_select(
+        "SELECT cluster_name, owner_user FROM compute.backing_compute_month "
+        "WHERE instance_id = 'i-driver1'"
+    )[0]
+    assert fallback["cluster_name"] == "c1"
+    assert fallback["owner_user"] == "(unknown)"
+
+
+def test_backing_compute_matches_instance_per_charge_month(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The join is `(instance_id, charge_month)`, not just `instance_id` — an instance
+    mapped in one month must not silently map cost in a month the map never covered.
+
+    This is the honesty upgrade over backing storage's single-snapshot-for-all-history
+    join: node_timeline reports bounded historical activity, so a month the map didn't
+    see for this instance must read `unmapped`, not `databricks`.
+    """
+    from flashlight.gold.reader import run_select
+    from flashlight.lake import bronze
+    from flashlight.lake.compute_instances import write_compute_instances
+    from flashlight.transform.runner import build_gold
+
+    earlier_window = IngestWindow(date(2026, 4, 1), date(2026, 4, 30))
+    bronze.write_window(
+        "t",
+        earlier_window,
+        [
+            FocusRecord(
+                provider_name=ProviderName.AWS,
+                billing_account_id="acct",
+                billing_period_start=date(2026, 4, 1),
+                billing_period_end=date(2026, 4, 30),
+                charge_period_start=datetime(2026, 4, 10, tzinfo=UTC),
+                charge_period_end=datetime(2026, 4, 10, 1, tzinfo=UTC),
+                billed_cost=Decimal("80"),
+                effective_cost=Decimal("80"),
+                list_cost=Decimal("80"),
+                charge_category=ChargeCategory.USAGE,
+                service_category=ServiceCategory.COMPUTE,
+                service_name=_EC2,
+                resource_id="i-driver1",
+                x_source_connector="t",
+            )
+        ],
+        ingest_run_id="r0",
+    )
+    # The map only ever saw this instance in May, not April.
+    write_compute_instances(_WINDOW, [_inst("c1", "i-driver1", is_driver=True)])
+    build_gold()
+
+    april_mapping = {
+        str(r["charge_month"])[:10]: r["mapping"]
+        for r in run_select(
+            "SELECT charge_month, mapping FROM compute.backing_compute_month "
+            "WHERE instance_id = 'i-driver1'"
+        )
+    }
+    assert april_mapping["2026-04-01"] == "unmapped"

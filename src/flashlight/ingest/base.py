@@ -12,6 +12,7 @@ from flashlight.core.settings import get_settings
 from flashlight.efficiency.model import EfficiencyRecord
 from flashlight.focus.model import FocusRecord
 from flashlight.lake.ai_usage_schema import AiUsageRecord
+from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
 from flashlight.lake.storage_location_schema import StorageLocationRecord
 
@@ -148,5 +149,25 @@ class Connector(ABC):
         runner warns and skips), and an empty result is treated as "couldn't see
         anything", never as "this platform has no storage" (see
         ``lake.storage_locations.write_storage_locations``).
+        """
+        return iter(())
+
+    def fetch_compute_instances(self, window: IngestWindow) -> Iterator[ComputeInstanceRecord]:
+        """Yield this platform's cloud-compute-instance membership map (default: none).
+
+        Optional, non-abstract, and metadata only — no cost, no utilization. It answers
+        "which cloud VM backed this cluster/job?", which is what lets the *cloud
+        provider's* compute bill be attributed to the platform sitting on top of it
+        (Databricks' own bill covers DBU compute only — see
+        ``docs/design/backing-compute.md``).
+
+        Unlike :meth:`fetch_storage_locations`, ``window`` is genuinely honored here:
+        the source (e.g. Databricks' ``system.compute.node_timeline``) reports real
+        historical instance activity bounded by time, not a present-tense snapshot, so
+        a pull for a given window is authoritative for that window and the writer does
+        a real partition-replace (see ``lake.compute_instances.write_compute_instances``).
+
+        Best-effort — a failure here must not abort the canonical cost ingest (the
+        runner warns and skips).
         """
         return iter(())

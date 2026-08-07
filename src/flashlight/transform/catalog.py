@@ -64,6 +64,15 @@ AI_USAGE_GROUP = "ai_usage"
 # Databricks *metadata* (a bucket list) — never AWS cost to Databricks cost.
 STORAGE_GROUP = "storage"
 
+# The fixed group holding the backing-compute views — the cloud compute (EC2) bill
+# labelled with the Databricks cluster that node_timeline says ran on it. The identical
+# shape as STORAGE_GROUP, for compute instead of storage — cross-provider by construction
+# for the same reason (billing_provider_name/platform_provider_name), and the same
+# enforceable "No cross-provider cost join" guarantee: nothing here writes into
+# gold/databricks/, and the join is AWS *cost* to Databricks *metadata* (an
+# instance/cluster map) — never AWS cost to Databricks cost.
+COMPUTE_GROUP = "compute"
+
 
 class MeasureUnit(StrEnum):
     """What a measure is denominated in.
@@ -139,6 +148,7 @@ MEASURE_UNITS: dict[str, MeasureUnit] = {
     "endpoint_count": MeasureUnit.COUNT,
     "model_count": MeasureUnit.COUNT,
     "location_count": MeasureUnit.COUNT,
+    "mapping_row_count": MeasureUnit.COUNT,
     # Provider-native quantities. Tokens are the metered billing unit for pay-per-token
     # serving — the same class as consumed_quantity (DBUs), not a cardinality of objects.
     "consumed_quantity": MeasureUnit.QUANTITY,
@@ -983,6 +993,106 @@ STORAGE_BASE_VIEWS: tuple[ViewSpec, ...] = (
 )
 
 
+# ── Backing compute (the cloud compute bill behind a data platform) ──────────────
+# Fixed group, fed by metrics.compute_instance (Databricks' node_timeline-derived
+# instance/cluster map) joined to the FOCUS plane's EC2 rows.
+#
+# THE ONE RULE EVERY VIEW HERE CARRIES: these dollars are billed by AWS, live ONLY in
+# this compute GOLD group (aws.* GOLD excludes Amazon Elastic Compute Cloud via
+# silver.focus_provider_bill), and must never be added to databricks.monthly_bill —
+# Databricks' own bill covers DBU compute only, and summing the two is exactly the TCO
+# join CLAUDE.md removed. MCP and the assistant read these descriptions, so the rule
+# has to live here.
+_TWO_BILLS_RULE_COMPUTE = (
+    "This money is billed by AWS and is excluded from aws.* GOLD — compute.backing_compute_month "
+    "is its only GOLD home (mapped rows are named Databricks Compute). It is NOT "
+    "Databricks DBU spend: Databricks' own bill covers compute only, so these are two "
+    "separate bills and must never be summed into one 'total Databricks cost'. Report "
+    "them side by side, never added."
+)
+
+COMPUTE_BASE_VIEWS: tuple[ViewSpec, ...] = (
+    ViewSpec(
+        view="compute_instance",
+        title="Compute instance map",
+        description="Databricks' own map of which cloud VM instance backed which cluster, "
+        "sourced from system.compute.node_timeline — metadata, no cost. CLASSIC compute "
+        "only: serverless SQL warehouses, serverless jobs and DLT serverless pipelines "
+        "have no rows here at all (no customer-visible instance to report), so absence "
+        "here is not evidence a cluster had no cloud infra cost. One row per "
+        "(cluster_id, instance_id, charge_month) — a real charge period, not a snapshot, "
+        "unlike storage.storage_location.",
+        cost_metric=None,
+        dimensions=(
+            "platform_provider_name",
+            "charge_month",
+            "cluster_id",
+            "cluster_name",
+            "owner_user",
+            "instance_id",
+            "is_driver",
+            "node_type",
+            "x_source_connector",
+        ),
+        measures=(),
+    ),
+    ViewSpec(
+        view="backing_compute_month",
+        title="Backing compute cost / month",
+        description="AWS-billed Amazon EC2 cost per (instance, month), labelled by "
+        "whether the instance backed a Databricks cluster. Mapped rows "
+        "(mapping='databricks') use service_name 'Databricks Compute' — they are "
+        "excluded from aws.* GOLD (silver.focus_provider_bill) and this view is their "
+        "only GOLD home. EVERY EC2 row is here, mapped or not, so mapping='databricks' "
+        "is a numerator with an honest denominator — sum across all mapping values and "
+        "you get the account's whole EC2 bill. "
+        f"{_TWO_BILLS_RULE_COMPUTE} "
+        "mapping: 'databricks' = this EC2 instance backed a Databricks cluster (matched "
+        "by instance id AND charge_month against system.compute.node_timeline); "
+        "'unmapped' = it did not (includes non-instance EC2-service resources such as "
+        "EBS volumes, which carry a ResourceId but never match an instance map); "
+        "'no_resource_id' = EC2 cost carrying no ResourceId at all (a cost_explorer-sourced "
+        "AWS connection never has one), attributable to no instance. "
+        "CLASSIC COMPUTE ONLY, SO THIS FIGURE IS A FLOOR, never a ceiling: serverless "
+        "compute has no customer-visible instance for Databricks to report, so it can "
+        "never appear as mapped here even though it may carry real DBU cost. The map is "
+        "also bounded by node_timeline's ~90-day retention — an instance whose activity "
+        "predates the retention window at the time of ingest can never be recovered. "
+        "cluster_id names WHICH Databricks cluster owns the instance — '(not managed)' "
+        "on every unmapped row; cluster_name/owner_user are the human-readable name and "
+        "owner from system.compute.clusters, falling back to the bare cluster_id/'(unknown)' "
+        "when that table has no row for it (aged out, or the token can't read it) — never "
+        "dropped as a row, just less readable. instance_role is 'driver'/'worker'/'n/a' "
+        "(unmapped). pricing_category is FOCUS's own column, carried straight from the AWS "
+        "bill (no Databricks-side join): 'Dynamic' is FOCUS's term for Spot (and other "
+        "provider-variable pricing) — there is no separate 'spot' value — 'Committed' means "
+        "an existing Reserved Instance/Savings Plan discounted the charge, 'Standard' is "
+        "on-demand/negotiated-rate; '(unknown)' means the AWS export carried no value for "
+        "this row (older exports, or a charge FOCUS itself allows to be null). "
+        "Unlike storage.backing_storage_month, this join is per (instance_id, "
+        "charge_month) rather than a present-tense snapshot applied to all history — "
+        "node_timeline itself reports bounded historical activity, not current state.",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=(
+            "billing_provider_name",
+            "service_name",
+            "instance_id",
+            "mapping",
+            "platform_provider_name",
+            "cluster_id",
+            "cluster_name",
+            "owner_user",
+            "instance_role",
+            "node_type",
+            "region_id",
+            "pricing_category",
+            "charge_month",
+        ),
+        measures=("net_cost", "gross_cost", "mapping_row_count"),
+    ),
+)
+
+
 def provider_group(provider_name: str) -> str:
     """Slug a ``provider_name`` into a filesystem/DuckDB-safe group id.
 
@@ -1022,7 +1132,7 @@ def _view(group: str, spec: ViewSpec) -> GoldView:
 
 def build_catalog(provider_groups: Iterable[str]) -> tuple[GoldView, ...]:
     """Expand the base specs over the provider groups + the fixed efficiency/
-    driver_health/policy/ai_usage groups."""
+    driver_health/policy/ai_usage/storage/compute groups."""
     views: list[GoldView] = []
     for group in provider_groups:
         views.extend(_view(group, spec) for spec in PROVIDER_BASE_VIEWS)
@@ -1031,6 +1141,7 @@ def build_catalog(provider_groups: Iterable[str]) -> tuple[GoldView, ...]:
     views.extend(_view(POLICY_GROUP, spec) for spec in POLICY_BASE_VIEWS)
     views.extend(_view(AI_USAGE_GROUP, spec) for spec in AI_USAGE_BASE_VIEWS)
     views.extend(_view(STORAGE_GROUP, spec) for spec in STORAGE_BASE_VIEWS)
+    views.extend(_view(COMPUTE_GROUP, spec) for spec in COMPUTE_BASE_VIEWS)
     return tuple(views)
 
 
@@ -1040,13 +1151,20 @@ def build_catalog(provider_groups: Iterable[str]) -> tuple[GoldView, ...]:
 #: ``<group>.monthly_bill`` that doesn't exist. Add a new fixed group here in the same
 #: commit that creates it.
 FIXED_GROUPS: frozenset[str] = frozenset(
-    {EFFICIENCY_GROUP, DRIVER_HEALTH_GROUP, POLICY_GROUP, AI_USAGE_GROUP, STORAGE_GROUP}
+    {
+        EFFICIENCY_GROUP,
+        DRIVER_HEALTH_GROUP,
+        POLICY_GROUP,
+        AI_USAGE_GROUP,
+        STORAGE_GROUP,
+        COMPUTE_GROUP,
+    }
 )
 
 
 def discover_provider_groups() -> list[str]:
     """Provider groups published under ``gold/`` (excludes every :data:`FIXED_GROUPS`
-    one: efficiency/driver_health/policy/ai_usage/storage)."""
+    one: efficiency/driver_health/policy/ai_usage/storage/compute)."""
     gold = paths.gold_dir()
     if not gold.exists():
         return []

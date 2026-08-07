@@ -275,7 +275,9 @@ def build_pages() -> None:
     # outbound-LLM and MCP-tool stack into a demo process that must never reach either.
     from flashlight.dashboard.views import (
         ai_costs,
+        backing_compute,
         backing_storage,
+        databricks_footprint,
         driver_health,
         home_overview,
         provider_focus,
@@ -353,21 +355,34 @@ def build_pages() -> None:
         addition to it — same bill, same dollars, so the card says "part of" and keeps the
         default hue rather than claiming a colour of its own.
 
-        Backing storage is nested on a slightly different basis: it has **two** producers
-        (``aws_focus`` for the S3 cost, ``databricks`` for the Unity Catalog bucket map)
-        but exactly one *subject* — the storage behind this platform. The rule's purpose is
+        Backing storage and Backing compute are nested on a slightly different basis: each
+        has **two** producers (``aws_focus`` for the AWS cost, ``databricks`` for the
+        Databricks-side map — Unity Catalog's bucket map for storage,
+        ``system.compute.node_timeline``'s instance/cluster map for compute) but exactly
+        one *subject* — the storage or compute behind this platform. The rule's purpose is
         to keep a page-specific tab off every other provider page, and that still holds.
-        Its dollars are AWS-billed and stay out of ``databricks.monthly_bill`` and out of
+        Their dollars are AWS-billed and stay out of ``databricks.monthly_bill`` and out of
         every figure derived from it, the ``Databricks net`` KPI included (see
-        views/backing_storage.py and CLAUDE.md's "No cross-provider cost join"). They do
-        get their own card *beside* those KPIs (``extra_kpis``) rather than only living a
-        tab away, because "what does Databricks cost me?" is asked at the top of this page:
-        the card names its biller, says it is not in net, and is a separate hue for the
-        same reason. Side by side, never summed.
+        views/backing_storage.py, views/backing_compute.py and CLAUDE.md's "No
+        cross-provider cost join"). They do get their own card *beside* those KPIs
+        (``extra_kpis``) rather than only living a tab away, because "what does Databricks
+        cost me?" is asked at the top of this page: each card names its biller, says it is
+        not in net, and shares a hue for the same reason (a satellite AWS bill, not a slice
+        of net). Side by side, never summed.
 
-        Spend detail (AI Costs, Databricks Storage) sits after Breakdown via
-        ``after_breakdown``; Client Driver Health lands before Alerts via ``extra_tabs``.
-        Alerts stays last on every provider page.
+        ``databricks_footprint.footprint_card`` is the one deliberate exception to "never
+        summed" — and it says so on its own face. It adds Net Spend + Backing storage +
+        Backing compute into one "Total Databricks footprint" number, explicitly labelled
+        and explicitly not the same thing as Net Spend (its subtitle names both
+        components), because "what does running Databricks actually cost me end to end" is
+        a real question this page didn't have an answer to otherwise. It sits right after
+        Net Spend, before the individual satellite cards, and is omitted (not shown as
+        merely equal to Net Spend) when neither backing plane has any mapped spend for the
+        window.
+
+        Spend detail (AI Costs, Databricks Storage, Databricks Compute) sits after
+        Breakdown via ``after_breakdown``; Client Driver Health lands before Alerts via
+        ``extra_tabs``. Alerts stays last on every provider page.
 
         Neither Efficiency & Waste nor Policy Compliance is in this list: both are core
         tabs on every provider page now (provider_focus.render), including providers with
@@ -378,12 +393,21 @@ def build_pages() -> None:
         provider_focus.render(
             "databricks",
             label,
-            # In-bill slice first, other-bill cost second — the row reads outward from
-            # what Databricks charged (see each module's KPI_SUB).
-            extra_kpis=[ai_costs.kpi_card, backing_storage.kpi_card],
+            # The combined footprint card sits right after Net Spend (the two numbers
+            # that answer "what did Databricks bill me" and "what does running it
+            # actually cost, including AWS infra" belong next to each other), then the
+            # in-bill slice, then the other-bill breakdowns — the row reads outward from
+            # what Databricks charged (see each module's KPI_SUB/subtitle).
+            extra_kpis=[
+                databricks_footprint.footprint_card,
+                ai_costs.kpi_card,
+                backing_storage.kpi_card,
+                backing_compute.kpi_card,
+            ],
             after_breakdown=[
                 ("AI Costs", ai_costs.render),
                 ("Databricks Storage", backing_storage.render),
+                ("Databricks Compute", backing_compute.render),
             ],
             extra_tabs=[
                 ("Client Driver Health", driver_health.render),

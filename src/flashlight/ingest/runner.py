@@ -37,8 +37,17 @@ from flashlight.ingest.connectors import (
     DatabricksConnector,
     RedshiftConnector,
 )
-from flashlight.lake import ai_usage, bronze, driver_health, metrics, runlog, storage_locations
+from flashlight.lake import (
+    ai_usage,
+    bronze,
+    compute_instances,
+    driver_health,
+    metrics,
+    runlog,
+    storage_locations,
+)
 from flashlight.lake.ai_usage_schema import AiUsageRecord
+from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
 from flashlight.lake.storage_location_schema import StorageLocationRecord
 from flashlight.transform.runner import build_gold
@@ -262,10 +271,16 @@ def run_ingest(
     # rather than a backing-storage tab that reads "never measured" until the next run.
     _run_storage_locations(window, succeeded_connectors)
 
+    # Best-effort compute-instance pull (which cloud VM backed which Databricks cluster —
+    # metadata, no cost). Same reasoning as storage-locations: must run before the final
+    # build_gold() below so the first sync publishes a map rather than an empty
+    # backing-compute tab until the next run.
+    _run_compute_instances(window, succeeded_connectors)
+
     # Final holistic rebuild — same idempotent build_gold() as above, now
-    # picking up whatever fresh efficiency/waste, driver-health, AI-usage and
-    # storage-location data those phases just wrote (the earlier publish above ran
-    # before any had a
+    # picking up whatever fresh efficiency/waste, driver-health, AI-usage,
+    # storage-location and compute-instance data those phases just wrote (the earlier
+    # publish above ran before any had a
     # chance to). A failed connector's own window is left as it was before this
     # run (bronze.write_window re-purges on error, never leaving a partial
     # write), so GOLD never reflects a half-written pull.
@@ -430,4 +445,40 @@ def _run_storage_locations(window: IngestWindow, connectors: list[Connector]) ->
         return 0
     written = storage_locations.write_storage_locations(all_records)
     logger.info("storage_locations_written", rows=written)
+    return written
+
+
+def _run_compute_instances(window: IngestWindow, connectors: list[Connector]) -> int:
+    """Pull each platform's cloud-compute-instance membership map (concurrently,
+    bounded), then write it all in one call. Best-effort, same never-block-cost-ingest
+    guarantee and the same single-write merge as :func:`_run_driver_health`.
+
+    Metadata only — no cost. This is what lets the AWS EC2 bill be labelled with the
+    Databricks cluster behind it (see ``docs/design/backing-compute.md``); the two are
+    never summed into one figure.
+
+    Unlike :func:`_run_storage_locations`, ``window`` is genuinely honored by both the
+    hook and the writer — ``system.compute.node_timeline`` reports bounded historical
+    activity, not present-tense state (see
+    ``lake.compute_instances.write_compute_instances``).
+    """
+
+    def _pull(connector: Connector) -> list[ComputeInstanceRecord]:
+        name = connector.name
+        try:
+            records = list(connector.fetch_compute_instances(window))
+        except Exception as exc:  # noqa: BLE001 - secondary signal; never block ingest
+            logger.warning("compute_instances_pull_failed", connector=name, error=str(exc))
+            return []
+        if records:
+            logger.info("compute_instances_fetched", connector=name, rows=len(records))
+        return records
+
+    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+        all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
+
+    if not all_records:
+        return 0
+    written = compute_instances.write_compute_instances(window, all_records)
+    logger.info("compute_instances_written", rows=written)
     return written

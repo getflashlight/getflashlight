@@ -17,6 +17,7 @@ import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from flashlight.core.exceptions import ConfigError
+from flashlight.ingest._ec2_service_names import EC2_SERVICE_NAMES
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 from flashlight.ingest._s3_service_names import S3_SERVICE_NAMES
 from flashlight.ingest.connection_credentials import load_secret
@@ -24,9 +25,13 @@ from flashlight.lake import paths
 
 # The default AWS FOCUS pull: Redshift's own services (the cost the /aws page reports)
 # plus S3 (the storage behind Unity Catalog, which Databricks' own DBU-only bill can't
-# show — see docs/design/backing-storage.md). One constant so the model default, the
-# scaffolded connections.yml template and the tests can't disagree about it.
-DEFAULT_INCLUDE_SERVICES: tuple[str, ...] = tuple(sorted(REDSHIFT_SERVICE_NAMES | S3_SERVICE_NAMES))
+# show — see docs/design/backing-storage.md) plus EC2 (the cloud VMs behind a classic
+# Databricks cluster, same reasoning — see docs/design/backing-compute.md). One constant
+# so the model default, the scaffolded connections.yml template and the tests can't
+# disagree about it.
+DEFAULT_INCLUDE_SERVICES: tuple[str, ...] = tuple(
+    sorted(REDSHIFT_SERVICE_NAMES | S3_SERVICE_NAMES | EC2_SERVICE_NAMES)
+)
 
 
 def scoped_env_name(base: str, *, name: str | None, ctype: str) -> str:
@@ -70,9 +75,9 @@ class AwsFocusConfig(BaseModel):
     # Allow-list of FOCUS ServiceName values to ingest (also used as the Cost
     # Explorer SERVICE-dimension filter when cost_source="cost_explorer"). AWS
     # Data Exports is account-wide and cannot be scoped per service at the
-    # source, so Flashlight narrows here. Defaults to Redshift + S3 (see
+    # source, so Flashlight narrows here. Defaults to Redshift + S3 + EC2 (see
     # DEFAULT_INCLUDE_SERVICES) — set explicitly (e.g. `[]` for the whole
-    # account) to widen, or to just Redshift's names to opt out of S3.
+    # account) to widen, or to just Redshift's names to opt out of S3/EC2.
     include_services: list[str] = Field(
         default_factory=lambda: list(DEFAULT_INCLUDE_SERVICES)
     )
