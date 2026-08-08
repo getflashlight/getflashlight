@@ -60,7 +60,7 @@ Databricks ─────────┤  (vendored FOCUS 1.3 query)         �
 `ingest/connectors/databricks.py` · `ingest/runner.py` · `transform/runner.py` ·
 `transform/catalog.py` · `transform/sql/055_gold_utilization.sql` ·
 `efficiency/waste_rules.py` · `efficiency/policy_rules.py` · `efficiency/policy_config.py` ·
-`dashboard/router.py` · `dashboard/views/efficiency_waste.py` · `flashlight/sample.py`
+`dashboard/router.py` · `dashboard/views/efficiency_waste.py` · `scripts/build_demo_lake.py`
 
 ## Phase 1 — AI spend, from the existing lake
 
@@ -320,11 +320,11 @@ Then, after `flashlight ingest`:
 
 ```bash
 uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run pytest
-uv run flashlight sample   # regenerates + self-verifies the local demo lake
+uv run python scripts/build_demo_lake.py --out demo/lake   # regenerates + self-verifies
 uv run flashlight transform                                 # Phase 1 needs no re-pull
 uv run flashlight dashboard serve                           # /databricks → AI Costs
 ```
 
-`flashlight sample` covers **both** cost-allocation bases, a service-principal
+`scripts/build_demo_lake.py` covers **both** cost-allocation bases, a service-principal
 requester, a Genie row with a non-AI `service_category`, and all three endpoint findings — and
 asserts each, so a future change that empties the tab fails there rather than in a browser.

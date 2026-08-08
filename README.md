@@ -90,15 +90,16 @@ store; `FocusRecord` is the canonical ingestion schema.
 ```bash
 pip install getflashlight
 
-# Generate linked FOCUS, Redshift, and Databricks demo data in the local lake.
+# Load public FOCUS sample data into the local lake.
 flashlight sample
 
 # Open the dashboard at http://127.0.0.1:8501.
 flashlight dashboard serve
 ```
 
-`flashlight sample` is the zero-config way to see the dashboard with deterministic,
-schema-validated demo data. For your own sources instead:
+`flashlight sample [--rows 1000|10000]` is the zero-config way to see the dashboard
+with real data — it loads the CSV straight into Parquet via a vectorized DuckDB
+projection (no per-row Python). For your own sources instead:
 
 ```bash
 # Create <FLASHLIGHT_HOME>/config/ with commented starter files.
@@ -116,6 +117,35 @@ flashlight ingest
 * CLI: `flashlight init | ingest | transform | mcp serve | dashboard serve | aws create-export`
 * Config: `<home>/config/{connections,policies,assistant}.yml` — never any secrets; those
   go to your OS keychain or the env vars the config names.
+
+## Try the live demo (self-hosted)
+
+A prebuilt image with a mocked, multi-month FOCUS/efficiency/driver-health/
+policy dataset (no real billing, no config needed) is published to GHCR on
+every push to `main`:
+
+```bash
+docker run -p 8501:8501 ghcr.io/ychaparala/getflashlight-demo:latest
+# → http://localhost:8501
+```
+
+Or with Compose:
+
+```yaml
+services:
+  flashlight-demo:
+    image: ghcr.io/ychaparala/getflashlight-demo:latest
+    ports: ["8501:8501"]
+    restart: unless-stopped
+```
+
+Runs with `FLASHLIGHT_DEMO=1` (disables the BYOK assistant and connections pages —
+the dashboard's only write/mutation surfaces) and mocked data baked in from
+the committed `demo/lake/` dataset — nothing downloaded or written at
+runtime, safe to expose publicly. The full docs site is bundled too — click
+"Docs" in the left nav, or go straight to `/docs`. Put it behind your own
+reverse proxy (Caddy/nginx/Traefik) for TLS — the container only serves
+plain HTTP.
 
 ## FOCUS handling (why the numbers are trustworthy)
 

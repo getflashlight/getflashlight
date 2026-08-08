@@ -1,4 +1,4 @@
-"""Placeholder connectors for sources beyond the v1 (Databricks + AWS) scope.
+"""Placeholder connectors for sources beyond the implemented providers.
 
 These are wired into the registry so config/validation paths exist, but raise on
 ``fetch``. Each notes the native-export path we'll lean on when implemented.
@@ -31,8 +31,3 @@ class _NotYet(Connector):
 class BigQueryConnector(_NotYet):
     name = "bigquery"
     native_export = "GCP FOCUS-aligned Cloud Billing export to BigQuery"
-
-
-class SnowflakeConnector(_NotYet):
-    name = "snowflake"
-    native_export = "Snowflake ORGANIZATION_USAGE views → custom FOCUS mapper"

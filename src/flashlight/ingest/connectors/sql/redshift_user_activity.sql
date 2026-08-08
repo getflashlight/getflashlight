@@ -25,15 +25,12 @@ WITH q AS (
 ),
 spill AS (
     SELECT
-        r.query AS query,
-        r.userid AS userid,
+        query,
+        userid,
         sum(CASE WHEN is_diskbased = 't' THEN bytes ELSE 0 END) / 1024.0 / 1024 / 1024
                                                                         AS spill_gb
-    -- Scope the expensive step-level view to the requested query IDs before
-    -- aggregating it.  This avoids grouping all retained query-report history.
-    FROM svl_query_report r
-    JOIN q ON q.query = r.query AND q.userid = r.userid
-    GROUP BY r.query, r.userid
+    FROM svl_query_report
+    GROUP BY query, userid
 )
 SELECT
     u.usename                          AS username,

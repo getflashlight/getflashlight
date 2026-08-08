@@ -346,32 +346,23 @@ def test_fetch_storage_locations_captures_every_metastore_not_just_this_workspac
     """``metastores.list()`` is preferred over ``summary()`` because summary() returns ONLY
     the metastore assigned to the workspace this connector points at.
 
-    The real bug: an account with production and development metastores attached to different workspaces
+    The real bug: an account with a prd and a dev metastore attached to different workspaces
     reported one of them, and the other's bucket sat in `unmapped` looking like it wasn't
     Databricks storage at all.
     """
     client = _client(
         metastores_list_raises=False,
         metastores=[
-            SimpleNamespace(
-                name="production-metastore",
-                storage_root="s3://production-example-bucket/metastore/d5f",
-            ),
-            SimpleNamespace(
-                name="development-metastore",
-                storage_root="s3://development-example-bucket/metastore/a0b",
-            ),
+            SimpleNamespace(name="pii-prd-metastore", storage_root="s3://prd-metastore/metastore/d5f"),
+            SimpleNamespace(name="pii-dev-metastore", storage_root="s3://dev-metastore/metastore/a0b"),
         ],
-        # summary() would only ever have returned the production one.
-        summary=SimpleNamespace(
-            name="production-metastore",
-            storage_root="s3://production-example-bucket/metastore/d5f",
-        ),
+        # summary() would only ever have returned the prd one.
+        summary=SimpleNamespace(name="pii-prd-metastore", storage_root="s3://prd-metastore/metastore/d5f"),
     )
     records = list(_connector(monkeypatch, client).fetch_storage_locations(_window()))
 
     roots = {r.bucket_name for r in records if r.location_kind == "metastore_root"}
-    assert roots == {"production-example-bucket", "development-example-bucket"}
+    assert roots == {"prd-metastore", "dev-metastore"}
 
 
 def test_fetch_storage_locations_falls_back_to_summary_for_a_non_admin_token(  # type: ignore[no-untyped-def]
@@ -381,14 +372,12 @@ def test_fetch_storage_locations_falls_back_to_summary_for_a_non_admin_token(  #
     workspace's metastore rather than nothing at all."""
     client = _client(
         metastores_list_raises=True,
-        summary=SimpleNamespace(
-            name="production-metastore", storage_root="s3://production-example-bucket/m"
-        ),
+        summary=SimpleNamespace(name="pii-prd-metastore", storage_root="s3://prd-metastore/m"),
     )
     records = list(_connector(monkeypatch, client).fetch_storage_locations(_window()))
 
     assert [r.bucket_name for r in records if r.location_kind == "metastore_root"] == [
-        "production-example-bucket"
+        "prd-metastore"
     ]
 
 

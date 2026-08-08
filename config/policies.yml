@@ -1,0 +1,23 @@
+# Cost-policy thresholds. Every value below is already the default — this
+# file exists so you can tighten or relax them for your org. Delete it and
+# Flashlight falls back to these same defaults.
+#
+# Changing a value takes effect on the next `flashlight transform`/`ingest`:
+# thresholds are baked into the published GOLD, so the dashboard, the MCP
+# server, and any agent all classify identically.
+#
+# The rules themselves (what Flashlight checks) are the shipped catalog —
+# see the Policy page or the MCP `list_policy_rules` tool.
+
+thresholds:
+  # An interactive cluster's auto-termination timeout must be set and no longer than this to count as compliant.
+  max_auto_termination_minutes: 60
+
+  # A SQL warehouse's auto-stop timeout must be set and no longer than this to count as compliant.
+  max_warehouse_auto_stop_minutes: 30
+
+  # A model serving endpoint below this many requests in a month counts as low-traffic, which is what makes always-on provisioned capacity (scale-to-zero off, or a large GPU class) worth reviewing.
+  low_traffic_endpoint_requests: 100
+
+  # Average utilization at or below this reads as underutilized waste.
+  underutilized_pct: 20

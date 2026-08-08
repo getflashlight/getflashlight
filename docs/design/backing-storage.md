@@ -157,7 +157,7 @@ Three implementation details are load-bearing rather than cosmetic:
 
 Summing `net_cost` across all `mapping` values reproduces the account's whole S3 bill — the
 contract asserted in `test_backing_storage_accounts_for_every_s3_row` and in
-the schema-driven demo generator's GOLD contract audit.
+`build_demo_lake.verify_demo_lake`.
 
 ### 5. The dashboard
 

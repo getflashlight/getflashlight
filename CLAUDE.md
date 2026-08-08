@@ -45,7 +45,7 @@ per-file rename. See `src/flashlight/cli.py`.
 ```bash
 uv sync
 uv run flashlight init             # scaffold the lake home + connections.yml
-uv run flashlight sample           # generate reconciled Redshift, Databricks, and FOCUS demo data
+uv run flashlight sample           # download the FinOps FOCUS sample + seed it
 uv run flashlight ingest           # pull billing → BRONZE, rebuild GOLD
 uv run flashlight transform        # rebuild GOLD from BRONZE (no re-pull)
 uv run flashlight mcp serve        # MCP server :8002 (agents)
@@ -60,8 +60,8 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   vocab (`enums.py`). Every connector maps its source into a `FocusRecord`; this
   is the one contract between ingestion and storage.
 - **`ingest/`** — `Connector` ABC (`base.py`), YAML config (`config.py`), the
-  `runner.py` orchestrator, and `connectors/` (aws_focus, databricks, redshift, plus
-  stubs for bigquery/snowflake). Each connector config carries an optional `name`
+  `runner.py` orchestrator, and `connectors/` (aws_focus, databricks, redshift,
+  snowflake, plus a stub for bigquery). Each connector config carries an optional `name`
   (falls back to `type`; enforced unique via `effective_connector_name`) — needed
   once there's more than one connection of a type (e.g. several Redshift clusters),
   since `Connector.name` is set from it and is what BRONZE partitioning, the runlog,
@@ -80,6 +80,9 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   Databricks→FOCUS 1.3 query (`connectors/sql/databricks_focus_1_3.sql`, from
   `databricks-solutions/cloud-infra-costs`) on a warehouse and maps its output —
   don't reintroduce hand-rolled DBU math. Re-pull that file upstream to update it.
+  The **snowflake** connector reads `ORGANIZATION_USAGE.USAGE_IN_CURRENCY_DAILY`
+  into `FocusRecord` rows and also implements `fetch_driver_health` (ACCOUNT_USAGE
+  sessions → `support_status` via `_snowflake_supported_drivers.py`).
 - **`lake/`** — the Parquet persistence layer. `paths.py` (on-disk layout under
   `FLASHLIGHT_HOME`), `schema.py` (the BRONZE Arrow schema + row builder, replacing the
   old SQLModel table; `tags` is a JSON string), `bronze.py` (partition-replace
@@ -105,8 +108,11 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   provider page carries the **same five core tabs** — Trend & changes, Breakdown,
   Attribution (`views/attribution.py`), Efficiency & Waste (`views/efficiency_waste.py`) and
   Policy Compliance (`views/policy.py`) — plus per-provider extras (Databricks: AI Costs
-  (`views/ai_costs.py`), Backing storage (`views/backing_storage.py`) and Backing compute
-  (`views/backing_compute.py`)); Redshift also has Client Driver Health. Home is
+  (`views/ai_costs.py`), Backing storage (`views/backing_storage.py`), Backing compute
+  (`views/backing_compute.py`) and Client Driver Health; Snowflake: LeaderBoard +
+  Visibility from `dashboard/snowflake/` plus Client Driver Health). `/snowflake` is
+  always registered (nav includes it even before GOLD exists) and falls back to
+  synthetic Parquet under `snowflake/synthetic_data/` for the visibility UX. Home is
   the only cross-provider page; the old `/utilization` and `/leaderboard` pages are gone
   (`router._RETIRED_ROUTES` 307s them to Home). Redshift
   has no GOLD group of its own (its cost flows into `aws.*`; only its efficiency/waste
@@ -169,9 +175,8 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   its own dashboard page, and efficiency/waste is a **core tab on every one of them** —
   including providers with no telemetry, which get a named empty state rather than a
   hidden tab ("never measured" must not look like "nothing to find"). Only AI Costs,
-  Backing storage and Backing compute are Databricks-only extras; Client Driver Health
-  is an extra for Databricks and Redshift. The first is Databricks-only because it is
-  its sole *producer*; Backing storage/Backing
+  Backing storage, Backing compute and driver health are Databricks-only extras — the
+  first and last because Databricks is their sole *producer*, Backing storage/Backing
   compute because each has two producers (`aws_focus` for the AWS cost, `databricks` for
   the Databricks-side map — Unity Catalog's bucket map, or `system.compute.node_timeline`'s
   instance/cluster map) but a single *subject*, which serves the same purpose: keep a

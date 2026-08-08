@@ -86,6 +86,7 @@ CONNECTOR_LOGOS: dict[str, str] = {
         "https://upload.wikimedia.org/wikipedia/commons/7/73/Amazon-Redshift-Logo.svg"
         "?utm_source=commons.wikimedia.org&utm_campaign=index&utm_content=original"
     ),
+    "snowflake": "/dashboard-assets/snowflake.svg",
 }
 
 # Declared so Safari (and iOS "Add to Home Screen") uses this instead of probing
@@ -687,19 +688,16 @@ def flat_table(
     int_cols: Sequence[str] = (),
     num_cols: Sequence[str] = (),
     rename: dict[str, str] | None = None,
-    pagination: int | None = None,
 ) -> ui.table:
-    """A compact table, unpaginated by default and optionally page-sized."""
+    """An unpaginated ``ui.table`` for a fully-visible pivot/summary table."""
     columns, rows = _fmt_columns(
         df, money_cols=money_cols, pct_cols=pct_cols, int_cols=int_cols,
         num_cols=num_cols, rename=rename,
     )
-    props = "flat dense" if pagination is not None else "flat dense hide-pagination"
-    table_kwargs: dict[str, Any] = {"columns": columns, "rows": rows}
-    if pagination is not None:
-        table_kwargs["pagination"] = pagination
-    return ui.table(**table_kwargs).props(props).classes(
-        f"fl-table w-full {key}"
+    return (
+        ui.table(columns=columns, rows=rows)
+        .props("flat dense hide-pagination")
+        .classes(f"fl-table w-full {key}")
     )
 
 
@@ -735,12 +733,9 @@ def heatmap_table(
     """
     disp = df.rename(columns=rename) if rename else df.copy()
     heat_name = (rename or {}).get(heat_col, heat_col)
-    money_names = [(rename or {}).get(column, column) for column in money_cols]
 
     columns, rows = _fmt_columns(
-        disp,
-        money_cols=money_names,
-        pct_cols=[heat_name] if heat_name in disp.columns else [],
+        disp, money_cols=money_cols, pct_cols=[heat_name] if heat_name in disp.columns else [],
     )
     if heat_name in disp.columns:
         for row, val in zip(rows, disp[heat_name], strict=True):

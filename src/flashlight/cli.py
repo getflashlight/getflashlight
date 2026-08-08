@@ -1,8 +1,8 @@
 """Unified ``flashlight`` command — the one operator interface.
 
     flashlight init               scaffold the lake home (config skeleton + connections.yml)
-    flashlight sample             generate the linked Redshift, Databricks, and FOCUS demo
-    flashlight sample --clean     remove generated demo data, then rebuild GOLD
+    flashlight sample             download the FinOps FOCUS sample dataset and seed it
+    flashlight sample --clean     remove all seeded sample data, then rebuild GOLD
     flashlight ingest             pull billing → BRONZE Parquet, then rebuild GOLD
     flashlight transform          rebuild GOLD Parquet from BRONZE
     flashlight cleanup            remove ALL lake data (BRONZE/GOLD Parquet + run log)
@@ -64,21 +64,24 @@ def init(
 
 @app.command()
 def sample(
+    rows: int = typer.Option(1000, help="Sample size: 1000 or 10000"),
+    url: str | None = typer.Option(None, help="Override the FOCUS sample CSV URL"),
+    force: bool = typer.Option(False, "--force", help="Re-download even if cached"),
     clean: bool = typer.Option(
-        False, "--clean", help="Remove generated demo data instead of generating it"
+        False, "--clean", help="Remove all seeded sample data instead of seeding"
     ),
 ) -> None:
-    """Generate a reconciled Redshift, Databricks, and FOCUS demo for the dashboard.
+    """Download the FinOps FOCUS sample dataset and seed it for the dashboard.
 
-    The scenario is deterministic and schema-validated: cluster names, owners,
-    emails, tags, cost records, and telemetry all refer to the same entities.
+    With ``--clean``, removes everything the sample seeded (BRONZE partitions, cached
+    CSVs, run-log entries) and rebuilds GOLD — other connectors are left untouched.
     """
     from flashlight.sample import cleanup, load_sample
 
     if clean:
         cleanup()
         return
-    load_sample()
+    load_sample(rows=rows, url=url, force=force)
 
 
 @mcp_app.command("serve")
@@ -125,7 +128,7 @@ def _progress_printer() -> Callable[[str, str, int], None]:
             if event == "start":
                 typer.echo(f"  {name} ...")
             elif event == "done":
-                typer.echo(f"  {name} ... cost pull complete: {rows:,} rows")
+                typer.echo(f"  {name} ... {rows:,} rows done")
             elif event == "failed":
                 typer.secho(f"  {name} ... failed", fg=typer.colors.RED)
             elif event == "efficiency_done":

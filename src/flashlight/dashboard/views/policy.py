@@ -41,7 +41,7 @@ from nicegui import ui
 
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import gold_df, gold_view_published
-from flashlight.efficiency.policy_rules import POLICY_LABELS
+from flashlight.efficiency.policy_rules import POLICY_RULES
 
 _STALE_MSG = (
     "Policy compliance isn't published in this lake yet — run `flashlight transform` "
@@ -52,7 +52,7 @@ _STALE_MSG = (
 # grain table reads better than the raw snake_case category, falls back to it if a
 # category has no matching rule (shouldn't happen; policy_record is generated from
 # this same pool, but a stale lake could carry a retired category).
-_CATEGORY_LABEL = POLICY_LABELS
+_CATEGORY_LABEL = {r.category: r.label for r in POLICY_RULES}
 # The reverse, for the policy-grain table's row click: the table displays policy_label
 # (not the raw category the DataFrame passed to `chrome.searchable_table` never carries
 # — only `_POLICY_COLS` do), so recovering which policy was clicked has to go through

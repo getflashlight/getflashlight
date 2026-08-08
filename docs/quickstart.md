@@ -15,7 +15,7 @@ directory (real shell env wins).
 ## 2. Try it with sample data (no configuration)
 
 ```bash
-flashlight sample               # generate linked Redshift, Databricks, and FOCUS demo data
+flashlight sample               # download the FinOps FOCUS sample + seed it
 flashlight dashboard serve      # dashboard → http://127.0.0.1:8501
 ```
 

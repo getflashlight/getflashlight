@@ -16,10 +16,10 @@ WITH q AS (
       AND userid > 1  -- exclude bootstrap/system queries
 ),
 spill AS (
-    SELECT DISTINCT s.query
-    FROM svl_query_summary s
-    JOIN q ON q.query = s.query
-    WHERE s.is_diskbased = 't'
+    SELECT DISTINCT query
+    FROM svl_query_summary
+    WHERE is_diskbased = 't'
+      AND query IN (SELECT query FROM q)
 ),
 scaling AS (
     SELECT sum(datediff(seconds, start_time, end_time)) AS active_seconds
@@ -32,41 +32,27 @@ wlm AS (
     -- queued statement including internal/bootstrap ones, which would otherwise dilute
     -- the percentile toward zero with near-instant system-queue entries that never
     -- reflect real user wait.
-    SELECT w.total_queue_time, w.total_exec_time
-    FROM stl_wlm_query w
-    JOIN q ON q.query = w.query
-    WHERE w.queue_start_time >= :start_date AND w.queue_start_time < :end_date
-),
-q_stats AS (
-    SELECT count(*) AS query_count FROM q
-),
-spill_stats AS (
-    SELECT count(*) AS disk_spill_query_count FROM spill
-),
-wlm_stats AS (
-    -- Keep the two percentile calculations and wait/execute ratio in one
-    -- aggregate over the already-scoped WLM rows.  The former scalar subqueries
-    -- could each re-read/sort the same system-table result.
-    SELECT
-        percentile_cont(0.95) WITHIN GROUP (ORDER BY total_queue_time) AS wlm_queue_wait_us_p95,
-        percentile_cont(0.99) WITHIN GROUP (ORDER BY total_queue_time) AS wlm_queue_wait_us_p99,
-        avg(total_queue_time)::double precision / nullif(avg(total_exec_time), 0)
-                                                                    AS wlm_wait_to_exec_ratio
-    FROM wlm
+    SELECT total_queue_time, total_exec_time
+    FROM stl_wlm_query
+    WHERE queue_start_time >= :start_date AND queue_start_time < :end_date
+      AND query IN (SELECT query FROM q)
 )
 SELECT
-    q_stats.query_count,
-    wlm_stats.wlm_queue_wait_us_p95,
-    wlm_stats.wlm_queue_wait_us_p99,
-    wlm_stats.wlm_wait_to_exec_ratio,
-    spill_stats.disk_spill_query_count,
-    coalesce(scaling.active_seconds, 0)                             AS concurrency_scaling_active_seconds,
+    (SELECT count(*) FROM q)                                       AS query_count,
+    (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY total_queue_time) FROM wlm)
+                                                                    AS wlm_queue_wait_us_p95,
+    (SELECT percentile_cont(0.99) WITHIN GROUP (ORDER BY total_queue_time) FROM wlm)
+                                                                    AS wlm_queue_wait_us_p99,
+    -- avg queue time / avg exec time — how much of a query's wall time is spent waiting
+    -- on a WLM slot vs. actually running, mirrors the runbook's own
+    -- admin.v_wlm_queue_queries_stats_agg_day_h "avg_wait_to_exec_ratio".
+    (SELECT avg(total_queue_time)::double precision
+            / nullif(avg(total_exec_time), 0) FROM wlm)
+                                                                    AS wlm_wait_to_exec_ratio,
+    (SELECT count(*) FROM spill)                                   AS disk_spill_query_count,
+    coalesce((SELECT active_seconds FROM scaling), 0)              AS concurrency_scaling_active_seconds,
     -- STL_QUERY's own retention floor (typically a handful of days, see the module
     -- docstring). The connector compares this against :start_date to tell "confirmed
     -- zero queries" apart from "the window predates what STL_QUERY still retains" —
     -- count(*) returns 0 either way, but only the first one is honestly "idle".
-    (SELECT min(starttime) FROM stl_query)                          AS earliest_retained_query_ts
-FROM q_stats
-CROSS JOIN spill_stats
-CROSS JOIN wlm_stats
-LEFT JOIN scaling ON true;
+    (SELECT min(starttime) FROM stl_query)                         AS earliest_retained_query_ts;

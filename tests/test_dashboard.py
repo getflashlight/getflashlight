@@ -592,7 +592,7 @@ def test_connections_page_sync_button_streams_output_without_crashing(  # type: 
             return self._returncode
 
     async def _fake_create_subprocess_exec(*cmd, **kwargs):  # type: ignore[no-untyped-def]
-        lines = [b"  Prod-Focus ...\n", b"  Prod-Focus ... cost pull complete: 42 rows\n"]
+        lines = [b"  Prod-Focus ...\n", b"  Prod-Focus ... 42 rows done\n"]
         return _FakeProcess(lines, returncode=0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
@@ -631,7 +631,7 @@ def test_connections_page_sync_button_streams_output_without_crashing(  # type: 
                 if isinstance(child, ui.label)
             ]
             assert "  Prod-Focus ..." in log_lines
-            assert "  Prod-Focus ... cost pull complete: 42 rows" in log_lines
+            assert "  Prod-Focus ... 42 rows done" in log_lines
 
     asyncio.run(_check())
     assert not caught, f"sync click triggered unexpected exception(s): {caught}"
@@ -1646,7 +1646,7 @@ _REDSHIFT_TABS = (
     "Trend & changes",
     "Breakdown",
     "Attribution",
-    "Efficiency & Waste",
+    "Optimization",
 )
 
 # Databricks: spend detail after Breakdown, Client Driver Health last.

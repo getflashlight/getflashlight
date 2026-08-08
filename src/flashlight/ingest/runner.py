@@ -7,9 +7,9 @@ regardless of earlier failures — one broken source (an expired token, a moved
 bucket) must not block a fresh pull from every other source. Failures are
 collected and, once every connector has run, raised together as
 :class:`IngestError` so the CLI still exits non-zero and names every connector
-that needs attention. After every selected connector has finished writing its
-own BRONZE data (including best-effort supplemental telemetry for successful
-cost pulls), SILVER and GOLD are built once from the complete available lake.
+that needs attention. GOLD is rebuilt from whatever succeeded (best-effort
+efficiency/driver-health pulls run only for the connectors whose cost pull
+worked — a connector with broken creds fails those the same way).
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ from flashlight.ingest.config import (
     AwsFocusConfig,
     DatabricksConfig,
     RedshiftConfig,
+    SnowflakeConfig,
     effective_connector_name,
     load_connections,
 )
@@ -36,6 +37,7 @@ from flashlight.ingest.connectors import (
     AwsFocusConnector,
     DatabricksConnector,
     RedshiftConnector,
+    SnowflakeConnector,
 )
 from flashlight.lake import (
     ai_usage,
@@ -43,16 +45,12 @@ from flashlight.lake import (
     compute_instances,
     driver_health,
     metrics,
-    redshift_policy_config,
-    redshift_table_observability,
     runlog,
     storage_locations,
 )
 from flashlight.lake.ai_usage_schema import AiUsageRecord
 from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
-from flashlight.lake.redshift_policy_config_schema import RedshiftPolicyConfigRecord
-from flashlight.lake.redshift_table_observability_schema import RedshiftTableObservabilityRecord
 from flashlight.lake.storage_location_schema import StorageLocationRecord
 from flashlight.transform.runner import build_gold
 
@@ -62,6 +60,7 @@ _REGISTRY: dict[type[BaseModel], type[Connector]] = {
     AwsFocusConfig: AwsFocusConnector,
     DatabricksConfig: DatabricksConnector,
     RedshiftConfig: RedshiftConnector,
+    SnowflakeConfig: SnowflakeConnector,
 }
 
 #: Fallback when ``FLASHLIGHT_INGEST_LOOKBACK_DAYS`` is unset — see
@@ -240,21 +239,36 @@ def run_ingest(
             failed.append(outcome.name)
             logger.error("connector_failed", connector=outcome.name, detail=outcome.detail)
 
-    _run_supplemental(
-        window,
-        succeeded_connectors,
-        on_progress,
-    )
-
-    # The layer boundary is deliberate: all selected connectors finish their
-    # BRONZE writes before SILVER is evaluated and GOLD is published. A failed
-    # connector's window is left as it was before this run (bronze.write_window
-    # re-purges on error, never leaving a partial write), while a successful
-    # connector contributes its fresh partitions. One full, idempotent transform
-    # therefore publishes one coherent view of everything available in BRONZE.
+    # Publish GOLD from the cost pull immediately — don't make dashboard-visible
+    # cost data wait on the slower, best-effort efficiency/driver-health phases
+    # below. build_gold() is a full, idempotent rebuild from whatever's
+    # currently on disk (see transform/runner.py), safe to call again after
+    # those phases finish (below) — this just means a process that dies
+    # partway through them (e.g. killed mid-efficiency-pull) still leaves
+    # already-successfully-pulled cost data published, instead of leaving GOLD
+    # untouched until a sync completes end to end.
     if not no_transform and succeeded_connectors:
         published = build_gold()
-        logger.info("transform_done", gold_views=published, phase="bronze_complete")
+        logger.info("transform_done", gold_views=published, phase="cost")
+
+    # The five supplemental planes are independent reads and write to distinct Parquet
+    # roots. Run the phases concurrently so a slow warehouse query (for example driver
+    # health) does not make the REST-only storage inventory wait behind it. Each phase is
+    # deliberately given one worker internally: this outer pool is the global bound, so
+    # a single sync never fans out to five nested pools and exceeds ingest_max_workers.
+    # Their individual helpers still use per-connector concurrency when called directly.
+    _run_supplemental(window, succeeded_connectors, on_progress)
+
+    # Final holistic rebuild — same idempotent build_gold() as above, now
+    # picking up whatever fresh efficiency/waste, driver-health, AI-usage,
+    # storage-location and compute-instance data those phases just wrote (the earlier
+    # publish above ran before any had a
+    # chance to). A failed connector's own window is left as it was before this
+    # run (bronze.write_window re-purges on error, never leaving a partial
+    # write), so GOLD never reflects a half-written pull.
+    if not no_transform and succeeded_connectors:
+        published = build_gold()
+        logger.info("transform_done", gold_views=published, phase="final")
     logger.info(
         "ingest_complete",
         connectors=len(connectors),
@@ -272,23 +286,10 @@ def _run_supplemental(
     connectors: list[Connector],
     on_progress: ProgressCallback | None = None,
 ) -> None:
-    """Run supplemental telemetry under one global concurrency cap.
-
-    Driver health and policy configuration run first because they have a short,
-    predictable latency. The remaining planes are still independent and concurrent.
-    All of these writes stay in BRONZE until the single transform at the end of
-    :func:`run_ingest`.
-    """
-    priority_phases = (
-        lambda: _run_driver_health(window, connectors, max_workers=1),
-        lambda: _run_policy_config(window, connectors, max_workers=1),
-    )
-    with ThreadPoolExecutor(max_workers=_max_workers(len(priority_phases))) as pool:
-        list(pool.map(lambda phase: phase(), priority_phases))
-
+    """Run independent best-effort telemetry phases under one global concurrency cap."""
     phases = (
         lambda: _run_efficiency(window, connectors, on_progress, max_workers=1),
-        lambda: _run_redshift_table_observability(window, connectors, max_workers=1),
+        lambda: _run_driver_health(window, connectors, max_workers=1),
         lambda: _run_ai_usage(window, connectors, max_workers=1),
         lambda: _run_storage_locations(window, connectors, max_workers=1),
         lambda: _run_compute_instances(window, connectors, max_workers=1),
@@ -383,43 +384,6 @@ def _run_driver_health(
         return 0
     written = driver_health.write_driver_health(window, all_records)
     logger.info("driver_health_written", rows=written)
-    return written
-
-
-def _run_policy_config(
-    window: IngestWindow, connectors: list[Connector], *, max_workers: int | None = None
-) -> int:
-    def _pull(connector: Connector) -> list[RedshiftPolicyConfigRecord]:
-        try:
-            return list(connector.fetch_policy_config(window))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("policy_config_pull_failed", connector=connector.name, error=str(exc))
-            return []
-
-    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
-        records = [record for batch in pool.map(_pull, connectors) for record in batch]
-    return redshift_policy_config.write(window, records)
-
-
-def _run_redshift_table_observability(
-    window: IngestWindow, connectors: list[Connector], *, max_workers: int | None = None
-) -> int:
-    """Collect daily Redshift table/Spectrum facts as a best-effort typed BRONZE plane."""
-
-    def _pull(connector: Connector) -> list[RedshiftTableObservabilityRecord]:
-        try:
-            return list(connector.fetch_redshift_table_observability(window))
-        except Exception as exc:  # noqa: BLE001 - supplemental telemetry must not block billing
-            logger.warning(
-                "redshift_table_observability_pull_failed", connector=connector.name, error=str(exc)
-            )
-            return []
-
-    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
-        records = [record for batch in pool.map(_pull, connectors) for record in batch]
-    written = redshift_table_observability.write(records)
-    if written:
-        logger.info("redshift_table_observability_written", rows=written)
     return written
 
 

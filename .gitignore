@@ -22,13 +22,27 @@ htmlcov/
 # local operator config (commit the *.example.* templates instead)
 .env
 config/connections.yml
-config/assistant.yml
 
 # Lake data — billing Parquet must never be committed
 *.parquet
-
-# Local development utilities are not package source.
+# ...except the mocked, synthetic demo dataset (scripts/build_demo_lake.py), which is
+# meant to ship in the repo and in the self-host Docker image (see demo/README.md).
+# Note: `demo/` itself must NOT be listed here — git cannot re-include a file whose
+# parent *directory* is excluded, so an ignored `demo/` would make this negation a
+# no-op and silently un-ship the demo lake (which breaks the Docker build, since
+# publish-demo-image.yml builds from a fresh checkout with `context: .`).
+# !demo/lake/**/*.parquet
+demo/
 scripts/
+Dockerfile
+.dockerignore
+
+# ...but not the demo lake's runtime artifacts. These are recreated on demand — the
+# DuckDB spill dir and the NiceGUI storage dir are mkdir'd on boot (lake/duck.py,
+# dashboard/launch.py), and gold.staging is a transient transform dir.
+demo/lake/tmp/
+demo/lake/gold.staging/
+demo/lake/meta/dashboard_storage/
 
 # Logs
 *.log
@@ -38,3 +52,4 @@ scripts/
 .cursor/mcp.json
 docs/cli.md
 site/
+config/assistant.yml

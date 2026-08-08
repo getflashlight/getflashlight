@@ -2,21 +2,19 @@
 
 Reads the one GOLD passthrough view (``driver_health.driver_health``): query volume
 per (client_driver, client_application, executed_by, month). No dollar figure, and
-still no verdict against the provider's *actual* released versions — there's no
+still no verdict against Databricks' *actual* released versions — there's no
 reference table of those in this data.
 
 What *is* computed here, presentation-only, is a self-referential staleness check:
-``client_driver`` carries a family/version label (for example, ``DatabricksJDBCDriver,
-2.7.1`` or ``Redshift JDBC Driver 2.0.0.0``), so within a family we can tell who's
-behind the newest version already running *somewhere else in the same fleet* this
-month — real drift, independent of whether that "newest seen" is itself the vendor's
-latest release. That's the genuinely actionable read of this tab: not the raw
-leaderboard, but who's lagging their own peers.
+``client_driver`` carries "<family>, <version>" together (e.g. "DatabricksJDBCDriver,
+2.7.1"), so within a family we can tell who's behind the newest version already
+running *somewhere else in the same fleet* this month — real drift, independent of
+whether that "newest seen" is itself Databricks' latest release. That's the
+genuinely actionable read of this tab: not the raw leaderboard, but who's lagging
+their own peers.
 """
 
 from __future__ import annotations
-
-import re
 
 import pandas as pd
 from nicegui import ui
@@ -24,10 +22,14 @@ from nicegui import ui
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import gold_df
 
-_VERSION_SUFFIX = re.compile(r"^(?P<family>.+?)[, ]+(?P<version>\d+(?:\.\d+)+)$")
+_EMPTY_MSG = (
+    "No driver-health data yet. This view needs the Databricks system-table pull "
+    "(system.query.history) — run `flashlight ingest` with a Databricks connector configured."
+)
 
 _COLS = [
     "client_driver",
+    "client_application",
     "executed_by",
     "provider_name",
     "query_count",
@@ -35,6 +37,7 @@ _COLS = [
 ]
 _RENAME = {
     "client_driver": "Driver",
+    "client_application": "Application",
     "executed_by": "User",
     "provider_name": "Provider",
     "query_count": "Queries",
@@ -42,12 +45,14 @@ _RENAME = {
 }
 _OUTDATED_COLS = [
     "client_driver",
+    "client_application",
     "executed_by",
     "newest_seen_version",
     "query_count",
 ]
 _OUTDATED_RENAME = {
     "client_driver": "Driver",
+    "client_application": "Application",
     "executed_by": "User",
     "newest_seen_version": "Newest seen in fleet",
     "query_count": "Queries",
@@ -67,11 +72,10 @@ def _df(sql: str) -> pd.DataFrame:
 
 
 def _parse_driver(client_driver: object) -> tuple[str, str]:
-    """Split a driver label into family/version when it has a numeric suffix.
+    """Split "DatabricksJDBCDriver, 2.7.1" into ("DatabricksJDBCDriver", "2.7.1").
 
-    Databricks uses ``"DatabricksJDBCDriver, 2.7.1"`` while Redshift connection logs
-    use labels such as ``"Redshift JDBC Driver 2.0.0.0"``.  This is presentation-only:
-    it separates either source's family and version for a within-fleet comparison.
+    Both halves are already top-level, populated columns in ``system.query.history``
+    (see ``databricks_driver_health.sql``) — this just separates them for comparison.
     Falls back to ``(raw, "")`` when there's no ", version" suffix, so an unexpected
     format degrades to "can't judge" rather than raising. ``client_driver`` is a
     nullable Parquet string column, which pandas surfaces as ``float('nan')`` (not
@@ -80,10 +84,8 @@ def _parse_driver(client_driver: object) -> tuple[str, str]:
     """
     if not isinstance(client_driver, str):
         return "", ""
-    match = _VERSION_SUFFIX.match(client_driver.strip())
-    if match is None:
-        return client_driver.strip(), ""
-    return match["family"].strip(), match["version"]
+    family, _, version = client_driver.partition(",")
+    return family.strip(), version.strip()
 
 
 def _version_key(version: str) -> tuple[int, ...]:
@@ -142,25 +144,14 @@ def _with_staleness(records: pd.DataFrame) -> pd.DataFrame:
     return records
 
 
-def render(provider_name: str = "Databricks", label: str = "Databricks") -> None:
-    """Render one provider's driver fleet, never mixing version baselines.
-
-    ``provider_name`` is the raw source name stored in the record (``AWS`` for
-    Redshift), while *label* is the provider-page display name.
-    """
-    chrome.section_title(f"{label} client driver health")
-    provider_sql = provider_name.replace("'", "''")
+def render() -> None:
+    chrome.section_title("Client driver health")
 
     records = _df(
-        "SELECT * FROM driver_health.driver_health "
-        f"WHERE provider_name = '{provider_sql}' "
-        "ORDER BY charge_month DESC, query_count DESC"
+        "SELECT * FROM driver_health.driver_health ORDER BY charge_month DESC, query_count DESC"
     )
     if records.empty:
-        ui.label(
-            f"No driver-health data yet for {label}. Run `flashlight ingest` with its "
-            "connector configured; this signal is collected independently from cost data."
-        ).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+        ui.label(_EMPTY_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
         return
 
     records = _with_staleness(records)
@@ -180,12 +171,19 @@ def render(provider_name: str = "Databricks", label: str = "Databricks") -> None
                 "already seen elsewhere in your fleet."
             )
         else:
+            chrome.caption_info(
+                f"{len(outdated):,} of {len(month_rows):,} driver/application/user "
+                f"combinations this month are behind a newer version of the same driver "
+                "already running elsewhere in your fleet.",
+                "Compared against the newest version of each driver family seen anywhere "
+                "in this lake's history, not against Databricks' actual latest release — "
+                "there's no reference table of released versions in this data.",
+            )
             chrome.flat_table(
                 outdated[_OUTDATED_COLS],
                 key="driver_health_outdated",
                 int_cols=["query_count"],
                 rename=_OUTDATED_RENAME,
-                pagination=10,
             )
 
     with chrome.panel():
@@ -195,5 +193,4 @@ def render(provider_name: str = "Databricks", label: str = "Databricks") -> None
             search_col="client_driver",
             int_cols=["query_count"],
             rename=_RENAME,
-            pagination=10,
         )

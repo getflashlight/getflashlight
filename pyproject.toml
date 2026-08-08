@@ -5,10 +5,7 @@ description = "FOCUS-based multi-cloud spend-visualization platform"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-authors = [
-    { name = "Yuga Chaparala", email = "ychaparala@gmail.com" },
-    { name = "Velu Natarajan", email = "velunatsf@gmail.com" },
-]
+authors = [{ name = "Yuga Chaparala", email = "ychaparala@gmail.com" }]
 requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -36,6 +33,7 @@ dependencies = [
     "pydantic-settings>=2.14.2",
     "python-dotenv>=1.0.1",
     "pyyaml>=6.0.3",
+    "snowflake-connector-python>=3.12.0",
     "structlog>=26.1.0",
     "typer>=0.27.0",
 ]

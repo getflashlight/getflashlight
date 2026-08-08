@@ -12,8 +12,8 @@ AI-usage, storage-location, or compute-inventory telemetry.
 | AWS Cost Explorer | Yes, coarser totals | No | — | Supported fallback |
 | Databricks system tables | Yes | Yes | Driver health, AI usage, storage locations, compute inventory | Supported |
 | Amazon Redshift | No* | Yes | Query patterns and operational telemetry | Supported |
+| Snowflake | Yes | No | Driver health (`support_status` vs published minimums) | Supported |
 | BigQuery | — | — | — | Planned stub |
-| Snowflake | — | — | — | Planned stub |
 
 \*Redshift cost is expected to arrive through AWS FOCUS data. The Redshift connector does
 not duplicate that cost pull; it adds telemetry that makes the AWS cost more actionable.

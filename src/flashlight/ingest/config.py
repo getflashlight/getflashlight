@@ -261,12 +261,40 @@ class RedshiftConfig(BaseModel):
         return self
 
 
-ConnectorConfig = AwsFocusConfig | DatabricksConfig | RedshiftConfig
+class SnowflakeConfig(BaseModel):
+    """Snowflake cost connector — reads ORGANIZATION_USAGE.USAGE_IN_CURRENCY_DAILY."""
+
+    type: str = "snowflake"
+    enabled: bool = True
+    # Optional — see AwsFocusConfig.name for the fallback/uniqueness contract.
+    name: str | None = None
+    account: str
+    user_env: str = "SNOWFLAKE_USER"
+    password_env: str = "SNOWFLAKE_PASSWORD"
+    role: str = "ACCOUNTADMIN"
+    warehouse: str | None = None
+    database: str = "SNOWFLAKE"
+    authenticator: str | None = None
+    private_key_path: str | None = None
+
+    @model_validator(mode="after")
+    def _scope_default_secret_env_names(self) -> SnowflakeConfig:
+        if "user_env" not in self.model_fields_set:
+            self.user_env = scoped_env_name(self.user_env, name=self.name, ctype=self.type)
+        if "password_env" not in self.model_fields_set:
+            self.password_env = scoped_env_name(
+                self.password_env, name=self.name, ctype=self.type
+            )
+        return self
+
+
+ConnectorConfig = AwsFocusConfig | DatabricksConfig | RedshiftConfig | SnowflakeConfig
 
 _CONFIG_TYPES: dict[str, type[BaseModel]] = {
     "aws_focus": AwsFocusConfig,
     "databricks": DatabricksConfig,
     "redshift": RedshiftConfig,
+    "snowflake": SnowflakeConfig,
 }
 
 
