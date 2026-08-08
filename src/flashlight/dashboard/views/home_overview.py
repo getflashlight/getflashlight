@@ -24,6 +24,7 @@ from flashlight.dashboard.theme import (
     provider_color,
     provider_color_map,
 )
+from flashlight.dashboard.views.efficiency_waste import action_group_rows
 from flashlight.transform.catalog import discover_provider_groups
 
 
@@ -267,18 +268,27 @@ def _provider_history(groups: list[str], start: date, end: date) -> pd.DataFrame
 
 
 def _recoverable_by_provider(month: date) -> pd.Series:
-    """provider_name -> sum(recoverable_cost) for *month*; empty on any issue
-    (efficiency.waste_record may not exist yet — no connector configured).
+    """Provider -> conservative actionable-savings potential for *month*.
+
+    This deliberately shares the Efficiency & Waste action queue's roll-up: the best
+    priced finding per entity/lens, rather than summing overlapping findings. The two
+    remedy lanes remain distinct in that tab, but this home-page total is their combined
+    navigation summary and carries a non-additivity note wherever it is rendered.
     """
     try:
         df = gold_df(
-            "SELECT provider_name, sum(recoverable_cost) AS recoverable "
-            f"FROM efficiency.waste_record WHERE charge_month = '{month}' "
-            "GROUP BY provider_name"
+            "SELECT * FROM efficiency.waste_record "
+            f"WHERE charge_month = '{month}'"
         )
     except Exception:  # noqa: BLE001 - view may be unbuilt
         return pd.Series(dtype=float)
-    return df.set_index("provider_name")["recoverable"]
+    if df.empty:
+        return pd.Series(dtype=float)
+    values = {
+        str(provider): float(action_group_rows(rows)["potential_savings"].sum())
+        for provider, rows in df.groupby("provider_name")
+    }
+    return pd.Series(values, dtype=float)
 
 
 def _credits_note(month: date) -> None:
@@ -405,11 +415,12 @@ def render() -> None:
                     delta_variant(total_delta),
                 ),
                 (
-                    "Recoverable this month",
+                    "Actionable savings potential",
                     compact_money(total_recoverable) if total_recoverable else "—",
-                    f"{100 * total_recoverable / total_cur:.1f}% of spend"
+                    f"{100 * total_recoverable / total_cur:.1f}% of spend · "
+                    "remedy lanes may overlap"
                     if total_cur and total_recoverable
-                    else "waste + opportunity",
+                    else "tune + move options",
                     "unattributed",
                 ),
             ],
@@ -536,7 +547,7 @@ def render() -> None:
                             color=color,
                             delta_color=delta_hex,
                             href=f"/{row.group}",
-                            note=f"{compact_money(rec)} recoverable" if rec else None,
+                            note=f"{compact_money(rec)} action potential" if rec else None,
                         )
 
     body()

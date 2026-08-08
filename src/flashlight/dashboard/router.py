@@ -444,8 +444,8 @@ def build_pages() -> None:
         window.
 
         Spend detail (AI Costs, Databricks Storage, Databricks Compute) sits after
-        Breakdown via ``after_breakdown``; Client Driver Health lands before Alerts via
-        ``extra_tabs``. Alerts stays last on every provider page.
+        Breakdown via ``after_breakdown``; Client Driver Health is supplied through
+        ``extra_tabs``. Alerts are intentionally not shown on the Databricks page.
 
         Neither Efficiency & Waste nor Policy Compliance is in this list: both are core
         tabs on every provider page now (provider_focus.render), including providers with
@@ -475,6 +475,7 @@ def build_pages() -> None:
             extra_tabs=[
                 ("Client Driver Health", driver_health.render),
             ],
+            show_alerts=False,
         )
 
     # One parameterized route, not one @ui.page per group discovered right now —

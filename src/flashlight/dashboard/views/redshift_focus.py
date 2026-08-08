@@ -39,12 +39,11 @@ connector only supplies efficiency/waste telemetry. So this page:
   ``provider_name = 'AWS'`` only the Redshift connector emits them (S3's own signal
   uses ``entity_type = 'storage'``), so the combination stays Redshift-only despite
   ``entity_type`` names being shared in *name* with Databricks' own entity type
-  (just under a different ``provider_name``). ``efficiency_waste.rule_coverage_table``
+  (just under a different ``provider_name``). ``efficiency_waste.coverage_summary``
   also cross-references ``efficiency.efficiency_entity_month`` (every rule this connector
-  evaluates, not just the ones that fired) so a rule that found nothing reads
-  differently from one whose telemetry never arrived this window. That table used to live
-  here, driven by a hand-maintained rule→group map; it's derived from the rule pool now
-  (``waste_rules.coverage_groups``) and renders on every provider's tab.
+  evaluates, not just the ones that fired) so a rule that found nothing reads differently
+  from one whose telemetry never arrived this window. It is compact diagnostic text; the
+  single table per cluster is the same drill-down action queue used by every provider.
 
   This tab is why the page does NOT also carry ``efficiency_waste.render()`` the way every
   other provider page does: ``_waste_section`` is scoped per *cluster*, which is finer than
@@ -107,6 +106,7 @@ def scope() -> Scope:
         values=tuple(sorted(REDSHIFT_SERVICE_NAMES)),
         account_wide=_ACCOUNT_WIDE,
     )
+
 
 def _sql_str(value: str) -> str:
     return value.replace("'", "''")
@@ -221,9 +221,7 @@ def _spend_partition(sm: date, end: date) -> None:
     #    them (those carry a NULL ResourceId — AWS ties neither side to a resource).
     #    Credits matter here — confirmed against real data: excluding them would
     #    report a materially wrong, misleadingly positive "commitment" number.
-    _attributed = (
-        "resource_id <> '(none)' AND resource_id NOT LIKE '%:reserved-instances/%'"
-    )
+    _attributed = "resource_id <> '(none)' AND resource_id NOT LIKE '%:reserved-instances/%'"
     committed = gold_df(
         f"SELECT sum(net_cost) AS net_cost FROM {_GROUP}.resource_month "
         f"WHERE service_name IN ({_SERVICE_IN}) AND NOT ({_attributed}) AND {_in_range}"
@@ -261,7 +259,9 @@ def _spend_partition(sm: date, end: date) -> None:
                 "concurrency scaling. Excludes RI commitments and credits (see above)."
             )
             chrome.flat_table(
-                cluster, key="redshift_cluster", money_cols=["net_cost"],
+                cluster,
+                key="redshift_cluster",
+                money_cols=["net_cost"],
                 rename={"cluster": "Cluster", "net_cost": "Net cost"},
             )
 
@@ -274,7 +274,9 @@ def _spend_partition(sm: date, end: date) -> None:
         with chrome.panel():
             chrome.panel_title("Spend by SKU")
             chrome.flat_table(
-                sku, key="redshift_sku", money_cols=["net_cost"],
+                sku,
+                key="redshift_sku",
+                money_cols=["net_cost"],
                 rename={"sku_id": "SKU", "description": "Description", "net_cost": "Net cost"},
             )
 
@@ -341,8 +343,11 @@ def _tags_section(sm: date, end: date) -> None:
                 )
                 return
             chrome.searchable_table(
-                tags, key="redshift_tags", search_col="tag_value",
-                money_cols=["net_cost"], rename={"tag_value": sel, "net_cost": "Net cost"},
+                tags,
+                key="redshift_tags",
+                search_col="tag_value",
+                money_cols=["net_cost"],
+                rename={"tag_value": sel, "net_cost": "Net cost"},
             )
 
     (
@@ -410,8 +415,10 @@ def _waste_section() -> None:
     else:
         with ui.tabs().classes("w-full") as tabs:
             tab_refs = [ui.tab(cluster_id) for cluster_id in clusters]
-        with ui.tab_panels(tabs, value=tab_refs[0]).classes("w-full").style(
-            "background:transparent;"
+        with (
+            ui.tab_panels(tabs, value=tab_refs[0])
+            .classes("w-full")
+            .style("background:transparent;")
         ):
             for cluster_id, tab_ref in zip(clusters, tab_refs, strict=True):
                 with ui.tab_panel(tab_ref):
@@ -445,9 +452,7 @@ def _cluster_waste_section(cluster_id: str) -> None:
         return  # shouldn't happen — cluster_id came from this same view
 
     month = str(sorted(coverage["charge_month"].astype(str).unique())[-1])
-    measured_types = set(
-        coverage.loc[coverage["charge_month"].astype(str) == month, "entity_type"]
-    )
+    measured_types = set(coverage.loc[coverage["charge_month"].astype(str) == month, "entity_type"])
 
     records = gold_df(
         f"SELECT * FROM efficiency.waste_record WHERE provider_name = '{_PROVIDER}' "
@@ -460,14 +465,9 @@ def _cluster_waste_section(cluster_id: str) -> None:
     month_label = pd.Timestamp(month).strftime("%b %Y")
     chrome.section_caption(f"Showing {month_label} — the latest month with telemetry.")
 
-    waste_total = (
-        records.loc[records["lens"] == "WASTE", "recoverable_cost"].sum()
-        if not records.empty else 0.0
-    )
-    opp_total = (
-        records.loc[records["lens"] == "OPPORTUNITY", "recoverable_cost"].sum()
-        if not records.empty else 0.0
-    )
+    action_groups = efficiency_waste.action_group_rows(records)
+    waste_total = action_groups.loc[action_groups["lens"] == "WASTE", "potential_savings"].sum()
+    opp_total = action_groups.loc[action_groups["lens"] == "OPPORTUNITY", "potential_savings"].sum()
     chrome.kpi_row(
         [
             (
@@ -492,26 +492,12 @@ def _cluster_waste_section(cluster_id: str) -> None:
     # per query shape, neither of which has a per-entity utilization reading.
     efficiency_waste.coverage_caption(_PROVIDER, scope_sql=scope)
 
-    # The shared coverage table, at this cluster's scope. It used to live here, driven by a
-    # hand-maintained rule→group map; it's derived from the rule pool now, so a new
-    # WasteRule appears here (and on every other provider's tab) with no edit.
-    efficiency_waste.rule_coverage_table(
+    # Compact diagnostic summary; the action queue below is the only table for this
+    # cluster, drilled workload/remedy → entity → evidence just like Attribution.
+    efficiency_waste.coverage_summary(
         _PROVIDER,
         records,
         measured_types,
-        key=f"redshift_rule_coverage_{_slug(cluster_id)}",
         scope_note="for this cluster",
     )
-
-    # Reuses efficiency_waste's own lens-table renderer — same WASTE/OPPORTUNITY
-    # split, never summed (a cluster can be both, different remedies). Its own
-    # sub-$1 floor keeps this table impact-ranked; the coverage table above is where
-    # a real-but-unpriced finding (Redshift bills neither per-table nor per-query)
-    # stays visible instead of disappearing.
-    efficiency_waste.lens_table(
-        records, "WASTE", "Waste — tune or right-size it", f"redshift_waste_{_slug(cluster_id)}"
-    )
-    efficiency_waste.lens_table(
-        records, "OPPORTUNITY", "Opportunity — move it to cheaper compute",
-        f"redshift_opp_{_slug(cluster_id)}",
-    )
+    efficiency_waste.action_queue(records, key=f"redshift_actions_{_slug(cluster_id)}")

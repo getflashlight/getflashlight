@@ -1,8 +1,8 @@
 """Efficiency & waste — one provider's recoverable spend, and what was measured to find it.
 
-The "Efficiency & Waste" tab on every provider page. Reads the one standardized GOLD view
-(``efficiency.waste_record``), rendered as a faceted leaderboard: the category IS the cause,
-recoverable_cost is the headline, WASTE = tune/right-size it, OPPORTUNITY = move it.
+The "Efficiency & Waste" tab on every provider page. It reads the one standardized GOLD view
+(``efficiency.waste_record``) and presents one action queue, drilled in place like
+Attribution: workload/remedy → entity → evidence and recommended action.
 
 ``waste_record`` only carries entities a rule *fired* on, so on its own it can answer "what
 is wasteful?" but never "what didn't we look at?". :func:`coverage_caption` answers the
@@ -14,17 +14,10 @@ mostly absence of measurement, and a tab that didn't say so would read as a clea
 health. The rest of the measurement stage (per-signal readings, $/native-unit rates) stays in
 GOLD for the assistant and MCP rather than being a second set of panels here.
 
-Two later stages of the same pipeline were published to GOLD but never rendered here until
-now — a rendering gap, not a missing feature:
-
-* :func:`owner_leaderboard` reads ``efficiency.waste_by_owner_month`` (the "whose?" rollup
-  ``056_gold_owner_leaderboard.sql`` builds) — who a WASTE/OPPORTUNITY finding belongs to,
-  with the normalized ``(unattributed)`` bucket for shared compute kept visible rather than
-  dropped.
-* :func:`resolution_panel` reads ``efficiency.waste_resolution_month`` (pure re-detection
-  over ``waste_record`` history, no user input) — did a flagged finding stop reappearing,
-  and did its billed cost actually drop. This is the only place in the app that answers
-  "is this getting fixed?" rather than "what's wrong right now?".
+The second and final table is :func:`resolution_panel`, a filterable view of
+``efficiency.waste_resolution_month``. It answers whether a flagged finding stopped
+reappearing and whether billed cost actually dropped. Ownership is shown beside every
+entity in both tables, rather than in a separate leaderboard.
 
 Both are gated behind :func:`~flashlight.dashboard.data.gold_view_published` like every
 other view here, so a lake that hasn't re-transformed since these views were added degrades
@@ -182,9 +175,10 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
 
     coverage_caption(provider_name)
 
-    waste_total = month_rows.loc[month_rows["lens"] == "WASTE", "recoverable_cost"].sum()
-    opp_total = month_rows.loc[month_rows["lens"] == "OPPORTUNITY", "recoverable_cost"].sum()
-    high_total = month_rows.loc[month_rows["confidence"] == "high", "recoverable_cost"].sum()
+    action_groups = action_group_rows(month_rows)
+    waste_total = action_groups.loc[action_groups["lens"] == "WASTE", "potential_savings"].sum()
+    opp_total = action_groups.loc[action_groups["lens"] == "OPPORTUNITY", "potential_savings"].sum()
+    high_total = action_groups.loc[action_groups["lens"] == "WASTE", "high_confidence"].sum()
     n_entities = month_rows["entity_id"].nunique()
     waste_delta = mom_recoverable_delta(records, months, "WASTE")
     opp_delta = mom_recoverable_delta(records, months, "OPPORTUNITY")
@@ -206,29 +200,24 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
                 _delta_sub(opp_delta, "→ jobs compute"),
                 delta_variant(opp_delta) if opp_delta is not None else "decrease",
             ),
-            ("High confidence", compact_money(high_total), "of waste"),
+            ("High confidence", compact_money(high_total), "of tune/right-size actions"),
             ("Entities flagged", f"{n_entities:,}", month_label),
         ],
     )
 
     recoverable_trend_chart(records, sm, end)
 
-    # What was checked, including what found nothing — the counterpart to the lens tables
-    # below, which can only ever show rules that fired.
-    rule_coverage_table(
+    coverage_summary(
         provider_name,
         month_rows,
         measured_entity_types(provider_name, month),
-        key=f"rule_coverage_{provider_name.lower().replace(' ', '_')}",
         scope_note=f"for {label}",
     )
 
-    # Split by lens — WASTE and OPPORTUNITY are different remedies and share billed_cost
-    # for the same entity, so a single flat list invites double-counting.
-    lens_table(month_rows, "WASTE", "Waste — tune or right-size it", "waste")
-    lens_table(month_rows, "OPPORTUNITY", "Opportunity — move it to cheaper compute", "opp")
-
-    owner_leaderboard(provider_name, month, month_rows)
+    # One action queue, drilled in place just like Attribution.  The two lenses remain
+    # distinct rows at its root: a cluster can be both underused and movable, and those
+    # are alternative remedies rather than an additive savings total.
+    action_queue(month_rows, key=f"actions_{provider_name.lower().replace(' ', '_')}")
     resolution_panel(provider_name)
 
 
@@ -243,9 +232,7 @@ def _delta_sub(delta: float | None, fallback: str) -> str:
     return f"{sign}{compact_money(abs(delta))} vs prior month · {fallback}"
 
 
-def mom_recoverable_delta(
-    records: pd.DataFrame, months: list[str], lens: str
-) -> float | None:
+def mom_recoverable_delta(records: pd.DataFrame, months: list[str], lens: str) -> float | None:
     """*lens*'s recoverable-$ change, latest measured month vs. the one before it — or
     ``None`` with fewer than two months of history to compare.
 
@@ -321,6 +308,255 @@ def recoverable_trend_chart(records: pd.DataFrame, sm: date, end: date) -> None:
             labels={"month": "", "recoverable_cost": "", "lens": ""},
         )
         chrome.plot(chrome.style_fig(fig, has_legend=True, category_x=True))
+
+
+# ── Savings opportunities ────────────────────────────────────────────────────────────
+# One drill-through table, deliberately shaped like Attribution's cost hierarchy.  A
+# finding is one rule firing, not necessarily an independent saving: an underutilized
+# cluster can also be a placement candidate.  The rollups below therefore take the best
+# priced action per entity *within one lens*, while the final level retains every finding.
+_ENTITY_LABELS = {
+    "job": "Jobs",
+    "interactive": "All-purpose clusters",
+    "sql_warehouse": "SQL warehouses",
+    "sql_warehouse_user": "SQL warehouse users",
+    "notebook": "Notebooks",
+    "table": "Tables",
+    "storage": "Storage",
+    "query_pattern": "Query patterns",
+    "endpoint": "Serving endpoints",
+}
+_LENS_LABELS = {
+    "WASTE": "Tune or right-size",
+    "OPPORTUNITY": "Move to cheaper compute",
+}
+_ACTION_GROUP_COLS = ["workload", "potential_savings", "entities", "high_confidence"]
+_ACTION_GROUP_RENAME = {
+    "workload": "Savings opportunity",
+    "potential_savings": "Potential savings",
+    "entities": "Entities",
+    "high_confidence": "High confidence",
+}
+_ACTION_ENTITY_COLS = [
+    "entity_name",
+    "owner_user",
+    "billed_cost",
+    "potential_savings",
+    "confidence",
+    "findings",
+]
+_ACTION_ENTITY_RENAME = {
+    "entity_name": "Entity",
+    "owner_user": "Owner",
+    "billed_cost": "Billed",
+    "potential_savings": "Potential savings",
+    "confidence": "Confidence",
+    "findings": "Findings",
+}
+_ACTION_FINDING_COLS = ["waste_category", "detail", "remedy", "recoverable_cost", "confidence"]
+_ACTION_FINDING_RENAME = {
+    "waste_category": "Finding",
+    "detail": "Evidence",
+    "remedy": "Recommended action",
+    "recoverable_cost": "Potential savings",
+    "confidence": "Confidence",
+}
+
+
+@dataclass(frozen=True)
+class _ActionDrill:
+    level: str = "workload"
+    entity_type: str | None = None
+    lens: str | None = None
+    entity_id: str | None = None
+    entity_name: str | None = None
+
+
+def _action_entity_rows(rows: pd.DataFrame, entity_type: str, lens: str) -> pd.DataFrame:
+    """One action row per entity, using its largest priced recommendation.
+
+    Multiple rules can describe the same entity and must remain visible after drilling
+    in, but adding their dollar figures would overstate what one optimization can save.
+    """
+    scoped = rows[(rows["entity_type"] == entity_type) & (rows["lens"] == lens)].copy()
+    if scoped.empty:
+        return pd.DataFrame(columns=_ACTION_ENTITY_COLS)
+    scoped["recoverable_cost"] = pd.to_numeric(scoped["recoverable_cost"], errors="coerce").fillna(
+        0
+    )
+    scoped["billed_cost"] = pd.to_numeric(scoped["billed_cost"], errors="coerce").fillna(0)
+    ordered = scoped.sort_values("recoverable_cost", ascending=False)
+    best = ordered.drop_duplicates("entity_id").copy()
+    counts = scoped.groupby("entity_id").size().rename("findings")
+    best = best.join(counts, on="entity_id")
+    best = best.rename(columns={"recoverable_cost": "potential_savings"})
+    return best.sort_values("potential_savings", ascending=False)
+
+
+def _workload_label(entity_type: str, lens: str) -> str:
+    entity_label = _ENTITY_LABELS.get(entity_type, entity_type.replace("_", " ").title())
+    return f"{entity_label} — {_LENS_LABELS.get(lens, lens.title())}"
+
+
+def action_group_rows(month_rows: pd.DataFrame) -> pd.DataFrame:
+    """Actionable savings by workload and remedy, safe from finding-level double counts."""
+    if month_rows.empty:
+        return pd.DataFrame(columns=_ACTION_GROUP_COLS)
+    parts: list[dict[str, object]] = []
+    for (entity_type, lens), _ in month_rows.groupby(["entity_type", "lens"], dropna=False):
+        entities = _action_entity_rows(month_rows, str(entity_type), str(lens))
+        if entities.empty:
+            continue
+        potential = float(entities["potential_savings"].sum())
+        high = float(entities.loc[entities["confidence"] == "high", "potential_savings"].sum())
+        parts.append(
+            {
+                "entity_type": str(entity_type),
+                "lens": str(lens),
+                "workload": _workload_label(str(entity_type), str(lens)),
+                "potential_savings": potential,
+                "entities": int(len(entities)),
+                "high_confidence": high,
+            }
+        )
+    return (
+        pd.DataFrame(parts).sort_values("potential_savings", ascending=False)
+        if parts
+        else pd.DataFrame(columns=_ACTION_GROUP_COLS)
+    )
+
+
+def _action_breadcrumb(
+    *steps: tuple[str, _ActionDrill | None], refresh: Callable[[_ActionDrill], object]
+) -> None:
+    with ui.row().classes("items-center gap-2 text-xs"):
+        for i, (label, target) in enumerate(steps):
+            if i:
+                ui.label("/").style(f"color:{chrome.INK_MUTED}")
+            if target is None:
+                ui.label(label).style(f"color:{chrome.INK_SECONDARY}")
+            else:
+                ui.button(label, on_click=lambda t=target: refresh(t)).props(
+                    "flat dense no-caps"
+                ).style(f"color:{chrome.ACCENT};padding:0 2px;min-height:0;")
+
+
+def action_queue(month_rows: pd.DataFrame, *, key: str) -> None:
+    """The primary action table: workload/remedy → entity → evidence and next step."""
+    with chrome.panel():
+        title = (
+            ui.label("Savings opportunities")
+            .classes("text-sm font-medium mb-2")
+            .style(f"color:{chrome.INK_SECONDARY}")
+        )
+        body = ui.column().classes("w-full gap-2")
+
+        @ui.refreshable
+        def _body(state: _ActionDrill) -> None:
+            body.clear()
+            with body:
+                if state.level == "workload":
+                    title.text = "Savings opportunities"
+                    chrome.section_caption(
+                        "Click a workload to see the affected entities. Potential savings uses the "
+                        "single best priced action per entity; different remedy lanes are "
+                        "not added together."
+                    )
+                    rows = action_group_rows(month_rows)
+                    if rows.empty:
+                        chrome.section_caption(
+                            "No actionable findings in the latest measured month."
+                        )
+                        return
+
+                    def _open_workload(row: dict[str, object]) -> None:
+                        _body.refresh(
+                            _ActionDrill(
+                                level="entity",
+                                entity_type=str(row["entity_type"]),
+                                lens=str(row["lens"]),
+                            )
+                        )
+
+                    chrome.searchable_table(
+                        rows[_ACTION_GROUP_COLS],
+                        key=f"{key}_workloads",
+                        search_col="workload",
+                        money_cols=["potential_savings", "high_confidence"],
+                        int_cols=["entities"],
+                        rename=_ACTION_GROUP_RENAME,
+                        max_rows=_MAX_ROWS,
+                        on_row_click=_open_workload,
+                    )
+                    return
+
+                assert state.entity_type is not None and state.lens is not None
+                workload = _workload_label(state.entity_type, state.lens)
+                _action_breadcrumb(
+                    ("← All opportunities", _ActionDrill()), (workload, None), refresh=_body.refresh
+                )
+                entities = _action_entity_rows(month_rows, state.entity_type, state.lens)
+                if state.level == "entity":
+                    title.text = f"Savings opportunities — {workload}"
+
+                    def _open_entity(row: dict[str, object]) -> None:
+                        _body.refresh(
+                            _ActionDrill(
+                                level="finding",
+                                entity_type=state.entity_type,
+                                lens=state.lens,
+                                entity_id=str(row["entity_id"]),
+                                entity_name=str(row["entity_name"]),
+                            )
+                        )
+
+                    chrome.searchable_table(
+                        entities[_ACTION_ENTITY_COLS],
+                        key=f"{key}_entities",
+                        search_col="entity_name",
+                        money_cols=["billed_cost", "potential_savings"],
+                        int_cols=["findings"],
+                        rename=_ACTION_ENTITY_RENAME,
+                        max_rows=_MAX_ROWS,
+                        on_row_click=_open_entity,
+                    )
+                    return
+
+                assert state.entity_id is not None and state.entity_name is not None
+                title.text = f"Savings opportunities — {state.entity_name}"
+                _action_breadcrumb(
+                    ("← All opportunities", _ActionDrill()),
+                    (
+                        workload,
+                        _ActionDrill(
+                            level="entity", entity_type=state.entity_type, lens=state.lens
+                        ),
+                    ),
+                    (state.entity_name, None),
+                    refresh=_body.refresh,
+                )
+                findings = month_rows[
+                    (month_rows["entity_type"] == state.entity_type)
+                    & (month_rows["lens"] == state.lens)
+                    & (month_rows["entity_id"].astype(str) == state.entity_id)
+                ].copy()
+                findings = findings.assign(
+                    remedy=findings["waste_category"].map(_REMEDY_BY_CATEGORY)
+                )
+                chrome.section_caption(
+                    "Each row is a detected signal. Treat alternative actions for this entity "
+                    "as non-additive."
+                )
+                chrome.searchable_table(
+                    findings[_ACTION_FINDING_COLS],
+                    key=f"{key}_findings",
+                    search_col="waste_category",
+                    money_cols=["recoverable_cost"],
+                    rename=_ACTION_FINDING_RENAME,
+                    max_rows=_MAX_ROWS,
+                )
+
+        _body(_ActionDrill())
 
 
 # ── Owner attribution rollup ─────────────────────────────────────────────────────────
@@ -402,9 +638,7 @@ def _owner_rows(provider_name: str, month: str) -> pd.DataFrame:
     )
 
 
-def _render_owner_level(
-    rows: pd.DataFrame, *, refresh: Callable[[_OwnerDrill], object]
-) -> None:
+def _render_owner_level(rows: pd.DataFrame, *, refresh: Callable[[_OwnerDrill], object]) -> None:
     """Level 1: owners ranked by recoverable $, split by lens (see module docstring for
     why a combined ranking would blur two different remedies together)."""
     chrome.section_caption(
@@ -419,9 +653,7 @@ def _render_owner_level(
         lens_rows = rows[rows["lens"] == lens]
         if lens_rows.empty:
             continue
-        ui.label(sub_title).classes("text-xs font-medium mt-2").style(
-            f"color:{chrome.INK_MUTED}"
-        )
+        ui.label(sub_title).classes("text-xs font-medium mt-2").style(f"color:{chrome.INK_MUTED}")
 
         def _on_click(row: dict[str, object], lens: str = lens) -> None:
             refresh(
@@ -659,33 +891,67 @@ def resolution_panel(provider_name: str) -> None:
             ],
         )
 
-        if open_count:
-            chrome.panel_title("Still open — oldest flagged first")
-            open_rows = rows[~rows["is_resolved"].astype(bool)].sort_values("first_seen_month")
-            cols = [c for c in _OPEN_COLS if c in open_rows]
-            chrome.searchable_table(
-                open_rows[cols],
-                key=f"waste_open_{provider_name.lower().replace(' ', '_')}",
-                search_col="entity_name",
-                money_cols=["recoverable_cost_at_last_seen"],
-                rename=_OPEN_RENAME,
-                max_rows=_MAX_ROWS,
-            )
+        status_body = ui.column().classes("w-full gap-2")
 
-        if resolved_count:
-            chrome.panel_title("Recently resolved")
-            resolved_rows = rows[rows["is_resolved"].astype(bool)].sort_values(
-                "resolved_month", ascending=False
+        @ui.refreshable
+        def _status(filter_value: str) -> None:
+            status_body.clear()
+            is_resolved = rows["is_resolved"].astype(bool)
+            if filter_value == "Open":
+                shown = rows[~is_resolved].sort_values("first_seen_month")
+            elif filter_value == "Resolved":
+                shown = rows[is_resolved].sort_values("resolved_month", ascending=False)
+            else:
+                shown = rows.assign(_sort=pd.to_datetime(rows["first_seen_month"])).sort_values(
+                    "_sort"
+                )
+            if shown.empty:
+                with status_body:
+                    chrome.section_caption(f"No {filter_value.lower()} findings.")
+                return
+            display = shown.assign(
+                status=shown["is_resolved"].map({True: "Resolved", False: "Open"}),
+                potential_savings=shown["recoverable_cost_at_last_seen"],
             )
-            cols = [c for c in _RESOLVED_COLS if c in resolved_rows]
-            chrome.searchable_table(
-                resolved_rows[cols],
-                key=f"waste_resolved_{provider_name.lower().replace(' ', '_')}",
-                search_col="entity_name",
-                money_cols=["realized_savings"],
-                rename=_RESOLVED_RENAME,
-                max_rows=_MAX_ROWS,
-            )
+            cols = [
+                "status",
+                "entity_name",
+                "entity_type",
+                "waste_category",
+                "owner_user",
+                "first_seen_month",
+                "potential_savings",
+                "resolved_month",
+                "realized_savings",
+            ]
+            rename = {
+                "status": "Status",
+                "entity_name": "Entity",
+                "entity_type": "Type",
+                "waste_category": "Cause",
+                "owner_user": "Owner",
+                "first_seen_month": "Flagged since",
+                "potential_savings": "Potential savings",
+                "resolved_month": "Resolved",
+                "realized_savings": "Realized savings",
+            }
+            with status_body:
+                chrome.searchable_table(
+                    display[[c for c in cols if c in display]],
+                    key=f"waste_status_{provider_name.lower().replace(' ', '_')}",
+                    search_col="entity_name",
+                    money_cols=["potential_savings", "realized_savings"],
+                    rename=rename,
+                    max_rows=_MAX_ROWS,
+                )
+
+        ui.select(
+            ["Open", "Resolved", "All"],
+            value="Open",
+            label="Show",
+            on_change=lambda event: _status.refresh(str(event.value)),
+        ).props("dense outlined").classes("w-40")
+        _status("Open")
 
 
 # Displayed in order; descriptor columns that are constant across a lens table collapse
@@ -808,9 +1074,7 @@ _GROUP_ORDER: tuple[str, ...] = (
 )
 
 
-def measured_entity_types(
-    provider_name: str, month: str, *, scope_sql: str = ""
-) -> set[str]:
+def measured_entity_types(provider_name: str, month: str, *, scope_sql: str = "") -> set[str]:
     """Entity types this provider actually returned telemetry for in *month*.
 
     The difference between "clean" (we checked, found nothing) and "no data" (the pull
@@ -839,7 +1103,8 @@ def rule_coverage_rows(
         records.groupby("waste_category").agg(
             n=("recoverable_cost", "size"), recoverable_cost=("recoverable_cost", "sum")
         )
-        if not records.empty else pd.DataFrame(columns=["n", "recoverable_cost"])
+        if not records.empty
+        else pd.DataFrame(columns=["n", "recoverable_cost"])
     )
     # The single most-recoverable row's own `detail` text per category — so a fired
     # row can say *what* fired ("$3,458 scanned"), not just how many, without making
@@ -848,7 +1113,8 @@ def rule_coverage_rows(
         records.sort_values("recoverable_cost", ascending=False)
         .groupby("waste_category")["detail"]
         .first()
-        if not records.empty and "detail" in records.columns else pd.Series(dtype=object)
+        if not records.empty and "detail" in records.columns
+        else pd.Series(dtype=object)
     )
 
     rows: list[dict[str, object]] = []
@@ -860,8 +1126,10 @@ def rule_coverage_rows(
                 recoverable = float(by_category.loc[category, "recoverable_cost"])
                 priced = recoverable > 0
                 sample = sample_detail_by_category.get(category) or ""
-                status = f"fired · {sample}" if n == 1 and sample else (
-                    f"fired · {n} entities" + (f" — e.g. {sample}" if sample else "")
+                status = (
+                    f"fired · {sample}"
+                    if n == 1 and sample
+                    else (f"fired · {n} entities" + (f" — e.g. {sample}" if sample else ""))
                 )
                 if not priced:
                     status += " (unpriced)"
@@ -883,6 +1151,34 @@ def rule_coverage_rows(
                 }
             )
     return rows
+
+
+def coverage_summary(
+    provider_name: str,
+    records: pd.DataFrame,
+    measured_types: set[str],
+    *,
+    scope_note: str,
+) -> None:
+    """Compact diagnostic counterpart to the action queue, deliberately not a table."""
+    groups = _ordered_groups(coverage_groups(provider_name))
+    if not groups:
+        return
+    fired = set(records["waste_category"]) if not records.empty else set()
+    groups, dry = _split_dry_groups(groups, measured_types, fired)
+    rows = rule_coverage_rows(records, measured_types, groups)
+    if not rows:
+        return
+    triggered = sum(str(row["Status"]).startswith("fired") for row in rows)
+    clean = sum(row["Status"] == "clean" for row in rows)
+    no_data = sum(row["Status"] == "no data" for row in rows) + len(dry)
+    blocked = len(blocked_rules(provider_name))
+    chrome.section_caption(
+        f"Detection coverage {scope_note} · {triggered} triggered · {clean} clean · "
+        f"{no_data} without telemetry"
+        + (f" · {blocked} known patterns not implemented" if blocked else "")
+        + ". Unpriced findings remain available after drilling into an entity."
+    )
 
 
 def _ordered_groups(

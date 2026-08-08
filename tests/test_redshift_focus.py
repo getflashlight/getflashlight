@@ -1386,9 +1386,9 @@ def test_cluster_facets_split_instrumented_from_cost_only(monkeypatch, tmp_path)
     assert redshift_focus._telemetry_cluster_ids() == ["instrumented-cluster"]
 
 
-def test_redshift_tab_renders_per_cluster_with_coverage_table(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_redshift_tab_renders_per_cluster_with_action_queue(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """End-to-end render smoke test: the /aws page's Redshift tab must show the
-    instrumented cluster's rule-coverage table and list the cost-only cluster as
+    instrumented cluster's savings action queue and list the cost-only cluster as
     not yet instrumented, without raising.
     """
     import asyncio
@@ -1442,7 +1442,7 @@ def test_redshift_tab_renders_per_cluster_with_coverage_table(monkeypatch, tmp_p
                 x_source_connector="redshift",
             ),
             # Fires redshift_spectrum_table_scan — unpriced (recoverable_cost = 0), so
-            # this also proves the Opportunity table no longer drops $0 findings.
+            # this also proves unpriced findings still reach the action drill-down.
             EfficiencyRecord(
                 provider_name="AWS",
                 charge_month=date(2026, 1, 1),
@@ -1472,19 +1472,15 @@ def test_redshift_tab_renders_per_cluster_with_coverage_table(monkeypatch, tmp_p
             await user.should_see("Redshift spend")
             user.find(kind=ui.tab, content="Efficiency & Waste").click()
             await user.should_see("Cluster: prod-cluster")
-            await user.should_see("Optimization rule coverage")
+            await user.should_see("Savings opportunities")
+            await user.should_see("Detection coverage for this cluster")
             await user.should_see("Not yet instrumented")
             await user.should_see("orphan-cluster")
 
             # ui.table renders rows as data, not as text nodes should_see can match —
-            # inspect the tables directly for the per-table Spectrum drill-down (visible
-            # despite being unpriced).
+            # inspect the root action queue for its unpriced Spectrum workload group.
             tables = user.find(kind=ui.table).elements
             all_rows = " ".join(str(t.rows) for t in tables)
-            assert "spectrumdb.events" in all_rows
-            assert "External table driving Spectrum scan cost" in all_rows
-            # A single-row Opportunity table collapses its (constant) remedy into the
-            # caption line instead of a column — the remedy text is on the page either way.
-            await user.should_see("Review this specific external table's partitioning")
+            assert "Tables — Move to cheaper compute" in all_rows
 
     asyncio.run(_check())

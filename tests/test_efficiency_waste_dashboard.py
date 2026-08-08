@@ -19,6 +19,7 @@ import pytest
 from flashlight.dashboard.views.efficiency_waste import (
     _realized_savings_variant,
     _trend_by_month,
+    action_group_rows,
     entities_for_owner,
     mom_recoverable_delta,
     resolution_summary,
@@ -107,6 +108,56 @@ def test_trend_by_month_empty_when_nothing_in_range() -> None:
 
 def test_trend_by_month_empty_input_is_empty_not_broken() -> None:
     assert _trend_by_month(pd.DataFrame(), date(2026, 5, 1), date(2026, 6, 30)).empty
+
+
+# ── action_group_rows ────────────────────────────────────────────────────────────────
+
+
+def test_action_groups_use_one_best_recommendation_per_entity_and_lens() -> None:
+    """Two overlapping rule findings must not turn into an inflated Jobs savings total."""
+    rows = _month_rows(
+        [
+            {
+                "entity_id": "job-1",
+                "entity_type": "job",
+                "lens": "WASTE",
+                "recoverable_cost": 100.0,
+                "billed_cost": 200.0,
+                "confidence": "high",
+            },
+            {
+                "entity_id": "job-1",
+                "entity_type": "job",
+                "lens": "WASTE",
+                "recoverable_cost": 60.0,
+                "billed_cost": 200.0,
+                "confidence": "candidate",
+            },
+            {
+                "entity_id": "job-2",
+                "entity_type": "job",
+                "lens": "WASTE",
+                "recoverable_cost": 40.0,
+                "billed_cost": 80.0,
+                "confidence": "candidate",
+            },
+            {
+                "entity_id": "job-1",
+                "entity_type": "job",
+                "lens": "OPPORTUNITY",
+                "recoverable_cost": 25.0,
+                "billed_cost": 200.0,
+                "confidence": "candidate",
+            },
+        ]
+    )
+
+    groups = action_group_rows(rows).set_index("workload")
+    waste = groups.loc["Jobs — Tune or right-size"]
+    assert waste["potential_savings"] == pytest.approx(140.0)
+    assert waste["entities"] == 2
+    assert waste["high_confidence"] == pytest.approx(100.0)
+    assert groups.loc["Jobs — Move to cheaper compute", "potential_savings"] == pytest.approx(25.0)
 
 
 # ── entities_for_owner ───────────────────────────────────────────────────────────────

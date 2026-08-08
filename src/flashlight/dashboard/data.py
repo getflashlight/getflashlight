@@ -34,6 +34,16 @@ _session_con: ContextVar[duckdb.DuckDBPyConnection | None] = ContextVar(
     "gold_session_con", default=None
 )
 
+# Dashboard panels often ask the same small question more than once while composing a
+# page (for example, a date bound used by both a KPI and a chart).  GOLD is immutable for
+# the life of a page render, so cache only within ``gold_session``: this avoids stale-data
+# invalidation and keeps independent browser requests isolated.  DataFrames are mutable,
+# therefore :func:`gold_df` returns a copy from this cache rather than exposing the cached
+# object to a panel that might add display columns or sort it in place.
+_session_results: ContextVar[dict[str, pd.DataFrame] | None] = ContextVar(
+    "gold_session_results", default=None
+)
+
 
 @contextmanager
 def gold_session() -> Iterator[None]:
@@ -51,11 +61,13 @@ def gold_session() -> Iterator[None]:
         return
     con = duck.connect()
     duck.register_gold(con)
-    token = _session_con.set(con)
+    connection_token = _session_con.set(con)
+    results_token = _session_results.set({})
     try:
         yield
     finally:
-        _session_con.reset(token)
+        _session_results.reset(results_token)
+        _session_con.reset(connection_token)
         con.close()
 
 
@@ -159,7 +171,14 @@ def gold_df(sql: str) -> pd.DataFrame:
     """
     session_con = _session_con.get()
     if session_con is not None:
-        return session_con.execute(sql).df()
+        results = _session_results.get()
+        assert results is not None  # set alongside _session_con in gold_session()
+        cached = results.get(sql)
+        if cached is not None:
+            return cached.copy(deep=True)
+        result = session_con.execute(sql).df()
+        results[sql] = result
+        return result.copy(deep=True)
     con = duck.connect()
     try:
         duck.register_gold(con)

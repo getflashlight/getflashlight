@@ -4,7 +4,7 @@
 -- aggregated AT SOURCE — never one row per request. Substituted by the connector:
 -- :start_date, :end_date, :account_prices.
 --
--- *** VALIDATED against a live warehouse 2026-08-05 (goodrx-general-pii-prd). ***
+-- *** VALIDATED against a live production warehouse 2026-08-05. ***
 -- The published docs' column list does NOT match the live schema. Differences baked in:
 --
 --   endpoint_usage

@@ -239,7 +239,7 @@ proof of a *useful* tag; it is still the honest answer to "has this been tagged 
 
 ## §7 — Verification against a live warehouse
 
-Validated 2026-08-05 against `goodrx-general-pii-prd`. Live schema deltas from the published
+Validated 2026-08-05 against a live production warehouse. Live schema deltas from the published
 docs (baked into `databricks_ai_usage.sql`):
 
 * `endpoint_usage` has **no** `endpoint_name` or `execution_duration_ms` — join via

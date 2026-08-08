@@ -6,12 +6,13 @@ date range picker (own state, not shared across page navigations — see
 ``router.py``) drives every panel below it. ``render`` is bound per provider by
 ``router.build_pages()``.
 
-Every provider page carries the same six core tabs — **Trend & changes**, **Breakdown**,
+Every provider page carries the same five core tabs — **Trend & changes**, **Breakdown**,
 **Attribution** (``views/attribution.py``), **Efficiency & Waste**
-(``views/efficiency_waste.py``), **Policy Compliance** (``views/policy.py``) and
-**Alerts** (``views/alerts.py``, always last) — plus caller-supplied extras.
+(``views/efficiency_waste.py``), **Policy Compliance** (``views/policy.py``), and,
+where enabled, **Alerts** (``views/alerts.py``, always last) — plus caller-supplied
+extras.
 ``after_breakdown`` inserts spend-detail tabs (Databricks: AI Costs, Databricks Storage)
-right after Breakdown; ``extra_tabs`` land before Alerts (Databricks: Client Driver
+right after Breakdown; ``extra_tabs`` follow the core tabs (Databricks: Client Driver
 Health). Attribution and Efficiency & Waste used to be cross-provider pages,
 ``/leaderboard`` and ``/utilization``; they are per-provider now because both answer
 questions you ask *about a bill*. Policy Compliance used to be a Databricks-only extra
@@ -138,6 +139,7 @@ def render(
     extra_kpis: Sequence[Callable[[date, date], chrome.KpiCard | None]] = (),
     attribution_tab: Callable[[date, date], None] | None = None,
     efficiency_tab: Callable[[], None] | None = None,
+    show_alerts: bool = True,
 ) -> None:
     """Render one provider's page.
 
@@ -151,8 +153,8 @@ def render(
     * *after_breakdown* inserts provider-shaped tabs immediately after Breakdown (spend
       detail that belongs next to composition — Databricks' AI Costs and Storage). Each
       callable receives ``(sm, end)`` so those tabs share the page date range.
-    * *extra_tabs* inserts tabs before Alerts (ops/compliance signals that aren't spend
-      composition — Databricks' Client Driver Health). Alerts stays last on every page.
+    * *extra_tabs* inserts tabs after the core tabs (ops/compliance signals that aren't
+      spend composition — Databricks' Client Driver Health).
     * *extra_kpis* appends provider-shaped cards to the KPI row — each returning ``None``
       when it has nothing to report, so a page never carries a "$0" card. A card here is
       *beside* the headline, never a term in it: Databricks' backing storage is billed by
@@ -163,10 +165,11 @@ def render(
       than per provider, so the shared tab beside them would render the same
       ``waste_record`` rows twice; and its owner/tag panels are account-wide and have to
       say so.
+    * *show_alerts* controls the optional Alerts tab. It remains last when enabled;
+      Databricks disables it.
 
-    The core tab *labels* never vary — a hook changes what's inside a tab or inserts
-    extras around them, never whether the six exist, so every provider page answers the
-    same questions in the same places.
+    The five core tab *labels* never vary — a hook changes what's inside a tab or inserts
+    extras around them. Alerts are optional because they are not relevant to every provider.
     """
     sc = scope if scope is not None else Scope(group)
     bounds = gold_df(
@@ -218,8 +221,7 @@ def render(
         _kpis(sc, label, start, end, sm, partial=partial, extra_kpis=extra_kpis)
 
         # Ordered tab bar: core spend → after_breakdown (Databricks spend detail) →
-        # attribution/efficiency/policy → extra_tabs (ops signals) → Alerts last.
-        # Labels of the six core tabs never vary; only insertion points do.
+        # attribution/efficiency/policy → extra_tabs (ops signals) → optional Alerts.
         def _panel_trend() -> None:
             with chrome.panel():
                 _trend(sc, label, start, end, accent=accent)
@@ -288,8 +290,9 @@ def render(
             ("Efficiency & Waste", _panel_efficiency),
             ("Policy Compliance", _panel_policy),
             *extra_tabs,
-            ("Alerts", _panel_alerts),
         ]
+        if show_alerts:
+            tab_specs.append(("Alerts", _panel_alerts))
         # Only the active tab's content is built (chrome.lazy_tab_panels) — every
         # other tab's queries/charts wait until the user actually clicks it, rather
         # than all ~9 tabs paying for themselves on every load (see that helper's

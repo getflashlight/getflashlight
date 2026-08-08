@@ -248,34 +248,13 @@ def run_ingest(
         published = build_gold()
         logger.info("transform_done", gold_views=published, phase="cost")
 
-    # Best-effort efficiency/waste pull (secondary to cost): each connector that exposes
-    # utilization telemetry writes aggregated EfficiencyRecords to the metrics plane. A
-    # failure here warns and skips — it must NOT block the canonical cost pipeline.
-    # Only the connectors whose cost pull just succeeded are retried — one whose
-    # fetch() already failed almost certainly has broken creds/config, and
-    # re-invoking it here would just duplicate that failure.
-    _run_efficiency(window, succeeded_connectors, on_progress)
-
-    # Best-effort driver-health pull (fleet-health/compliance, unrelated to waste): each
-    # connector that exposes client-driver telemetry writes aggregated
-    # DriverHealthRecords. Same never-block-cost-ingest guarantee as efficiency.
-    _run_driver_health(window, succeeded_connectors)
-
-    # Best-effort AI serving-usage pull (token/model/requester measurement). Same
-    # never-block-cost-ingest guarantee; a connector whose serving system tables aren't
-    # enabled yields nothing at all rather than partial or guessed rows.
-    _run_ai_usage(window, succeeded_connectors)
-
-    # Best-effort storage-location pull (Unity Catalog's bucket map — metadata, no cost).
-    # Must run before the final build_gold() below so the very first sync publishes a map
-    # rather than a backing-storage tab that reads "never measured" until the next run.
-    _run_storage_locations(window, succeeded_connectors)
-
-    # Best-effort compute-instance pull (which cloud VM backed which Databricks cluster —
-    # metadata, no cost). Same reasoning as storage-locations: must run before the final
-    # build_gold() below so the first sync publishes a map rather than an empty
-    # backing-compute tab until the next run.
-    _run_compute_instances(window, succeeded_connectors)
+    # The five supplemental planes are independent reads and write to distinct Parquet
+    # roots. Run the phases concurrently so a slow warehouse query (for example driver
+    # health) does not make the REST-only storage inventory wait behind it. Each phase is
+    # deliberately given one worker internally: this outer pool is the global bound, so
+    # a single sync never fans out to five nested pools and exceeds ingest_max_workers.
+    # Their individual helpers still use per-connector concurrency when called directly.
+    _run_supplemental(window, succeeded_connectors, on_progress)
 
     # Final holistic rebuild — same idempotent build_gold() as above, now
     # picking up whatever fresh efficiency/waste, driver-health, AI-usage,
@@ -299,10 +278,31 @@ def run_ingest(
     return total
 
 
+def _run_supplemental(
+    window: IngestWindow,
+    connectors: list[Connector],
+    on_progress: ProgressCallback | None = None,
+) -> None:
+    """Run independent best-effort telemetry phases under one global concurrency cap."""
+    phases = (
+        lambda: _run_efficiency(window, connectors, on_progress, max_workers=1),
+        lambda: _run_driver_health(window, connectors, max_workers=1),
+        lambda: _run_ai_usage(window, connectors, max_workers=1),
+        lambda: _run_storage_locations(window, connectors, max_workers=1),
+        lambda: _run_compute_instances(window, connectors, max_workers=1),
+    )
+    with ThreadPoolExecutor(max_workers=_max_workers(len(phases))) as pool:
+        # Consume results so an unexpected programmer error keeps the former fail-fast
+        # behavior. Connector/network failures remain contained in each helper.
+        list(pool.map(lambda phase: phase(), phases))
+
+
 def _run_efficiency(
     window: IngestWindow,
     connectors: list[Connector],
     on_progress: ProgressCallback | None = None,
+    *,
+    max_workers: int | None = None,
 ) -> int:
     """Pull efficiency records for every connector that exposes them (concurrently,
     bounded — see :func:`_max_workers`), then write them all in one call. Best-effort:
@@ -343,7 +343,7 @@ def _run_efficiency(
             on_progress("efficiency_done", name, len(records))
         return records
 
-    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
         all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
 
     if not all_records:
@@ -353,7 +353,9 @@ def _run_efficiency(
     return written
 
 
-def _run_driver_health(window: IngestWindow, connectors: list[Connector]) -> int:
+def _run_driver_health(
+    window: IngestWindow, connectors: list[Connector], *, max_workers: int | None = None
+) -> int:
     """Pull driver-health records for every connector that exposes them (concurrently,
     bounded), then write them all in one call. Best-effort, same never-block-cost-
     ingest guarantee as :func:`_run_efficiency` — and the same purge-before-write
@@ -372,7 +374,7 @@ def _run_driver_health(window: IngestWindow, connectors: list[Connector]) -> int
             logger.info("driver_health_fetched", connector=name, rows=len(records))
         return records
 
-    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
         all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
 
     if not all_records:
@@ -382,7 +384,9 @@ def _run_driver_health(window: IngestWindow, connectors: list[Connector]) -> int
     return written
 
 
-def _run_ai_usage(window: IngestWindow, connectors: list[Connector]) -> int:
+def _run_ai_usage(
+    window: IngestWindow, connectors: list[Connector], *, max_workers: int | None = None
+) -> int:
     """Pull AI serving-usage records for every connector that exposes them (concurrently,
     bounded), then write them all in one call. Best-effort, same never-block-cost-ingest
     guarantee and the same single-write merge as :func:`_run_driver_health` (the writer
@@ -403,7 +407,7 @@ def _run_ai_usage(window: IngestWindow, connectors: list[Connector]) -> int:
             logger.info("ai_usage_fetched", connector=name, rows=len(records))
         return records
 
-    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
         all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
 
     if not all_records:
@@ -413,7 +417,9 @@ def _run_ai_usage(window: IngestWindow, connectors: list[Connector]) -> int:
     return written
 
 
-def _run_storage_locations(window: IngestWindow, connectors: list[Connector]) -> int:
+def _run_storage_locations(
+    window: IngestWindow, connectors: list[Connector], *, max_workers: int | None = None
+) -> int:
     """Pull each platform's cloud object-storage location map (concurrently, bounded),
     then write it all in one call. Best-effort, same never-block-cost-ingest guarantee
     and the same single-write merge as :func:`_run_driver_health`.
@@ -438,7 +444,7 @@ def _run_storage_locations(window: IngestWindow, connectors: list[Connector]) ->
             logger.info("storage_locations_fetched", connector=name, rows=len(records))
         return records
 
-    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
         all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
 
     if not all_records:
@@ -448,7 +454,9 @@ def _run_storage_locations(window: IngestWindow, connectors: list[Connector]) ->
     return written
 
 
-def _run_compute_instances(window: IngestWindow, connectors: list[Connector]) -> int:
+def _run_compute_instances(
+    window: IngestWindow, connectors: list[Connector], *, max_workers: int | None = None
+) -> int:
     """Pull each platform's cloud-compute-instance membership map (concurrently,
     bounded), then write it all in one call. Best-effort, same never-block-cost-ingest
     guarantee and the same single-write merge as :func:`_run_driver_health`.
@@ -474,7 +482,7 @@ def _run_compute_instances(window: IngestWindow, connectors: list[Connector]) ->
             logger.info("compute_instances_fetched", connector=name, rows=len(records))
         return records
 
-    with ThreadPoolExecutor(max_workers=_max_workers(len(connectors))) as pool:
+    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
         all_records = [record for batch in pool.map(_pull, connectors) for record in batch]
 
     if not all_records:

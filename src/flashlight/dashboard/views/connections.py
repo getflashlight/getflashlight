@@ -848,6 +848,9 @@ def render() -> None:
     connections_body()
 
     with chrome.panel():
+        history_page = [0]
+        history_page_size = 5
+
         with ui.row().classes("w-full items-center justify-between"):
             chrome.panel_title("Recent sync history")
             connector_filter = ui.select(["All"], value="All")
@@ -872,7 +875,11 @@ def render() -> None:
         # closing the live dialog that started it — see ingest_runner.py).
         @ui.refreshable
         def history_body() -> None:
-            groups = read_run_groups()
+            # Keep enough history for useful pagination, newest first. Sorting here
+            # makes that display order explicit even if the runlog reader changes.
+            groups = read_run_groups(limit=100).sort_values(
+                "finished_at", ascending=False
+            ).reset_index(drop=True)
             if groups.empty:
                 chrome.empty_state("history", "No syncs yet", "Run a sync to see its history here.")
                 return
@@ -888,7 +895,13 @@ def render() -> None:
                         "history", "No syncs yet", "Run a sync to see its history here."
                     )
                     return
-            for _, run in groups.iterrows():
+
+            total_pages = max(1, (len(groups) + history_page_size - 1) // history_page_size)
+            history_page[0] = min(history_page[0], total_pages - 1)
+            page_start = history_page[0] * history_page_size
+            page_groups = groups.iloc[page_start : page_start + history_page_size]
+
+            for _, run in page_groups.iterrows():
                 run_id = run["run_id"]
                 started = pd.Timestamp(run["started_at"]).strftime("%Y-%m-%d %H:%M %Z")
                 failed = run["status"] == "failed"
@@ -934,6 +947,32 @@ def render() -> None:
                                     "word-break:break-word;"
                                 )
 
+            if total_pages > 1:
+                with ui.row().classes("w-full items-center justify-end gap-2 pt-3"):
+                    ui.label(
+                        f"{page_start + 1}–{min(page_start + history_page_size, len(groups))} "
+                        f"of {len(groups)}"
+                    ).classes("text-xs").style(f"color:{chrome.INK_MUTED}")
+
+                    def _previous_page() -> None:
+                        history_page[0] -= 1
+                        history_body.refresh()
+
+                    def _next_page() -> None:
+                        history_page[0] += 1
+                        history_body.refresh()
+
+                    previous = ui.button(icon="chevron_left", on_click=_previous_page).props(
+                        "flat dense round"
+                    ).tooltip("Previous page")
+                    next_page = ui.button(icon="chevron_right", on_click=_next_page).props(
+                        "flat dense round"
+                    ).tooltip("Next page")
+                    if history_page[0] == 0:
+                        previous.disable()
+                    if history_page[0] == total_pages - 1:
+                        next_page.disable()
+
         def _open_saved_log(path: Path, label: str) -> None:
             try:
                 text = path.read_text()
@@ -960,7 +999,11 @@ def render() -> None:
 
         history_body()
 
-    connector_filter.on_value_change(history_body.refresh)
+    def _filter_history() -> None:
+        history_page[0] = 0
+        history_body.refresh()
+
+    connector_filter.on_value_change(_filter_history)
 
     async def _watch(total: int, connector: str | None) -> None:
         """Open the live-tail dialog and follow the current sync to completion —

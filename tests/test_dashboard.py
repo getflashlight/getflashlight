@@ -1638,10 +1638,11 @@ _CORE_TABS = (
     "Attribution",
     "Efficiency & Waste",
     "Policy Compliance",
-    "Alerts",
 )
 
-# Databricks: spend detail after Breakdown, Client Driver Health before Alerts.
+_ALERTS_TAB = "Alerts"
+
+# Databricks: spend detail after Breakdown, Client Driver Health last.
 _DATABRICKS_TABS = (
     "Trend & changes",
     "Breakdown",
@@ -1652,7 +1653,6 @@ _DATABRICKS_TABS = (
     "Efficiency & Waste",
     "Policy Compliance",
     "Client Driver Health",
-    "Alerts",
 )
 
 
@@ -1664,7 +1664,8 @@ def test_provider_page_carries_the_core_tabs(lake_home) -> None:  # type: ignore
 
     Loops the *discovered* groups rather than a hard-coded pair, so a provider added later
     can't quietly get a different set. GCP is seeded deliberately: a connector that pulls
-    FOCUS cost and nothing else must still show all six, with named empty states.
+    FOCUS cost and nothing else must still show all core tabs and Alerts, with named empty
+    states. Databricks deliberately omits Alerts.
     """
     from nicegui.testing.user_simulation import user_simulation
 
@@ -1688,12 +1689,16 @@ def test_provider_page_carries_the_core_tabs(lake_home) -> None:  # type: ignore
                 await user.open(f"/{group}")
                 for tab in _CORE_TABS:
                     await user.should_see(tab)
+                if group == "databricks":
+                    await user.should_not_see(_ALERTS_TAB)
+                else:
+                    await user.should_see(_ALERTS_TAB)
 
     asyncio.run(_check())
 
 
 def test_databricks_tab_order_puts_spend_detail_after_breakdown(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """AI Costs / Storage sit next to Breakdown; Client Driver Health before Alerts.
+    """AI Costs / Storage sit next to Breakdown; Alerts are absent.
 
     Extras used to append after Policy, so the most-asked spend questions scrolled off
     the tab bar. Order is the contract — presence alone is covered by the core-tabs test.
@@ -1730,12 +1735,14 @@ def test_alerts_tab_holds_mom_prose_not_the_kpi_header(lake_home) -> None:  # ty
     from flashlight.transform.runner import build_gold
 
     april = _db_cost_row()
+    april.provider_name = ProviderName.GCP
     april.billing_period_start = date(2026, 4, 1)
     april.billing_period_end = date(2026, 4, 30)
     april.charge_period_start = datetime(2026, 4, 15, tzinfo=UTC)
     april.charge_period_end = datetime(2026, 4, 15, 1, tzinfo=UTC)
     april.billed_cost = april.effective_cost = april.list_cost = Decimal("80")
     may = _db_cost_row()
+    may.provider_name = ProviderName.GCP
     may.billed_cost = may.effective_cost = may.list_cost = Decimal("100")
     bronze.write_window(
         "t",
@@ -1748,7 +1755,7 @@ def test_alerts_tab_holds_mom_prose_not_the_kpi_header(lake_home) -> None:  # ty
     async def _check() -> None:
         async with user_simulation() as user:
             build_pages()
-            await user.open("/databricks")
+            await user.open("/gcp")
             await user.should_see("Net Spend")
             await user.should_see("Alerts")
             await user.should_not_see("in the selected window")

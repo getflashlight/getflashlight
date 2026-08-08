@@ -78,11 +78,14 @@ LOGO_SVG = (
 LOGO_DATA_URL = f"data:image/svg+xml,{quote(LOGO_SVG)}"
 FAVICON_SVG = LOGO_SVG
 
-# Shared local assets: use the same provider mark wherever a provider is named,
-# rather than allowing navigation and connection cards to drift apart.
+# Use the same provider mark wherever a provider is named, rather than allowing
+# navigation and connection cards to drift apart.
 CONNECTOR_LOGOS: dict[str, str] = {
     "databricks": "/dashboard-assets/databricks.png",
-    "redshift": "/dashboard-assets/redshift.svg",
+    "redshift": (
+        "https://upload.wikimedia.org/wikipedia/commons/7/73/Amazon-Redshift-Logo.svg"
+        "?utm_source=commons.wikimedia.org&utm_campaign=index&utm_content=original"
+    ),
 }
 
 # Declared so Safari (and iOS "Add to Home Screen") uses this instead of probing

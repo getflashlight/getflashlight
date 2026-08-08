@@ -1,5 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Amazon Redshift">
-  <path fill="#8C4FFF" d="M5 8.5 16 2l11 6.5v15L16 30 5 23.5z"/>
-  <path fill="#B999FF" d="M16 2v28l11-6.5v-15z"/>
-  <path fill="#fff" opacity=".9" d="M10 11h12v2H10zm0 4h12v2H10zm0 4h12v2H10z"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 44" role="img" aria-label="Amazon Redshift">
+  <path fill="#6ba4df" d="m2 16 6-3.5v19L2 35V16Z"/>
+  <path fill="#4d8ed2" d="m9 11 6-3.5v29L9 40V11Z"/>
+  <path fill="#2d72b9" d="m16 6 8-4.5v38L16 44V6Z"/>
+  <path fill="#3e82c8" d="m25 9 6-3.5v29L25 38V9Z"/>
+  <path fill="#5a99d8" d="m32 14 6-3.5v19L32 33V14Z"/>
+  <path fill="#7bb2e6" d="m2 16 6 3.5v12L2 35V16Zm7-5 6 3.5v22L9 40V11Zm7-5 8 4.5v29L16 44V6Zm9 3 6 3.5v22L25 38V9Zm7 5 6 3.5v15L32 33V14Z"/>
 </svg>
