@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Iterator
 
 import pytest
 
@@ -53,3 +54,23 @@ def _fresh_assistant_config():  # type: ignore[no-untyped-def]
     load.cache_clear()
     yield
     load.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_nicegui_clients() -> Iterator[None]:
+    """Keep page simulations isolated across tests.
+
+    NiceGUI's application reset clears configuration and storage but deliberately
+    leaves live clients alone. A client created by ``user_simulation`` can therefore
+    leave its page elements visible to the next test's finder, making a later route
+    assertion inspect the previous test's page. Delete those clients before resetting
+    the app so every simulation starts from an empty page registry and client set.
+    """
+    yield
+
+    from nicegui import app
+    from nicegui.client import Client
+
+    for client in list(Client.instances.values()):
+        client.delete()
+    app.reset()
