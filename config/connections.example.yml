@@ -3,23 +3,25 @@
 # named by the *_env fields (set them in .env / your shell / secrets manager).
 
 connectors:
-  # Local FOCUS file (CSV or Parquet) — easiest way to load sample data or any
-  # vendor's FOCUS export with no cloud credentials. See data/README.md to fetch
-  # the official FinOps FOCUS sample dataset.
-  - type: focus_file
-    enabled: false
-    path: /data/focus_sample.csv
-    respect_window: false   # ingest all rows regardless of the run's date window
-
   # AWS native FOCUS export (preferred). Point at the S3 location of your
   # AWS Data Exports FOCUS 1.0 dataset. Includes Redshift, S3, EC2/EBS lines.
+  # `name` is optional for a single connection of a type (falls back to the
+  # type itself) — set it once you have more than one, e.g. several AWS
+  # accounts or several Redshift clusters below.
   - type: aws_focus
     enabled: true
+    name: Prod cost
     s3_bucket: my-cur-exports
     s3_prefix: focus/flashlight/data
     region: us-east-1
     access_key_env: AWS_ACCESS_KEY_ID
     secret_key_env: AWS_SECRET_ACCESS_KEY
+    # cost_source defaults to focus_export (the S3 export above). Set to
+    # cost_explorer instead to query Cost Explorer directly — no export
+    # needed, but coarser (account-level totals, no per-charge detail) and
+    # needs ce:GetCostAndUsage. Pick one explicitly; there's no automatic
+    # fallback between them:
+    # cost_source: cost_explorer
 
   # Databricks DBU usage. Runs the vendored Databricks→FOCUS 1.3 query on a SQL
   # warehouse (see data/README + the SQL header for provenance/attribution).
@@ -27,18 +29,10 @@ connectors:
   # system.access.workspaces_latest.
   - type: databricks
     enabled: true
+    name: Prod workspace
     host: https://dbc-xxxxxxxx.cloud.databricks.com
     token_env: DATABRICKS_TOKEN
     sql_warehouse_id: null   # null → auto-pick a warehouse
-
-  # AWS infra via Cost Explorer — only needed if you do NOT have a native FOCUS
-  # export. Attributes EC2/EBS/S3 to clusters via the cluster tag. Disabled by default.
-  - type: aws_infra
-    enabled: false
-    region: us-east-1
-    cluster_tag_key: ClusterId
-    tag_filters:
-      Vendor: Databricks
 
   # Redshift efficiency/waste telemetry only — no cost pull (Redshift cost already
   # flows through aws_focus above, which should ideally be enabled too; this
@@ -50,8 +44,11 @@ connectors:
   # none of that needs cost data. Runs read-only queries against Redshift system
   # tables (STL_*/SVL_*/SVCS_*) via the Data API (IAM-based, no persistent DB
   # credentials). Set exactly one of cluster_identifier / workgroup_name.
+  # `name` matters here more than anywhere else — a `name` per cluster is what
+  # keeps multiple Redshift connections distinct in BRONZE/the dashboard.
   - type: redshift
     enabled: false
+    name: Prod (main)
     region: us-east-1
     cluster_identifier: my-redshift-cluster
     # workgroup_name: my-serverless-workgroup   # alternative to cluster_identifier

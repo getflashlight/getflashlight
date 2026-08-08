@@ -4,7 +4,9 @@
 -- GOLD view. Reuses the same warehouse + account-prices table as the FOCUS pull, so
 -- billed_cost reconciles to FOCUS. Run as a single statement (no internal `;`).
 --
--- Substituted by the connector: :account_prices (price table), :start_date, :end_date.
+-- Substituted by the connector: :account_prices (price table), :start_date, :end_date,
+-- :project_tag_key (DatabricksConfig.project_tag_key, default 'project' — the custom-tag
+-- key read as owner_project; literal match, case-sensitive, no fold across spellings).
 --
 -- VALIDATED against a live warehouse 2026-06-28: all columns/struct fields below confirmed
 -- (pricing.default, usage_metadata.*, identity_metadata.run_as, job_run_timeline.result_state,
@@ -74,7 +76,7 @@
 --     attribution, not a join into an existing branch — job_id on these REFRESH rows
 --     does NOT match usage_metadata.job_id (checked, zero matches). Deferred: 30 days
 --     of this billing line showed zero spill, zero shuffle — revisit if that changes.
---     FOCUS/TCO cost is unaffected (databricks_focus_1_3.sql sums billing.usage
+--     FOCUS cost is unaffected (databricks_focus_1_3.sql sums billing.usage
 --     unconditionally) — only waste classification can't see this compute class.
 --
 -- ADDED 2026-07-12, VALIDATED against a live warehouse (30-day percentile scan, see
@@ -119,6 +121,26 @@
 -- (DBUs aren't billed per-query), not an exact split; always 'candidate' downstream (see
 -- sql_warehouse_user_concentration, sql_warehouse_high_frequency_workload,
 -- sql_warehouse_serverless_pricing_gap in waste_rules.py).
+--
+-- ADDED 2026-07-31, NOT YET VALIDATED against a live warehouse: policy_id (cluster-only —
+-- system.compute.clusters, no counterpart on warehouses) and tag_count (size(tags),
+-- clusters AND warehouses both — a "has this resource been tagged at all" fact, distinct
+-- from the per-usage-row custom_tags on system.billing.usage already read into `project`
+-- above). Feeds the policy-compliance plane (efficiency/policy_rules.py's
+-- cluster_tagging/warehouse_tagging/cluster_policy_assigned categories via
+-- gold.policy_record) — a pass/fail governance signal, not a $ waste classification. Column
+-- names are Databricks' documented system-table schema, not yet confirmed against a live
+-- workspace the way every other column in this file has been — re-run `flashlight ingest`
+-- and spot-check cause_detail.policy_id/tag_count before trusting the policy_record rows
+-- that depend on them.
+--
+-- ADDED 2026-08-03, NOT YET VALIDATED against a live warehouse: auto_stop_minutes
+-- (system.compute.warehouses — the warehouse counterpart to a cluster's
+-- auto_termination_minutes, NULL on every non-warehouse branch). Feeds policy_rules.py's
+-- warehouse_auto_stop category. Same caveat as policy_id/tag_count above: the column name
+-- is Databricks' documented system-table schema, not yet confirmed live. If this workspace
+-- doesn't expose it, the query fails loudly on the warehouse_meta CTE rather than silently
+-- reporting every warehouse as unmeasured — drop the column and re-block the rule.
 --
 -- NOT YET VALIDATED against a live warehouse: notebook_id/notebook_path on rows where
 -- billing_origin_product IN ('INTERACTIVE','NOTEBOOKS') (serverless notebooks) — the
@@ -191,7 +213,7 @@ usage AS (
     u.identity_metadata.run_as                               AS run_as,
     u.billing_origin_product                                 AS product,
     u.sku_name                                               AS sku_name,
-    element_at(u.custom_tags, 'project')                     AS project,
+    element_at(u.custom_tags, :project_tag_key)              AS project,
     date_trunc('MONTH', u.usage_date)                        AS charge_month,
     u.usage_quantity                                         AS usage_quantity,
     u.usage_quantity * COALESCE(p.unit_price, 0)             AS cost,
@@ -297,7 +319,9 @@ cluster_meta AS (
     min_autoscale_workers, max_autoscale_workers, auto_termination_minutes,
     worker_node_type,
     COALESCE(aws_attributes.availability, azure_attributes.availability,
-             gcp_attributes.availability)                  AS availability
+             gcp_attributes.availability)                  AS availability,
+    policy_id,
+    size(tags)                                              AS tag_count
   FROM system.compute.clusters
   QUALIFY ROW_NUMBER() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) = 1
 ),
@@ -305,7 +329,8 @@ cluster_meta AS (
 -- drives sql_warehouse_serverless_pricing_gap / sql_warehouse_high_frequency_workload
 -- (waste_rules.py) instead of inferring serverless from SKU text.
 warehouse_meta AS (
-  SELECT warehouse_id, warehouse_name, warehouse_type
+  SELECT warehouse_id, warehouse_name, warehouse_type, size(tags) AS tag_count,
+         auto_stop_minutes
   FROM system.compute.warehouses
   QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) = 1
 ),
@@ -443,7 +468,13 @@ SELECT
   MAX(ut.pct_time_high_mem_swap)                            AS pct_time_high_mem_swap,
   MIN(ut.min_local_disk_free_bytes)                         AS min_local_disk_free_bytes,
   MAX(ut.network_bytes)                                     AS network_bytes,
-  MAX(r.avg_run_seconds)                                    AS avg_run_seconds
+  MAX(r.avg_run_seconds)                                    AS avg_run_seconds,
+  -- Same ephemeral per-run cluster join as worker_node_type/core_count above — policy_id/
+  -- tag_count describe the job's underlying cluster config, not the job itself.
+  MAX(cmj.policy_id)                                        AS policy_id,
+  MAX(cmj.tag_count)                                        AS tag_count,
+  -- auto_stop is a SQL-warehouse concept; clusters use auto_termination_minutes above.
+  CAST(NULL AS BIGINT)                                      AS auto_stop_minutes
 FROM usage u
 LEFT JOIN util ut ON ut.cluster_id = u.cluster_id AND ut.charge_month = u.charge_month
 LEFT JOIN runs r  ON r.job_id      = u.job_id     AND r.charge_month  = u.charge_month
@@ -486,7 +517,9 @@ SELECT
   -- MAX not SUM — same duplication reasoning as the JOBS branch above.
   MAX(ut.pct_time_high_cpu_wait), MAX(ut.pct_time_high_mem_swap),
   MIN(ut.min_local_disk_free_bytes), MAX(ut.network_bytes),
-  CAST(NULL AS DOUBLE)  -- avg_run_seconds: no job-run concept for interactive clusters
+  CAST(NULL AS DOUBLE),  -- avg_run_seconds: no job-run concept for interactive clusters
+  MAX(cm.policy_id), MAX(cm.tag_count),
+  CAST(NULL AS BIGINT)  -- auto_stop_minutes: warehouse-only concept
 FROM usage u
 LEFT JOIN util ut ON ut.cluster_id = u.cluster_id AND ut.charge_month = u.charge_month
 LEFT JOIN cluster_meta cm ON cm.cluster_id = u.cluster_id
@@ -514,7 +547,10 @@ SELECT
   CAST(NULL AS DOUBLE),
   MAX(qs.spill_query_count), MAX(qs.spilled_bytes), MAX(qs.shuffle_bytes),
   CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
-  CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE)
+  CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
+  CAST(NULL AS STRING),  -- policy_id: cluster-only concept, no warehouse counterpart
+  MAX(wm.tag_count),
+  MAX(wm.auto_stop_minutes)
 FROM usage u
 LEFT JOIN warehouse_meta wm ON wm.warehouse_id = u.warehouse_id
 LEFT JOIN warehouse_query_stats qs
@@ -547,7 +583,10 @@ SELECT
   CAST(NULL AS DOUBLE),
   CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
   CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
-  CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE)
+  CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
+  CAST(NULL AS STRING),  -- policy_id: cluster-only concept, no warehouse counterpart
+  MAX(wm.tag_count),
+  MAX(wm.auto_stop_minutes)
 FROM usage u
 JOIN warehouse_query_users wqu
   ON wqu.warehouse_id = u.warehouse_id AND wqu.charge_month = u.charge_month
@@ -579,7 +618,10 @@ SELECT
   SUM(u.jobs_priced_cost),
   CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
   CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
-  CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE)
+  CAST(NULL AS BIGINT), CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE),
+  -- Serverless notebooks have no cluster/warehouse identity to join for policy_id/
+  -- tag_count/auto_stop_minutes.
+  CAST(NULL AS STRING), CAST(NULL AS BIGINT), CAST(NULL AS BIGINT)
 FROM usage u
 WHERE u.product IN ('INTERACTIVE', 'NOTEBOOKS') AND u.notebook_id IS NOT NULL
 GROUP BY u.notebook_id, u.run_as, u.charge_month

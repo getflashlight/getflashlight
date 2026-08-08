@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 from flashlight.core.logging import setup_logging
 
 app = typer.Typer(
-    help="Flashlight — FOCUS-based multi-cloud TCO spend visualization",
+    help="Flashlight — FOCUS-based multi-cloud spend visualization",
     no_args_is_help=True,
 )
 aws_app = typer.Typer(help="AWS Data Exports setup", no_args_is_help=True)
@@ -93,11 +93,17 @@ def mcp_serve() -> None:
 
 
 @dashboard_app.command("serve")
-def dashboard_serve() -> None:
+def dashboard_serve(
+    dev: bool = typer.Option(
+        False,
+        "--dev",
+        help="Reload the dashboard when Python source files change (development only)",
+    ),
+) -> None:
     """Run the dashboard for humans (reads the GOLD Parquet read-only)."""
     from flashlight.dashboard.launch import serve_dashboard
 
-    serve_dashboard()
+    serve_dashboard(dev=dev)
 
 
 def _progress_printer() -> Callable[[str, str, int], None]:
@@ -109,7 +115,11 @@ def _progress_printer() -> Callable[[str, str, int], None]:
     keeps one connector's line from interleaving with another's mid-write. The
     per-chunk "rows" tick (event="rows") is intentionally not printed — a live
     running count needs its own line per connector to stay legible, not worth it
-    for a CLI progress hint.
+    for a CLI progress hint. ``efficiency_done``/``efficiency_failed`` (from
+    ``_run_efficiency``, after every connector's cost pull has already finished)
+    get their own line too — otherwise a connector whose cost pull is a no-op
+    (Redshift) prints "done" while its real payload, the efficiency pull, is
+    still running or has silently failed with nothing printed at all.
     """
     lock = threading.Lock()
 
@@ -121,6 +131,10 @@ def _progress_printer() -> Callable[[str, str, int], None]:
                 typer.echo(f"  {name} ... {rows:,} rows done")
             elif event == "failed":
                 typer.secho(f"  {name} ... failed", fg=typer.colors.RED)
+            elif event == "efficiency_done":
+                typer.echo(f"  {name} ... efficiency: {rows:,} records")
+            elif event == "efficiency_failed":
+                typer.secho(f"  {name} ... efficiency failed", fg=typer.colors.RED)
 
     return _on_progress
 
@@ -130,7 +144,21 @@ def ingest(
     start: str | None = typer.Option(None, help="ISO start date (default: 35d lookback)"),
     end: str | None = typer.Option(None, help="ISO end date (default: today)"),
     connections: str | None = typer.Option(None, help="Path to connections.yml"),
+    connector: str | None = typer.Option(
+        None,
+        "--connector",
+        help="Only run this connector (its configured `name`, or `type` if unnamed)",
+    ),
     no_transform: bool = typer.Option(False, "--no-transform", help="Skip SILVER/GOLD refresh"),
+    run_id: str | None = typer.Option(
+        None,
+        "--run-id",
+        help=(
+            "Identify this sync in the run log with a caller-supplied id instead of "
+            "generating one (the dashboard passes its own so it can name a saved-log "
+            "file before the subprocess starts — see dashboard/ingest_runner.py)."
+        ),
+    ),
     full_refresh: bool = typer.Option(
         False,
         "--full-refresh",
@@ -161,9 +189,11 @@ def ingest(
             start=date.fromisoformat(start) if start else None,
             end=date.fromisoformat(end) if end else None,
             connections=connections,
+            connector=connector,
             no_transform=no_transform,
             full_refresh=full_refresh,
             on_progress=_progress_printer(),
+            run_id=run_id,
         )
     except IngestError as exc:
         typer.secho(

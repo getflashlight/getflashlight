@@ -49,6 +49,33 @@ def test_no_rest_api_or_db_commands() -> None:
     assert "db" not in result.output
 
 
+def test_dashboard_serve_help_offers_development_reload() -> None:
+    result = runner.invoke(app, ["dashboard", "serve", "--help"])
+    assert result.exit_code == 0
+    assert "--dev" in _plain(result.output)
+
+
+def test_dashboard_serve_passes_development_mode(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from flashlight.dashboard import launch
+
+    seen: list[bool] = []
+    monkeypatch.setattr(launch, "serve_dashboard", lambda *, dev: seen.append(dev))
+
+    result = runner.invoke(app, ["dashboard", "serve", "--dev"])
+    assert result.exit_code == 0
+    assert seen == [True]
+
+
+def test_dashboard_dev_mode_uses_the_flashlight_watcher(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from flashlight.dashboard import launch
+
+    watched: list[bool] = []
+    monkeypatch.setattr(launch, "_serve_with_reload", lambda: watched.append(True))
+
+    launch.serve_dashboard(dev=True)
+    assert watched == [True]
+
+
 def test_aws_group_lists_all_subcommands() -> None:
     result = runner.invoke(app, ["aws", "--help"])
     assert result.exit_code == 0

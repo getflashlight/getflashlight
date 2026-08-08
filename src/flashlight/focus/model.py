@@ -17,7 +17,10 @@ from pydantic import BaseModel, Field, field_validator
 from flashlight.focus.enums import (
     ChargeCategory,
     ChargeClass,
+    CommitmentDiscountCategory,
+    CommitmentDiscountStatus,
     ComputeClass,
+    PricingCategory,
     ServiceCategory,
 )
 
@@ -65,7 +68,7 @@ class FocusRecord(BaseModel):
     # ── Costs (one currency per record; never sum across currencies) ────────
     billing_currency: str = "USD"  # FOCUS: BillingCurrency
     billed_cost: Decimal = Decimal("0")  # FOCUS: BilledCost
-    effective_cost: Decimal = Decimal("0")  # FOCUS: EffectiveCost (default for TCO)
+    effective_cost: Decimal = Decimal("0")  # FOCUS: EffectiveCost (the canonical metric)
     list_cost: Decimal = Decimal("0")  # FOCUS: ListCost
     contracted_cost: Decimal = Decimal("0")  # FOCUS: ContractedCost
 
@@ -79,6 +82,10 @@ class FocusRecord(BaseModel):
     service_name: str  # FOCUS: ServiceName
     sku_id: str | None = None  # FOCUS: SkuId
     region_id: str | None = None  # FOCUS: RegionId
+    # Conditional — null wherever a source has no pricing model to report (e.g.
+    # Tax rows, per spec, MUST be null here). DYNAMIC is FOCUS's own term for Spot/
+    # other provider-variable pricing; there is no separate "spot" value.
+    pricing_category: PricingCategory | None = None  # FOCUS: PricingCategory
 
     # ── Resource ────────────────────────────────────────────────────────────
     resource_id: str | None = None  # FOCUS: ResourceId
@@ -89,7 +96,22 @@ class FocusRecord(BaseModel):
     consumed_quantity: float | None = None  # FOCUS: ConsumedQuantity
     consumed_unit: str | None = None  # FOCUS: ConsumedUnit
 
-    # ── Tags (used for TCO attribution) ─────────────────────────────────────
+    # ── Contract commitment (Conditional — NULL where a source has none, e.g.
+    # Databricks: no system table exposes reservation/savings-plan data) ────
+    commitment_discount_id: str | None = None  # FOCUS: CommitmentDiscountId
+    # FOCUS: CommitmentDiscountType — open, provider-specific (e.g. Reserved | SavingsPlan)
+    commitment_discount_type: str | None = None
+    commitment_discount_category: CommitmentDiscountCategory | None = None
+    commitment_discount_name: str | None = None  # FOCUS: CommitmentDiscountName
+    commitment_discount_status: CommitmentDiscountStatus | None = None
+    commitment_discount_quantity: float | None = None  # FOCUS: CommitmentDiscountQuantity
+    commitment_discount_unit: str | None = None  # FOCUS: CommitmentDiscountUnit
+
+    # ── Invoice details (Recommended/Conditional) ───────────────────────────
+    invoice_id: str | None = None  # FOCUS: InvoiceId
+    invoice_issuer_name: str | None = None  # FOCUS: InvoiceIssuerName
+
+    # ── Tags (drive cost allocation / attribution) ──────────────────────────
     tags: dict[str, str] = Field(default_factory=dict)  # FOCUS: Tags
 
     # ── Flashlight extensions (x_ prefix mirrors FOCUS provider-extension style)

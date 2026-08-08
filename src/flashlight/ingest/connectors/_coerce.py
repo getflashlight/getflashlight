@@ -5,7 +5,13 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
-from flashlight.focus.enums import ChargeCategory, ServiceCategory
+from flashlight.focus.enums import (
+    ChargeCategory,
+    CommitmentDiscountCategory,
+    CommitmentDiscountStatus,
+    PricingCategory,
+    ServiceCategory,
+)
 
 
 def to_service_category(value: str | None) -> ServiceCategory:
@@ -26,6 +32,42 @@ def to_charge_category(value: str | None) -> ChargeCategory:
         return ChargeCategory(value)
     except ValueError:
         return ChargeCategory.USAGE
+
+
+def to_commitment_category(value: str | None) -> CommitmentDiscountCategory | None:
+    """Map a commitment-discount-category string to the FOCUS enum, or None (Conditional field)."""
+    if not value:
+        return None
+    try:
+        return CommitmentDiscountCategory(value)
+    except ValueError:
+        return None
+
+
+def to_commitment_status(value: str | None) -> CommitmentDiscountStatus | None:
+    """Map a commitment-discount-status string to the FOCUS enum, or None (Conditional field)."""
+    if not value:
+        return None
+    try:
+        return CommitmentDiscountStatus(value)
+    except ValueError:
+        return None
+
+
+def to_pricing_category(value: str | None) -> PricingCategory | None:
+    """Map a pricing-category string to the FOCUS enum, or None (Conditional field).
+
+    Unrecognized rather than absent still resolves to ``None``, not ``OTHER``: a
+    provider value we can't parse is a mapping gap, not FOCUS's own "priced in a way
+    not covered by the other categories" case — coercing it to ``OTHER`` would claim
+    provider intent we don't actually have.
+    """
+    if not value:
+        return None
+    try:
+        return PricingCategory(value)
+    except ValueError:
+        return None
 
 
 def to_decimal(value: object) -> Decimal:

@@ -159,6 +159,47 @@ def test_ingest_classifies_redshift_subcategory(lake_home, tmp_path, monkeypatch
     assert row[0] == "concurrency_scaling"
 
 
+def test_ingest_maps_commitment_and_invoice_columns(lake_home, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from flashlight.lake import duck
+
+    path = _write_parquet(
+        tmp_path / "focus.parquet",
+        [
+            {
+                "ProviderName": "AWS",
+                "BillingAccountId": "acct-1",
+                "ChargePeriodStart": date(2026, 6, 15),
+                "ChargePeriodEnd": date(2026, 6, 15),
+                "BillingCurrency": "USD",
+                "ChargeCategory": "Usage",
+                "ServiceCategory": "Compute",
+                "ServiceName": "AmazonEC2",
+                "EffectiveCost": 10.0,
+                "BilledCost": 10.0,
+                "CommitmentDiscountId": "cud-1",
+                "CommitmentDiscountType": "SavingsPlan",
+                "CommitmentDiscountCategory": "Spend",
+                "CommitmentDiscountStatus": "Used",
+                "CommitmentDiscountQuantity": 1.0,
+                "CommitmentDiscountUnit": "Hrs",
+                "InvoiceId": "inv-1",
+                "InvoiceIssuerName": "Amazon Web Services",
+            },
+        ],
+    )
+    connector = _connector(monkeypatch, tmp_path, [path], include_services=[])
+    connector.ingest(_WINDOW, run_id="r1")
+
+    con = duck.connect()
+    duck.register_bronze(con)
+    row = con.execute(
+        "SELECT commitment_discount_id, commitment_discount_category, "
+        "commitment_discount_status, invoice_id, invoice_issuer_name "
+        "FROM raw.focus_record"
+    ).fetchone()
+    assert row == ("cud-1", "Spend", "Used", "inv-1", "Amazon Web Services")
+
+
 def test_ingest_no_manifests_returns_zero(lake_home, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     connector = _connector(monkeypatch, tmp_path, [])
     assert connector.ingest(_WINDOW, run_id="r1") == 0
@@ -283,3 +324,242 @@ def test_ingest_pushes_down_service_allow_list(lake_home, tmp_path, monkeypatch)
     connector = _connector(monkeypatch, tmp_path, [path], include_services=["AmazonS3"])
     written = connector.ingest(_WINDOW, run_id="r1")
     assert written == 1
+
+
+# ── manifest listing ─────────────────────────────────────────────────────────
+
+
+def _manifest_connector(monkeypatch, listing: dict[str, list[str]], **config_kw: object):  # type: ignore[no-untyped-def]
+    """Connector whose S3 answers ``listing`` (prefix -> keys) and records what was listed.
+
+    ``CommonPrefixes`` for the delimited call is derived from the keys, mimicking S3.
+    """
+    monkeypatch.setattr(
+        "flashlight.ingest.connectors.aws_focus.aws_client", MagicMock(return_value=MagicMock())
+    )
+    connector = AwsFocusConnector(
+        AwsFocusConfig.model_validate({"s3_bucket": "b", "region": "us-west-2", **config_kw})
+    )
+    scanned: list[str] = []
+
+    def paginate(Bucket: str, Prefix: str) -> list[dict[str, object]]:  # noqa: N803
+        scanned.append(Prefix)
+        keys = [k for k in listing.get("__all__", []) if k.startswith(Prefix)]
+        return [{"Contents": [{"Key": k} for k in keys]}]
+
+    def list_objects_v2(Bucket: str, Prefix: str, Delimiter: str) -> dict[str, object]:  # noqa: N803
+        children = {
+            k[len(Prefix) :].split("/")[0]
+            for k in listing.get("__all__", [])
+            if k.startswith(Prefix) and "/" in k[len(Prefix) :]
+        }
+        return {"CommonPrefixes": [{"Prefix": f"{Prefix}{c}/"} for c in sorted(children)]}
+
+    connector._s3.get_paginator.return_value.paginate = paginate
+    connector._s3.list_objects_v2 = list_objects_v2
+    return connector, scanned
+
+
+_MANIFEST_KEY = "focus/my-export/metadata/billing_period=2026-06/foo-Manifest.json"
+_DATA_KEY = "focus/my-export/data/billing_period=2026-06/chunk-0.snappy.parquet"
+
+
+def test_list_manifests_scans_metadata_subtree_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The data/ subtree — every Parquet the export ever wrote — must never be listed."""
+    connector, scanned = _manifest_connector(
+        monkeypatch, {"__all__": [_MANIFEST_KEY, _DATA_KEY]}, s3_prefix="focus"
+    )
+    assert connector._list_partition_manifests() == {"2026-06": _MANIFEST_KEY}
+    assert scanned == ["focus/metadata/", "focus/my-export/metadata/"]
+    assert not any("/data/" in p for p in scanned)
+
+
+def test_list_manifests_falls_back_to_full_prefix(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A layout that nests metadata/ deeper than one level still ingests, via fallback."""
+    deep = "focus/a/b/my-export/metadata/billing_period=2026-06/foo-Manifest.json"
+    connector, scanned = _manifest_connector(monkeypatch, {"__all__": [deep]}, s3_prefix="focus")
+    assert connector._list_partition_manifests() == {"2026-06": deep}
+    assert scanned[-1] == "focus"  # the whole-prefix fallback ran last
+
+
+# ── cost_source="cost_explorer" ──────────────────────────────────────────────
+
+
+def _ce_connector(monkeypatch, **config_kw: object):  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        "flashlight.ingest.connectors.aws_focus.aws_client", MagicMock(return_value=MagicMock())
+    )
+    config = AwsFocusConfig.model_validate(
+        {"cost_source": "cost_explorer", "region": "us-west-2", **config_kw}
+    )
+    return AwsFocusConnector(config)
+
+
+def test_ingest_cost_explorer_path_skips_manifest_scan(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from flashlight.lake import duck
+
+    connector = _ce_connector(monkeypatch)
+    monkeypatch.setattr(
+        connector,
+        "_manifest_files",
+        lambda window: (_ for _ in ()).throw(AssertionError("must not scan S3 manifests")),
+    )
+    connector._ce.get_cost_and_usage.return_value = {
+        "ResultsByTime": [
+            {
+                "TimePeriod": {"Start": "2026-06-15", "End": "2026-06-16"},
+                "Groups": [
+                    {
+                        "Keys": ["Amazon Redshift"],
+                        "Metrics": {"UnblendedCost": {"Amount": "12.50"}},
+                    },
+                ],
+            }
+        ]
+    }
+
+    written = connector.ingest(_WINDOW, run_id="r1")
+    assert written == 1
+
+    con = duck.connect()
+    duck.register_bronze(con)
+    row = con.execute(
+        "SELECT service_name, effective_cost, x_source_connector FROM raw.focus_record"
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "Amazon Redshift"
+    assert float(row[1]) == pytest.approx(12.50)
+    assert row[2] == "aws_focus"
+
+
+def test_ce_filter_uses_include_services() -> None:
+    connector = AwsFocusConnector(
+        AwsFocusConfig(cost_source="cost_explorer", include_services=["Amazon Redshift"])
+    )
+    assert connector._ce_filter() == {
+        "Dimensions": {"Key": "SERVICE", "Values": ["Amazon Redshift"]}
+    }
+
+
+def test_ce_filter_empty_when_include_services_widened() -> None:
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer", include_services=[]))
+    assert connector._ce_filter() == {}
+
+
+def test_map_ce_group_drops_zero_cost() -> None:
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer"))
+    group = {"Keys": ["Amazon Redshift"], "Metrics": {"UnblendedCost": {"Amount": "0"}}}
+    assert connector._map_ce_group(group, date(2026, 6, 1), date(2026, 6, 2)) is None
+
+
+def test_map_ce_group_categorizes_redshift_as_analytics() -> None:
+    from flashlight.focus.enums import ServiceCategory
+
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer"))
+    group = {"Keys": ["Amazon Redshift"], "Metrics": {"UnblendedCost": {"Amount": "5.00"}}}
+    record = connector._map_ce_group(group, date(2026, 6, 1), date(2026, 6, 2))
+    assert record is not None
+    assert record.service_category == ServiceCategory.ANALYTICS
+    assert record.service_name == "Amazon Redshift"
+
+
+def test_map_ce_group_falls_back_to_other_for_unknown_service() -> None:
+    from flashlight.focus.enums import ServiceCategory
+
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer"))
+    group = {
+        "Keys": ["Amazon Elastic Compute Cloud - Compute"],
+        "Metrics": {"UnblendedCost": {"Amount": "5.00"}},
+    }
+    record = connector._map_ce_group(group, date(2026, 6, 1), date(2026, 6, 2))
+    assert record is not None
+    assert record.service_category == ServiceCategory.OTHER
+
+
+def test_paginate_follows_next_page_token() -> None:
+    connector = AwsFocusConnector(AwsFocusConfig(cost_source="cost_explorer"))
+    page1 = {
+        "ResultsByTime": [{"TimePeriod": {"Start": "2026-06-01", "End": "2026-06-02"}}],
+        "NextPageToken": "p2",
+    }
+    page2 = {"ResultsByTime": [{"TimePeriod": {"Start": "2026-06-02", "End": "2026-06-03"}}]}
+    connector._ce.get_cost_and_usage = MagicMock(side_effect=[page1, page2])
+    results = connector._paginate(TimePeriod={"Start": "2026-06-01", "End": "2026-06-30"})
+    assert len(results) == 2
+    assert connector._ce.get_cost_and_usage.call_count == 2
+
+
+def test_ingest_classifies_s3_subcategory(lake_home, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """S3 rows reach BRONZE with x_cost_subcategory stamped per charge type.
+
+    "S3 cost" as one number can't tell a storage-growth problem from a request-volume
+    one, and Databricks drives heavy LIST/GET metadata traffic — so the split is what
+    makes the backing-storage figure actionable. Redshift rows keep their own
+    classification in the same pass (see test_ingest_classifies_redshift_subcategory),
+    which is the regression proof that composing the two classifiers into one CASE was
+    behaviour-preserving.
+    """
+    rows = [
+        ("TimedStorage-ByteHrs", "bkt-a", "storage"),
+        ("Requests-Tier1", "bkt-b", "requests"),
+        ("DataTransfer-Out-Bytes", "bkt-c", "data_transfer"),
+        ("Monitoring-Automation-INT", "bkt-d", "monitoring"),
+        ("EarlyDelete-ByteHrs", "bkt-e", "early_delete"),
+        ("some unrecognized S3 line", "bkt-f", "other"),
+    ]
+    path = _write_parquet(
+        tmp_path / "focus.parquet",
+        [
+            {
+                "ProviderName": "AWS",
+                "BillingAccountId": "acct-1",
+                "ChargePeriodStart": date(2026, 6, 10),
+                "ChargePeriodEnd": date(2026, 6, 10),
+                "BillingCurrency": "USD",
+                "ChargeCategory": "Usage",
+                "ServiceCategory": "Storage",
+                "ServiceName": "Amazon Simple Storage Service",
+                "ChargeDescription": description,
+                "ResourceId": resource,
+                "EffectiveCost": 1.0,
+                "BilledCost": 1.0,
+            }
+            for description, resource, _ in rows
+        ]
+        # An EC2 row must still get NULL — neither classifier claims it.
+        + [
+            {
+                "ProviderName": "AWS",
+                "BillingAccountId": "acct-1",
+                "ChargePeriodStart": date(2026, 6, 11),
+                "ChargePeriodEnd": date(2026, 6, 11),
+                "BillingCurrency": "USD",
+                "ChargeCategory": "Usage",
+                "ServiceCategory": "Compute",
+                "ServiceName": "AmazonEC2",
+                "ChargeDescription": "BoxUsage:m5.large storage optimized",
+                "ResourceId": "i-1",
+                "EffectiveCost": 9.0,
+                "BilledCost": 9.0,
+            }
+        ],
+    )
+    connector = _connector(monkeypatch, tmp_path, [path], include_services=[])
+    assert connector.ingest(_WINDOW, run_id="r1") == len(rows) + 1
+
+    from flashlight.lake import duck
+
+    con = duck.connect()
+    try:
+        duck.register_bronze(con)
+        got = dict(
+            con.execute(
+                "SELECT resource_id, x_cost_subcategory FROM raw.focus_record"
+            ).fetchall()
+        )
+    finally:
+        con.close()
+
+    for _, resource, expected in rows:
+        assert got[resource] == expected, f"{resource} should classify as {expected}"
+    assert got["i-1"] is None  # EC2 is in neither service family

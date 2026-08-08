@@ -6,22 +6,57 @@
 ![Python versions](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-FOCUS-based, multi-cloud Total Cost of Ownership (TCO) spend visualization.
+FOCUS-based, multi-cloud cloud-spend visualization.
 
 Flashlight ingests cloud billing in the [FinOps FOCUS](https://focus.finops.org/focus-specification/)
 format, standardizes it into a layered data model, and serves a bundled NiceGUI
 dashboard plus an MCP server for agents. It answers what you're actually
-spending — including the often-hidden TCO of a Databricks workload (DBU cost
-plus the AWS infra it provisions).
+spending — across every cloud and data platform on one FOCUS-normalized bill,
+plus how much of it is recoverable waste.
+
+## Choose a path
+
+<div class="grid cards" markdown>
+
+- :material-rocket-launch: **Try it in five minutes**
+
+  ---
+
+  Install Flashlight, load the FOCUS sample, and open the dashboard.
+
+  [Start the quickstart](quickstart.md)
+
+- :material-cloud-download: **Connect production billing**
+
+  ---
+
+  Configure AWS, Databricks, or Redshift with least-privilege credentials.
+
+  [Connect a source](getting-started/real-source.md)
+
+- :material-robot-outline: **Use an agent**
+
+  ---
+
+  Give an MCP-compatible agent read-only access to the same metrics as the dashboard.
+
+  [Set up MCP](guides/mcp.md)
+
+- :material-book-open-page-variant: **Understand the numbers**
+
+  ---
+
+  Learn the FOCUS model, the lake layers, and the integrity rules behind every total.
+
+  [Read the concepts](concepts/focus-and-integrity.md)
+
+</div>
 
 ## Why use Flashlight?
 
 - **One binary, no infra.** `pip install getflashlight`. No Docker, no database
   server. State is Parquet under `FLASHLIGHT_HOME`, queried by a throwaway
   in-memory DuckDB in each process.
-- **True TCO, not sticker price.** A Databricks workload's DBU cost is joined
-  with the AWS infra it provisions, without double-counting — classic compute
-  adds the infra; serverless doesn't need to.
 - **FOCUS-native.** Every connector maps its source into one canonical
   `FocusRecord`. One cost metric (`EffectiveCost`) is summed everywhere; nothing
   gets to invent its own column.
@@ -44,7 +79,7 @@ flashlight dashboard serve      # dashboard → http://127.0.0.1:8501
 ```
 
 Connecting real billing — AWS, Databricks, Redshift — is a `connections.yml`
-away; see [Quick start](quickstart.md) and [Connectors](connectors.md).
+away; see [Quick start](quickstart.md) and [Connectors](connectors/overview.md).
 
 ## Data integrity
 
@@ -57,11 +92,12 @@ The SILVER/GOLD layer enforces the rules that make FOCUS data safe to sum:
 - AWS spend that can't be attributed to a cluster is shown as an explicit
   unattributed bucket, never hidden
 
-## Where to next
+## Documentation
 
-- [Quick start](quickstart.md) — sample data to a running dashboard in two commands
-- [Architecture](architecture.md) — the BRONZE → SILVER → GOLD lake, and the invariants that keep it honest
-- [Connectors](connectors.md) — AWS, Databricks, FOCUS files, and the mapping SQL behind each one
-- [CLI reference](cli.md) — every `flashlight` command, generated straight from the CLI itself
-- [Efficiency / waste](design/efficiency-waste.md) — recoverable spend: idle time, underutilized capacity, wrong compute placement
+- [Get started](getting-started/overview.md) — installation, a short trial, and production setup
+- [User guide](guides/configure.md) — configure, ingest, explore, deploy, and use agents
+- [Concepts](concepts/focus-and-integrity.md) — FOCUS, data contracts, integrity, and metric definitions
+- [Connectors](connectors/overview.md) — supported sources, prerequisites, and mapping details
+- [Reference](reference/cli.md) — commands, configuration, data contracts, and MCP tools
+- [Troubleshooting](troubleshooting/index.md) — solve setup, credentials, data, and serving issues
 - <a href="llms.txt">llms.txt</a> — an index of these docs for LLM tooling; the MCP server (`flashlight mcp serve`) reads the same GOLD views the dashboard does

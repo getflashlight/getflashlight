@@ -11,7 +11,10 @@ from flashlight.core.exceptions import FocusValidationError
 from flashlight.core.settings import get_settings
 from flashlight.efficiency.model import EfficiencyRecord
 from flashlight.focus.model import FocusRecord
+from flashlight.lake.ai_usage_schema import AiUsageRecord
+from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
+from flashlight.lake.storage_location_schema import StorageLocationRecord
 
 # A progress event: (event, connector_name, rows). "start" (rows always 0),
 # "rows" (running count, emitted every PROGRESS_EVERY rows — row-based
@@ -54,7 +57,7 @@ class Connector(ABC):
         instead override :meth:`ingest` directly with one vectorized DuckDB SQL
         write (see :mod:`flashlight.focus.sql_mapping`) and leave this method
         unimplemented — no FocusRecord objects, no per-row Python at all. See
-        ``ingest/connectors/aws_focus.py`` / ``focus_file.py``.
+        ``ingest/connectors/aws_focus.py``.
 
         Implementations must stamp ``x_source_connector = self.name`` on each
         record and pick FOCUS-valid controlled-vocabulary values, falling back
@@ -114,5 +117,57 @@ class Connector(ABC):
         fleet-health/compliance signal (which JDBC/ODBC driver versions are in use), not
         a waste signal. Best-effort — a failure here must not abort the canonical cost
         ingest (the runner warns and skips).
+        """
+        return iter(())
+
+    def fetch_ai_usage(self, window: IngestWindow) -> Iterator[AiUsageRecord]:
+        """Yield aggregated AI serving-usage records for the window (default: none).
+
+        Optional, non-abstract: a source with no model-serving telemetry emits no token
+        rows, and a source whose telemetry tables aren't enabled must emit none rather
+        than guessing. Measurement only — token/request volume per served model and
+        requester, with no dollar figure (the endpoint's spend stays canonical in the
+        FOCUS plane). Best-effort — a failure here must not abort the canonical cost
+        ingest (the runner warns and skips).
+        """
+        return iter(())
+
+    def fetch_storage_locations(self, window: IngestWindow) -> Iterator[StorageLocationRecord]:
+        """Yield this platform's cloud object-storage locations (default: none).
+
+        Optional, non-abstract, and metadata only — no cost, no utilization. It answers
+        "which buckets back this platform?", which is what lets the *cloud provider's*
+        storage bill be attributed to the platform sitting on top of it (Databricks'
+        own bill covers DBU compute only — see ``docs/design/backing-storage.md``).
+
+        ``window`` is accepted for hook uniformity and **deliberately ignored**: Unity
+        Catalog and its equivalents expose only current state, so a pull can only ever
+        produce a present-tense snapshot. It's stamped with the month it ran in, the
+        same call ``databricks._fetch_table_inventory`` makes.
+
+        Best-effort — a failure here must not abort the canonical cost ingest (the
+        runner warns and skips), and an empty result is treated as "couldn't see
+        anything", never as "this platform has no storage" (see
+        ``lake.storage_locations.write_storage_locations``).
+        """
+        return iter(())
+
+    def fetch_compute_instances(self, window: IngestWindow) -> Iterator[ComputeInstanceRecord]:
+        """Yield this platform's cloud-compute-instance membership map (default: none).
+
+        Optional, non-abstract, and metadata only — no cost, no utilization. It answers
+        "which cloud VM backed this cluster/job?", which is what lets the *cloud
+        provider's* compute bill be attributed to the platform sitting on top of it
+        (Databricks' own bill covers DBU compute only — see
+        ``docs/design/backing-compute.md``).
+
+        Unlike :meth:`fetch_storage_locations`, ``window`` is genuinely honored here:
+        the source (e.g. Databricks' ``system.compute.node_timeline``) reports real
+        historical instance activity bounded by time, not a present-tense snapshot, so
+        a pull for a given window is authoritative for that window and the writer does
+        a real partition-replace (see ``lake.compute_instances.write_compute_instances``).
+
+        Best-effort — a failure here must not abort the canonical cost ingest (the
+        runner warns and skips).
         """
         return iter(())

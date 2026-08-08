@@ -103,7 +103,7 @@ def test_sample_cleanup_removes_all_data(lake_home, tmp_path) -> None:  # type: 
     assert not cached.exists()
     assert not run_file.exists()
     # GOLD is rebuilt from now-empty BRONZE, so no provider groups remain (the
-    # sample's spend is gone); only the empty shared/ TCO group is left.
+    # sample's spend is gone); only the empty fixed groups are left.
     from flashlight.transform.catalog import discover_provider_groups
 
     assert discover_provider_groups() == []

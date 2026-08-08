@@ -16,14 +16,14 @@ def test_publish_lands_files_under_group_dirs(tmp_path) -> None:  # type: ignore
     staging = tmp_path / "gold.staging"
     target = tmp_path / "gold"
     _write(staging / "aws" / "monthly_bill.parquet")
-    _write(staging / "shared" / "tco_summary_month.parquet")
+    _write(staging / "efficiency" / "waste_record.parquet")
 
     # target/aws doesn't exist yet → first-publish mkdir path.
     published = atomic_publish(staging, target)
 
     assert published == 2
     assert (target / "aws" / "monthly_bill.parquet").exists()
-    assert (target / "shared" / "tco_summary_month.parquet").exists()
+    assert (target / "efficiency" / "waste_record.parquet").exists()
     assert not staging.exists()  # staging tree removed
 
 
@@ -34,11 +34,11 @@ def test_publish_prunes_stale_group(tmp_path) -> None:  # type: ignore[no-untype
 
     staging = tmp_path / "gold.staging"
     _write(staging / "aws" / "monthly_bill.parquet")
-    _write(staging / "shared" / "tco_summary_month.parquet")
+    _write(staging / "efficiency" / "waste_record.parquet")
 
     atomic_publish(staging, target)
 
     # snowflake is gone from the new data → its group dir is pruned.
     assert not (target / "snowflake").exists()
     assert (target / "aws").exists()
-    assert (target / "shared").exists()
+    assert (target / "efficiency").exists()

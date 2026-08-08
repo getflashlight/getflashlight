@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from flashlight.core.exceptions import IngestError
+from flashlight.core.exceptions import ConnectorError, IngestError
 from flashlight.ingest import runner
 from flashlight.ingest.runner import ConnectorOutcome, run_ingest
 from flashlight.lake import bronze as bronze_module
@@ -29,7 +29,7 @@ def _stub(monkeypatch, outcomes: list[ConnectorOutcome], built: list[bool], ran:
     monkeypatch.setattr(runner, "load_connections", lambda _c: configs)
     monkeypatch.setattr(runner, "build_connector", lambda c: c)
 
-    def _run_connector(conn, _w, _on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
+    def _run_connector(conn, _w, _run_id, _on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
         outcome = outcome_by_config[conn]
         ran.append(outcome.name)
         return outcome
@@ -41,8 +41,7 @@ def _stub(monkeypatch, outcomes: list[ConnectorOutcome], built: list[bool], ran:
         return 11
 
     monkeypatch.setattr(runner, "build_gold", _build_gold)
-    monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c: 0)
-    monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None: None)
 
 
 def test_all_connectors_run_even_after_a_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -65,8 +64,51 @@ def test_all_connectors_run_even_after_a_failure(monkeypatch) -> None:  # type: 
     # ...but every connector ran, including the one after the failure. Order isn't
     # guaranteed once connectors run concurrently (see _stub's docstring).
     assert set(ran) == {"databricks", "aws_focus", "aws_infra"}
-    # GOLD is still rebuilt from the connectors that succeeded.
-    assert built == [True]
+    # GOLD is still rebuilt from the connectors that succeeded — twice: once
+    # right after the cost pull, once more as the final holistic rebuild after
+    # the efficiency/driver-health phases (see run_ingest).
+    assert built == [True, True]
+
+
+def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The dashboard's per-connection Sync button (and the CLI's --connector) pass
+    `connector=<effective name>` — only that one connector's config should reach
+    build_connector/run_connector, everything else about the run is unchanged.
+    """
+    class _Config:
+        def __init__(self, type: str) -> None:  # noqa: A002 - mirrors ConnectorConfig's own field name
+            self.type = type
+            self.name = None
+
+    built: list[bool] = []
+    ran: list[str] = []
+    outcomes = [
+        ConnectorOutcome(name="aws_focus", rows=10, ok=True),
+        ConnectorOutcome(name="redshift", rows=0, ok=True),
+    ]
+    configs = [_Config("aws_focus"), _Config("redshift")]
+    outcome_by_config = dict(zip(configs, outcomes, strict=True))
+    monkeypatch.setattr(runner, "load_connections", lambda _c: configs)
+    monkeypatch.setattr(runner, "build_connector", lambda c: c)
+
+    def _run_connector(conn, _w, _run_id, _on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
+        outcome = outcome_by_config[conn]
+        ran.append(outcome.name)
+        return outcome
+
+    monkeypatch.setattr(runner, "run_connector", _run_connector)
+
+    def _build_gold() -> int:
+        built.append(True)
+        return 1
+
+    monkeypatch.setattr(runner, "build_gold", _build_gold)
+    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None: None)
+
+    rows = run_ingest(connector="redshift")
+    assert ran == ["redshift"]
+    assert rows == 0
+    assert built == [True, True]  # cost-pull publish + final holistic rebuild
 
 
 def test_all_fail_skips_gold_rebuild(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -101,8 +143,44 @@ def test_all_success_returns_rows_and_builds_gold(monkeypatch) -> None:  # type:
         ran,
     )
     assert run_ingest() == 15
-    assert built == [True]
+    assert built == [True, True]  # cost-pull publish + final holistic rebuild
     assert set(ran) == {"databricks", "aws_focus"}
+
+
+def test_supplemental_phases_share_a_bounded_parallel_pool(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Independent telemetry planes overlap, without each creating an unbounded pool."""
+    import threading
+    import time
+
+    monkeypatch.setattr(runner, "_max_workers", lambda n: min(n, 3))
+    lock = threading.Lock()
+    started = threading.Event()
+    active = peak = completed = 0
+
+    def _phase(*_args: object, **_kwargs: object) -> int:
+        nonlocal active, peak, completed
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if peak >= 2:
+                started.set()
+        started.wait(timeout=1)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+            completed += 1
+        return 0
+
+    monkeypatch.setattr(runner, "_run_efficiency", _phase)
+    monkeypatch.setattr(runner, "_run_driver_health", _phase)
+    monkeypatch.setattr(runner, "_run_ai_usage", _phase)
+    monkeypatch.setattr(runner, "_run_storage_locations", _phase)
+    monkeypatch.setattr(runner, "_run_compute_instances", _phase)
+
+    runner._run_supplemental(object(), [object()])  # type: ignore[arg-type, list-item]
+
+    assert completed == 5
+    assert 2 <= peak <= 3
 
 
 def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -117,23 +195,44 @@ def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  
         built,
         ran,
     )
-    efficiency_configs: list[list[object]] = []
-    driver_health_configs: list[list[object]] = []
+    supplemental_configs: list[list[object]] = []
 
-    def _record_efficiency(_w: object, configs: list[object]) -> int:
-        efficiency_configs.append(configs)
-        return 0
+    def _record_supplemental(_w: object, configs: list[object], _p: object = None) -> None:
+        supplemental_configs.append(configs)
 
-    def _record_driver_health(_w: object, configs: list[object]) -> int:
-        driver_health_configs.append(configs)
-        return 0
-
-    monkeypatch.setattr(runner, "_run_efficiency", _record_efficiency)
-    monkeypatch.setattr(runner, "_run_driver_health", _record_driver_health)
+    monkeypatch.setattr(runner, "_run_supplemental", _record_supplemental)
     with pytest.raises(IngestError):
         run_ingest()
-    assert len(efficiency_configs[0]) == 1  # only the one connector that succeeded
-    assert len(driver_health_configs[0]) == 1
+    assert len(supplemental_configs[0]) == 1  # only the one connector that succeeded
+
+
+def test_cost_pull_gold_publish_survives_a_later_phase_dying(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Regression test for a real incident: a process killed partway through
+    the best-effort efficiency/driver-health phases left successfully-pulled
+    cost data sitting in BRONZE with GOLD never published at all, because the
+    old code called build_gold() exactly once, at the very end. build_gold()
+    must instead run right after the cost pull too — simulated here by making
+    _run_efficiency blow up outright (standing in for the process dying
+    mid-phase) and confirming the cost-pull publish already happened by then.
+    """
+    built: list[bool] = []
+    ran: list[str] = []
+    _stub(
+        monkeypatch,
+        [ConnectorOutcome(name="databricks", rows=10, ok=True)],
+        built,
+        ran,
+    )
+
+    def _boom(_w: object, _c: object, _p: object = None) -> None:
+        raise RuntimeError("simulated mid-run kill")
+
+    monkeypatch.setattr(runner, "_run_supplemental", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated mid-run kill"):
+        run_ingest()
+
+    assert built == [True]
 
 
 def test_run_ingest_threads_progress_callback_to_every_connector(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -143,12 +242,11 @@ def test_run_ingest_threads_progress_callback_to_every_connector(monkeypatch) ->
     monkeypatch.setattr(runner, "load_connections", lambda _c: [object(), object()])
     monkeypatch.setattr(runner, "build_connector", lambda c: c)
     monkeypatch.setattr(runner, "build_gold", lambda: 0)
-    monkeypatch.setattr(runner, "_run_efficiency", lambda _w, _c: 0)
-    monkeypatch.setattr(runner, "_run_driver_health", lambda _w, _c: 0)
+    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None: None)
 
     received: list[object] = []
 
-    def _run_connector(_conn, _w, on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
+    def _run_connector(_conn, _w, _run_id, on_progress=None, *, full_refresh=False):  # type: ignore[no-untyped-def]
         received.append(on_progress)
         return ConnectorOutcome(name="x", rows=1, ok=True)
 
@@ -167,7 +265,6 @@ def test_run_connector_emits_start_done_and_failed_events(monkeypatch) -> None: 
     from flashlight.ingest.base import Connector, IngestWindow
     from flashlight.ingest.runner import run_connector
 
-    monkeypatch.setattr(bronze_module, "new_run_id", lambda: "r1")
     monkeypatch.setattr(runlog_module, "record_run", lambda **_kw: None)
 
     class _Ok(Connector):
@@ -192,11 +289,11 @@ def test_run_connector_emits_start_done_and_failed_events(monkeypatch) -> None: 
 
     events: list[tuple[str, str, int]] = []
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
-    run_connector(_Ok(), window, on_progress=lambda *e: events.append(e))
+    run_connector(_Ok(), window, "r1", on_progress=lambda *e: events.append(e))
     assert events == [("start", "ok", 0), ("done", "ok", 0)]
 
     events.clear()
-    run_connector(_Broken(), window, on_progress=lambda *e: events.append(e))
+    run_connector(_Broken(), window, "r1", on_progress=lambda *e: events.append(e))
     assert events == [("start", "broken", 0), ("failed", "broken", 0)]
 
 
@@ -206,7 +303,6 @@ def test_run_connector_full_refresh_purges_connector_bronze_first(monkeypatch) -
     from flashlight.ingest.base import Connector, IngestWindow
     from flashlight.ingest.runner import run_connector
 
-    monkeypatch.setattr(bronze_module, "new_run_id", lambda: "r1")
     monkeypatch.setattr(runlog_module, "record_run", lambda **_kw: None)
 
     class _Stub(Connector):
@@ -220,10 +316,10 @@ def test_run_connector_full_refresh_purges_connector_bronze_first(monkeypatch) -
     monkeypatch.setattr(bronze_module, "purge_connector", lambda name: purged.append(name))
 
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
-    run_connector(_Stub(), window, full_refresh=False)
+    run_connector(_Stub(), window, "r1", full_refresh=False)
     assert purged == []
 
-    run_connector(_Stub(), window, full_refresh=True)
+    run_connector(_Stub(), window, "r1", full_refresh=True)
     assert purged == ["aws_focus"]
 
 
@@ -280,12 +376,10 @@ def test_efficiency_writes_are_merged_not_clobbered(monkeypatch) -> None:  # typ
         def fetch_efficiency(self, _window: object) -> Iterator[EfficiencyRecord]:
             return iter(self._records)
 
-    configs = [object(), object()]
-    connectors = {
-        configs[0]: _Fake("aws_focus", [record_a]),
-        configs[1]: _Fake("redshift", [record_b]),
-    }
-    monkeypatch.setattr(runner, "build_connector", lambda c: connectors[c])
+    connectors = [
+        _Fake("aws_focus", [record_a]),
+        _Fake("redshift", [record_b]),
+    ]
 
     writes: list[list[EfficiencyRecord]] = []
 
@@ -296,8 +390,48 @@ def test_efficiency_writes_are_merged_not_clobbered(monkeypatch) -> None:  # typ
     monkeypatch.setattr(metrics_module, "write_efficiency", _write_efficiency)
 
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
-    written = runner._run_efficiency(window, configs)  # type: ignore[arg-type]
+    written = runner._run_efficiency(window, connectors)  # type: ignore[arg-type]
 
     assert written == 2
     assert len(writes) == 1  # one combined write, not one per connector
     assert {r.entity_id for r in writes[0]} == {"a", "b"}
+
+
+def test_efficiency_progress_reports_done_and_failed_per_connector(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A connector whose cost pull is a no-op (Redshift) otherwise reports "done"
+    while its real payload — fetch_efficiency — is still silently running or has
+    failed with nothing printed. _run_efficiency must emit its own progress event
+    per connector so that gap is visible (see connections.py's own comment on
+    _CONNECTOR_DONE_RE for the user-facing symptom this fixes).
+    """
+    from collections.abc import Iterator
+    from datetime import date
+
+    from flashlight.efficiency.model import EfficiencyRecord
+    from flashlight.ingest.base import IngestWindow
+
+    class _Ok:
+        name = "redshift-ok"
+
+        def fetch_efficiency(self, _window: object) -> Iterator[EfficiencyRecord]:
+            return iter(())
+
+    class _Broken:
+        name = "redshift-broken"
+
+        def fetch_efficiency(self, _window: object) -> Iterator[EfficiencyRecord]:
+            raise ConnectorError(self.name, "Statement did not complete in time")
+
+    connectors = [_Ok(), _Broken()]
+
+    events: list[tuple[str, str, int]] = []
+    window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
+    runner._run_efficiency(
+        window,
+        connectors,  # type: ignore[arg-type]
+        lambda event, name, rows: events.append((event, name, rows)),
+    )
+
+    by_name = {name: (event, rows) for event, name, rows in events}
+    assert by_name["redshift-ok"] == ("efficiency_done", 0)
+    assert by_name["redshift-broken"] == ("efficiency_failed", 0)

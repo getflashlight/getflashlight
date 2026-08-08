@@ -2,7 +2,7 @@
 
 Shared by the MCP server and the dashboard. A single cached in-memory DuckDB
 registers ``<group>.<view>`` over each ``gold/<group>/<view>.parquet`` — a schema
-per provider group, plus ``shared`` for TCO (see
+per provider group, plus the fixed cross-provider groups (see
 :func:`flashlight.lake.duck.register_gold`); the connection is rebuilt whenever a
 publish changes the GOLD files, so reads are always fresh. Only GOLD is
 registered, so raw/silver are simply not reachable.
@@ -78,19 +78,45 @@ def _rows(sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
         ]
 
 
+def _split_sort_direction(order_by: str, descending: bool) -> tuple[str, bool]:
+    """Accept a SQL-style ``"net_cost DESC"`` as well as a bare column name.
+
+    ``order_by`` is a column and ``descending`` a separate flag, but an LLM
+    naturally writes the ORDER BY clause it would write in SQL — confirmed live,
+    a Databricks gpt-oss-20b sent ``order_by="net_cost DESC"``, got
+    ``Cannot order by 'net_cost DESC'``, and gave up on the question entirely
+    rather than retrying without it. The direction it asked for is unambiguous,
+    so honour it instead of failing; an explicit ``descending=True`` still wins,
+    since a caller that passed both meant the flag. Anything else (a real
+    unknown column, an expression) still falls through to the catalog check and
+    raises, so this widens the accepted spelling without widening what can run.
+    """
+    column, _, direction = order_by.strip().rpartition(" ")
+    if column and direction.upper() in ("ASC", "DESC"):
+        return column.strip(), descending or direction.upper() == "DESC"
+    return order_by, descending
+
+
 def query_view(
     view_name: str,
     limit: int = 1000,
     order_by: str | None = None,
     descending: bool = False,
     filters: dict[str, Any] | None = None,
+    measures: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return rows from a catalogued GOLD view. Only known views are allowed.
 
     ``filters`` is an equality map over the view's dimensions/measures (e.g.
     ``{"charge_month": "2026-07-01", "compute_family": "job"}``) — the common case
-    for an agent that already knows what it's looking for. For anything filters
-    can't express (ranges, joins, aggregation), use ``run_sql``.
+    for an agent that already knows what it's looking for. A value may also be a
+    list for an IN-match (e.g. ``{"charge_month": ["2026-06-01", "2026-07-01"]}``).
+    For anything filters can't express (ranges, joins, aggregation), use ``run_sql``.
+
+    ``measures`` narrows the returned columns to the view's dimensions plus this
+    subset of its measures (default: every measure) — e.g. a view with several
+    cost measures (net/gross/credit/...) returns all of them unless narrowed,
+    which is too wide to chart as one dimension + one measure.
     """
     view = current_catalog_by_name().get(view_name)
     if view is None:
@@ -98,17 +124,35 @@ def query_view(
 
     allowed = set(view.dimensions) | set(view.measures)
     limit = max(1, min(limit, MAX_LIMIT))
-    sql = f'SELECT * FROM {view.name}'  # noqa: S608 - name validated against catalog
+    if measures:
+        unknown = [m for m in measures if m not in view.measures]
+        if unknown:
+            raise QueryError(
+                f"Not a measure on {view_name}: {unknown}; measures are {list(view.measures)}"
+            )
+        columns = ", ".join([*view.dimensions, *measures])
+        sql = f'SELECT {columns} FROM {view.name}'  # noqa: S608 - names validated against catalog
+    else:
+        sql = f'SELECT * FROM {view.name}'  # noqa: S608 - name validated against catalog
     params: list[Any] = []
     if filters:
         conditions = []
         for column, value in filters.items():
             if column not in allowed:
                 raise QueryError(f"Cannot filter by {column!r} on {view_name}")
-            conditions.append(f"{column} = ?")  # noqa: S608 - column validated against catalog
-            params.append(value)
+            if isinstance(value, list):
+                if not value:
+                    raise QueryError(f"Empty filter list for {column!r} on {view_name}")
+                placeholders = ", ".join("?" for _ in value)
+                # noqa: S608 - column validated against catalog
+                conditions.append(f"{column} IN ({placeholders})")
+                params.extend(value)
+            else:
+                conditions.append(f"{column} = ?")  # noqa: S608 - column validated against catalog
+                params.append(value)
         sql += " WHERE " + " AND ".join(conditions)
     if order_by:
+        order_by, descending = _split_sort_direction(order_by, descending)
         if order_by not in allowed:
             raise QueryError(f"Cannot order by {order_by!r} on {view_name}")
         sql += f" ORDER BY {order_by} {'DESC' if descending else 'ASC'}"
@@ -170,6 +214,38 @@ def run_select(sql: str, limit: int = 1000) -> list[dict[str, Any]]:
     )
     if any(re.search(rf"\b{kw}\b", lowered) for kw in forbidden):
         raise QueryError("Mutating keywords are not permitted")
+    # DuckDB's table functions read the local filesystem, and a SELECT that only *reads*
+    # slips past every keyword above. Verified before this list existed:
+    # `select * from read_csv_auto('/etc/hosts')` and `select * from glob('/some/dir/*')`
+    # both returned data. `enable_external_access` has to stay on (the GOLD views are
+    # themselves read_parquet over disk paths — see connect() above), so the block is here.
+    #
+    # Blocking read_parquet in *user* SQL is safe: this check only ever sees the caller's
+    # query string, never a view definition, so the views' own read_parquet calls are
+    # untouched. Network egress is already closed by autoinstall/autoload=false +
+    # lock_configuration=true, which keeps httpfs unloadable.
+    file_readers = (
+        "read_csv",
+        "read_csv_auto",
+        "sniff_csv",
+        "read_text",
+        "read_blob",
+        "read_json",
+        "read_json_auto",
+        "read_ndjson",
+        "read_ndjson_auto",
+        "read_parquet",
+        "parquet_scan",
+        "parquet_metadata",
+        "parquet_schema",
+        "glob",
+        "delta_scan",
+        "iceberg_scan",
+    )
+    if any(re.search(rf"\b{fn}\b", lowered) for fn in file_readers):
+        raise QueryError(
+            "Filesystem-reading functions are not permitted; query the metric views instead"
+        )
     # Only the published GOLD groups are registered; reject raw/silver/meta (and the
     # old flat `gold.` schema) with a clear pointer to the per-provider schemas.
     for schema in re.findall(r"\b(raw|silver|meta|gold)\.", lowered):

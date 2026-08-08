@@ -192,7 +192,7 @@ def write_window_sql(
     Returns rows written.
 
     Used by connectors whose source DuckDB can scan and map directly (see
-    :mod:`flashlight.focus.sql_mapping`) — ``aws_focus``/``focus_file``. The caller
+    :mod:`flashlight.focus.sql_mapping`) — ``aws_focus``. The caller
     owns ``con`` (and closing it); ``mapped_sql`` is materialized into a temp table
     here so its source (e.g. an S3 Parquet scan) is read exactly once, regardless
     of how many times this function itself queries the result.

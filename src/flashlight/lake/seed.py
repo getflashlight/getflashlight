@@ -1,7 +1,7 @@
 """Vectorized FOCUS-CSV -> BRONZE Parquet loader, for ``flashlight sample``.
 
 Delegates the row mapping entirely to :mod:`flashlight.focus.sql_mapping` — the
-same SQL projection ``aws_focus``/``focus_file`` use — so a sample seed and a real
+same SQL projection ``aws_focus`` uses — so a sample seed and a real
 connector pull are mapped by exactly one set of rules, never two. This module only
 adds the CSV-specific read expression and its own purge semantics: a full
 connector-replace (:func:`flashlight.lake.bronze.purge_connector`) rather than a

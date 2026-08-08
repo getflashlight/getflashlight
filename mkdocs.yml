@@ -1,5 +1,5 @@
 site_name: Flashlight
-site_description: FOCUS-based, multi-cloud TCO spend visualization. Finds what's burning money in the dark.
+site_description: FOCUS-based, multi-cloud spend visualization. Finds what's burning money in the dark.
 site_url: https://getflashlight.app/
 repo_url: https://github.com/ychaparala/getflashlight
 repo_name: ychaparala/getflashlight
@@ -38,6 +38,8 @@ theme:
     - content.tabs.link
 
 markdown_extensions:
+  - attr_list
+  - md_in_html
   - admonition
   - pymdownx.superfences
   - tables
@@ -51,7 +53,7 @@ plugins:
   - search
   - llmstxt:
       markdown_description: >
-        FOCUS-based, multi-cloud TCO spend visualization. Ingests cloud billing
+        FOCUS-based, multi-cloud spend visualization. Ingests cloud billing
         in the FinOps FOCUS format, standardizes it into a BRONZE/SILVER/GOLD
         Parquet lake, and serves a bundled dashboard plus an MCP server for
         agents. Installs with `pip install getflashlight` — no Docker, no
@@ -61,19 +63,54 @@ plugins:
           - index.md: Overview — what Flashlight is and why the numbers are trustworthy
           - quickstart.md: Sample data to a running dashboard in two commands
           - architecture.md: The BRONZE → SILVER → GOLD lake and its invariants
-          - connectors.md: AWS, Databricks, FOCUS files, and the mapping SQL
-          - cli.md: Every `flashlight` command
+          - connectors.md: AWS, Databricks, Redshift, and the mapping SQL
+          - reference/cli.md: Every `flashlight` command
         Design:
           - design/efficiency-waste.md: The efficiency/waste GOLD group and its rules
+          - design/ai-costs.md: AI/LLM spend, token attribution per project and user, and why a $/token figure is only honest for pay-per-token serving
 
 nav:
   - Home: index.md
-  - Quick start: quickstart.md
-  - Architecture: architecture.md
-  - Connectors: connectors.md
-  - CLI reference: cli.md
-  - Design:
-      - Efficiency / waste: design/efficiency-waste.md
+  - Get started:
+      - Overview: getting-started/overview.md
+      - Install Flashlight: getting-started/installation.md
+      - Quickstart: quickstart.md
+      - Connect a real source: getting-started/real-source.md
+  - User guide:
+      - Configure Flashlight: guides/configure.md
+      - Ingest and manage data: guides/ingest.md
+      - Explore the dashboard: guides/dashboard.md
+      - Use Flashlight with agents: guides/mcp.md
+      - Deploy the demo: guides/demo.md
+  - Concepts:
+      - Data architecture: architecture.md
+      - FOCUS and cost integrity: concepts/focus-and-integrity.md
+      - GOLD views and metrics: concepts/gold-views.md
+      - Efficiency and recoverable spend: design/efficiency-waste.md
+      - AI costs and usage: design/ai-costs.md
+      - Backing storage: design/backing-storage.md
+      - Backing compute: design/backing-compute.md
+  - Connectors:
+      - Overview and support matrix: connectors/overview.md
+      - AWS: connectors/aws.md
+      - Databricks: connectors/databricks.md
+      - Amazon Redshift: connectors/redshift.md
+      - Mapping details: connectors.md
+      - Build a connector: connectors/custom.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Configuration: reference/configuration.md
+      - Data contracts: reference/data-contracts.md
+      - MCP tools: reference/mcp-tools.md
+  - Troubleshooting: troubleshooting/index.md
+  - Development:
+      - Contributing: development/contributing.md
+      - Documentation guide: development/documentation.md
+      - Design decisions:
+          - Efficiency / waste: design/efficiency-waste.md
+          - AI costs: design/ai-costs.md
+          - Backing storage: design/backing-storage.md
+          - Backing compute: design/backing-compute.md
 
 exclude_docs: |
   research/

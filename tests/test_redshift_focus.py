@@ -36,15 +36,17 @@ def test_redshift_config_accepts_cluster_or_workgroup() -> None:
 
 
 def test_redshift_config_disabled_by_default() -> None:
-    # Supplementary telemetry connector, same posture as aws_infra — opt-in.
+    # Supplementary telemetry connector — opt-in, not on by default.
     assert RedshiftConfig.model_validate({"cluster_identifier": "prod"}).enabled is False
 
 
 def test_redshift_config_aws_profile_defaults_unset() -> None:
     config = RedshiftConfig.model_validate({"cluster_identifier": "prod"})
     assert config.aws_profile is None
-    # access_key_env/secret_key_env still get their usual defaults regardless.
-    assert config.access_key_env == "AWS_ACCESS_KEY_ID"
+    # access_key_env/secret_key_env still default (scoped by name/type, since two
+    # connections must never silently share one keychain entry — see config.py's
+    # scoped_env_name) regardless of aws_profile.
+    assert config.access_key_env == "AWS_ACCESS_KEY_ID__REDSHIFT"
 
 
 def test_redshift_config_accepts_aws_profile() -> None:
@@ -220,15 +222,19 @@ def test_bastion_credentials_falls_back_to_iam_without_password_env() -> None:
 
 
 def test_bastion_reuses_one_connection_across_all_queries(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
-    """The whole point of _bastion_connection(): one SSH tunnel + one DB connection
-    for the entire fetch_efficiency() pull, not one per query.
+    """One SSH tunnel for the entire fetch_efficiency() pull — but, since the
+    activity lane and the table-inventory lane run concurrently (see
+    _run_lanes/_lane_connection_factory), each of their queries opens its OWN DB
+    connection through that one tunnel rather than sharing a single connection.
 
     The fake cursor reports no rows for anything, including the cheap
     earliest-retained probe — so the pull correctly judges the window
     unmeasurable (no retained history at all) and runs its reduced query set:
-    the probe, then table-inventory/table-usage/table-owner. query-pattern,
-    user-activity, spectrum-table-usage, and the full (expensive) cluster_activity
-    query are all skipped — see fetch_efficiency's unmeasurable-window guard.
+    the probe (activity lane, 1 connection), then table-inventory/table-usage/
+    table-owner (table lane, 3 concurrent connections) — 4 connections total.
+    query-pattern, user-activity, spectrum-table-usage, and the full (expensive)
+    cluster_activity query are all skipped — see fetch_efficiency's
+    unmeasurable-window guard.
     """
     import sys
     from datetime import date
@@ -280,9 +286,7 @@ def test_bastion_reuses_one_connection_across_all_queries(monkeypatch, tmp_path)
     connector = RedshiftConnector(config)
     connector._redshift = MagicMock(
         describe_clusters=MagicMock(
-            return_value={
-                "Clusters": [{"Endpoint": {"Address": "cluster.internal", "Port": 5439}}]
-            }
+            return_value={"Clusters": [{"Endpoint": {"Address": "cluster.internal", "Port": 5439}}]}
         ),
         describe_reserved_nodes=MagicMock(return_value={"ReservedNodes": []}),
     )
@@ -291,17 +295,139 @@ def test_bastion_reuses_one_connection_across_all_queries(monkeypatch, tmp_path)
     records = list(connector.fetch_efficiency(window))
 
     assert len(records) == 1  # just the cluster row — every sub-fetch got 0 rows back
-    fake_sshtunnel.SSHTunnelForwarder.assert_called_once()
-    fake_redshift_connector.connect.assert_called_once()
-    fake_conn.close.assert_called_once()
-    # probe + table_inventory + table_usage + table_owner, all on the ONE connection —
-    # the other 4 (cluster_activity, query_patterns, user_activity,
-    # spectrum_table_usage) are skipped for an unmeasurable window.
+    fake_sshtunnel.SSHTunnelForwarder.assert_called_once()  # one tunnel, shared by every lane
+    # 4 connections opened through that one tunnel: 1 for the probe (activity lane)
+    # + 3 for table_inventory/table_usage/table_owner (table lane, concurrent).
+    assert fake_redshift_connector.connect.call_count == 4
+    assert fake_conn.close.call_count == 4
+    # probe + table_inventory + table_usage + table_owner — the other 4
+    # (cluster_activity, query_patterns, user_activity, spectrum_table_usage) are
+    # skipped for an unmeasurable window.
     assert fake_cursor.execute.call_count == 4
     # describe_clusters fires twice total: once to resolve the tunnel endpoint
     # (previously once PER query — 5x — now once for the whole pull) and once,
     # unrelated to this fix, inside _reserved_node_coverage()'s own lookup.
     assert connector._redshift.describe_clusters.call_count == 2
+
+
+def test_session_init_sql_runs_once_before_the_real_queries(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """RedshiftConfig.session_init_sql (e.g. a WLM ``SET query_group TO '...';``
+    to prioritize this connector's queries) must run immediately after EACH
+    connection opens and before that connection's own real query — not skipped
+    even when the activity window turns out to be unmeasurable (session state,
+    unlike the windowed queries, still needs setting up regardless of what the
+    window's data looks like). Since fetch_efficiency's activity and
+    table-inventory lanes now open one connection per concurrent query (see
+    _run_lanes), this runs once per connection (4, for this unmeasurable-window
+    fixture) rather than once for the whole pull.
+    """
+    import sys
+    from datetime import date
+    from types import ModuleType
+    from unittest.mock import MagicMock, call
+
+    from flashlight.core.settings import get_settings
+    from flashlight.ingest.base import IngestWindow
+
+    monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
+    get_settings.cache_clear()
+
+    fake_cursor = MagicMock()
+    fake_cursor.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_cursor.__exit__ = MagicMock(return_value=False)
+    fake_cursor.description = None
+    fake_cursor.fetchall = MagicMock(return_value=[])
+
+    fake_conn = MagicMock()
+    fake_conn.cursor = MagicMock(return_value=fake_cursor)
+
+    fake_redshift_connector = ModuleType("redshift_connector")
+    fake_redshift_connector.connect = MagicMock(return_value=fake_conn)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "redshift_connector", fake_redshift_connector)
+
+    fake_tunnel = MagicMock()
+    fake_tunnel.local_bind_port = 5555
+    fake_tunnel.__enter__ = MagicMock(return_value=fake_tunnel)
+    fake_tunnel.__exit__ = MagicMock(return_value=False)
+    fake_sshtunnel = ModuleType("sshtunnel")
+    fake_sshtunnel.SSHTunnelForwarder = MagicMock(return_value=fake_tunnel)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sshtunnel", fake_sshtunnel)
+
+    fake_paramiko = ModuleType("paramiko")
+    fake_paramiko.RSAKey = MagicMock()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "paramiko", fake_paramiko)
+
+    monkeypatch.setenv("FLASHLIGHT_TEST_DB_PASSWORD", "s3cret")
+    config = RedshiftConfig.model_validate(
+        {
+            "cluster_identifier": "prod",
+            "db_user": "flashlight_ro",
+            **_BASTION_FIELDS,
+            "db_password_env": "FLASHLIGHT_TEST_DB_PASSWORD",
+            "session_init_sql": "SET query_group TO 'superuser';",
+        }
+    )
+    connector = RedshiftConnector(config)
+    connector._redshift = MagicMock(
+        describe_clusters=MagicMock(
+            return_value={"Clusters": [{"Endpoint": {"Address": "cluster.internal", "Port": 5439}}]}
+        ),
+        describe_reserved_nodes=MagicMock(return_value={"ReservedNodes": []}),
+    )
+
+    window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
+    list(connector.fetch_efficiency(window))
+
+    # 4 connections opened (probe + table_inventory + table_usage + table_owner,
+    # across the two concurrent lanes) => session_init_sql runs 4 times, plus the
+    # 4 real per-connection queries — 8 execute() calls total. Global ordering
+    # across connections isn't deterministic under concurrency (each connection's
+    # own session_init always precedes its own real query, but which connection's
+    # pair runs first isn't guaranteed) — so assert counts, not a fixed position.
+    assert fake_cursor.execute.call_count == 8
+    init_call = call("SET query_group TO 'superuser';")
+    assert fake_cursor.execute.call_args_list.count(init_call) == 4
+
+
+def test_session_init_sql_failure_raises_actionable_error(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A typo'd/unset WLM queue name must surface as a clear connector failure,
+    not silently abort the connection's transaction and break every query after
+    it (the same rollback-worthy failure mode _execute already guards against
+    for the real queries)."""
+    import sys
+    from types import ModuleType
+    from unittest.mock import MagicMock
+
+    from flashlight.core.exceptions import ConnectorError
+
+    fake_cursor = MagicMock()
+    fake_cursor.__enter__ = MagicMock(return_value=fake_cursor)
+    fake_cursor.__exit__ = MagicMock(return_value=False)
+    fake_cursor.execute = MagicMock(side_effect=RuntimeError("no such WLM queue"))
+
+    fake_conn = MagicMock()
+    fake_conn.cursor = MagicMock(return_value=fake_cursor)
+
+    fake_redshift_connector = ModuleType("redshift_connector")
+    fake_redshift_connector.connect = MagicMock(return_value=fake_conn)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "redshift_connector", fake_redshift_connector)
+
+    monkeypatch.setenv("FLASHLIGHT_TEST_DB_PASSWORD", "s3cret")
+    config = RedshiftConfig.model_validate(
+        {
+            "cluster_identifier": "prod",
+            "db_user": "flashlight_ro",
+            "db_host": "cluster.internal",
+            "db_port": 5439,
+            "db_password_env": "FLASHLIGHT_TEST_DB_PASSWORD",
+            "session_init_sql": "SET query_group TO 'nonexistent_queue';",
+        }
+    )
+    connector = RedshiftConnector(config)
+
+    with pytest.raises(ConnectorError, match="session_init_sql failed"):
+        with connector._direct_connection():
+            pass
 
 
 def test_direct_connection_missing_extra_raises_actionable_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -345,15 +471,16 @@ def test_direct_connection_raises_on_empty_password_env(monkeypatch) -> None:  #
 def test_direct_connection_reuses_one_connection_across_all_queries(  # type: ignore[no-untyped-def]
     monkeypatch, tmp_path
 ) -> None:
-    """No tunnel this time — a direct connection straight to the cluster's endpoint,
-    still opened once and reused across the whole pull (see
-    test_bastion_reuses_one_connection_across_all_queries for why the fake's
-    all-empty cursor means only 4 of the 7 possible queries actually run).
+    """No tunnel this time — a direct connection straight to the cluster's
+    endpoint, resolved once and reused to open one connection per concurrent lane
+    query (see test_bastion_reuses_one_connection_across_all_queries for why the
+    fake's all-empty cursor means only 4 of the 7 possible queries actually run,
+    and why that means 4 connections here too).
     """
     import sys
     from datetime import date
     from types import ModuleType
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, call
 
     from flashlight.core.settings import get_settings
     from flashlight.ingest.base import IngestWindow
@@ -385,9 +512,7 @@ def test_direct_connection_reuses_one_connection_across_all_queries(  # type: ig
     connector = RedshiftConnector(config)
     connector._redshift = MagicMock(
         describe_clusters=MagicMock(
-            return_value={
-                "Clusters": [{"Endpoint": {"Address": "cluster.internal", "Port": 5439}}]
-            }
+            return_value={"Clusters": [{"Endpoint": {"Address": "cluster.internal", "Port": 5439}}]}
         ),
         describe_reserved_nodes=MagicMock(return_value={"ReservedNodes": []}),
     )
@@ -396,11 +521,19 @@ def test_direct_connection_reuses_one_connection_across_all_queries(  # type: ig
     records = list(connector.fetch_efficiency(window))
 
     assert len(records) == 1
-    fake_redshift_connector.connect.assert_called_once_with(
-        host="cluster.internal", port=5439, database="dev",
-        user="flashlight_ro", password="s3cret", ssl=True,
+    # 4 connections opened (probe + table_inventory + table_usage + table_owner,
+    # across the two concurrent lanes), each to the same resolved endpoint —
+    # endpoint/password are resolved once and reused by every one of them.
+    expected_call = call(
+        host="cluster.internal",
+        port=5439,
+        database="dev",
+        user="flashlight_ro",
+        password="s3cret",
+        ssl=True,
     )
-    fake_conn.close.assert_called_once()
+    assert fake_redshift_connector.connect.call_args_list == [expected_call] * 4
+    assert fake_conn.close.call_count == 4
     assert fake_cursor.execute.call_count == 4  # probe + table_{inventory,usage,owner}
     assert connector._redshift.describe_clusters.call_count == 2  # endpoint + reserved-nodes
 
@@ -416,7 +549,7 @@ def test_db_host_override_skips_describe_clusters_for_endpoint(  # type: ignore[
     import sys
     from datetime import date
     from types import ModuleType
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, call
 
     from flashlight.core.settings import get_settings
     from flashlight.ingest.base import IngestWindow
@@ -458,7 +591,10 @@ def test_db_host_override_skips_describe_clusters_for_endpoint(  # type: ignore[
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
     list(connector.fetch_efficiency(window))
 
-    fake_redshift_connector.connect.assert_called_once_with(
+    # 4 connections opened (probe + table_inventory + table_usage + table_owner,
+    # across the two concurrent lanes), each to the same db_host-overridden
+    # endpoint — resolved once and reused by every one of them.
+    expected_call = call(
         host="my-cluster.abc123.us-east-1.redshift.amazonaws.com",
         port=5439,
         database="dev",
@@ -466,6 +602,7 @@ def test_db_host_override_skips_describe_clusters_for_endpoint(  # type: ignore[
         password="s3cret",
         ssl=True,
     )
+    assert fake_redshift_connector.connect.call_args_list == [expected_call] * 4
     # describe_clusters fires exactly once — from _reserved_node_coverage()'s own,
     # separate node-count lookup (unrelated to this fix and unaffected by db_host).
     # Previously it ALSO fired to resolve the tunnel/direct-connection endpoint;
@@ -476,8 +613,7 @@ def test_db_host_override_skips_describe_clusters_for_endpoint(  # type: ignore[
 def test_classify_redshift_cost_category() -> None:
     assert _classify_redshift_cost_category("Spectrum data scan", None) == "spectrum_scan"
     assert (
-        _classify_redshift_cost_category("Concurrency Scaling usage", None)
-        == "concurrency_scaling"
+        _classify_redshift_cost_category("Concurrency Scaling usage", None) == "concurrency_scaling"
     )
     assert _classify_redshift_cost_category("Serverless RPU-Hours", None) == "serverless"
     assert _classify_redshift_cost_category(None, "backup-storage-sku") == "storage"
@@ -525,11 +661,54 @@ def test_connector_constructs_without_live_credentials() -> None:
     # boto3.client() builds a local client object — no network call — so this must
     # not require real AWS credentials to be configured, same expectation as any
     # other connector's __init__.
-    config = RedshiftConfig.model_validate(
-        {"cluster_identifier": "prod", "region": "us-east-1"}
-    )
+    config = RedshiftConfig.model_validate({"cluster_identifier": "prod", "region": "us-east-1"})
     connector = RedshiftConnector(config)
     assert connector.name == "redshift"
+
+
+def test_test_connection_data_api_provisioned() -> None:
+    from unittest.mock import MagicMock
+
+    config = RedshiftConfig.model_validate({"cluster_identifier": "prod", "database": "dev"})
+    connector = RedshiftConnector(config)
+    connector._redshift = MagicMock(
+        describe_clusters=MagicMock(
+            return_value={"Clusters": [{"Endpoint": {"Address": "prod.example.com", "Port": 5439}}]}
+        )
+    )
+    connector._data = _FakeDataApiClient({"SELECT 1": (["?column?"], [[1]])})
+
+    message = connector.test_connection()
+
+    assert "cluster resolved to prod.example.com:5439" in message
+    assert "Data API" in message
+
+
+def test_test_connection_serverless_data_api() -> None:
+    from unittest.mock import MagicMock
+
+    config = RedshiftConfig.model_validate({"workgroup_name": "default", "database": "dev"})
+    connector = RedshiftConnector(config)
+    connector._redshift_serverless = MagicMock(
+        get_workgroup=MagicMock(return_value={"workgroup": {"status": "AVAILABLE"}})
+    )
+    connector._data = _FakeDataApiClient({"SELECT 1": (["?column?"], [[1]])})
+
+    message = connector.test_connection()
+
+    assert "workgroup resolved (status=AVAILABLE)" in message
+    assert "Data API" in message
+
+
+def test_cluster_endpoint_wraps_unexpected_exception() -> None:
+    from unittest.mock import MagicMock
+
+    config = RedshiftConfig.model_validate({"cluster_identifier": "prod"})
+    connector = RedshiftConnector(config)
+    connector._redshift = MagicMock(describe_clusters=MagicMock(side_effect=Exception("boom")))
+
+    with pytest.raises(ConnectorError):
+        connector._cluster_endpoint()
 
 
 def test_fetch_yields_nothing() -> None:
@@ -642,9 +821,13 @@ def test_fetch_efficiency_yields_all_entity_types(monkeypatch, tmp_path) -> None
             ),
             "wlm_queue_wait_us_p95": (
                 [
-                    "query_count", "wlm_queue_wait_us_p95", "wlm_queue_wait_us_p99",
-                    "wlm_wait_to_exec_ratio", "disk_spill_query_count",
-                    "concurrency_scaling_active_seconds", "earliest_retained_query_ts",
+                    "query_count",
+                    "wlm_queue_wait_us_p95",
+                    "wlm_queue_wait_us_p99",
+                    "wlm_wait_to_exec_ratio",
+                    "disk_spill_query_count",
+                    "concurrency_scaling_active_seconds",
+                    "earliest_retained_query_ts",
                 ],
                 # earliest_retained_query_ts well before the window start (2026-01-01)
                 # — stl_query retains the whole window, so the measured 1000 queries
@@ -653,31 +836,79 @@ def test_fetch_efficiency_yields_all_entity_types(monkeypatch, tmp_path) -> None
             ),
             "qry_md5": (
                 [
-                    "qry_md5", "run_count", "total_run_min", "avg_exec_min",
-                    "avg_queue_min", "pct_runs_spilling", "avg_disk_spill_gb",
-                    "avg_workmem_gb", "avg_skew_ratio", "max_skew_ratio",
-                    "avg_slices_in_use", "top_user",
+                    "qry_md5",
+                    "run_count",
+                    "total_run_min",
+                    "avg_exec_min",
+                    "avg_queue_min",
+                    "pct_runs_spilling",
+                    "avg_disk_spill_gb",
+                    "avg_workmem_gb",
+                    "avg_skew_ratio",
+                    "max_skew_ratio",
+                    "avg_slices_in_use",
+                    "top_user",
                 ],
                 [["abc123", 5, 42.0, 2.0, 0.5, 0.6, 3.5, 1.2, 4.0, 6.0, 8.0, "alice"]],
             ),
             "exec_microseconds": (
                 [
-                    "username", "query_count", "exec_microseconds",
-                    "total_exec_microseconds", "queue_microseconds", "cpu_microseconds",
-                    "blocks_read", "temp_blocks_to_disk", "scan_rows",
-                    "spectrum_scan_rows", "spectrum_scan_mb", "spill_gb",
+                    "username",
+                    "query_count",
+                    "exec_microseconds",
+                    "total_exec_microseconds",
+                    "queue_microseconds",
+                    "cpu_microseconds",
+                    "blocks_read",
+                    "temp_blocks_to_disk",
+                    "scan_rows",
+                    "spectrum_scan_rows",
+                    "spectrum_scan_mb",
+                    "spill_gb",
                 ],
                 [
-                    ["alice", 100, 800_000_000, 1_000_000_000, 10_000_000, 400_000_000,
-                     5000, 10, 20000, 0, 0.0, 1.5],
-                    ["bob", 50, 200_000_000, 1_000_000_000, 5_000_000, 100_000_000,
-                     1000, 0, 5000, 0, 0.0, 0.0],
+                    [
+                        "alice",
+                        100,
+                        800_000_000,
+                        1_000_000_000,
+                        10_000_000,
+                        400_000_000,
+                        5000,
+                        10,
+                        20000,
+                        0,
+                        0.0,
+                        1.5,
+                    ],
+                    [
+                        "bob",
+                        50,
+                        200_000_000,
+                        1_000_000_000,
+                        5_000_000,
+                        100_000_000,
+                        1000,
+                        0,
+                        5000,
+                        0,
+                        0.0,
+                        0.0,
+                    ],
                 ],
             ),
             "svv_table_info": (
                 [
-                    "table_id", "database", "schema", "table", "encoded", "diststyle",
-                    "size", "unsorted", "stats_off", "tbl_rows",
+                    "table_id",
+                    "database",
+                    "schema",
+                    "table",
+                    "encoded",
+                    "diststyle",
+                    "size",
+                    "unsorted",
+                    "stats_off",
+                    "tbl_rows",
                 ],
                 [[42, "dev", "public", "orders", "N", "KEY", 10240, 25.0, 30.0, 1_000_000]],
             ),
@@ -779,9 +1010,13 @@ def test_activity_window_unmeasurable_when_window_predates_stl_retention(monkeyp
     connector = RedshiftConnector(config)
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
     activity_cols = [
-        "query_count", "wlm_queue_wait_us_p95", "wlm_queue_wait_us_p99",
-        "wlm_wait_to_exec_ratio", "disk_spill_query_count",
-        "concurrency_scaling_active_seconds", "earliest_retained_query_ts",
+        "query_count",
+        "wlm_queue_wait_us_p95",
+        "wlm_queue_wait_us_p99",
+        "wlm_wait_to_exec_ratio",
+        "disk_spill_query_count",
+        "concurrency_scaling_active_seconds",
+        "earliest_retained_query_ts",
     ]
 
     for earliest_retained in ("2026-07-01", None):  # too-old window, and no history at all
@@ -810,9 +1045,13 @@ def test_activity_partial_window_keeps_real_counts(monkeypatch) -> None:  # type
     connector = RedshiftConnector(config)
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
     activity_cols = [
-        "query_count", "wlm_queue_wait_us_p95", "wlm_queue_wait_us_p99",
-        "wlm_wait_to_exec_ratio", "disk_spill_query_count",
-        "concurrency_scaling_active_seconds", "earliest_retained_query_ts",
+        "query_count",
+        "wlm_queue_wait_us_p95",
+        "wlm_queue_wait_us_p99",
+        "wlm_wait_to_exec_ratio",
+        "disk_spill_query_count",
+        "concurrency_scaling_active_seconds",
+        "earliest_retained_query_ts",
     ]
     # Retention only reaches back to Jan 20 (11 of the 31 requested days), but those
     # 11 days have 40 real queries, 3 of which spilled.
@@ -874,10 +1113,18 @@ def test_user_activity_share_uses_true_total_even_when_top_n_excludes_a_user() -
         {
             "exec_microseconds": (
                 [
-                    "username", "query_count", "exec_microseconds",
-                    "total_exec_microseconds", "queue_microseconds", "cpu_microseconds",
-                    "blocks_read", "temp_blocks_to_disk", "scan_rows",
-                    "spectrum_scan_rows", "spectrum_scan_mb", "spill_gb",
+                    "username",
+                    "query_count",
+                    "exec_microseconds",
+                    "total_exec_microseconds",
+                    "queue_microseconds",
+                    "cpu_microseconds",
+                    "blocks_read",
+                    "temp_blocks_to_disk",
+                    "scan_rows",
+                    "spectrum_scan_rows",
+                    "spectrum_scan_mb",
+                    "spill_gb",
                 ],
                 [
                     ["alice", 100, 800_000_000, 1_100_000_000, 0, 0, 0, 0, 0, 0, 0.0, 0.0],
@@ -937,29 +1184,43 @@ def test_dashboard_waste_query_includes_shared_categories_on_redshift_entities( 
     records = [
         # Idle Redshift cluster — shared `idle` category, entity_type=sql_warehouse.
         EfficiencyRecord(
-            provider_name="AWS", charge_month=month, entity_type=EntityType.SQL_WAREHOUSE,
-            entity_id="redshift-idle", billed_cost=Decimal("100"), activity_count=0,
+            provider_name="AWS",
+            charge_month=month,
+            entity_type=EntityType.SQL_WAREHOUSE,
+            entity_id="redshift-idle",
+            billed_cost=Decimal("100"),
+            activity_count=0,
             x_source_connector="redshift",
         ),
         # One user drives a Redshift warehouse — shared `sql_warehouse_user_concentration`.
         EfficiencyRecord(
-            provider_name="AWS", charge_month=month, entity_type=EntityType.SQL_WAREHOUSE_USER,
-            entity_id="redshift-user-alice", billed_cost=Decimal("100"),
+            provider_name="AWS",
+            charge_month=month,
+            entity_type=EntityType.SQL_WAREHOUSE_USER,
+            entity_id="redshift-user-alice",
+            billed_cost=Decimal("100"),
             cause_detail={"duration_share_pct": 80.0, "query_count": 500},
             x_source_connector="redshift",
         ),
         # Redshift-prefixed, priced category — the pre-existing LIKE match.
         EfficiencyRecord(
-            provider_name="AWS", charge_month=month, entity_type=EntityType.TABLE,
-            entity_id="redshift-unused-table", billed_cost=Decimal("0"),
+            provider_name="AWS",
+            charge_month=month,
+            entity_type=EntityType.TABLE,
+            entity_id="redshift-unused-table",
+            billed_cost=Decimal("0"),
             native_quantity=10240.0,
             cause_detail={"days_since_last_access": 120},
             x_source_connector="redshift",
         ),
         # Idle S3 bucket — same shared `idle` category, but NOT Redshift.
         EfficiencyRecord(
-            provider_name="AWS", charge_month=month, entity_type=EntityType.STORAGE,
-            entity_id="s3-idle-bucket", billed_cost=Decimal("50"), activity_count=0,
+            provider_name="AWS",
+            charge_month=month,
+            entity_type=EntityType.STORAGE,
+            entity_id="s3-idle-bucket",
+            billed_cost=Decimal("50"),
+            activity_count=0,
             x_source_connector="aws_focus",
         ),
     ]
@@ -987,7 +1248,8 @@ def test_rule_coverage_rows_distinguishes_fired_clean_and_no_data() -> None:
     """
     import pandas as pd
 
-    from flashlight.dashboard.views.redshift_focus import _rule_coverage_rows
+    from flashlight.dashboard.views.efficiency_waste import rule_coverage_rows
+    from flashlight.efficiency.waste_rules import coverage_groups
 
     records = pd.DataFrame(
         [
@@ -1017,7 +1279,13 @@ def test_rule_coverage_rows_distinguishes_fired_clean_and_no_data() -> None:
     # telemetry pull came back completely empty (the real gap seen in production).
     measured_types = {"sql_warehouse", "table"}
 
-    by_category = {r["category"]: r for r in _rule_coverage_rows(records, measured_types)}
+    # The rule→group structure is derived from the pool now (coverage_groups) rather than
+    # restated in the view, so this passes AWS's own set — the same rules the old
+    # hand-maintained map listed, minus the Databricks-only ones it could never fire.
+    by_category = {
+        r["category"]: r
+        for r in rule_coverage_rows(records, measured_types, coverage_groups("AWS"))
+    }
 
     # A single fired entity states what actually fired, not just a count — this is
     # what tells a reader "$1,038 recoverable, for what" right in the coverage row.
@@ -1054,6 +1322,11 @@ def test_cluster_facets_split_instrumented_from_cost_only(monkeypatch, tmp_path)
     _cost_cluster_ids() must see both — that's what lets _waste_section() list the
     uninstrumented one instead of silently omitting it — while _telemetry_cluster_ids()
     sees only the one with real optimization telemetry.
+
+    Named "Prod" here, not "redshift": a real multi-cluster setup names each
+    connection (effective_connector_name), so x_source_connector is never the
+    literal connector type once more than one cluster is configured — the
+    matching must not assume otherwise (see redshift_focus.py's own reasoning).
     """
     from datetime import date, datetime
     from decimal import Decimal
@@ -1076,11 +1349,16 @@ def test_cluster_facets_split_instrumented_from_cost_only(monkeypatch, tmp_path)
         window,
         [
             FocusRecord(
-                provider_name="AWS", billing_account_id="123456789012",
-                billing_period_start=date(2026, 1, 1), billing_period_end=date(2026, 2, 1),
-                charge_period_start=datetime(2026, 1, 15), charge_period_end=datetime(2026, 1, 16),
-                charge_category=ChargeCategory.USAGE, service_category=ServiceCategory.DATABASES,
-                service_name="Amazon Redshift", effective_cost=Decimal("500.0"),
+                provider_name="AWS",
+                billing_account_id="123456789012",
+                billing_period_start=date(2026, 1, 1),
+                billing_period_end=date(2026, 2, 1),
+                charge_period_start=datetime(2026, 1, 15),
+                charge_period_end=datetime(2026, 1, 16),
+                charge_category=ChargeCategory.USAGE,
+                service_category=ServiceCategory.DATABASES,
+                service_name="Amazon Redshift",
+                effective_cost=Decimal("500.0"),
                 resource_id=f"arn:aws:redshift:us-east-1:123456789012:cluster:{cluster}",
                 x_source_connector="aws_focus",
             )
@@ -1092,10 +1370,13 @@ def test_cluster_facets_split_instrumented_from_cost_only(monkeypatch, tmp_path)
         window,
         [
             EfficiencyRecord(
-                provider_name="AWS", charge_month=date(2026, 1, 1),
-                entity_type=EntityType.SQL_WAREHOUSE, entity_id="instrumented-cluster",
-                billed_cost=Decimal("100"), activity_count=5,
-                x_source_connector="redshift",
+                provider_name="AWS",
+                charge_month=date(2026, 1, 1),
+                entity_type=EntityType.SQL_WAREHOUSE,
+                entity_id="instrumented-cluster",
+                billed_cost=Decimal("100"),
+                activity_count=5,
+                x_source_connector="Prod",
             ),
         ],
     )
@@ -1105,9 +1386,9 @@ def test_cluster_facets_split_instrumented_from_cost_only(monkeypatch, tmp_path)
     assert redshift_focus._telemetry_cluster_ids() == ["instrumented-cluster"]
 
 
-def test_redshift_tab_renders_per_cluster_with_coverage_table(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_redshift_tab_renders_per_cluster_with_action_queue(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """End-to-end render smoke test: the /aws page's Redshift tab must show the
-    instrumented cluster's rule-coverage table and list the cost-only cluster as
+    instrumented cluster's savings action queue and list the cost-only cluster as
     not yet instrumented, without raising.
     """
     import asyncio
@@ -1131,11 +1412,16 @@ def test_redshift_tab_renders_per_cluster_with_coverage_table(monkeypatch, tmp_p
         window,
         [
             FocusRecord(
-                provider_name="AWS", billing_account_id="123456789012",
-                billing_period_start=date(2026, 1, 1), billing_period_end=date(2026, 2, 1),
-                charge_period_start=datetime(2026, 1, 15), charge_period_end=datetime(2026, 1, 16),
-                charge_category=ChargeCategory.USAGE, service_category=ServiceCategory.DATABASES,
-                service_name="Amazon Redshift", effective_cost=Decimal("500.0"),
+                provider_name="AWS",
+                billing_account_id="123456789012",
+                billing_period_start=date(2026, 1, 1),
+                billing_period_end=date(2026, 2, 1),
+                charge_period_start=datetime(2026, 1, 15),
+                charge_period_end=datetime(2026, 1, 16),
+                charge_category=ChargeCategory.USAGE,
+                service_category=ServiceCategory.DATABASES,
+                service_name="Amazon Redshift",
+                effective_cost=Decimal("500.0"),
                 resource_id=f"arn:aws:redshift:us-east-1:123456789012:cluster:{cluster}",
                 x_source_connector="aws_focus",
             )
@@ -1147,19 +1433,26 @@ def test_redshift_tab_renders_per_cluster_with_coverage_table(monkeypatch, tmp_p
         window,
         [
             EfficiencyRecord(
-                provider_name="AWS", charge_month=date(2026, 1, 1),
-                entity_type=EntityType.SQL_WAREHOUSE, entity_id="prod-cluster",
-                billed_cost=Decimal("100"), activity_count=5,
+                provider_name="AWS",
+                charge_month=date(2026, 1, 1),
+                entity_type=EntityType.SQL_WAREHOUSE,
+                entity_id="prod-cluster",
+                billed_cost=Decimal("100"),
+                activity_count=5,
                 x_source_connector="redshift",
             ),
             # Fires redshift_spectrum_table_scan — unpriced (recoverable_cost = 0), so
-            # this also proves the Opportunity table no longer drops $0 findings.
+            # this also proves unpriced findings still reach the action drill-down.
             EfficiencyRecord(
-                provider_name="AWS", charge_month=date(2026, 1, 1),
-                entity_type=EntityType.TABLE, entity_id="prod-cluster:spectrum:spectrumdb.events",
-                entity_name="spectrumdb.events", x_source_connector="redshift",
+                provider_name="AWS",
+                charge_month=date(2026, 1, 1),
+                entity_type=EntityType.TABLE,
+                entity_id="prod-cluster:spectrum:spectrumdb.events",
+                entity_name="spectrumdb.events",
+                x_source_connector="redshift",
                 cause_detail={
-                    "spectrum_scan_count": 12, "spectrum_scanned_gb": 42.0,
+                    "spectrum_scan_count": 12,
+                    "spectrum_scanned_gb": 42.0,
                     "spectrum_returned_gb": 10.0,
                 },
             ),
@@ -1177,20 +1470,17 @@ def test_redshift_tab_renders_per_cluster_with_coverage_table(monkeypatch, tmp_p
             build_pages()
             await user.open("/aws")
             await user.should_see("Redshift spend")
+            user.find(kind=ui.tab, content="Efficiency & Waste").click()
             await user.should_see("Cluster: prod-cluster")
-            await user.should_see("Optimization rule coverage")
+            await user.should_see("Savings opportunities")
+            await user.should_see("Detection coverage for this cluster")
             await user.should_see("Not yet instrumented")
             await user.should_see("orphan-cluster")
 
             # ui.table renders rows as data, not as text nodes should_see can match —
-            # inspect the tables directly for the per-table Spectrum drill-down (visible
-            # despite being unpriced).
+            # inspect the root action queue for its unpriced Spectrum workload group.
             tables = user.find(kind=ui.table).elements
             all_rows = " ".join(str(t.rows) for t in tables)
-            assert "spectrumdb.events" in all_rows
-            assert "External table driving Spectrum scan cost" in all_rows
-            # A single-row Opportunity table collapses its (constant) remedy into the
-            # caption line instead of a column — the remedy text is on the page either way.
-            await user.should_see("Review this specific external table's partitioning")
+            assert "Tables — Move to cheaper compute" in all_rows
 
     asyncio.run(_check())
