@@ -29,6 +29,9 @@ from flashlight.lake.metrics_schema import empty_table as empty_metrics_table
 from flashlight.lake.redshift_policy_config_schema import (
     empty_table as empty_redshift_policy_config_table,
 )
+from flashlight.lake.redshift_table_observability_schema import (
+    empty_table as empty_redshift_table_observability_table,
+)
 from flashlight.lake.schema import empty_table
 from flashlight.lake.storage_location_schema import empty_table as empty_storage_location_table
 
@@ -180,6 +183,20 @@ def register_redshift_policy_config(con: duckdb.DuckDBPyConnection) -> None:
             f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
         )
     con.execute(f"CREATE OR REPLACE VIEW raw.redshift_policy_config AS {select}")
+
+
+def register_redshift_table_observability(con: duckdb.DuckDBPyConnection) -> None:
+    """Expose durable daily Redshift table and Spectrum facts in ``raw``."""
+    con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+    con.register("_redshift_table_observability_empty", empty_redshift_table_observability_table())
+    select = "SELECT * FROM _redshift_table_observability_empty"
+    if list(paths.redshift_table_observability_dir().glob("**/*.parquet")):
+        glob = str(paths.redshift_table_observability_dir() / "**" / "*.parquet").replace("'", "''")
+        select += (
+            " UNION ALL BY NAME SELECT * FROM "
+            f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
+        )
+    con.execute(f"CREATE OR REPLACE VIEW raw.redshift_table_observability AS {select}")
 
 
 def register_ai_usage(con: duckdb.DuckDBPyConnection) -> None:

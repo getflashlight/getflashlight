@@ -74,6 +74,7 @@ from flashlight.lake import duck as lake_duck
 from flashlight.lake import paths as lake_paths
 from flashlight.lake.driver_health_schema import DriverHealthRecord
 from flashlight.lake.redshift_policy_config_schema import RedshiftPolicyConfigRecord
+from flashlight.lake.redshift_table_observability_schema import RedshiftTableObservabilityRecord
 
 logger = get_logger(__name__)
 
@@ -82,6 +83,13 @@ _QUERY_PATTERN_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_query_patt
 _USER_ACTIVITY_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_user_activity.sql"
 _SPECTRUM_TABLE_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_spectrum_table_usage.sql"
 _DRIVER_HEALTH_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_driver_health.sql"
+_TABLE_USAGE_DAILY_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_table_usage_daily.sql"
+_EXTERNAL_TABLE_CATALOG_QUERY_PATH = (
+    Path(__file__).parent / "sql" / "redshift_external_table_catalog.sql"
+)
+_EXTERNAL_QUERY_DAILY_QUERY_PATH = (
+    Path(__file__).parent / "sql" / "redshift_external_query_daily.sql"
+)
 _TERMINAL_STATES = {"FINISHED", "ABORTED", "FAILED"}
 
 # Floor/cap for the query-pattern pull — a cluster can have thousands of distinct query
@@ -337,6 +345,138 @@ class RedshiftConnector(Connector):
                 query_count=_opt_int(row.get("query_count")) or 0,
                 x_source_connector=self.name,
             )
+
+    def fetch_redshift_table_observability(
+        self, window: IngestWindow
+    ) -> Iterator[RedshiftTableObservabilityRecord]:
+        """Persist daily table and Spectrum facts before source history expires.
+
+        The two system-log extracts run for the window's final UTC day only. Their
+        retention is finite, and replaying a default multi-week ingest window would
+        add expensive, empty system-table scans; daily scheduled ingests create the
+        durable history going forward. The external catalog is likewise captured as
+        a present-tense snapshot for that day. Failures in one optional extract don't
+        discard facts from another.
+        """
+        if self._config.bastion_host is not None:
+            mode = "bastion_tunnel"
+        elif self._config.db_password_env is not None:
+            mode = "direct_sql"
+        else:
+            mode = "data_api"
+
+        def sql_for(path: Path, start: date, end: date) -> str:
+            return (
+                path.read_text()
+                .replace(":start_date", f"'{start}'")
+                .replace(":end_date", f"'{end}'")
+            )
+
+        def collect(conn: Any = None) -> list[RedshiftTableObservabilityRecord]:
+            records: list[RedshiftTableObservabilityRecord] = []
+            current = window.end
+            while current <= window.end:
+                next_day = current + timedelta(days=1)
+                try:
+                    rows = self._execute(
+                        sql_for(_TABLE_USAGE_DAILY_QUERY_PATH, current, next_day),
+                        conn,
+                        name="table_usage_daily",
+                    )
+                    records.extend(
+                        RedshiftTableObservabilityRecord(
+                            cluster_id=self._config.cluster_identifier,
+                            observation_date=current,
+                            record_kind="table_usage",
+                            table_id=_opt_int(row.get("table_id")),
+                            query_count=_opt_int(row.get("query_count")),
+                            scan_step_count=_opt_int(row.get("scan_step_count")),
+                            scan_bytes=_opt_int(row.get("scan_bytes")),
+                            rows_pre_filter=_opt_int(row.get("rows_pre_filter")),
+                            rows_returned=_opt_int(row.get("rows_returned")),
+                            first_scan_at=row.get("first_scan_at"),
+                            last_scan_at=row.get("last_scan_at"),
+                            x_source_connector=self.name,
+                        )
+                        for row in rows
+                        if _opt_int(row.get("table_id")) is not None
+                    )
+                except ConnectorError as exc:
+                    logger.warning(
+                        "redshift_table_usage_daily_failed", error=str(exc), day=str(current)
+                    )
+                try:
+                    rows = self._execute(
+                        sql_for(_EXTERNAL_QUERY_DAILY_QUERY_PATH, current, next_day),
+                        conn,
+                        name="external_query_daily",
+                    )
+                    records.extend(
+                        RedshiftTableObservabilityRecord(
+                            cluster_id=self._config.cluster_identifier,
+                            observation_date=current,
+                            record_kind="external_query",
+                            source_type=row.get("source_type"),
+                            external_table=row.get("external_table"),
+                            file_location=row.get("file_location"),
+                            file_format=row.get("file_format"),
+                            query_count=_opt_int(row.get("query_count")),
+                            segment_count=_opt_int(row.get("segment_count")),
+                            duration_seconds=_opt_float(row.get("duration_seconds")),
+                            total_partitions=_opt_int(row.get("total_partitions")),
+                            qualified_partitions=_opt_int(row.get("qualified_partitions")),
+                            scanned_files=_opt_int(row.get("scanned_files")),
+                            source_rows=_opt_int(row.get("source_rows")),
+                            source_bytes=_opt_int(row.get("source_bytes")),
+                            s3_listing_milliseconds=_opt_int(row.get("s3_listing_milliseconds")),
+                            partition_catalog_milliseconds=_opt_int(
+                                row.get("partition_catalog_milliseconds")
+                            ),
+                            x_source_connector=self.name,
+                        )
+                        for row in rows
+                    )
+                except ConnectorError as exc:
+                    logger.warning(
+                        "redshift_external_query_daily_failed", error=str(exc), day=str(current)
+                    )
+                current = next_day
+            try:
+                rows = self._execute(
+                    _EXTERNAL_TABLE_CATALOG_QUERY_PATH.read_text(),
+                    conn,
+                    name="external_table_catalog",
+                )
+                records.extend(
+                    RedshiftTableObservabilityRecord(
+                        cluster_id=self._config.cluster_identifier,
+                        observation_date=window.end,
+                        record_kind="external_catalog",
+                        external_schema=row.get("external_schema"),
+                        external_table=row.get("external_table"),
+                        redshift_database_name=row.get("redshift_database_name"),
+                        table_type=row.get("tabletype"),
+                        table_location=row.get("table_location"),
+                        input_format=row.get("input_format"),
+                        output_format=row.get("output_format"),
+                        serialization_lib=row.get("serialization_lib"),
+                        compressed=_opt_int(row.get("compressed")),
+                        table_parameters=row.get("table_parameters"),
+                        partition_count=_opt_int(row.get("partition_count")),
+                        sample_partition_location=row.get("sample_partition_location"),
+                        x_source_connector=self.name,
+                    )
+                    for row in rows
+                )
+            except ConnectorError as exc:
+                logger.warning("redshift_external_table_catalog_failed", error=str(exc))
+            return records
+
+        if mode == "data_api":
+            yield from collect()
+        else:
+            with self._lane_connection_factory(mode) as lane_conn, lane_conn() as conn:
+                yield from collect(conn)
 
     def fetch_policy_config(self, window: IngestWindow) -> Iterator[RedshiftPolicyConfigRecord]:
         """Snapshot policy-relevant control-plane configuration into typed Bronze."""

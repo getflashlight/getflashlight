@@ -15,6 +15,7 @@ from flashlight.lake.ai_usage_schema import AiUsageRecord
 from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
 from flashlight.lake.redshift_policy_config_schema import RedshiftPolicyConfigRecord
+from flashlight.lake.redshift_table_observability_schema import RedshiftTableObservabilityRecord
 from flashlight.lake.storage_location_schema import StorageLocationRecord
 
 # A progress event: (event, connector_name, rows). "start" (rows always 0),
@@ -123,6 +124,17 @@ class Connector(ABC):
 
     def fetch_policy_config(self, window: IngestWindow) -> Iterator[RedshiftPolicyConfigRecord]:
         """Yield policy-control evidence (default: none), collected only at ingest."""
+        return iter(())
+
+    def fetch_redshift_table_observability(
+        self, window: IngestWindow
+    ) -> Iterator[RedshiftTableObservabilityRecord]:
+        """Yield durable daily Redshift table/Spectrum facts (default: none).
+
+        This is separate from efficiency summaries: it retains operational facts at
+        their natural daily grain so unused-table and external-table analysis remain
+        valid after Redshift system-table history expires.
+        """
         return iter(())
 
     def fetch_ai_usage(self, window: IngestWindow) -> Iterator[AiUsageRecord]:

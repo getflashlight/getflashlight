@@ -44,6 +44,7 @@ from flashlight.lake import (
     driver_health,
     metrics,
     redshift_policy_config,
+    redshift_table_observability,
     runlog,
     storage_locations,
 )
@@ -51,6 +52,7 @@ from flashlight.lake.ai_usage_schema import AiUsageRecord
 from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
 from flashlight.lake.redshift_policy_config_schema import RedshiftPolicyConfigRecord
+from flashlight.lake.redshift_table_observability_schema import RedshiftTableObservabilityRecord
 from flashlight.lake.storage_location_schema import StorageLocationRecord
 from flashlight.transform.runner import build_gold
 
@@ -286,6 +288,7 @@ def _run_supplemental(
 
     phases = (
         lambda: _run_efficiency(window, connectors, on_progress, max_workers=1),
+        lambda: _run_redshift_table_observability(window, connectors, max_workers=1),
         lambda: _run_ai_usage(window, connectors, max_workers=1),
         lambda: _run_storage_locations(window, connectors, max_workers=1),
         lambda: _run_compute_instances(window, connectors, max_workers=1),
@@ -396,6 +399,28 @@ def _run_policy_config(
     with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
         records = [record for batch in pool.map(_pull, connectors) for record in batch]
     return redshift_policy_config.write(window, records)
+
+
+def _run_redshift_table_observability(
+    window: IngestWindow, connectors: list[Connector], *, max_workers: int | None = None
+) -> int:
+    """Collect daily Redshift table/Spectrum facts as a best-effort typed BRONZE plane."""
+
+    def _pull(connector: Connector) -> list[RedshiftTableObservabilityRecord]:
+        try:
+            return list(connector.fetch_redshift_table_observability(window))
+        except Exception as exc:  # noqa: BLE001 - supplemental telemetry must not block billing
+            logger.warning(
+                "redshift_table_observability_pull_failed", connector=connector.name, error=str(exc)
+            )
+            return []
+
+    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
+        records = [record for batch in pool.map(_pull, connectors) for record in batch]
+    written = redshift_table_observability.write(records)
+    if written:
+        logger.info("redshift_table_observability_written", rows=written)
+    return written
 
 
 def _run_ai_usage(

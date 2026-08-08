@@ -68,6 +68,11 @@ def redshift_policy_config_dir() -> Path:
     return bronze_dir() / "redshift_policy_config"
 
 
+def redshift_table_observability_dir() -> Path:
+    """Typed Bronze daily internal-table and Spectrum observability evidence."""
+    return bronze_dir() / "redshift_table_observability"
+
+
 def metrics_dir() -> Path:
     """Efficiency-telemetry root, Hive-partitioned ``provider_name=…/charge_month=…/``.
 
