@@ -1212,6 +1212,97 @@ def test_activity_partial_window_keeps_real_counts(monkeypatch) -> None:  # type
     assert activity["activity_measured_since"] == "2026-01-20"
 
 
+def test_partial_activity_skips_expensive_detail_queries(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A short retained slice still yields cluster-level truth, but not misleading
+    per-user/pattern/Spectrum drill-downs that scan broad system views."""
+    from contextlib import nullcontext
+    from datetime import date
+
+    from flashlight.ingest.base import IngestWindow
+
+    connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
+    window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
+    monkeypatch.setattr(connector, "_probe_earliest_retained", lambda _conn: date(2026, 1, 28))
+    monkeypatch.setattr(
+        connector,
+        "_activity",
+        lambda _window, _conn, **_kwargs: {
+            "query_count": 12,
+            "activity_measured_since": "2026-01-28",
+            "activity_window_unmeasurable": False,
+        },
+    )
+    for method in ("_fetch_query_patterns", "_fetch_user_activity", "_fetch_spectrum_table_usage"):
+        monkeypatch.setattr(
+            connector,
+            method,
+            lambda *_args, **_kwargs: pytest.fail(f"{method} should have been skipped"),
+        )
+
+    activity, records = connector._run_activity_lane(
+        window, "prod", date(2026, 1, 1), 0.0, lambda: nullcontext(None)
+    )
+
+    assert activity["query_count"] == 12
+    assert records == []
+
+
+def test_table_inventory_cache_reuses_catalog_but_keeps_usage_live(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from contextlib import nullcontext
+    from datetime import date
+
+    from flashlight.core.settings import get_settings
+    from flashlight.ingest.base import IngestWindow
+
+    monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
+    get_settings.cache_clear()
+    connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
+    calls: list[str] = []
+    results = {
+        "table_inventory": [
+            {
+                "table_id": 7,
+                "database": "dev",
+                "schema": "public",
+                "table": "orders",
+                "size": 10,
+            }
+        ],
+        "table_usage": [{"table_id": 7, "query_count": 2}],
+        "table_owner": [{"schemaname": "public", "tablename": "orders", "tableowner": "owner"}],
+    }
+
+    def _execute(_sql: str, _conn: object, *, name: str) -> list[dict[str, object]]:
+        calls.append(name)
+        return results[name]
+
+    monkeypatch.setattr(connector, "_execute", _execute)
+    window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
+
+    def lane():  # type: ignore[no-untyped-def]
+        return nullcontext(None)
+
+    first = connector._run_table_inventory_lane(window, "prod", date(2026, 1, 1), lane)
+    assert len(first) == 1
+    assert set(calls) == {"table_inventory", "table_usage", "table_owner"}
+
+    calls.clear()
+    second = connector._run_table_inventory_lane(window, "prod", date(2026, 1, 1), lane)
+    assert len(second) == 1
+    assert calls == ["table_usage"]
+
+
+def test_detail_sql_scopes_step_views_to_window_query_ids() -> None:
+    from flashlight.ingest.connectors import redshift
+
+    patterns = redshift._QUERY_PATTERN_QUERY_PATH.read_text()
+    users = redshift._USER_ACTIVITY_QUERY_PATH.read_text()
+
+    assert "FROM svl_query_report r\n    JOIN q ON q.query = r.query" in patterns
+    user_scope = "FROM svl_query_report r\n    JOIN q ON q.query = r.query AND q.userid = r.userid"
+    assert user_scope in users
+
+
 def test_execute_rolls_back_shared_connection_after_a_failed_query() -> None:
     """A failed statement leaves a real SQL connection's transaction aborted — without
     a rollback, every later query reusing that same connection fails with "current

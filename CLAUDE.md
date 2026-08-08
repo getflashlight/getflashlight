@@ -45,7 +45,7 @@ per-file rename. See `src/flashlight/cli.py`.
 ```bash
 uv sync
 uv run flashlight init             # scaffold the lake home + connections.yml
-uv run flashlight sample           # download the FinOps FOCUS sample + seed it
+uv run flashlight sample           # generate reconciled Redshift, Databricks, and FOCUS demo data
 uv run flashlight ingest           # pull billing → BRONZE, rebuild GOLD
 uv run flashlight transform        # rebuild GOLD from BRONZE (no re-pull)
 uv run flashlight mcp serve        # MCP server :8002 (agents)

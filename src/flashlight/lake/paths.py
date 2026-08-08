@@ -78,6 +78,16 @@ def metrics_dir() -> Path:
     return home() / "metrics"
 
 
+def redshift_table_inventory_cache_dir() -> Path:
+    """Durable, per-cluster cache for present-tense Redshift table metadata.
+
+    Table inventory is a current catalog snapshot, not billing-period data; keeping
+    it outside ``metrics_dir`` prevents its JSON payload from being picked up by the
+    efficiency Parquet glob.
+    """
+    return home() / "cache" / "redshift_table_inventory"
+
+
 def legacy_driver_health_dir() -> Path:
     """Pre-Bronze driver-health location, read-only during the storage cutover.
 

@@ -604,11 +604,29 @@ def _render_spectrum_table_attribution(cluster_id: str, sm: date, end: date) -> 
                 "month closes."
             )
         else:
-            chrome.section_caption(
-                "No Spectrum table telemetry for this cluster. Enable its Redshift connector "
-                "with access to `SVL_S3QUERY_SUMMARY`, then run `flashlight ingest`; table "
-                "costs are not inferred from the SKU alone."
+            history = gold_df(
+                "SELECT count(*) AS telemetry_months, count(*) FILTER (WHERE "
+                "json_extract_string(cause_detail, '$.activity_window_unmeasurable') = 'true') "
+                "AS retention_gaps FROM efficiency.efficiency_entity_month "
+                "WHERE provider_name = 'AWS' AND entity_type = 'sql_warehouse' "
+                f"AND entity_id = '{cluster}' "
+                f"AND charge_month >= '{sm}' AND charge_month <= '{end}'"
             )
+            retention_gap = not history.empty and int(history["retention_gaps"].iloc[0]) > 0
+            if retention_gap:
+                chrome.section_caption(
+                    "No table-level Spectrum cost for this selected range: Redshift query "
+                    "history did not retain its full start date when telemetry was collected. "
+                    "The connector is active, but table costs cannot be safely inferred from "
+                    "a partial scan-history window. Choose a recent completed period or retain "
+                    "query history externally for longer-term attribution."
+                )
+            else:
+                chrome.section_caption(
+                    "No Spectrum table telemetry for this cluster. Confirm the Redshift connector "
+                    "can read `SVL_S3QUERY_SUMMARY`, then run `flashlight ingest`; table costs "
+                    "are not inferred from the SKU alone."
+                )
         return
 
     rows["return_pct"] = (100.0 * rows["returned_gb"] / rows["scanned_gb"]).round(1)
@@ -718,7 +736,7 @@ def _render_compute_heavy_tables(cluster_id: str, sm: date, end: date) -> None:
     at the user grain, where the measured billing-period share actually exists.
     """
     cluster = _sql_str(cluster_id)
-    rows = gold_df(
+    sql = (
         "SELECT entity_name AS table_name, owner_user, "
         "try_cast(json_extract_string(cause_detail, '$.table_weighted_exec_seconds') AS DOUBLE) "
         "AS weighted_exec_seconds, "
@@ -739,6 +757,23 @@ def _render_compute_heavy_tables(cluster_id: str, sm: date, end: date) -> None:
         "'$.table_weighted_exec_seconds') AS DOUBLE) "
         "IS NOT NULL ORDER BY weighted_exec_seconds DESC"
     )
+    try:
+        rows = gold_df(sql)
+    except Exception:  # noqa: BLE001 - old published GOLD lacks owner_user until transformed
+        # The new view includes owner_user, but a running dashboard can still have a
+        # pre-upgrade Parquet file registered. Keep the drill usable during that one
+        # refresh cycle instead of turning a new optional column into a page failure.
+        legacy_sql = (
+            sql.replace(
+                "entity_name AS table_name, owner_user, ",
+                "entity_name AS table_name, NULL::VARCHAR AS owner_user, ",
+            )
+            .replace(
+                "activity_count AS query_count, ",
+                "NULL::BIGINT AS query_count, ",
+            )
+        )
+        rows = gold_df(legacy_sql)
     if rows.empty:
         chrome.section_caption(
             "No retained table-to-query workload telemetry. Re-run the Redshift connector "

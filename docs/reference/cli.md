@@ -8,8 +8,8 @@ below describe the stable operator interface.
 | Command | Description |
 | --- | --- |
 | `flashlight init [--force]` | Create lake layout and starter configuration |
-| `flashlight sample [--rows 1000\|10000] [--force]` | Download and seed the FOCUS sample |
-| `flashlight sample --clean` | Remove only sample-seeded data and rebuild GOLD |
+| `flashlight sample` | Generate deterministic, reconciled Redshift, Databricks, and FOCUS demo data |
+| `flashlight sample --clean` | Remove the generated demo's scoped partitions and rebuild GOLD |
 | `flashlight ingest` | Pull enabled connectors and rebuild GOLD |
 | `flashlight transform` | Rebuild GOLD from existing BRONZE data |
 | `flashlight cleanup` | Remove all lake data after confirmation |

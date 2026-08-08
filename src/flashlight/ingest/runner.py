@@ -7,14 +7,13 @@ regardless of earlier failures — one broken source (an expired token, a moved
 bucket) must not block a fresh pull from every other source. Failures are
 collected and, once every connector has run, raised together as
 :class:`IngestError` so the CLI still exits non-zero and names every connector
-that needs attention. GOLD is rebuilt from whatever succeeded (best-effort
-efficiency/driver-health pulls run only for the connectors whose cost pull
-worked — a connector with broken creds fails those the same way).
+that needs attention. After every selected connector has finished writing its
+own BRONZE data (including best-effort supplemental telemetry for successful
+cost pulls), SILVER and GOLD are built once from the complete available lake.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -239,45 +238,21 @@ def run_ingest(
             failed.append(outcome.name)
             logger.error("connector_failed", connector=outcome.name, detail=outcome.detail)
 
-    # Publish GOLD from the cost pull immediately — don't make dashboard-visible
-    # cost data wait on the slower, best-effort efficiency/driver-health phases
-    # below. build_gold() is a full, idempotent rebuild from whatever's
-    # currently on disk (see transform/runner.py), safe to call again after
-    # those phases finish (below) — this just means a process that dies
-    # partway through them (e.g. killed mid-efficiency-pull) still leaves
-    # already-successfully-pulled cost data published, instead of leaving GOLD
-    # untouched until a sync completes end to end.
-    if not no_transform and succeeded_connectors:
-        published = build_gold()
-        logger.info("transform_done", gold_views=published, phase="cost")
-
-    # Driver health and policy configuration are the fast, independently useful
-    # governance signals. Publish them before starting the potentially long-running
-    # efficiency pull: Redshift's STL activity aggregation can take minutes on a busy
-    # cluster, and should not keep already-written driver-health Bronze invisible in
-    # GOLD for that whole time.
-    def _publish_priority_telemetry() -> None:
-        if not no_transform and succeeded_connectors:
-            published = build_gold()
-            logger.info("transform_done", gold_views=published, phase="priority_telemetry")
-
     _run_supplemental(
         window,
         succeeded_connectors,
         on_progress,
-        on_priority_complete=_publish_priority_telemetry,
     )
 
-    # Final holistic rebuild — same idempotent build_gold() as above, now
-    # picking up whatever fresh efficiency/waste, driver-health, AI-usage,
-    # storage-location and compute-instance data those phases just wrote (the earlier
-    # publish above ran before any had a
-    # chance to). A failed connector's own window is left as it was before this
-    # run (bronze.write_window re-purges on error, never leaving a partial
-    # write), so GOLD never reflects a half-written pull.
+    # The layer boundary is deliberate: all selected connectors finish their
+    # BRONZE writes before SILVER is evaluated and GOLD is published. A failed
+    # connector's window is left as it was before this run (bronze.write_window
+    # re-purges on error, never leaving a partial write), while a successful
+    # connector contributes its fresh partitions. One full, idempotent transform
+    # therefore publishes one coherent view of everything available in BRONZE.
     if not no_transform and succeeded_connectors:
         published = build_gold()
-        logger.info("transform_done", gold_views=published, phase="final")
+        logger.info("transform_done", gold_views=published, phase="bronze_complete")
     logger.info(
         "ingest_complete",
         connectors=len(connectors),
@@ -294,14 +269,13 @@ def _run_supplemental(
     window: IngestWindow,
     connectors: list[Connector],
     on_progress: ProgressCallback | None = None,
-    *,
-    on_priority_complete: Callable[[], None] | None = None,
 ) -> None:
     """Run supplemental telemetry under one global concurrency cap.
 
     Driver health and policy configuration run first because they have a short,
-    predictable latency and can be published before a deep system-table efficiency
-    query finishes. The remaining planes are still independent and concurrent.
+    predictable latency. The remaining planes are still independent and concurrent.
+    All of these writes stay in BRONZE until the single transform at the end of
+    :func:`run_ingest`.
     """
     priority_phases = (
         lambda: _run_driver_health(window, connectors, max_workers=1),
@@ -309,8 +283,6 @@ def _run_supplemental(
     )
     with ThreadPoolExecutor(max_workers=_max_workers(len(priority_phases))) as pool:
         list(pool.map(lambda phase: phase(), priority_phases))
-    if on_priority_complete is not None:
-        on_priority_complete()
 
     phases = (
         lambda: _run_efficiency(window, connectors, on_progress, max_workers=1),

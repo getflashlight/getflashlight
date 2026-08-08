@@ -51,6 +51,8 @@ lazily imported so the default install doesn't need it.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import warnings
 from collections.abc import Callable, Iterator
@@ -69,6 +71,7 @@ from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 from flashlight.ingest.base import Connector, IngestWindow
 from flashlight.ingest.config import RedshiftConfig, aws_client, effective_connector_name, env
 from flashlight.lake import duck as lake_duck
+from flashlight.lake import paths as lake_paths
 from flashlight.lake.driver_health_schema import DriverHealthRecord
 from flashlight.lake.redshift_policy_config_schema import RedshiftPolicyConfigRecord
 
@@ -99,6 +102,18 @@ _USER_ACTIVITY_TOP_N = 50
 # widest fan-out used here (query_patterns/user_activity/spectrum_table_usage, and
 # separately table_inventory/table_usage/table_owner).
 _EFFICIENCY_CONCURRENCY = 3
+
+# Detailed per-user/pattern/Spectrum telemetry is useful only when there is enough
+# retained query history to be representative.  The cluster-level row still records
+# the partial measurement, but skipping these three broad system-view queries avoids
+# spending minutes producing a misleadingly short sample.
+_MIN_DETAIL_ACTIVITY_COVERAGE_DAYS = 14
+
+# SVV_TABLE_INFO is a present-tense catalog snapshot and was the slowest query in the
+# parallel table lane.  Reusing a day-old snapshot keeps normal ingests from sorting
+# the full catalog every time while still refreshing table shape/maintenance evidence
+# daily.  Recent STL_SCAN usage deliberately remains live and is never cached.
+_TABLE_INVENTORY_CACHE_TTL = timedelta(days=1)
 
 # Table-access history, joined to the table inventory by table_id (STL_SCAN.tbl ==
 # SVV_TABLE_INFO.table_id, same join key the runbook's table_usage load script uses).
@@ -587,6 +602,23 @@ class RedshiftConnector(Connector):
         if activity.get("activity_window_unmeasurable"):
             return activity, []
 
+        measured_since = _opt_date(activity.get("activity_measured_since"))
+        detail_coverage_days = (
+            (window.end - measured_since).days + 1 if measured_since is not None else None
+        )
+        if (
+            detail_coverage_days is not None
+            and detail_coverage_days < _MIN_DETAIL_ACTIVITY_COVERAGE_DAYS
+        ):
+            logger.info(
+                "redshift_windowed_detail_queries_skipped",
+                reason="partial_activity_window",
+                measured_since=str(measured_since),
+                coverage_days=detail_coverage_days,
+                minimum_coverage_days=_MIN_DETAIL_ACTIVITY_COVERAGE_DAYS,
+            )
+            return activity, []
+
         def _patterns() -> list[EfficiencyRecord]:
             with lane_conn() as conn:
                 return list(self._fetch_query_patterns(window, entity_id, month, conn))
@@ -649,17 +681,76 @@ class RedshiftConnector(Connector):
                     logger.warning("redshift_table_owner_failed", error=str(exc))
                     return []
 
-        with ThreadPoolExecutor(max_workers=_EFFICIENCY_CONCURRENCY) as pool:
-            inv_f = pool.submit(_inventory)
-            usage_f = pool.submit(_usage)
-            owner_f = pool.submit(_owner)
-            rows, usage_rows, owner_rows = inv_f.result(), usage_f.result(), owner_f.result()
+        cached = self._load_table_inventory_cache()
+        if cached is not None:
+            rows, owner_rows = cached
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                usage_rows = pool.submit(_usage).result()
+            logger.info(
+                "redshift_table_inventory_cache_hit",
+                tables=len(rows),
+                owners=len(owner_rows),
+            )
+        else:
+            with ThreadPoolExecutor(max_workers=_EFFICIENCY_CONCURRENCY) as pool:
+                inv_f = pool.submit(_inventory)
+                usage_f = pool.submit(_usage)
+                owner_f = pool.submit(_owner)
+                rows, usage_rows, owner_rows = inv_f.result(), usage_f.result(), owner_f.result()
+            if rows:
+                self._store_table_inventory_cache(rows, owner_rows)
 
         return list(
             self._build_table_inventory_records(
                 window, entity_id, month, rows, usage_rows, owner_rows
             )
         )
+
+    def _table_inventory_cache_path(self) -> Path:
+        """Stable, filesystem-safe cache location for this cluster's catalog."""
+        key = "\x00".join(
+            (self._config.region, self._config.database, self._config.cluster_identifier)
+        )
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        return lake_paths.redshift_table_inventory_cache_dir() / f"{digest}.json"
+
+    def _load_table_inventory_cache(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+        path = self._table_inventory_cache_path()
+        try:
+            age = datetime.now() - datetime.fromtimestamp(path.stat().st_mtime)
+            if age > _TABLE_INVENTORY_CACHE_TTL:
+                return None
+            payload = json.loads(path.read_text())
+            rows = payload["inventory"]
+            owners = payload["owners"]
+            if not isinstance(rows, list) or not isinstance(owners, list):
+                raise ValueError("cache payload is not row lists")
+            return rows, owners
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("redshift_table_inventory_cache_ignored", path=str(path), error=str(exc))
+            return None
+
+    def _store_table_inventory_cache(
+        self, rows: list[dict[str, Any]], owner_rows: list[dict[str, Any]]
+    ) -> None:
+        path = self._table_inventory_cache_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(".tmp")
+            payload = json.dumps({"inventory": rows, "owners": owner_rows}, default=str)
+            tmp_path.write_text(payload)
+            tmp_path.replace(path)
+            logger.info(
+                "redshift_table_inventory_cache_written", tables=len(rows), owners=len(owner_rows)
+            )
+        except OSError as exc:
+            logger.warning(
+                "redshift_table_inventory_cache_write_failed", path=str(path), error=str(exc)
+            )
 
     @staticmethod
     def _allocate_spectrum_cost(

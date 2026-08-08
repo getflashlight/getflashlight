@@ -1,7 +1,7 @@
 """``flashlight cleanup`` — wipe all lake data (Parquet) under ``FLASHLIGHT_HOME``.
 
-The nuclear counterpart to ``sample --clean`` (which is scoped to the isolated
-``focus_sample`` connector): this removes *everything* the writers produce —
+The nuclear counterpart to ``sample --clean`` (which is scoped to the generated
+demo's partitions): this removes *everything* the writers produce —
 every BRONZE partition, every published GOLD view, any half-built staging dir,
 and the ingest run log — leaving only ``config/`` so the install stays usable.
 Idempotent: a no-op on a never-seeded home. Config (``connections.yml``) and any

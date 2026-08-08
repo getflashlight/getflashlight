@@ -32,12 +32,16 @@ WITH q AS (
       AND datediff(seconds, starttime, endtime) >= :min_duration_secs
 ),
 wlm AS (
-    SELECT query, total_queue_time, total_exec_time
-    FROM stl_wlm_query
+    -- Join to the small, window-scoped query set before reading the WLM history.
+    -- Aggregating retained history first made a short telemetry pull scan every
+    -- WLM row the cluster still held.
+    SELECT w.query, w.total_queue_time, w.total_exec_time
+    FROM stl_wlm_query w
+    JOIN q ON q.query = w.query
 ),
 spill AS (
     SELECT
-        query,
+        r.query AS query,
         max(CASE WHEN is_diskbased = 't' THEN 1 ELSE 0 END)::double precision AS spilled,
         sum(CASE WHEN is_diskbased = 't' THEN bytes ELSE 0 END) / 1024.0 / 1024 / 1024
                                                                               AS spill_gb,
@@ -46,8 +50,9 @@ spill AS (
         min(rows) AS min_rows,
         sum(rows) AS total_rows,
         count(rows) AS slices
-    FROM svl_query_report
-    GROUP BY query
+    FROM svl_query_report r
+    JOIN q ON q.query = r.query
+    GROUP BY r.query
 ),
 user_counts AS (
     SELECT
