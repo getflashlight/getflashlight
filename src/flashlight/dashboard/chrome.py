@@ -78,6 +78,13 @@ LOGO_SVG = (
 LOGO_DATA_URL = f"data:image/svg+xml,{quote(LOGO_SVG)}"
 FAVICON_SVG = LOGO_SVG
 
+# Shared local assets: use the same provider mark wherever a provider is named,
+# rather than allowing navigation and connection cards to drift apart.
+CONNECTOR_LOGOS: dict[str, str] = {
+    "databricks": "/dashboard-assets/databricks.png",
+    "redshift": "/dashboard-assets/redshift.svg",
+}
+
 # Declared so Safari (and iOS "Add to Home Screen") uses this instead of probing
 # /apple-touch-icon.png at the site root on spec. Both point at the same route —
 # see router.register_icon_routes, which is what stops those probes 404ing.

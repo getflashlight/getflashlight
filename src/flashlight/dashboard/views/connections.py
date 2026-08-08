@@ -65,12 +65,8 @@ _TYPE_ICONS: dict[str, str] = {
     "redshift": "storage",
 }
 
-# Both connector marks are bundled in the app so they render reliably in the
-# dashboard and sidebar without a third-party request at page load.
-_CONNECTOR_LOGOS: dict[str, str] = {
-    "databricks": "/dashboard-assets/databricks.png",
-    "redshift": "/dashboard-assets/redshift.svg",
-}
+# Keep card and sidebar provider marks in sync via the shared dashboard assets.
+_CONNECTOR_LOGOS = chrome.CONNECTOR_LOGOS
 
 # Matches the progress printer's own "  {name} ... {rows:,} rows done" / "  {name}
 # ... failed" lines (cli.py's _progress_printer) — not its "  {name} ..." start

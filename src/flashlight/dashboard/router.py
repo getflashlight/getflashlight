@@ -78,8 +78,8 @@ def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
 _NAV_GROUP_ORDER: tuple[str, ...] = ("databricks",)
 
 _SIDEBAR_PROVIDER_LOGOS: dict[str, str] = {
-    "databricks": "/dashboard-assets/databricks.png",
-    "aws": "/dashboard-assets/redshift.svg",
+    "databricks": chrome.CONNECTOR_LOGOS["databricks"],
+    "aws": chrome.CONNECTOR_LOGOS["redshift"],
 }
 
 
@@ -118,7 +118,9 @@ def _nav_row(
     )
     with row:
         if logo_source:
-            ui.image(logo_source).classes("w-5 h-5 flex-none").props("fit=contain no-spinner")
+            ui.image(logo_source).classes("flex-none").style(
+                "width:1.1rem;height:1.1rem;"
+            ).props("fit=contain no-spinner")
         else:
             ui.icon(icon, size="1.1rem").style(f"color:{chrome.INK_SECONDARY}")
         ui.link(label, href).classes("fl-sidebar-label text-sm no-underline").style(
