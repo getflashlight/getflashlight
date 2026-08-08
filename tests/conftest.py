@@ -66,11 +66,14 @@ def _reset_nicegui_clients() -> Iterator[None]:
     assertion inspect the previous test's page. Delete those clients before resetting
     the app so every simulation starts from an empty page registry and client set.
     """
-    yield
-
     from nicegui import app
     from nicegui.client import Client
 
-    for client in list(Client.instances.values()):
-        client.delete()
-    app.reset()
+    def reset() -> None:
+        for client in list(Client.instances.values()):
+            client.delete()
+        app.reset()
+
+    reset()
+    yield
+    reset()
