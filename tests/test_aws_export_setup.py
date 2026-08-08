@@ -21,7 +21,7 @@ def test_default_query_targets_focus_1_2_table() -> None:
 
 def test_default_query_selects_columns_the_mapper_reads() -> None:
     # The export projection must include every column map_focus_row pulls, or
-    # ingestion would silently lose fields. Tags drives TCO attribution.
+    # ingestion would silently lose fields. Tags drives cost allocation.
     sql = default_query_statement()
     for col in ("ProviderName", "ServiceName", "EffectiveCost", "ResourceId", "Tags"):
         assert col in sql

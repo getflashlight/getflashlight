@@ -51,6 +51,9 @@ _FOCUS_COLUMNS: tuple[str, ...] = (
     "ContractedCost", "ChargeCategory", "ChargeClass", "ChargeDescription",
     "ServiceCategory", "ServiceName", "SkuId", "RegionId", "ResourceId",
     "ResourceName", "ResourceType", "ConsumedQuantity", "ConsumedUnit", "Tags",
+    "CommitmentDiscountId", "CommitmentDiscountType", "CommitmentDiscountCategory",
+    "CommitmentDiscountName", "CommitmentDiscountStatus", "CommitmentDiscountQuantity",
+    "CommitmentDiscountUnit", "InvoiceId", "InvoiceIssuerName",
 )
 
 

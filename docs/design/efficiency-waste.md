@@ -48,7 +48,7 @@ rendered by **one** faceted dashboard. New platforms/compute-classes become *row
         register_metrics → metrics.efficiency_record   [NEW]
         sql/010,020,030 (FOCUS, unchanged)   +   sql/050_gold_waste.sql [NEW: classify→recoverable]
                    ▼  COPY per group → atomic publish
-   gold/<provider>/*   gold/shared/tco_*   gold/efficiency/{waste_record,waste_summary_month} [NEW]
+   gold/<provider>/*                       gold/efficiency/{waste_record,waste_summary_month} [NEW]
                    ▼
    dashboard/views/efficiency_waste.py  — ONE leaderboard: recoverable_$ × category × owner × provider
    FUTURE: BigQuery/Snowflake connector → fetch_efficiency() → same record → same gold → same dashboard

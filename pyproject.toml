@@ -2,7 +2,7 @@
 # PyPI name is getflashlight (flashlight is squatted); import + CLI stay `flashlight`
 name = "getflashlight"
 version = "0.2.0"
-description = "FOCUS-based multi-cloud TCO spend-visualization platform"
+description = "FOCUS-based multi-cloud spend-visualization platform"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -21,6 +21,7 @@ dependencies = [
     "databricks-sdk>=0.123.0",
     "duckdb>=1.5.5",
     "httpx>=0.28.1",
+    "keyring>=25.7.0",
     "mcp>=2.0.0",
     "nicegui>=3.15.0",
     "pandas>=3.0.5",
@@ -28,6 +29,8 @@ dependencies = [
     "plotly>=6.9.0",
     "pyarrow>=25.0.0",
     "pydantic>=2.13.4",
+    "pydantic-ai-slim[anthropic,google,openai]>=2.22.0",
+    "pydantic-graph>=2.22.0",
     "pydantic-settings>=2.14.2",
     "python-dotenv>=1.0.1",
     "pyyaml>=6.0.3",

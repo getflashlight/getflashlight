@@ -64,6 +64,7 @@ BRONZE_SCHEMA: pa.Schema = pa.schema(
         ("service_name", pa.string()),
         ("sku_id", pa.string()),
         ("region_id", pa.string()),
+        ("pricing_category", pa.string()),
         # ── Resource ────────────────────────────────────────────────────────
         ("resource_id", pa.string()),
         ("resource_name", pa.string()),
@@ -71,6 +72,16 @@ BRONZE_SCHEMA: pa.Schema = pa.schema(
         # ── Usage ───────────────────────────────────────────────────────────
         ("consumed_quantity", pa.float64()),
         ("consumed_unit", pa.string()),
+        # ── Contract commitment / invoice ───────────────────────────────────
+        ("commitment_discount_id", pa.string()),
+        ("commitment_discount_type", pa.string()),
+        ("commitment_discount_category", pa.string()),
+        ("commitment_discount_name", pa.string()),
+        ("commitment_discount_status", pa.string()),
+        ("commitment_discount_quantity", pa.float64()),
+        ("commitment_discount_unit", pa.string()),
+        ("invoice_id", pa.string()),
+        ("invoice_issuer_name", pa.string()),
         # ── Tags (JSON string) + extensions ─────────────────────────────────
         ("tags", pa.string()),
         ("x_compute_class", pa.string()),
@@ -127,11 +138,27 @@ def record_to_row(
         "service_name": record.service_name,
         "sku_id": record.sku_id,
         "region_id": record.region_id,
+        "pricing_category": record.pricing_category.value if record.pricing_category else None,
         "resource_id": record.resource_id,
         "resource_name": record.resource_name,
         "resource_type": record.resource_type,
         "consumed_quantity": record.consumed_quantity,
         "consumed_unit": record.consumed_unit,
+        "commitment_discount_id": record.commitment_discount_id,
+        "commitment_discount_type": record.commitment_discount_type,
+        "commitment_discount_category": (
+            record.commitment_discount_category.value
+            if record.commitment_discount_category
+            else None
+        ),
+        "commitment_discount_name": record.commitment_discount_name,
+        "commitment_discount_status": (
+            record.commitment_discount_status.value if record.commitment_discount_status else None
+        ),
+        "commitment_discount_quantity": record.commitment_discount_quantity,
+        "commitment_discount_unit": record.commitment_discount_unit,
+        "invoice_id": record.invoice_id,
+        "invoice_issuer_name": record.invoice_issuer_name,
         "tags": json.dumps(record.tags, sort_keys=True),
         "x_compute_class": record.x_compute_class.value,
         "x_focus_version": record.x_focus_version,

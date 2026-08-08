@@ -770,3 +770,146 @@ def test_summary_rolls_up(lake_home) -> None:  # type: ignore[no-untyped-def]
     summary = {str(r["lens"]): r for r in query_view("efficiency.waste_summary_month")}
     assert summary["WASTE"]["recoverable_cost"] == pytest.approx(100.0)
     assert summary["OPPORTUNITY"]["recoverable_cost"] == pytest.approx(140.0)
+
+
+def test_endpoint_waste_classification(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Model Serving endpoints join the existing waste plane as ROWS, not a new view.
+
+    The point of that choice is that `idle` and `failed` — both entity-type-agnostic — fire on
+    an endpoint with no rule of their own. Every branch gets a fires case AND a does-not-fire
+    case, because the does-not-fire ones are where a fabricated finding would appear.
+    """
+    from flashlight.gold.reader import query_view
+    from flashlight.lake import metrics
+    from flashlight.transform.runner import build_gold
+
+    def _ep(entity_id: str, cost: str, **cause: object) -> EfficiencyRecord:
+        activity = cause.pop("activity_count", None)
+        return _rec(
+            entity_id,
+            EntityType.ENDPOINT,
+            cost,
+            activity_count=activity,
+            native_unit="DBU",
+            cause_detail=cause,
+        )
+
+    records = [
+        # idle: a MEASURED zero request count on a billed endpoint → the existing `idle` rule,
+        # full cost, high confidence. No endpoint-specific rule involved.
+        _ep("ep-idle", "400", activity_count=0, serving_mode="provisioned_throughput"),
+        # ...but an UNMEASURED endpoint (activity_count None) must never be called idle.
+        _ep("ep-unmeasured", "400", serving_mode="provisioned_throughput"),
+        # failed: token-metered, so failed_cost is a real allocation → the existing `failed`.
+        _ep(
+            "ep-failed",
+            "300",
+            activity_count=100,
+            serving_mode="pay_per_token",
+            failed_cost=30.0,
+        ),
+        # scale-to-zero off AND low traffic → candidate, unpriced.
+        _ep(
+            "ep-always-on",
+            "200",
+            activity_count=5,
+            serving_mode="provisioned_compute",
+            scale_to_zero_enabled=False,
+            request_count=5,
+        ),
+        # scale-to-zero off but BUSY → must not fire (the traffic justifies always-on).
+        _ep(
+            "ep-busy",
+            "200",
+            activity_count=9_000,
+            serving_mode="provisioned_compute",
+            scale_to_zero_enabled=False,
+            request_count=9_000,
+        ),
+        # scale_to_zero_enabled unmeasured (NULL) on low traffic → must not fire; firing here
+        # would invent a config finding from config we never read.
+        _ep("ep-config-unknown", "200", activity_count=5, request_count=5),
+        # GPU class on low traffic → candidate opportunity, unpriced.
+        _ep(
+            "ep-gpu-quiet",
+            "900",
+            activity_count=10,
+            serving_mode="provisioned_compute",
+            workload_type="GPU_LARGE",
+            request_count=10,
+        ),
+        # GPU class but busy → must not fire.
+        _ep(
+            "ep-gpu-busy",
+            "900",
+            activity_count=50_000,
+            serving_mode="provisioned_compute",
+            workload_type="GPU_LARGE",
+            request_count=50_000,
+        ),
+    ]
+    assert metrics.write_efficiency(_WINDOW, records) == len(records)
+    build_gold()
+    rows = _by_entity_category(query_view("efficiency.waste_record"))
+
+    # The reuse payoff: no new rule, yet both fire on an endpoint.
+    idle = rows[("ep-idle", "idle")]
+    assert idle["recoverable_cost"] == pytest.approx(400.0)
+    assert idle["confidence"] == "high"
+    assert idle["entity_type"] == "endpoint"
+    assert ("ep-unmeasured", "idle") not in rows, "NULL activity is silence, not idleness"
+
+    assert rows[("ep-failed", "failed")]["recoverable_cost"] == pytest.approx(30.0)
+
+    # Endpoint-specific rules: real but unpriced, always candidate.
+    always_on = rows[("ep-always-on", "endpoint_scale_to_zero_disabled")]
+    assert always_on["confidence"] == "candidate"
+    assert always_on["recoverable_cost"] == pytest.approx(0.0)
+    assert always_on["lens"] == "WASTE"
+    assert ("ep-busy", "endpoint_scale_to_zero_disabled") not in rows
+    assert ("ep-config-unknown", "endpoint_scale_to_zero_disabled") not in rows
+
+    gpu = rows[("ep-gpu-quiet", "endpoint_oversized_workload")]
+    assert gpu["confidence"] == "candidate"
+    assert gpu["recoverable_cost"] == pytest.approx(0.0)
+    assert gpu["lens"] == "OPPORTUNITY"
+    assert ("ep-gpu-busy", "endpoint_oversized_workload") not in rows
+
+    # An endpoint has no CPU%, so it is not_applicable — not "we failed to measure it".
+    util = {
+        r["entity_id"]: r
+        for r in query_view("efficiency.utilization_entity_month")
+        if r["entity_type"] == "endpoint"
+    }
+    assert util["ep-idle"]["measurement_status"] == "not_applicable"
+    assert util["ep-idle"]["utilization_pct"] is None
+    # underutilized gates on utilization_pct IS NOT NULL, so it can never fire here.
+    assert not [k for k in rows if k[1] == "underutilized" and k[0].startswith("ep-")]
+
+
+def test_endpoint_tagging_policy(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """The tagging check that makes per-project AI attribution possible.
+
+    Unmeasured (NULL) must read as not_applicable and a measured-empty tag map as
+    non_compliant — collapsing the two would either invent a violation or hide one.
+    """
+    from flashlight.gold.reader import query_view
+    from flashlight.lake import metrics
+    from flashlight.transform.runner import build_gold
+
+    records = [
+        _rec("ep-tagged", EntityType.ENDPOINT, "100", cause_detail={"tag_count": 2}),
+        _rec("ep-untagged", EntityType.ENDPOINT, "100", cause_detail={"tag_count": 0}),
+        _rec("ep-unknown", EntityType.ENDPOINT, "100", cause_detail={}),
+    ]
+    metrics.write_efficiency(_WINDOW, records)
+    build_gold()
+    rows = {
+        str(r["entity_id"]): r
+        for r in query_view("policy.policy_record")
+        if r["policy_category"] == "endpoint_tagging"
+    }
+    assert rows["ep-tagged"]["status"] == "compliant"
+    assert rows["ep-untagged"]["status"] == "non_compliant"
+    assert rows["ep-unknown"]["status"] == "not_applicable"
+    assert "2 tag(s) set" in str(rows["ep-tagged"]["detail"])

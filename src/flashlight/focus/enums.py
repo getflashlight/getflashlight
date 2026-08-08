@@ -36,6 +36,23 @@ class ChargeClass(StrEnum):
     CORRECTION = "Correction"
 
 
+class PricingCategory(StrEnum):
+    """FOCUS PricingCategory — the pricing model behind a charge.
+
+    ``DYNAMIC`` is the FOCUS spec's term for provider-variable pricing the customer
+    can't lock in — on AWS that's exactly Spot (and other interruptible/low-priority
+    pricing); there is no separate "spot" value in FOCUS, this is it. ``COMMITTED``
+    means the charge itself is discounted by an existing commitment (a Reserved
+    Instance/Savings Plan covering it) — distinct from ``STANDARD``, which is the
+    on-demand/negotiated-rate case with no such discount applied.
+    """
+
+    STANDARD = "Standard"
+    DYNAMIC = "Dynamic"
+    COMMITTED = "Committed"
+    OTHER = "Other"
+
+
 class ServiceCategory(StrEnum):
     """FOCUS ServiceCategory — the highest-level grouping of a service."""
 
@@ -64,12 +81,30 @@ class CostMetric(StrEnum):
     CONTRACTED_COST = "ContractedCost"
 
 
+class CommitmentDiscountCategory(StrEnum):
+    """FOCUS CommitmentDiscountCategory — whether the commitment discounts spend or usage."""
+
+    SPEND = "Spend"
+    USAGE = "Usage"
+
+
+class CommitmentDiscountStatus(StrEnum):
+    """FOCUS CommitmentDiscountStatus — whether this charge used the commitment or not."""
+
+    USED = "Used"
+    UNUSED = "Unused"
+
+
 class ComputeClass(StrEnum):
-    """Flashlight extension — drives the TCO double-count guard.
+    """Flashlight extension — how a lakehouse charge is billed against cloud infra.
 
     ``CLASSIC`` compute (customer-managed VMs) is billed by the lakehouse vendor
-    in DBUs *and* by the cloud in separate infra lines → infra is additive.
-    ``SERVERLESS`` compute is billed all-in by the vendor → never add cloud infra.
+    in DBUs *and* by the cloud in separate infra lines. ``SERVERLESS`` compute is
+    billed all-in by the vendor, with no separate cloud infra line.
+
+    Stamped on every Databricks record at ingest (see
+    ``connectors/databricks.py::compute_class_for_sku``) and carried through
+    ``silver.focus_normalized``. Descriptive only — no GOLD view keys off it today.
     """
 
     CLASSIC = "classic"

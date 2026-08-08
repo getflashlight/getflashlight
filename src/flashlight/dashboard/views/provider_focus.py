@@ -5,11 +5,25 @@ so the page reads ``<group>.<view>`` with no ``provider_name`` filter. A per-pag
 date range picker (own state, not shared across page navigations — see
 ``router.py``) drives every panel below it. ``render`` is bound per provider by
 ``router.build_pages()``.
+
+Every provider page carries the same five core tabs — **Trend & changes**, **Breakdown**,
+**Attribution** (``views/attribution.py``), **Efficiency & Waste**
+(``views/efficiency_waste.py``), **Policy Compliance** (``views/policy.py``), and,
+where enabled, **Alerts** (``views/alerts.py``, always last) — plus caller-supplied
+extras.
+``after_breakdown`` inserts spend-detail tabs (Databricks: AI Costs, Databricks Storage)
+right after Breakdown; ``extra_tabs`` follow the core tabs (Databricks: Client Driver
+Health). Attribution and Efficiency & Waste used to be cross-provider pages,
+``/leaderboard`` and ``/utilization``; they are per-provider now because both answer
+questions you ask *about a bill*. Policy Compliance used to be a Databricks-only extra
+tab, which hid rows other providers were already producing — see ``views/policy.py``.
+Alerts holds the MoM callout that used to sit as a header caption under the KPIs.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import date
 
 import pandas as pd
@@ -19,10 +33,12 @@ from nicegui.events import GenericEventArguments
 
 from flashlight.dashboard import chrome, router
 from flashlight.dashboard.chrome import DateState
-from flashlight.dashboard.data import gold_df
+from flashlight.dashboard.data import gold_df, gold_view_published, provider_name_for_group
 from flashlight.dashboard.data import to_date as _d
-from flashlight.dashboard.summary import _service_movers, driver_dim, provider_spend_summary
+from flashlight.dashboard.summary import _service_movers, driver_dim
 from flashlight.dashboard.theme import compact_money, delta_variant, provider_color, rgba_hex
+from flashlight.dashboard.views import alerts, attribution, efficiency_waste, policy
+from flashlight.transform.catalog import provider_view_dimensions
 
 
 def _q(value: str) -> str:
@@ -34,22 +50,156 @@ def _info(text: str) -> None:
     ui.label(text).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
 
 
+@dataclass(frozen=True)
+class Scope:
+    """A page's data scope: one GOLD group, optionally narrowed to a subset of one
+    dimension's values inside it.
+
+    Every provider page is the whole group (``Scope("databricks")``). ``/aws`` is the
+    only narrowed one: the ``aws`` group restricted to Redshift's own FOCUS service
+    names, because the ``aws_focus`` connector ingests a Redshift-scoped slice of the
+    bill. That narrowing is why this exists at all — without it the two pages were two
+    implementations of the same four tabs.
+
+    A view under a narrowed scope is one of **three** things, and collapsing it to two
+    is what forced that fork:
+
+    * **scopable** — carries the narrowing dimension, so the predicate applies.
+    * **account-wide** — belongs to the whole account by nature. Declared in
+      *account_wide*, checked BEFORE the "does it carry the dimension?" test, because
+      ``credits_month`` *does* carry ``service_name`` and must still be read
+      account-wide: AWS applies a credit at account level and often tags it to no
+      service, so filtering would hide part of the discount.
+    * **unavailable** — no narrowing dimension, and the number would be wrong under a
+      narrowed heading (a group total, a percentage, a per-SKU variance, a forecast).
+      :meth:`available` is False and the panel must say why it's absent, never widen
+      silently.
+
+    A panel that takes a plain ``group: str`` rather than a ``Scope`` is one that reads
+    the whole group *by design* — see ``_credits``/``_commitment``.
+    """
+
+    group: str
+    dimension: str | None = None
+    values: tuple[str, ...] = ()
+    account_wide: frozenset[str] = field(default_factory=frozenset)
+
+    @property
+    def narrowed(self) -> bool:
+        return self.dimension is not None and bool(self.values)
+
+    def carries(self, view: str) -> bool:
+        """True when *view* declares this scope's narrowing dimension.
+
+        Read off the GOLD catalog rather than a local list, so widening a view (adding
+        ``service_name`` to ``spend_trend_daily``, say) makes it scopable here with no
+        second edit.
+        """
+        return self.dimension in provider_view_dimensions(view)
+
+    def available(self, view: str) -> bool:
+        """False when *view* cannot honestly serve this scope — see the class docstring."""
+        if not self.narrowed:
+            return True
+        return view in self.account_wide or self.carries(view)
+
+    def predicate(self, view: str) -> str:
+        """This scope's own SQL predicate for *view*; ``""`` when none applies."""
+        if not self.narrowed or view in self.account_wide:
+            return ""
+        if not self.carries(view):
+            raise ValueError(
+                f"{self.group}.{view} carries no {self.dimension} — check "
+                "Scope.available() first, or declare the view account-wide"
+            )
+        vals = ", ".join(f"'{_q(v)}'" for v in self.values)
+        return f"{self.dimension} IN ({vals})"
+
+    def where(self, view: str, *clauses: str) -> str:
+        """A complete ``WHERE …`` clause (or ``""``): *clauses* ANDed with this scope's
+        predicate for *view*, empty ones dropped.
+
+        For an un-narrowed scope this is exactly ``WHERE <clauses>`` — byte-identical to
+        what every panel built before this existed, which is what makes the conversion
+        safe and is pinned by a test over every provider base view.
+        """
+        parts = [c for c in (*clauses, self.predicate(view)) if c]
+        return f"WHERE {' AND '.join(parts)}" if parts else ""
+
+
 def render(
     group: str,
     label: str,
     *,
+    after_breakdown: Sequence[tuple[str, Callable[[date, date], None]]] = (),
     extra_tabs: Sequence[tuple[str, Callable[[], None]]] = (),
+    scope: Scope | None = None,
+    scope_caption: Callable[[date, date], None] | None = None,
+    breakdown_lead: Sequence[Callable[[date, date], None]] = (),
+    extra_kpis: Sequence[Callable[[date, date], chrome.KpiCard | None]] = (),
+    attribution_tab: Callable[[date, date], None] | None = None,
+    efficiency_tab: Callable[[], None] | None = None,
+    show_alerts: bool = True,
 ) -> None:
+    """Render one provider's page.
+
+    The keyword arguments are what let ``/aws`` be a *configuration* of this page rather
+    than a second implementation of it (see ``views/redshift_focus.py``):
+
+    * *scope* narrows every panel to a subset of one dimension's values — ``None`` means
+      the whole group, which is every other provider.
+    * *scope_caption* states the narrowing (and what it therefore hides) under the title.
+    * *breakdown_lead* prepends provider-shaped panels to the Breakdown tab.
+    * *after_breakdown* inserts provider-shaped tabs immediately after Breakdown (spend
+      detail that belongs next to composition — Databricks' AI Costs and Storage). Each
+      callable receives ``(sm, end)`` so those tabs share the page date range.
+    * *extra_tabs* inserts tabs after the core tabs (ops/compliance signals that aren't
+      spend composition — Databricks' Client Driver Health).
+    * *extra_kpis* appends provider-shaped cards to the KPI row — each returning ``None``
+      when it has nothing to report, so a page never carries a "$0" card. A card here is
+      *beside* the headline, never a term in it: Databricks' backing storage is billed by
+      AWS, so the card names its own biller and says it is not inside the net figure
+      (see ``views/backing_storage.kpi_card``).
+    * *attribution_tab* / *efficiency_tab* replace a whole tab, for a page whose version of it
+      is structured differently — Redshift's findings are faceted per *cluster*, finer
+      than per provider, so the shared tab beside them would render the same
+      ``waste_record`` rows twice; and its owner/tag panels are account-wide and have to
+      say so.
+    * *show_alerts* controls the optional Alerts tab. It remains last when enabled;
+      Databricks disables it.
+
+    The five core tab *labels* never vary — a hook changes what's inside a tab or inserts
+    extras around them. Alerts are optional because they are not relevant to every provider.
+    """
+    sc = scope if scope is not None else Scope(group)
     bounds = gold_df(
-        f'SELECT min(charge_day) AS lo, max(charge_day) AS hi FROM "{group}".spend_trend_daily'
+        f'SELECT min(charge_day) AS lo, max(charge_day) AS hi FROM "{group}".spend_trend_daily '
+        + sc.where("spend_trend_daily")
     )
     if bounds.empty or pd.isna(bounds["lo"].iloc[0]):
-        _info(f"No {label} billing data found. Your admin may need to enable the connection.")
+        # A narrowed page has two different reasons to be empty and must not conflate
+        # them: the group genuinely has no billing data, or it has plenty but none of it
+        # is in this page's scope. "Enable the connection" is wrong (and alarming) advice
+        # for the second.
+        if sc.narrowed and not gold_df(f'SELECT 1 FROM "{group}".spend_trend_daily LIMIT 1').empty:
+            _info(
+                f"No {label} spend found in the {group.upper()} bill. The account is "
+                f"connected and billing data is present, but none of it is "
+                f"{label}'s — nothing here is scoped to it."
+            )
+        else:
+            _info(f"No {label} billing data found. Your admin may need to enable the connection.")
         return
 
     lo, hi = _d(bounds["lo"].iloc[0]), _d(bounds["hi"].iloc[0])
     date_state: DateState = {
-        "start": max(lo, chrome.months_back(hi, 6)),
+        # YTD, not a rolling 6 months: a finance question ("what have we spent this year?")
+        # has a fixed anchor, and a rolling window silently redraws every month, so the same
+        # page compared week to week isn't the same window. `chrome.year_start` reads off the
+        # data's last month, so a stale lake opens on its own last year rather than on an
+        # empty January. Early in a calendar year this window is genuinely short — that's the
+        # honest answer to "year to date", and 6mo/12mo are one click away.
+        "start": max(lo, chrome.year_start(hi)),
         "end": hi,
         "bounds_min": lo,
         "bounds_max": hi,
@@ -65,98 +215,661 @@ def render(
         start, end = date_state["start"], date_state["end"]
         sm = start.replace(day=1)
         partial = router.range_has_partial_month(end)
-        cap = f"{label} net cost over the chosen window and what's driving it."
-        if partial:
-            cap += " Partial month — current month is still accruing."
-        chrome.section_caption(cap)
+        if scope_caption is not None:
+            scope_caption(sm, end)
 
-        _kpis(group, label, start, end, sm, accent=accent, partial=partial)
-        ui.markdown(provider_spend_summary(group, label, start, end, partial=partial)).style(
-            f"color:{chrome.INK_SECONDARY};font-size:13px;"
-        )
+        _kpis(sc, label, start, end, sm, partial=partial, extra_kpis=extra_kpis)
 
-        with ui.tabs().classes("w-full") as tabs:
-            tab_trend = ui.tab("Trend & changes")
-            tab_breakdown = ui.tab("Breakdown")
-            tab_tags = ui.tab("Tags")
-            extra_refs = [ui.tab(title) for title, _ in extra_tabs]
-        with ui.tab_panels(tabs, value=tab_trend).classes("w-full").style(
-            "background:transparent;"
-        ):
-            with ui.tab_panel(tab_trend), chrome.panel():
-                _trend(group, label, start, end, accent=accent)
-                _monthly_drill(group, label, end, sm, accent=accent)
-            with ui.tab_panel(tab_breakdown), chrome.panel():
-                _spend_pivot(group, end, sm)
-                _cost_subcategory(group, end, sm)
-                _savings(group, label, end, sm)
-                _driver_mom(group, end)
-            with ui.tab_panel(tab_tags), chrome.panel():
-                _tags(group, label, end, sm)
-            # extra_tabs already draw their own section titles/panels internally,
-            # so no chrome.panel() wrapper here (matches how redshift_focus.render()
-            # wasn't double-wrapped when it was nested under the old AWS tabs).
-            for tab_ref, (_, render_fn) in zip(extra_refs, extra_tabs, strict=True):
-                with ui.tab_panel(tab_ref):
-                    render_fn()
+        # Ordered tab bar: core spend → after_breakdown (Databricks spend detail) →
+        # attribution/efficiency/policy → extra_tabs (ops signals) → optional Alerts.
+        def _panel_trend() -> None:
+            with chrome.panel():
+                _trend(sc, label, start, end, accent=accent)
+            with chrome.panel():
+                # Forecast shares this chart's axis (not a panel of its own) so a
+                # projection can't out-scale an actual month.
+                _monthly_drill(sc, label, end, sm, accent=accent)
+
+        def _panel_breakdown() -> None:
+            # One panel per section — same as Trend & changes. Helpers that can
+            # render nothing (subcategory / credits / commitment) wrap themselves
+            # so an empty bill doesn't leave blank cards. Lead hooks (Redshift's
+            # spend partition) own their own panels too.
+            for lead in breakdown_lead:
+                lead(sm, end)
+            with chrome.panel():
+                _spend_pivot(sc, end, sm)
+            _cost_subcategory(sc, end, sm)
+            _credits(group, end, sm)
+            _commitment(group, end, sm)
+            with chrome.panel():
+                _driver_mom(sc, end)
+
+        def _panel_attribution() -> None:
+            # Own panels — no chrome.panel() wrapper (see views/attribution.py).
+            if attribution_tab is not None:
+                attribution_tab(sm, end)
+            else:
+                attribution.render(group, end, sm)
+
+        def _panel_efficiency() -> None:
+            if efficiency_tab is not None:
+                efficiency_tab()
+            else:
+                efficiency_waste.render(provider_name_for_group(group), label, sm, end)
+
+        def _panel_policy() -> None:
+            policy.render(provider_name_for_group(group), label, end, sm)
+
+        def _panel_alerts() -> None:
+            # monthly_bill has no service dimension, so a narrowed page reads its
+            # headline from the service-dimensioned view instead — otherwise MoM
+            # would report the whole account's spend under a narrowed heading.
+            alert_view = (
+                "monthly_bill" if sc.available("monthly_bill") else "spend_by_service_month"
+            )
+            alerts.render(
+                group,
+                label,
+                start,
+                end,
+                partial=partial,
+                bill_view=alert_view,
+                scope_sql=sc.predicate(alert_view),
+            )
+
+        # after_breakdown callables take (sm, end); wrap so the tab bar stays
+        # Callable[[], None] for every entry.
+        after = [(title, (lambda fn=fn: fn(sm, end))) for title, fn in after_breakdown]
+
+        tab_specs: list[tuple[str, Callable[[], None]]] = [
+            ("Trend & changes", _panel_trend),
+            ("Breakdown", _panel_breakdown),
+            *after,
+            ("Attribution", _panel_attribution),
+            ("Efficiency & Waste", _panel_efficiency),
+            ("Policy Compliance", _panel_policy),
+            *extra_tabs,
+        ]
+        if show_alerts:
+            tab_specs.append(("Alerts", _panel_alerts))
+        # Only the active tab's content is built (chrome.lazy_tab_panels) — every
+        # other tab's queries/charts wait until the user actually clicks it, rather
+        # than all ~9 tabs paying for themselves on every load (see that helper's
+        # docstring for the measured cost this avoids on /databricks).
+        chrome.lazy_tab_panels(tab_specs)
 
     body()
 
 
-def _kpis(
-    group: str, label: str, start: date, end: date, sm: date, *, accent: str, partial: bool
-) -> None:
-    agg = gold_df(
-        "SELECT coalesce(sum(net_cost),0) AS net, coalesce(sum(list_cost),0) AS lst, "
-        f'coalesce(sum(savings),0) AS sav FROM "{group}".monthly_bill '
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}'"
-    ).iloc[0]
-    net, lst, sav = float(agg["net"]), float(agg["lst"]), float(agg["sav"])
-    disc = f"{100 * sav / lst:.1f}%" if lst else "—"
-    span = f"{start:%b %d} → {end:%b %d}" + (" · partial" if partial else "")
-    chrome.kpi_row(
-        [
-            (f"{label} net", compact_money(net), span),
-            (f"{label} list", compact_money(lst), "before discounts", "paid"),
-            (f"{label} savings", compact_money(sav), "vs list", "savings"),
-            ("Realized discount", disc, "off list", "savings"),
-        ],
+def _bill_months(scope: Scope, sm: date, end: date) -> pd.DataFrame:
+    """``(charge_month, net_cost, list_cost, savings)`` for *scope*, month-ordered.
+
+    ``monthly_bill`` for a whole group; the service-dimensioned
+    ``spend_by_service_month`` aggregated to month when narrowed, since ``monthly_bill``
+    carries no service dimension and would report the entire account under a narrowed
+    heading. Both are the same ``sum(cost)``/``sum(list_cost)`` over the same
+    ``silver.focus_normalized``, only grouped finer, so they agree by construction —
+    that reconciliation is pinned in ``tests/test_lake_roundtrip.py`` and is the reason
+    ``list_cost``/``savings`` were added to the service view rather than a service
+    dimension being bolted onto the headline one.
+    """
+    months = f"charge_month >= '{sm}' AND charge_month <= '{end}'"
+    if scope.available("monthly_bill"):
+        return gold_df(
+            "SELECT charge_month, net_cost, list_cost, savings "
+            f'FROM "{scope.group}".monthly_bill {scope.where("monthly_bill", months)} '
+            "ORDER BY charge_month"
+        )
+    return gold_df(
+        "SELECT charge_month, sum(net_cost) AS net_cost, sum(list_cost) AS list_cost, "
+        f'sum(savings) AS savings FROM "{scope.group}".spend_by_service_month '
+        f"{scope.where('spend_by_service_month', months)} "
+        "GROUP BY charge_month ORDER BY charge_month"
     )
 
 
-def _trend(group: str, label: str, start: date, end: date, *, accent: str) -> None:
+def _kpis(
+    scope: Scope,
+    label: str,
+    start: date,
+    end: date,
+    sm: date,
+    *,
+    partial: bool,
+    extra_kpis: Sequence[Callable[[date, date], chrome.KpiCard | None]] = (),
+) -> None:
+    bills = _bill_months(scope, sm, end)
+    if bills.empty:
+        _info(f"No {label} spend in the selected range.")
+        return
+    net = float(bills["net_cost"].sum())
+    lst = float(bills["list_cost"].sum())
+    sav = float(bills["savings"].sum())
+    disc = f"{100 * sav / lst:.1f}%" if lst else "—"
+    # Net and realized discount are one fact: `net + savings = list`. A separate discount
+    # tile crowded the row; the percentage lives in the Net Spend subtitle with the list
+    # denominator (a bare % has no base) and the date span. Green only when there is a
+    # real discount — otherwise the card is just the net figure.
+    net_sub = f"{disc} savings vs. {compact_money(lst)} list"
+    net_card: chrome.KpiCard = (
+        ("Net Spend", compact_money(net), net_sub, "savings")
+        if lst and sav
+        else ("Net Spend", compact_money(net), net_sub)
+    )
+    cards: list[chrome.KpiCard] = [net_card]
+    # Only when there are any: a bill with no credits shouldn't carry a "$0" card. Net
+    # already includes these (EffectiveCost is post-credit) — the card names the swing so
+    # a month that dropped for a one-off discount, not for less usage, reads as one. This
+    # was a Redshift-page-only card; every provider's bill can carry a credit, and the
+    # home page deliberately excludes credits from its headline and points here for them.
+    credits = _credits_total(scope.group, end, sm)
+    if credits:
+        cards.append(
+            (
+                "Credits & Discounts",
+                f"−{compact_money(abs(credits))}",
+                "already in net · itemized under Breakdown",
+                "decrease",
+            )
+        )
+    # Provider-shaped cards sit after this provider's own bill and before the forward-
+    # looking projection, so the row reads: what it cost → what else is attached to it →
+    # where it's heading.
+    cards.extend(card for hook in extra_kpis if (card := hook(sm, end)) is not None)
+    projected = _projected_this_month(scope)
+    if projected is not None:
+        cards.append(projected)
+    chrome.kpi_row(cards)
+
+
+# A run-rate projection is a completed-day mean extended across the month, so its error
+# multiplier is roughly (days in month / history_days). At 1 day that's ~30x — one late
+# billing export and the tile reads a million dollars off (observed: $1.27M projected from
+# $43k actual on a lake with history_days=1). 3 is the smallest window where a single
+# anomalous day can't much more than triple the estimate, and it's reached by the 4th of
+# every month, so the tile is dark for at most a few days. 7 covers the weekday/weekend
+# cycle, the dominant periodicity in cloud spend.
+_RUN_RATE_MIN_DAYS = 3
+_RUN_RATE_LOW_CONFIDENCE_DAYS = 7
+
+
+def _run_rate_card(
+    *, month: date, forecast_cost: float, actual_to_date: float | None, history_days: int
+) -> chrome.KpiCard | None:
+    """The Projected KPI, suppressed when too little history backs it.
+
+    Gated here rather than in ``040_gold_forecast.sql`` on purpose: a two-day mean *is* a
+    valid mean, so NULLing it in GOLD would destroy a number an agent may legitimately
+    want (unlike the `trend` rows, where a hold over fewer than 3 complete months is
+    genuinely meaningless and so is NULL at source). It's the presentation that misleads, and
+    ``spend_forecast_month``'s catalog description carries the same warning so agents get
+    it too.
+
+    Under a week of history the run-rate is too noisy to present as a standalone KPI.
+    The chart still shows its clearly hatched projected remainder; at a week+, the
+    projection is the card.
+    """
+    if history_days < _RUN_RATE_MIN_DAYS:
+        return None
+    if history_days < _RUN_RATE_LOW_CONFIDENCE_DAYS:
+        return None
+    actual = f" · {compact_money(actual_to_date)} so far" if actual_to_date is not None else ""
+    return (
+        "Projected",
+        compact_money(forecast_cost),
+        f"{month:%b %Y} · {history_days}-day run rate{actual}",
+    )
+
+
+def _run_rate_row(scope: Scope) -> tuple[date, float, float | None, int] | None:
+    """The latest month's run-rate forecast row — ``(month, forecast_cost,
+    actual_to_date, history_days)`` — or None if unknowable.
+
+    Shared by the KPI card (:func:`_projected_this_month`) and the monthly chart's
+    partial-month bar segment (:func:`_partial_month_remainder`) so both read the same
+    number instead of two independently-fitted ones.
+
+    Absent from a lake published before the forecast view existed, so the file is
+    checked rather than the query being wrapped in a bare except — a real SQL error
+    should still surface loudly. Also absent under a narrowed scope: the forecast is
+    fitted per provider, so showing it beside narrowed KPIs would project the whole
+    account's run rate onto a subset of it.
+    """
+    if not scope.available("spend_forecast_month"):
+        return None
+    if not gold_view_published(scope.group, "spend_forecast_month"):
+        return None
+    row = gold_df(
+        "SELECT charge_month, forecast_cost, actual_to_date, history_days "
+        f'FROM "{scope.group}".spend_forecast_month '
+        "WHERE forecast_kind = 'run_rate' ORDER BY charge_month DESC LIMIT 1"
+    )
+    if row.empty or row["forecast_cost"].iloc[0] is None:
+        return None
+    actual = row["actual_to_date"].iloc[0]
+    forecast_cost = float(row["forecast_cost"].iloc[0])
+    actual_cost = None if pd.isna(actual) else float(actual)
+    if scope.group == "databricks":
+        backing_forecast, backing_actual = _databricks_backing_run_rate(
+            pd.Timestamp(row["charge_month"].iloc[0]).date(), int(row["history_days"].iloc[0])
+        )
+        forecast_cost += backing_forecast
+        actual_cost = (actual_cost or 0.0) + backing_actual
+    return (
+        pd.Timestamp(row["charge_month"].iloc[0]).date(),
+        forecast_cost,
+        actual_cost,
+        int(row["history_days"].iloc[0]),
+    )
+
+
+def _projected_this_month(scope: Scope) -> chrome.KpiCard | None:
+    """Where the latest month lands at its current run rate, or None if unknowable.
+
+    Only the run_rate row is shown here — it's the number that's actionable mid-month.
+    The 3-month trend rows get their own panel (see :func:`_forecast`).
+    """
+    row = _run_rate_row(scope)
+    if row is None:
+        return None
+    month, forecast_cost, actual_to_date, history_days = row
+    return _run_rate_card(
+        month=month,
+        forecast_cost=forecast_cost,
+        actual_to_date=actual_to_date,
+        history_days=history_days,
+    )
+
+
+def _trend(scope: Scope, label: str, start: date, end: date, *, accent: str) -> None:
+    # GROUP BY charge_day is load-bearing: spend_trend_daily is one row per
+    # (day, service), not per day. Without it px.area gets several points per x and
+    # draws a zig-zag that looks like real volatility rather than a bug.
     trend = gold_df(
-        f'SELECT charge_day, net_cost FROM "{group}".spend_trend_daily '
-        f"WHERE charge_day >= '{start}' AND charge_day <= '{end}' ORDER BY charge_day"
+        f'SELECT charge_day, sum(net_cost) AS net_cost FROM "{scope.group}".spend_trend_daily '
+        + scope.where("spend_trend_daily", f"charge_day >= '{start}'", f"charge_day <= '{end}'")
+        + " GROUP BY charge_day ORDER BY charge_day"
     )
     if trend.empty:
         _info(f"No daily {label} rows in range.")
         return
-    chrome.panel_title("Daily spend")
+    # This series comes only from the Databricks bill. Mapped S3/EC2 infrastructure
+    # costs are currently available at monthly granularity, so calling this total
+    # Databricks spend would imply a completeness it does not have.
+    chrome.panel_title(
+        "Daily Databricks usage (DBUs)" if scope.group == "databricks" else "Daily spend"
+    )
     fig = px.area(trend, x="charge_day", y="net_cost", labels={"charge_day": "", "net_cost": ""})
     fig.update_traces(line_color=accent, fillcolor=rgba_hex(accent, 0.18))
     chrome.plot(chrome.style_fig(fig, has_legend=False))
 
 
-def _monthly_drill(group: str, label: str, end: date, sm: date, *, accent: str) -> None:
-    """Clickable monthly bars → per-SKU or per-service breakdown of *why* a month moved."""
-    id_col, id_label, _ = driver_dim(group)
-    bills = gold_df(
-        f'SELECT charge_month, net_cost FROM "{group}".monthly_bill '
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' ORDER BY charge_month"
+#: The forecast series' legend name. Says "projection" in the legend itself, because the
+#: legend is the one label that stays on screen while a reader is reading the bars.
+FORECAST_SERIES = "Forecast (projection)"
+
+
+def _forecast_series(scope: Scope) -> tuple[pd.DataFrame, str]:
+    """The 3-month trend extrapolation as ``(month, forecast_cost)`` — or a stated reason
+    there isn't one, which the caller renders as a caption under the actuals.
+
+    Returns ``(empty, "")`` only when there is nothing to *say*: no published view at all,
+    or no forecast rows. The two cases that need words get them —
+    ``spend_forecast_month`` NULLs its trend rows until 3 complete months exist (a flat
+    hold over less is meaningless, and drawing nothing there looks like a bug), and a
+    narrowed page has a forecast fitted over the whole provider, which cannot be shown as
+    that page's own.
+
+    Split out of the chart so the forecast can share the actuals' axis: as its own panel it
+    had an independent y-scale, which drew a $14K projection taller than a $40K month.
+    """
+    if not gold_view_published(scope.group, "spend_forecast_month"):
+        return pd.DataFrame(), ""
+    if not scope.available("spend_forecast_month"):
+        return pd.DataFrame(), (
+            "Next 3 months: no forecast at this scope — it is fitted per provider over the "
+            f"whole {scope.group.upper()} bill, and `spend_forecast_month` carries no "
+            f"{scope.dimension} to narrow it by, so showing it here would project the "
+            "whole account's slope onto the subset of it this page covers."
+        )
+    rows = gold_df(
+        "SELECT charge_month, forecast_cost, history_days "
+        f'FROM "{scope.group}".spend_forecast_month '
+        "WHERE forecast_kind = 'trend' ORDER BY charge_month"
     )
+    if rows.empty:
+        return pd.DataFrame(), ""
+    priced = rows[rows["forecast_cost"].notna()]
+    if priced.empty:
+        return pd.DataFrame(), (
+            "Next 3 months: not enough history to project — need 3 complete months "
+            "(the current month never counts). Backfill with "
+            "`flashlight ingest --start <date>` (or raise FLASHLIGHT_INGEST_LOOKBACK_DAYS, "
+            "default 35) and re-run `flashlight transform`."
+        )
+    if scope.group == "databricks":
+        # The DBU forecast is generated in databricks.spend_forecast_month. Add the
+        # identically scoped, AWS-billed infrastructure forecast here so projected bars
+        # reconcile to the actual full-footprint stacks beside them.
+        priced = priced.copy()
+        priced["forecast_cost"] += _databricks_backing_trend_addition(priced)
+    return priced.assign(month=pd.to_datetime(priced["charge_month"]).dt.strftime("%Y-%m")), ""
+
+
+# Which providers get their monthly bar split by service rather than drawn flat.
+# Databricks only, for now: its service names carry real meaning in the FOCUS pull
+# ("Databricks Jobs Compute", "Databricks Serverless SQL"), so the stack answers
+# "why did the month move?" before anyone clicks. Deliberately narrower than
+# `_spend_pivot`'s SKU-for-Databricks rule below and *in tension with* it: SKU is the
+# right grain for a breakdown table, but dozens of SKUs make an unreadable stack,
+# where a handful of services fit the 8-slot palette. Other providers stay flat
+# because a credit lands as a negative service row and would render as a segment
+# below zero on the one chart that's meant to read as "the bill".
+_STACK_BY_SERVICE = frozenset({"databricks"})
+
+
+def _service_order(df: pd.DataFrame) -> list[str]:
+    """Services biggest-first, with the folded "Other" bucket pinned last — so a
+    segment keeps its colour and its position across months instead of shuffling
+    with whichever service happened to appear first in the query result."""
+    totals = df.groupby("service_name")["net_cost"].sum().sort_values(ascending=False)
+    named = [s for s in totals.index if s != chrome.OTHER_SERIES]
+    return named + ([chrome.OTHER_SERIES] if chrome.OTHER_SERIES in totals.index else [])
+
+
+def _monthly_by_service(scope: Scope, end: date, sm: date) -> pd.DataFrame:
+    """Monthly net cost split by service, capped to the palette — or empty if this
+    provider isn't stacked or the view predates the lake.
+
+    ``spend_by_service_month`` is the same ``sum(cost)`` over the same
+    ``silver.focus_normalized`` as ``monthly_bill``, only grouped finer, so the
+    stack's total height still equals the net cost the panel title promises.
+    """
+    if scope.group not in _STACK_BY_SERVICE or not gold_view_published(
+        scope.group, "spend_by_service_month"
+    ):
+        return pd.DataFrame()
+    df = gold_df(
+        f'SELECT charge_month, service_name, sum(net_cost) AS net_cost FROM "{scope.group}"'
+        ".spend_by_service_month "
+        + scope.where(
+            "spend_by_service_month", f"charge_month >= '{sm}'", f"charge_month <= '{end}'"
+        )
+        + " GROUP BY charge_month, service_name ORDER BY charge_month"
+    )
+    return df if df.empty else chrome.cap_series(df, "service_name", "net_cost")
+
+
+#: Same driver names home_overview.py folds into the Home stack — kept identical so a
+#: reader comparing the two pages sees the same label for the same AWS-billed spend.
+_DBX_STORAGE_SERVICE = "Databricks Storage"
+_DBX_COMPUTE_SERVICE = "Databricks Compute"
+
+
+def _databricks_backing_monthly(end: date, sm: date) -> pd.DataFrame:
+    """Databricks-managed Backing storage + Backing compute, monthly — shaped like
+    ``_monthly_by_service``'s own output so it can be concatenated straight onto it.
+
+    Databricks-only (callers gate on ``scope.group == "databricks"``): these are AWS
+    bills, not Databricks' own service breakdown, so appearing in this stack is a
+    deliberate exception, not something every provider's Trend & changes gets. Net
+    Spend (``databricks.monthly_bill``) is unaffected — this only changes what this one
+    chart draws, the same "beside, never inside" rule the KPI cards keep (see
+    ``databricks_footprint.py``, ``backing_storage.py``, ``backing_compute.py``).
+    """
+    frames: list[pd.DataFrame] = []
+    for group, view, service in (
+        ("storage", "backing_storage_month", _DBX_STORAGE_SERVICE),
+        ("compute", "backing_compute_month", _DBX_COMPUTE_SERVICE),
+    ):
+        if not gold_view_published(group, view):
+            continue
+        df = gold_df(
+            f"SELECT charge_month, sum(net_cost) AS net_cost FROM {group}.{view} "
+            f"WHERE mapping = 'databricks' AND charge_month >= '{sm}' AND charge_month <= '{end}' "
+            "GROUP BY charge_month"
+        )
+        if df.empty:
+            continue
+        df["service_name"] = service
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _databricks_backing_run_rate(month: date, history_days: int) -> tuple[float, float]:
+    """Forecast the mapped AWS infrastructure alongside a DBU run rate.
+
+    The backing views are monthly, so their accrued current-month total is extended using
+    the same completed-day count as the DBU forecast.  This keeps the chart's partial
+    actual bar and its hatched remainder on one *full Databricks footprint* basis.
+    """
+    if history_days <= 0:
+        return 0.0, 0.0
+    backing = _databricks_backing_monthly(month, month)
+    if backing.empty:
+        return 0.0, 0.0
+    actual = float(backing["net_cost"].sum())
+    days_in_month = (pd.Timestamp(month) + pd.offsets.MonthBegin(1) - pd.Timestamp(month)).days
+    return round(actual / history_days * days_in_month, 2), actual
+
+
+def _databricks_backing_trend_addition(forecast: pd.DataFrame) -> float:
+    """Trailing-three-month backing-cost mean for a DBU trend forecast.
+
+    A trend row starts in the month after its DBU anchor.  Use only backing months before
+    that anchor, matching the DBU forecast's complete-month rule, then add the same
+    level forecast to each future month.
+    """
+    if forecast.empty:
+        return 0.0
+    first_forecast_month = pd.Timestamp(forecast["charge_month"].min())
+    anchor = (first_forecast_month - pd.offsets.MonthBegin(1)).date()
+    backing = _databricks_backing_monthly(anchor, date(1900, 1, 1))
+    if backing.empty:
+        return 0.0
+    monthly = (
+        backing.assign(charge_month=pd.to_datetime(backing["charge_month"]))
+        .loc[lambda df: df["charge_month"] < pd.Timestamp(anchor)]
+        .groupby("charge_month")["net_cost"]
+        .sum()
+        .sort_index()
+        .tail(3)
+    )
+    return float(monthly.mean()) if not monthly.empty else 0.0
+
+
+def _forecast_marker() -> dict[str, object]:
+    """The hatched, cool-slate marker shared by every projected bar segment — a whole
+    forecast month or a partial-month remainder alike — so "not yet real" always reads
+    the same way. A fresh dict per call: Plotly mutates the figure's marker objects, so
+    two traces must never share one.
+    """
+    return dict(
+        color=rgba_hex(chrome.SEMANTIC["forecast"], 0.55),
+        pattern=dict(
+            shape="/",
+            fgcolor=chrome.SEMANTIC["forecast"],
+            bgcolor=rgba_hex(chrome.SEMANTIC["forecast"], 0.15),
+            size=7,
+            solidity=0.35,
+        ),
+    )
+
+
+def _partial_month_remainder(scope: Scope, bills: pd.DataFrame) -> tuple[str, float] | None:
+    """The still-to-come slice of the current, still-accruing month — or None if it
+    shouldn't be drawn.
+
+    ``bills`` already carries that month's actual-to-date as a real (measured) bar; this
+    returns ``(month, forecast_cost - actual_to_date)`` so the caller can stack it on top,
+    turning a sliver that reads as "the month collapsed" into "realized so far + what the
+    run rate says is coming".
+
+    Gated behind the same ``_RUN_RATE_MIN_DAYS`` floor as the KPI card: under 3 days of
+    history the run rate multiplies a single day by up to ~30, and stacking that onto the
+    chart would draw a bar dwarfing every real month beside it. Also None when the run
+    rate's anchor month isn't the latest month in ``bills`` — that happens right after a
+    month rolls over and only its first day has landed, so `spend_forecast_month` is still
+    anchored on the previous, now-complete month (see ``040_gold_forecast.sql``); that
+    barely-started month gets no bar segment at all until it has enough history of its own.
+    """
+    if bills.empty:
+        return None
+    row = _run_rate_row(scope)
+    if row is None:
+        return None
+    month, forecast_cost, actual_to_date, history_days = row
+    if actual_to_date is None or history_days < _RUN_RATE_MIN_DAYS:
+        return None
+    label = month.strftime("%Y-%m")
+    if label != bills["month"].max():
+        return None
+    remainder = round(forecast_cost - actual_to_date, 2)
+    return (label, remainder) if remainder > 0 else None
+
+
+def _monthly_drill(scope: Scope, label: str, end: date, sm: date, *, accent: str) -> None:
+    """Monthly bars with the 3-month forecast continuing the same axis to the right.
+
+    One chart, not two stacked panels. Past and projected months are the same quantity on
+    the same calendar, so splitting them gave the forecast its own y-scale — which drew a
+    $14K projection as a taller bar than a $40K actual month. Sharing the axis makes the
+    comparison the reader is already making a correct one.
+
+    What keeps that honest is that the forecast bars must never *look* measured: cool slate
+    where the actuals are the palette, hatched where they're solid, named "projection" in
+    the legend, and inert on click (there is no measured month behind them to break down).
+    Click still opens a per-SKU/service drilldown when it lands on an actual bar.
+
+    The current, still-accruing month is the one exception to "a month is either measured
+    or projected, never both": its actual-to-date bar gets a projected remainder stacked
+    on top (:func:`_partial_month_remainder`), so a partial month reads as "realized +
+    projected" instead of a sliver that looks like spend fell off a cliff.
+    """
+    bills = _monthly_by_service(scope, end, sm)
+    stacked = not bills.empty
+    if not stacked:
+        bills = _bill_months(scope, sm, end)[["charge_month", "net_cost"]]
+    backing = pd.DataFrame()
+    if scope.group == "databricks":
+        backing = _databricks_backing_monthly(end, sm)
+        if not backing.empty:
+            if not stacked and not bills.empty:
+                # The non-stacked fallback carries no service_name at all (see
+                # _bill_months) — give the DBU segment one now that Storage/Compute are
+                # about to join it as their own segments, so it doesn't render unlabelled.
+                bills = bills.assign(service_name=f"{label} (DBU)")
+            # A DBU-only chart with nothing else to stack still needs `stacked=True` once
+            # Storage/Compute join it — otherwise the trace-styling branch below treats
+            # this as the single-colour, non-stacked case and every segment renders as
+            # one unlabelled slice of "accent".
+            stacked = True
+            bills = pd.concat([bills, backing], ignore_index=True)
     if bills.empty:
         return
     bills["month"] = pd.to_datetime(bills["charge_month"]).dt.strftime("%Y-%m")
-    chrome.panel_title("Monthly net cost — click a bar to drill in")
-    chrome.section_caption(
-        f"Tip: select a month to see which {id_label.lower()}s drove its change."
-    )
+    forecast, forecast_note = _forecast_series(scope)
+    if not forecast.empty:
+        # A future month with an actual bar never also gets a forecast bar. barmode is
+        # "stack", so the two would pile into one column and read as a total that is part
+        # measured and part invented. This happens when the newest data lands on the 1st
+        # or 2nd of a month: `spend_forecast_month` fits on complete days only, so its
+        # trend projection starts at the previous month.
+        forecast = forecast[~forecast["month"].isin(set(bills["month"]))]
+        # Bars present ⇒ the legend names them; no prose caveat under the title. Only for
+        # the trend itself — the "why no 3-month forecast" note is about the next 3
+        # months, a separate question from whether *this* month gets a remainder bar
+        # below, so `remainder` never touches it.
+        forecast_note = ""
+    remainder = _partial_month_remainder(scope, bills)
+    if not forecast.empty:
+        title = "Monthly net cost & 3-month forecast"
+    elif remainder is not None:
+        title = "Monthly net cost & month-to-date projection"
+    else:
+        title = "Monthly net cost"
+    chrome.panel_title(title)
+    if forecast_note:
+        # Only the "why there's no forecast" states (unpublished / not scopable / <3 months).
+        chrome.section_caption(forecast_note)
     fig = px.bar(
-        bills, x="month", y="net_cost", custom_data=["month"], labels={"month": "", "net_cost": ""}
+        bills,
+        x="month",
+        y="net_cost",
+        # A stack needs the palette, not the provider's single accent hue — and its
+        # segments are ordered by total spend so the largest service is the same
+        # colour in the same place every month (identity, never rank).
+        color="service_name" if stacked else None,
+        color_discrete_sequence=list(chrome.CATEGORICAL_SLOTS) if stacked else None,
+        category_orders={"service_name": _service_order(bills)} if stacked else None,
+        barmode="stack",
+        custom_data=["month"],
+        labels={"month": "", "net_cost": "", "service_name": ""},
     )
-    fig.update_traces(marker_color=accent)
-    chart = chrome.plot(chrome.style_fig(fig, has_legend=False, category_x=True))
+    if not stacked:
+        fig.update_traces(marker_color=accent, name=f"{label} net", showlegend=True)
+    if not forecast.empty:
+        fig.add_bar(
+            x=list(forecast["month"]),
+            y=[float(v) for v in forecast["forecast_cost"]],
+            name=FORECAST_SERIES,
+            legendgroup="forecast",
+            # No custom_data: _on_click reads it to identify the clicked month, and its
+            # absence is exactly how a forecast bar declines to be drilled into.
+            marker=_forecast_marker(),
+            hovertemplate="%{x}<br>forecast $%{y:,.0f}<extra></extra>",
+        )
+    if remainder is not None:
+        remainder_month, remainder_cost = remainder
+        fig.add_bar(
+            x=[remainder_month],
+            y=[remainder_cost],
+            name=FORECAST_SERIES,
+            legendgroup="forecast",
+            # Share one legend entry with the whole-month forecast bars when both are
+            # present; stand in for it alone otherwise (<3 complete months ⇒ no trend).
+            showlegend=forecast.empty,
+            marker=_forecast_marker(),
+            # Its own wording: this segment projects only the rest of a month that's
+            # already partly real, not the whole month like the trend bars above.
+            hovertemplate="%{x}<br>projected remainder $%{y:,.0f}<extra></extra>",
+        )
+    if not forecast.empty or remainder is not None:
+        # An explicit category order: with a categorical x-axis Plotly orders by first
+        # appearance per trace, so a forecast month could otherwise land left of an actual.
+        # forecast may be the bare-empty DataFrame from _forecast_series (no "month"
+        # column at all) when only the remainder segment is present, hence the guard.
+        forecast_months = set(forecast["month"]) if not forecast.empty else set()
+        fig.update_xaxes(
+            categoryorder="array",
+            categoryarray=sorted({*bills["month"], *forecast_months}),
+        )
+    if stacked:
+        # A stack answers "what made up the month?"; it can't also answer "how big was
+        # the month?" without a reader summing 6-8 thin segments by eye. One text label
+        # per bar — the full stack height, actual plus whatever's projected on top of
+        # it — answers that directly, without a redundant "Total" legend entry.
+        totals: dict[str, float] = bills.groupby("month")["net_cost"].sum().to_dict()
+        if not forecast.empty:
+            for m, v in zip(forecast["month"], forecast["forecast_cost"], strict=True):
+                totals[m] = totals.get(m, 0.0) + float(v)
+        if remainder is not None:
+            remainder_month, remainder_cost = remainder
+            totals[remainder_month] = totals.get(remainder_month, 0.0) + remainder_cost
+        for month, total in totals.items():
+            fig.add_annotation(
+                x=month,
+                y=total,
+                text=compact_money(total),
+                showarrow=False,
+                yshift=10,
+                font=dict(size=11, color=chrome.INK_SECONDARY),
+            )
+    # The legend is what tells actuals from projection, so it's on whenever either the
+    # stack or a projection is present — not only for the stack.
+    has_legend = stacked or not forecast.empty or remainder is not None
+    chart = chrome.plot(chrome.style_fig(fig, has_legend=has_legend, category_x=True))
 
     drill_container = ui.column().classes("w-full gap-4")
 
@@ -166,79 +879,127 @@ def _monthly_drill(group: str, label: str, end: date, sm: date, *, accent: str) 
         if picked is None:
             return
         with drill_container:
-            _drilldown(group, picked)
+            _drilldown(scope, picked)
 
     def _on_click(e: GenericEventArguments) -> None:
         points = e.args.get("points") or []
-        if points:
-            drill_body.refresh(str(points[0]["customdata"][0]))
+        # A forecast bar carries no customdata, so clicking one is a no-op rather than a
+        # KeyError — and rather than a drilldown of a month that hasn't happened.
+        custom = points[0].get("customdata") if points else None
+        if custom:
+            drill_body.refresh(str(custom[0]))
 
     chart.on("plotly_click", _on_click)
 
 
-def _drill_movers(group: str, month: date, prior: date) -> pd.DataFrame:
+def _drill_movers(scope: Scope, month: date, prior: date) -> pd.DataFrame:
+    group = scope.group
     id_col, _, _ = driver_dim(group)
     if group == "databricks":
         return gold_df(
             f"SELECT {id_col}, net_cost, cost_delta, volume_effect, rate_effect, cost_pct_change "
-            f'FROM "{group}".sku_month_over_month WHERE charge_month = \'{month}\' '
+            f"FROM \"{group}\".sku_month_over_month WHERE charge_month = '{month}' "
             "AND cost_delta IS NOT NULL ORDER BY abs(cost_delta) DESC LIMIT 15"
         )
-    svc = _service_movers(group, month, prior).head(15)
+    svc = _service_movers(
+        group, month, prior, scope_sql=scope.predicate("spend_by_service_month")
+    ).head(15)
     return svc.rename(columns={"k": id_col})
 
 
-def _drilldown(group: str, month_label: str) -> None:
+def _drilldown(scope: Scope, month_label: str) -> None:
     """Render the month-over-month breakdown for the clicked month."""
+    group = scope.group
     m = pd.Timestamp(f"{month_label}-01")
     prior = m - pd.DateOffset(months=1)
 
-    agg = gold_df(
-        "SELECT coalesce(sum(net_cost),0) AS net, coalesce(sum(cost_delta),0) AS delta, "
-        "coalesce(sum(volume_effect),0) AS vol, coalesce(sum(rate_effect),0) AS rate, "
-        "count(prev_cost) AS comparable "
-        f'FROM "{group}".sku_month_over_month WHERE charge_month = \'{m.date()}\''
-    ).iloc[0]
-    if int(agg["comparable"]) == 0:
-        _info(f"No prior month to compare {m:%b %Y} against — it's the earliest in the data.")
-        return
+    movers = _drill_movers(scope, m.date(), prior.date())
+    decomposed = scope.available("sku_month_over_month")
 
-    net, delta, vol, rate = (float(agg[k]) for k in ("net", "delta", "vol", "rate"))
+    if decomposed:
+        agg = gold_df(
+            "SELECT coalesce(sum(net_cost),0) AS net, coalesce(sum(cost_delta),0) AS delta, "
+            "coalesce(sum(volume_effect),0) AS vol, coalesce(sum(rate_effect),0) AS rate, "
+            "count(prev_cost) AS comparable "
+            f"FROM \"{group}\".sku_month_over_month WHERE charge_month = '{m.date()}'"
+        ).iloc[0]
+        if int(agg["comparable"]) == 0:
+            _info(f"No prior month to compare {m:%b %Y} against — it's the earliest in the data.")
+            return
+        net, delta, vol, rate = (float(agg[k]) for k in ("net", "delta", "vol", "rate"))
+    else:
+        # `sku_month_over_month` is per-SKU across the whole provider and carries no
+        # service dimension, so at a narrowed scope its totals are the WHOLE account's —
+        # reading them here would print the entire AWS bill's delta under a Redshift
+        # heading. Derive the headline from this scope's own service movers instead, and
+        # say plainly that the volume/rate split isn't available (it exists only in the
+        # per-SKU view, which can't be narrowed).
+        if movers.empty:
+            _info(f"No prior month to compare {m:%b %Y} against — it's the earliest in the data.")
+            return
+        net = float(movers["net_cost"].sum())
+        delta = float(movers["cost_delta"].sum())
+        vol = rate = 0.0
+
     sign = "↑" if delta >= 0 else "↓"
     chrome.panel_title(f"Why did {m:%b %Y} change?")
-    chrome.section_caption(
+    caption = (
         f"Net cost {compact_money(net)} · {sign} {compact_money(abs(delta))} vs {prior:%b %Y}. "
-        "Volume = usage changed; Rate = price/mix changed (the two sum to the change)."
     )
+    caption += (
+        "Volume = usage changed; Rate = price/mix changed (the two sum to the change)."
+        if decomposed
+        else (
+            "No volume/rate split at this scope: that decomposition lives in the per-SKU "
+            f"variance view, which carries no {scope.dimension} to narrow by. The movers "
+            "below are this page's own services."
+        )
+    )
+    chrome.section_caption(caption)
 
     def _signed(v: float) -> str:
         return f"{'+' if v >= 0 else '−'}{compact_money(abs(v))}"
 
-    chrome.kpi_row(
-        [
-            (f"{m:%b %Y} net", compact_money(net), "after credits"),
-            ("Change vs prior", _signed(delta), f"vs {prior:%b}", delta_variant(delta)),
+    cards: list[chrome.KpiCard] = [
+        (f"{m:%b %Y} net", compact_money(net), "after credits"),
+        ("Change vs prior", _signed(delta), f"vs {prior:%b}", delta_variant(delta)),
+    ]
+    if decomposed:
+        cards += [
             ("Volume effect", _signed(vol), "usage", "volume"),
             ("Rate effect", _signed(rate), "price / mix", "rate"),
-        ],
-    )
+        ]
+    chrome.kpi_row(cards)
 
-    effects = pd.DataFrame(
-        [{"component": "Volume", "effect": vol}, {"component": "Rate", "effect": rate}]
-    )
-    fig = px.bar(
-        effects,
-        x="component",
-        y="effect",
-        color="component",
-        color_discrete_map={"Volume": chrome.SEMANTIC["volume"], "Rate": chrome.SEMANTIC["rate"]},
-        labels={"component": "", "effect": ""},
-    )
-    fig.update_layout(showlegend=False)
-    chrome.panel_title(f"What drove the change · {m:%b %Y}")
-    chrome.plot(chrome.style_fig(fig, has_legend=False))
+    if decomposed:
+        effects = pd.DataFrame(
+            [{"component": "Volume", "effect": vol}, {"component": "Rate", "effect": rate}]
+        )
+        fig = px.bar(
+            effects,
+            x="component",
+            y="effect",
+            color="component",
+            color_discrete_map={
+                "Volume": chrome.SEMANTIC["volume"],
+                "Rate": chrome.SEMANTIC["rate"],
+            },
+            labels={"component": "", "effect": ""},
+        )
+        fig.update_layout(showlegend=False)
+        for _, r in effects.iterrows():
+            fig.add_annotation(
+                x=r["component"],
+                y=r["effect"],
+                text=_signed(float(r["effect"])),
+                showarrow=False,
+                yshift=10 if r["effect"] >= 0 else -10,
+                yanchor="bottom" if r["effect"] >= 0 else "top",
+                font=dict(size=11, color=chrome.INK_SECONDARY),
+            )
+        chrome.panel_title(f"What drove the change · {m:%b %Y}")
+        chrome.plot(chrome.style_fig(fig, has_legend=False))
 
-    movers = _drill_movers(group, m.date(), prior.date())
     if movers.empty:
         return
     id_col, id_label, _ = driver_dim(group)
@@ -310,7 +1071,7 @@ def _driver_detail(group: str, m: pd.Timestamp, prior: pd.Timestamp, drivers: li
             else:
                 _resource_breakdown(group, "service_name", _q(selected), selected, m, prior, months)
                 chrome.section_caption(
-                    "Team/project tags are on the Tags tab — they span all services."
+                    "Team/project tags are on the Attribution tab — they span all services."
                 )
 
     ui.select(
@@ -359,16 +1120,18 @@ def _resource_breakdown(
         num_cols=["qty_delta"],
         pct_cols=["pct"],
         rename={
-            "resource_name": "Resource", "resource_type": "Type", "sub_account_id": "Workspace",
-            "cur": f"{m:%b} net", "delta": "Δ vs prior", "qty_delta": f"Usage Δ ({unit})",
+            "resource_name": "Resource",
+            "resource_type": "Type",
+            "sub_account_id": "Workspace",
+            "cur": f"{m:%b} net",
+            "delta": "Δ vs prior",
+            "qty_delta": f"Usage Δ ({unit})",
             "pct": "MoM %",
         },
     )
 
 
-def _tag_breakdown(
-    group: str, sku: str, m: pd.Timestamp, prior: pd.Timestamp, months: str
-) -> None:
+def _tag_breakdown(group: str, sku: str, m: pd.Timestamp, prior: pd.Timestamp, months: str) -> None:
     """Attribute the chosen SKU's spend to a project/team tag, surfacing the untagged remainder."""
     keys = gold_df(
         f'SELECT tag_key, sum(net_cost) AS net FROM "{group}".spend_by_sku_tag_month '
@@ -419,13 +1182,18 @@ def _tag_breakdown(
     _tag_body(default)
 
 
-def _spend_pivot(group: str, end: date, sm: date) -> None:
+def _spend_pivot(scope: Scope, end: date, sm: date) -> None:
     """Top cost drivers as a <dim> × month spend matrix with reconciling row/col totals.
 
     Pivots on SKU for Databricks (its service names — JOBS, SQL — are too coarse; the
     SKU id carries the real detail) and on service for everyone else (where names like
     'Amazon EC2' are meaningful).
+
+    Note the deliberate disagreement with ``_STACK_BY_SERVICE`` above, which splits the
+    Databricks *monthly bar* by service: a table can carry dozens of SKU rows, a stacked
+    bar cannot, so the coarser dimension wins there and the finer one wins here.
     """
+    group = scope.group
     if group == "databricks":
         dim, view, label = "sku_id", "spend_by_sku_month", "SKU"
     else:
@@ -435,8 +1203,8 @@ def _spend_pivot(group: str, end: date, sm: date) -> None:
     df = gold_df(
         f"SELECT {dim} AS k, charge_month, sum(net_cost) AS net_cost "
         f'FROM "{group}".{view} '
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
-        f"GROUP BY {dim}, charge_month"
+        + scope.where(view, f"charge_month >= '{sm}'", f"charge_month <= '{end}'")
+        + f" GROUP BY {dim}, charge_month"
     )
     if df.empty:
         _info(f"No {label.lower()} rows in range.")
@@ -472,84 +1240,222 @@ def _spend_pivot(group: str, end: date, sm: date) -> None:
     )
 
 
-def _cost_subcategory(group: str, end: date, sm: date) -> None:
+def _cost_subcategory(scope: Scope, end: date, sm: date) -> None:
     """Below-SKU cost breakdown, only where a connector stamps ``x_cost_subcategory``
-    (currently: Redshift compute/concurrency-scaling/storage/spectrum-scan/serverless).
-    Renders nothing for services that don't populate it.
+    (Redshift compute/concurrency-scaling/storage/spectrum-scan/serverless, and S3
+    storage/requests/data-transfer/monitoring/early-delete). Renders nothing for
+    services that don't populate it.
+
+    Takes a :class:`Scope`, not a bare ``group``, and that's load-bearing rather than
+    tidiness: the view carries ``service_name``, so on ``/aws`` — a Redshift-scoped page
+    over a group that also holds S3 — a bare group read would silently grow a second pie
+    titled "Amazon Simple Storage Service" under a Redshift heading. It was unscoped only
+    while Redshift was the sole ``x_cost_subcategory`` producer.
     """
+    where = scope.where(
+        "spend_by_cost_subcategory_month",
+        f"charge_month >= '{sm}'",
+        f"charge_month <= '{end}'",
+    )
     df = gold_df(
         "SELECT service_name, cost_subcategory, sum(net_cost) AS net_cost "
-        f'FROM "{group}".spend_by_cost_subcategory_month '
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
+        f'FROM "{scope.group}".spend_by_cost_subcategory_month {where} '
         "GROUP BY service_name, cost_subcategory"
     )
     if df.empty:
         return
-    chrome.panel_title("Cost subcategory breakdown")
-    chrome.section_caption(
-        "Spend below SKU granularity, where a connector supplies it "
-        "(e.g. Redshift compute vs concurrency-scaling vs storage vs Spectrum scan)."
-    )
-    with ui.row().classes("w-full gap-4 flex-wrap"):
-        for service_name, sub in df.groupby("service_name"):
-            with ui.column().classes("gap-0").style("min-width:280px;flex:1;"):
-                ui.label(str(service_name)).classes("text-sm").style(f"color:{chrome.INK_SECONDARY}")
-                pie = px.pie(sub, names="cost_subcategory", values="net_cost", hole=0.45)
-                pie.update_traces(textposition="inside", textinfo="percent+label")
-                chrome.plot(chrome.style_fig(pie, has_legend=False, currency_axis=None))
+    with chrome.panel():
+        chrome.panel_title("Cost subcategory breakdown")
+        with ui.row().classes("w-full gap-4 flex-wrap"):
+            for service_name, sub in df.groupby("service_name"):
+                with ui.column().classes("gap-0").style("min-width:280px;flex:1;"):
+                    ui.label(str(service_name)).classes("text-sm").style(
+                        f"color:{chrome.INK_SECONDARY}"
+                    )
+                    pie = px.pie(sub, names="cost_subcategory", values="net_cost", hole=0.45)
+                    pie.update_traces(textposition="inside", textinfo="percent+label")
+                    chrome.plot(chrome.style_fig(pie, has_legend=False, currency_axis=None))
 
 
-def _savings(group: str, label: str, end: date, sm: date) -> None:
-    sv = gold_df(
-        "SELECT charge_month, effective_cost, savings, list_cost, savings_pct "
-        f'FROM "{group}".savings_summary_month '
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' AND list_cost >= 1 "
-        "ORDER BY charge_month"
+def _commitment(group: str, end: date, sm: date) -> None:
+    """RI/Savings-Plan commitment coverage — Used vs Unused $. Renders nothing where
+    the provider has no commitment data (e.g. Databricks — no system table exposes
+    reservation/savings-plan data, see gold.commitment_summary_month's own docstring).
+
+    Three things this has to get right, all learned from real AWS data:
+
+    * **The headline % excludes the current month.** A month two days in shows almost all
+      of its commitment as Unused simply because nothing has drawn it down yet (observed:
+      $38.8k Unused vs $2.5k Used on the 2nd), which reads as a catastrophic 94% waste
+      rate. The percentage uses complete months only — the same discipline ``_driver_mom``
+      applies — while the chart still shows every month in range, current one labelled.
+    * **NULL-status commitment spend is disclosed, not silently dropped.** The chart is
+      rightly Used-vs-Unused only, but those rows still carry real dollars (including
+      negative corrective lines — observed: −$41,284.75), and excluding them from the
+      denominator without saying so overstates the split's coverage.
+    * **A negative total can't produce a percentage.** ``if total`` passes for a negative
+      sum and yields a nonsense figure, so the guard is ``> 0``.
+    """
+    current = _d(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
+    window = f"charge_month >= '{sm}' AND charge_month <= '{end}'"
+    cm = gold_df(
+        "SELECT charge_month, commitment_discount_status, sum(effective_cost) AS cost "
+        f'FROM "{group}".commitment_summary_month WHERE {window} '
+        "AND commitment_discount_status IS NOT NULL "
+        "GROUP BY charge_month, commitment_discount_status"
     )
-    if sv.empty:
+    if cm.empty:
         return
-    latest = sv.iloc[-1]
-    chrome.panel_title("Bill: list vs effective")
-    chrome.section_caption(
-        f"Effective + savings = list. Latest month · {latest['savings_pct']:.1f}% off list."
+
+    complete = cm[pd.to_datetime(cm["charge_month"]).dt.date < current]
+    basis = complete if not complete.empty else cm
+    unused = float(basis.loc[basis["commitment_discount_status"] == "Unused", "cost"].sum())
+    total = float(basis["cost"].sum())
+    pct = f"{100 * unused / total:.1f}%" if total > 0 else "—"
+    scope = (
+        "complete months only"
+        if not complete.empty
+        else "this window — no complete month in range yet, so treat it as provisional"
     )
-    melt = sv.copy()
-    melt["month"] = pd.to_datetime(melt["charge_month"]).dt.strftime("%Y-%m")
-    melt = melt.melt(
-        id_vars="month",
-        value_vars=["effective_cost", "savings"],
-        var_name="component",
-        value_name="cost",
+    caption = (
+        "Reserved Instance / Savings Plan spend, split by whether it was drawn down. "
+        f"{pct} of commitment spend was Unused ({scope}) — that's recoverable."
     )
-    melt["component"] = melt["component"].map(
-        {"effective_cost": "Effective (paid)", "savings": "Savings (discount)"}
-    )
+
+    # The rows the Used/Unused split leaves out. Queried separately rather than folded in,
+    # because they belong in the caption as a caveat, not on the chart as a third bar.
+    # The `negative` figure is per already-aggregated (month, type, category) row — GOLD
+    # sums line items, so an individual negative line that nets positive within its own
+    # group is not visible here, and claiming otherwise would overstate what we can see.
+    other = gold_df(
+        "SELECT coalesce(sum(effective_cost), 0) AS cost, "
+        "coalesce(sum(effective_cost) FILTER (WHERE effective_cost < 0), 0) AS negative "
+        f'FROM "{group}".commitment_summary_month WHERE {window} '
+        "AND commitment_discount_status IS NULL"
+    ).iloc[0]
+    other_cost, negative = float(other["cost"]), float(other["negative"])
+    if other_cost or negative:
+        caption += (
+            f" A further {compact_money(other_cost)} carries no CommitmentDiscountStatus "
+            "and is excluded from this split"
+        )
+        caption += (
+            f" (net of {compact_money(negative)} in negative corrections)." if negative else "."
+        )
+
+    plot_rows = cm.groupby("commitment_discount_status", as_index=False)["cost"].sum()
     fig = px.bar(
-        melt,
-        x="month",
+        plot_rows,
+        x="commitment_discount_status",
         y="cost",
-        color="component",
-        barmode="stack",  # stacked, so the full bar height = list cost (Grafana-style)
+        color="commitment_discount_status",
         color_discrete_map={
-            "Effective (paid)": chrome.SEMANTIC["paid"],
-            "Savings (discount)": chrome.SEMANTIC["savings"],
+            "Used": chrome.ACCENT,
+            "Unused": chrome.WASTE,
         },
-        category_orders={"component": ["Effective (paid)", "Savings (discount)"]},
-        labels={"month": "", "cost": "", "component": ""},
+        labels={"commitment_discount_status": "", "cost": ""},
     )
-    chrome.plot(chrome.style_fig(fig, has_legend=True, category_x=True))
+    fig.update_layout(showlegend=False)
+    for _, r in plot_rows.iterrows():
+        fig.add_annotation(
+            x=r["commitment_discount_status"],
+            y=r["cost"],
+            text=compact_money(float(r["cost"])),
+            showarrow=False,
+            yshift=10,
+            font=dict(size=11, color=chrome.INK_SECONDARY),
+        )
+    with chrome.panel():
+        chrome.panel_title("Commitment coverage")
+        chrome.section_caption(caption)
+        if not complete.empty and len(complete) != len(cm):
+            chrome.section_caption(
+                f"Chart includes the in-progress month ({current:%b %Y}), which will look "
+                "under-drawn until it completes."
+            )
+        chrome.plot(chrome.style_fig(fig, has_legend=False, category_x=True))
 
 
-def _driver_mom(group: str, end: date) -> None:
+def _credits_df(group: str, end: date, sm: date) -> pd.DataFrame:
+    """Credit/adjustment lines for *group* in range, newest month first.
+
+    Empty frame when the group has no credits, or when the lake predates
+    ``gold.credits_month`` (published but not re-transformed since) — callers render
+    nothing rather than raising, same guard as every other newer-view read here.
+    """
+    if not gold_view_published(group, "credits_month"):
+        return pd.DataFrame()
+    return gold_df(
+        "SELECT charge_month, charge_description, charge_category, service_name, "
+        "sum(net_cost) AS net_cost, sum(line_count) AS line_count "
+        f'FROM "{group}".credits_month '
+        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
+        "GROUP BY charge_month, charge_description, charge_category, service_name "
+        "ORDER BY charge_month DESC, net_cost"
+    )
+
+
+def _credits_total(group: str, end: date, sm: date) -> float:
+    """Signed (negative) sum of *group*'s credits in range; 0.0 when there are none."""
+    df = _credits_df(group, end, sm)
+    return float(df["net_cost"].sum()) if not df.empty else 0.0
+
+
+def _credits(group: str, end: date, sm: date) -> None:
+    """Discounts & credits, itemized by credit line.
+
+    The home page deliberately leaves credits out of its headline — a one-off credit
+    swings a month without any usage changing — and points here for the detail, so this
+    is where they're named rather than just netted. Renders nothing when the bill carries
+    none (absence needs no explanation: no credits means no credits).
+    """
+    df = _credits_df(group, end, sm)
+    if df.empty:
+        return
+    total = abs(float(df["net_cost"].sum()))
+    display = df.assign(charge_month=pd.to_datetime(df["charge_month"]).dt.strftime("%b %Y"))
+    with chrome.panel():
+        chrome.panel_title("Discounts & credits")
+        chrome.section_caption(
+            f"−{compact_money(total)} applied in this window, by credit line. Negative = money "
+            "off the bill. Already netted into every other figure on this page (EffectiveCost "
+            "is post-credit), so don't subtract it again. Includes account-level credits the "
+            "provider doesn't tag to a service."
+        )
+        chrome.flat_table(
+            display,
+            key=f"credits_{group}",
+            money_cols=["net_cost"],
+            int_cols=["line_count"],
+            rename={
+                "charge_month": "Month",
+                "charge_description": "Credit / adjustment",
+                "charge_category": "Category",
+                "service_name": "Service",
+                "net_cost": "Amount",
+                "line_count": "Lines",
+            },
+        )
+
+
+def _driver_mom(scope: Scope, end: date) -> None:
+    group = scope.group
     id_col, id_label, _ = driver_dim(group)
     chrome.panel_title(f"{id_label} month-over-month")
     # Compare the latest COMPLETE month (exclude the current, still-accruing month) so
-    # we never pit a partial month against a full one.
+    # we never pit a partial month against a full one. Narrowed pages discover that month
+    # from their own scoped rows: a month in which only services outside this page's scope
+    # billed is not a month this page can compare.
     current = pd.Timestamp(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
+    month_view = (
+        "sku_month_over_month"
+        if scope.available("sku_month_over_month")
+        else "spend_by_service_month"
+    )
     months = gold_df(
-        f'SELECT DISTINCT charge_month FROM "{group}".sku_month_over_month '
-        f"WHERE charge_month <= '{end}' AND charge_month < '{current.date()}' "
-        "ORDER BY charge_month DESC LIMIT 1"
+        f'SELECT DISTINCT charge_month FROM "{group}".{month_view} '
+        + scope.where(month_view, f"charge_month <= '{end}'", f"charge_month < '{current.date()}'")
+        + " ORDER BY charge_month DESC LIMIT 1"
     )
     if months.empty:
         chrome.section_caption("Not enough complete months in range to compare.")
@@ -562,7 +1468,7 @@ def _driver_mom(group: str, end: date) -> None:
     if group == "databricks":
         mom = gold_df(
             f"SELECT {id_col}, net_cost, cost_delta, cost_pct_change "
-            f'FROM "{group}".sku_month_over_month WHERE charge_month = \'{cmp_month.date()}\' '
+            f"FROM \"{group}\".sku_month_over_month WHERE charge_month = '{cmp_month.date()}' "
             "ORDER BY net_cost DESC LIMIT 20"
         )
         if mom.empty:
@@ -581,7 +1487,12 @@ def _driver_mom(group: str, end: date) -> None:
             },
         )
         return
-    svc = _service_movers(group, cmp_month.date(), prior.date()).head(20)
+    svc = _service_movers(
+        group,
+        cmp_month.date(),
+        prior.date(),
+        scope_sql=scope.predicate("spend_by_service_month"),
+    ).head(20)
     if svc.empty:
         _info(f"No {id_label.lower()} movement rows for the latest complete month.")
         return
@@ -598,49 +1509,3 @@ def _driver_mom(group: str, end: date) -> None:
             "cost_pct_change": "MoM %",
         },
     )
-
-
-def _tags(group: str, label: str, end: date, sm: date) -> None:
-    keys = gold_df(
-        f'SELECT tag_key, sum(net_cost) AS net FROM "{group}".spend_by_tag_month '
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
-        "GROUP BY tag_key ORDER BY net DESC"
-    )
-    chrome.panel_title("Spend by tag")
-    if keys.empty:
-        _info("No tagged spend in range.")
-        return
-
-    options = keys["tag_key"].tolist()
-    default = "team" if "team" in options else options[0]
-
-    body_container = ui.column().classes("w-full gap-4")
-
-    @ui.refreshable
-    def _tag_values(sel: str) -> None:
-        body_container.clear()
-        with body_container:
-            chrome.section_caption(f"{label} spend broken down by the `{sel}` tag")
-            tags = gold_df(
-                f"SELECT tag_value, sum(net_cost) AS net_cost FROM \"{group}\".spend_by_tag_month "
-                f"WHERE tag_key = '{sel}' AND charge_month >= '{sm}' AND charge_month <= '{end}' "
-                "GROUP BY tag_value ORDER BY net_cost DESC LIMIT 20"
-            )
-            if tags.empty:
-                _info("No values for this tag in range.")
-                return
-            chrome.searchable_table(
-                tags,
-                key=f"{group}_tags",
-                search_col="tag_value",
-                money_cols=["net_cost"],
-                rename={"tag_value": sel, "net_cost": "Net cost"},
-            )
-
-    (
-        ui.select(options=options, value=default, on_change=lambda e: _tag_values.refresh(e.value))
-        .props("dense outlined")
-        .classes("w-48")
-        .style(f"color:{chrome.INK_PRIMARY}")
-    )
-    _tag_values(default)

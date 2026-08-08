@@ -2,21 +2,25 @@
 
 | Connector | Source | How it maps to FOCUS | Efficiency signal? |
 |---|---|---|---|
-| `aws_focus` | AWS Data Exports (FOCUS 1.2 Parquet in S3) | already FOCUS — light coercion | S3 Intelligent-Tiering candidates |
-| `focus_file` | Local FOCUS CSV/Parquet (sample data, any vendor export) | already FOCUS — light coercion | — |
+| `aws_focus` | AWS Data Exports (FOCUS 1.2 Parquet in S3), or Cost Explorer via `cost_source="cost_explorer"` | S3 export: already FOCUS, light coercion. Cost Explorer: coarser account-level `SERVICE` totals, mapped in Python | S3 Intelligent-Tiering candidates |
 | `databricks` | Databricks system tables | **vendored Databricks → FOCUS 1.3 SQL** (below) | jobs/clusters/warehouses/tables + driver fleet health |
-| `aws_infra` | AWS Cost Explorer (fallback when no native FOCUS export) | mapped to FOCUS in Python | — |
 | `redshift` | Redshift Data API + Cost Explorer (efficiency/waste only) | no cost mapping — `fetch()` is a deliberate no-op; see below | query patterns, WLM, spill, tables |
 | `bigquery` / `snowflake` | — | stubs (planned) | — |
 
 Connectors are configured in `connections.yml` (scaffolded by `flashlight init`);
-credentials come from `.env` via the `*_env` fields.
+credentials come from `.env` via the `*_env` fields. Each connection also takes an
+optional `name` — falls back to its `type` for the common single-connection case,
+but needed (and enforced unique) once you have more than one connection of the
+same type, e.g. several Redshift clusters.
 
 ## AWS FOCUS setup
 
 This is the primary AWS path — a native **AWS Data Export** in FOCUS 1.2 format,
-delivered straight to your own S3 bucket. (`aws_infra`, below, is the Cost
-Explorer fallback for when you don't have one.)
+delivered straight to your own S3 bucket. Set `AwsFocusConfig.cost_source:
+cost_explorer` instead to skip the export entirely and query Cost Explorer
+directly — coarser (account-level `SERVICE` totals, no per-charge detail, no
+cost-subcategory classification) and needs `ce:GetCostAndUsage`, but no export
+to provision. Pick one explicitly; there's no automatic fallback between them.
 
 **1. Create the export.**
 
@@ -56,16 +60,24 @@ wiring up `flashlight ingest` so a config mistake doesn't look like an AWS delay
 ```yaml
 connectors:
   - type: aws_focus
+    name: Prod cost
     s3_bucket: my-focus-bucket
     s3_prefix: billing/focus
     region: us-east-1
-    include_services: []   # [] = whole account; default is Redshift only
+    include_services: []   # [] = whole account; default is Redshift + S3
 ```
 
 `include_services` is an allow-list of FOCUS `ServiceName` values — AWS Data
 Exports is account-wide and can't be scoped per service at the source, so
-Flashlight narrows here. It defaults to Redshift only; set `[]` to ingest the
-whole account, or list the specific services you want.
+Flashlight narrows here. Set `[]` to ingest the whole account, or list the
+specific services you want.
+
+It defaults to Redshift's own service names **plus `Amazon Simple Storage
+Service`**. S3 is in the default because Databricks' own bill covers DBU compute
+only — the storage behind a Unity Catalog external location is billed by AWS, so
+without S3 here the Databricks → **Backing storage** tab has nothing to show (see
+[Backing storage](design/backing-storage.md)). Narrowing it back to just
+Redshift's names opts out, and the AWS group's totals shrink accordingly.
 
 **5. Ingest.**
 
@@ -93,6 +105,33 @@ mention Intelligent-Tiering in `ChargeDescription`/`SkuId`. This is a
 text-match heuristic against the billing line, not a real storage-class field
 read from S3 — `candidate` confidence, not `high`.
 
+## Cost Explorer fallback (no export needed)
+
+```yaml
+connectors:
+  - type: aws_focus
+    name: Prod cost
+    cost_source: cost_explorer
+    region: us-east-1
+    include_services: []   # [] = whole account; default is Redshift + S3
+```
+
+Groups Cost Explorer's `get_cost_and_usage` by the `SERVICE` dimension and day,
+filtered by `include_services` — no S3 export, but only account-level totals
+per service, no per-charge detail, and no cost-subcategory classification (the
+Redshift $ breakdown other views rely on needs the FOCUS export's
+`ChargeDescription`/`SkuId`). Needs `ce:GetCostAndUsage` in addition to
+whatever IAM the S3 path would have needed.
+
+This path also **cannot feed the backing-storage view**: Cost Explorer returns
+account-level service totals with no `ResourceId`, so no S3 charge can be
+attributed to a bucket. Those rows land as `mapping='no_resource_id'`.
+
+There's no per-resource/tag scoping here (an earlier `aws_infra` connector did
+this for Databricks classic-compute AWS-infra attribution via a cluster tag;
+it was folded into this Cost Explorer path and that attribution capability was
+not carried over).
+
 ## Databricks mapping
 
 The `databricks` connector does **not** hand-roll the billing math. It runs the
@@ -103,13 +142,14 @@ from the Databricks solution accelerator
 The connector executes it on a SQL warehouse, then feeds the FOCUS-columned output
 through the same shared mapper used by the file/S3 connectors. The only field we add
 is `x_compute_class` (classic vs serverless), derived from the SKU — FOCUS doesn't
-carry it, but the TCO double-count guard needs it.
+carry it, and it's how you tell all-in serverless billing from classic compute that
+also shows up as separate cloud infra lines.
 
 **This SQL is repurposable** — that's a feature, not a one-off:
 
 - **Run it standalone.** Paste it into Databricks SQL / a notebook (set the
   `:account_prices` parameter) to materialize a FOCUS table, export it to
-  Parquet/Delta, and ingest via `aws_focus`/`focus_file` — no live API needed.
+  Parquet/Delta, and ingest via `aws_focus`'s S3 FOCUS export path — no live API needed.
 - **Template for other warehouses.** It's the reference pattern for *source-side*
   FOCUS mapping; the planned `snowflake`/`bigquery` connectors follow the same shape
   (run a warehouse-native FOCUS query, then map the rows).

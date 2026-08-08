@@ -13,10 +13,12 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from datetime import date
 from typing import Any
+from urllib.parse import quote
 
 import pandas as pd
 import plotly.graph_objects as go
 from nicegui import ui
+from nicegui.events import ValueChangeEventArguments
 
 # ── Chart chrome & ink — dark-mode tokens (dataviz skill, references/palette.md) ──
 PAGE = "#0d0d0d"
@@ -38,6 +40,11 @@ CATEGORICAL_SLOTS: tuple[str, ...] = (
     ACCENT, OPPORTUNITY, "#c98500", "#008300", "#9085e9", WASTE, "#d55181", "#d95926",
 )
 
+# Cool slate for projected (unmeasured) series — sits off the categorical palette so a
+# forecast bar can't be mistaken for a service segment, and reads clearer than muted ink
+# against the dark surface (hatched grey was disappearing into the panel).
+FORECAST = "#8fa3b8"
+
 # Semantic hues — dark-mode counterpart of theme.SEMANTIC, same keys.
 SEMANTIC: dict[str, str] = {
     "increase": WASTE,
@@ -49,16 +56,44 @@ SEMANTIC: dict[str, str] = {
     "volume": "#9085e9",
     "rate": "#c98500",
     "partial": INK_MUTED,
+    "forecast": FORECAST,
 }
 
-# A plain vector monogram, not NiceGUI's emoji-to-SVG-text favicon helper — that
-# renders the glyph via a generic font-family, which some browsers (Safari) fail to
-# substitute with a color-emoji font and show a generic placeholder icon instead.
-FAVICON_SVG = (
-    f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    f'<rect width="64" height="64" rx="14" fill="{ACCENT}"/>'
-    f'<text x="32" y="45" font-size="34" font-family="Arial,sans-serif" '
-    f'font-weight="700" fill="#ffffff" text-anchor="middle">F</text></svg>'
+# Flashlight's mark is the signal in a field of noise: one point brought into focus.
+# Keep it as vector geometry rather than a font glyph so it stays recognizable in a
+# favicon and does not depend on the browser's available fonts.
+LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" '
+    'aria-label="Flashlight — signal in the noise">'
+    f'<g fill="{INK_MUTED}" opacity=".72">'
+    '<circle cx="16" cy="16" r="3.5"/><circle cx="32" cy="16" r="3.5"/>'
+    '<circle cx="48" cy="16" r="3.5"/><circle cx="16" cy="32" r="3.5"/>'
+    '<circle cx="48" cy="32" r="3.5"/><circle cx="16" cy="48" r="3.5"/>'
+    '<circle cx="32" cy="48" r="3.5"/><circle cx="48" cy="48" r="3.5"/>'
+    '</g>'
+    f'<circle cx="32" cy="32" r="10" fill="none" stroke="{ACCENT}" stroke-width="2" opacity=".45"/>'
+    f'<circle cx="32" cy="32" r="6" fill="{ACCENT}"/>'
+    '</svg>'
+)
+LOGO_DATA_URL = f"data:image/svg+xml,{quote(LOGO_SVG)}"
+FAVICON_SVG = LOGO_SVG
+
+# Use the same provider mark wherever a provider is named, rather than allowing
+# navigation and connection cards to drift apart.
+CONNECTOR_LOGOS: dict[str, str] = {
+    "databricks": "/dashboard-assets/databricks.png",
+    "redshift": (
+        "https://upload.wikimedia.org/wikipedia/commons/7/73/Amazon-Redshift-Logo.svg"
+        "?utm_source=commons.wikimedia.org&utm_campaign=index&utm_content=original"
+    ),
+}
+
+# Declared so Safari (and iOS "Add to Home Screen") uses this instead of probing
+# /apple-touch-icon.png at the site root on spec. Both point at the same route —
+# see router.register_icon_routes, which is what stops those probes 404ing.
+HEAD_ICONS = (
+    '<link rel="apple-touch-icon" href="/apple-touch-icon.png">'
+    '<link rel="icon" type="image/svg+xml" href="/favicon.ico">'
 )
 
 HEAD_CSS = f"""
@@ -67,6 +102,24 @@ body, .q-page, .nicegui-content {{
     background: {PAGE} !important;
     color: {INK_PRIMARY};
     font-family: {FONT_STACK};
+}}
+/* A full-height page (assistant) owns its vertical space: nothing above the
+   transcript scrolls or pads, and the transcript itself scrolls instead.
+   Deliberately no hardcoded header height: .q-page-container is border-box and
+   already carries padding-top equal to the *real* header height, so
+   height:100vh on it leaves exactly the space under the header, and .q-page
+   takes 100% of that. Duplicating the header's pixel height here would drift
+   the moment its padding changes.
+   .nicegui-content needs flex:1 explicitly — NiceGUI ships it as a padded flex
+   column that sizes to its content, so without this the transcript's scroll
+   area collapses to zero height and the composer rides up under the top bar.
+   min-height:0 lets these flex children shrink below content so the inner
+   scroll area is actually bounded. Scoped to .fl-full-height so every
+   report-style scroll-the-page view is untouched. */
+.fl-full-height .q-page-container {{ height: 100vh; }}
+.fl-full-height .q-page {{ height: 100%; display: flex; flex-direction: column; overflow: hidden; }}
+.fl-full-height .nicegui-content {{
+    flex: 1; min-height: 0; padding: 0 !important; gap: 0 !important;
 }}
 .fl-table .q-table__card {{ background: transparent !important; box-shadow: none !important; }}
 .fl-table thead th {{
@@ -78,6 +131,26 @@ body, .q-page, .nicegui-content {{
 }}
 .fl-table-clickable tbody tr {{ cursor: pointer; }}
 .fl-table tbody tr:hover td {{ background: rgba(255,255,255,0.03) !important; }}
+/* ui.code's copy button is CSS-positioned `top: 0.5rem` (nicegui.css), which reads fine
+   against a multi-line block but sits visibly above-center on a single-line one (see
+   mcp_server.py's "quick add" command). Center it vertically for that one shape only —
+   untouched everywhere else. */
+.fl-code-oneline .nicegui-code-copy {{ top: 50%; transform: translateY(-50%); }}
+.q-drawer--mini .fl-sidebar-heading,
+.q-drawer--mini .fl-sidebar-label {{ display: none !important; }}
+.q-drawer--mini .fl-sidebar-row {{
+    width: 40px !important; height: 40px; min-height: 40px; margin: 2px auto;
+    justify-content: center; padding: 0 !important;
+}}
+.q-drawer--mini .fl-sidebar-row.fl-sidebar-active {{
+    background: rgba(57,135,229,0.22) !important;
+}}
+.q-drawer--standard .fl-sidebar-group-divider {{ display: none; }}
+.q-drawer--mini .fl-sidebar-group-divider {{ margin: 10px 8px; }}
+.fl-sidebar-toggle {{
+    position: absolute !important; left: 8px; bottom: 10px; z-index: 1;
+    background: {SURFACE}; border: 1px solid {BORDER};
+}}
 </style>
 """
 
@@ -112,13 +185,36 @@ def section_caption(text: str) -> None:
     ui.label(text).classes("text-xs").style(f"color:{INK_MUTED}")
 
 
+def info_icon(tooltip: str) -> None:
+    """A small hoverable (i) carrying a methodology note — *why*/*how computed*, not the
+    finding itself. Use next to a title or caption so the finding stays a one-line scan
+    and the reasoning behind it is one hover away instead of permanent paragraph text.
+    """
+    ui.icon("info", size="14px").style(f"color:{DEEMPHASIS};cursor:help;").tooltip(tooltip)
+
+
+def caption_info(text: str, tooltip: str) -> None:
+    """A :func:`section_caption` with a trailing :func:`info_icon` for supporting detail
+    (definitions, edge cases, "why this number") that doesn't need to be read every time.
+    """
+    with ui.row().classes("items-center gap-1"):
+        section_caption(text)
+        info_icon(tooltip)
+
+
 def kpi(title: str, value: str, sub: str, *, color: str = INK_PRIMARY) -> None:
     with panel():
-        ui.label(title).classes("text-sm").style(f"color:{INK_MUTED}")
+        # Reserve two lines for every heading.  Several KPI names intentionally wrap
+        # (for example, "Total Databricks footprint"), and without a shared title
+        # height the headline figures in the same row sit on different baselines.
+        ui.label(title).classes("text-sm").style(
+            f"color:{INK_MUTED};min-height:2.5rem;line-height:1.25rem"
+        )
         ui.label(value).classes("text-3xl font-semibold").style(
             f"color:{color};line-height:1.2;margin:4px 0 2px;"
         )
-        ui.label(sub).classes("text-xs").style(f"color:{INK_MUTED}")
+        if sub:
+            ui.label(sub).classes("text-xs").style(f"color:{INK_MUTED}")
 
 
 KpiCard = tuple[str, str, str] | tuple[str, str, str, str]
@@ -137,6 +233,77 @@ def kpi_row(cards: Sequence[KpiCard], *, columns: int | None = None) -> None:
                 variant or "", INK_PRIMARY
             )
             kpi(title, value, sub, color=color)
+
+
+def stat(title: str, value: str, sub: str, *, color: str = INK_PRIMARY) -> None:
+    """One ``(title, value, sub)`` block, same content shape as :func:`kpi` but with no
+    card chrome of its own — for grouping several numbers *inside* an existing
+    :func:`panel` (e.g. as a table's header strip) instead of giving each its own
+    bordered container. Use :func:`kpi_row` when the numbers are the whole panel;
+    use :func:`stat_row` when they're context for a table that follows in the same card.
+    """
+    with ui.column().classes("gap-0"):
+        ui.label(title).classes("text-xs").style(f"color:{INK_MUTED}")
+        ui.label(value).classes("text-2xl font-semibold").style(
+            f"color:{color};line-height:1.2;margin:2px 0;"
+        )
+        if sub:
+            ui.label(sub).classes("text-xs").style(f"color:{INK_MUTED};max-width:220px;")
+
+
+def stat_row(cards: Sequence[KpiCard]) -> None:
+    """A row of undecorated :func:`stat` blocks — the same ``(title, value, sub[,
+    variant])`` tuple shape as :func:`kpi_row`, for a panel where the table is the
+    point and these numbers are its header, not a KPI section of their own.
+    """
+    with ui.row().classes("w-full gap-8 flex-wrap mb-1"):
+        for card in cards:
+            title, value, sub = card[0], card[1], card[2]
+            variant = card[3] if len(card) > 3 else None
+            color = variant if variant and variant.startswith("#") else SEMANTIC.get(
+                variant or "", INK_PRIMARY
+            )
+            stat(title, value, sub, color=color)
+
+
+def empty_state(
+    icon: str,
+    title: str,
+    caption: str,
+    *,
+    button_label: str | None = None,
+    on_click: Callable[[], object] | None = None,
+) -> None:
+    """A centered icon + title + caption + optional CTA, for a section with
+    nothing in it yet — first-run guidance instead of a bare caption line
+    ("No connections yet — add one below."), which reads like an error rather
+    than an invitation.
+    """
+    with ui.column().classes("w-full items-center gap-2").style("padding:32px 0;"):
+        ui.icon(icon, size="2rem").style(f"color:{DEEMPHASIS}")
+        ui.label(title).classes("text-sm font-medium").style(f"color:{INK_SECONDARY}")
+        ui.label(caption).classes("text-xs").style(f"color:{INK_MUTED};max-width:420px;text-align:center;")
+        if button_label and on_click:
+            ui.button(button_label, icon="add", on_click=on_click).props(
+                "flat no-caps color=primary"
+            ).classes("mt-1")
+
+
+def status_badge(enabled: bool, *, labels: tuple[str, str] = ("Enabled", "Disabled")) -> None:
+    """A colored-dot + label pill instead of plain colored text, so status reads as a
+    status at a glance (same dot-plus-label shape as most connector/integration lists
+    elsewhere).
+
+    *labels* is ``(on, off)`` — Enabled/Disabled for a configured thing, Running/Stopped
+    for a process (see ``views/mcp_server.py``). Only the wording varies: green-for-on
+    and muted-for-off stay put, so the dot means the same thing on every page.
+    """
+    color = OPPORTUNITY if enabled else INK_MUTED
+    with ui.row().classes("items-center gap-1.5"):
+        ui.element("div").style(
+            f"width:6px;height:6px;border-radius:50%;background:{color};flex:none;"
+        )
+        ui.label(labels[0] if enabled else labels[1]).classes("text-xs").style(f"color:{color}")
 
 
 def provider_card(
@@ -162,7 +329,78 @@ def provider_card(
             ui.link(f"Open {name} →", href).classes("text-xs").style(f"color:{ACCENT}")
 
 
+# ── Tabs ─────────────────────────────────────────────────────────────────────
+def lazy_tab_panels(tab_specs: Sequence[tuple[str, Callable[[], None]]]) -> None:
+    """A tab bar + panels where only the active tab's content is ever built.
+
+    ``ui.tab_panels`` mounts every ``ui.tab_panel``'s Python content immediately —
+    NiceGUI only CSS-hides the inactive ones (Quasar's ``v-show``), so a page with N
+    tabs pays for every tab's queries and charts on load, whether or not it's ever
+    opened (confirmed on ``/databricks``: ~50 GOLD queries and every chart/table for
+    9 tabs, to show 1). This builds the first tab immediately — so the page isn't
+    blank on load — and defers every other tab's *args to the moment the user
+    actually switches to it, building each at most once (switching back to an
+    already-built tab is a free show/hide, not a re-query).
+
+    *tab_specs* mirrors ``provider_focus.py``'s existing shape: ``(title, render)``
+    pairs, in tab-bar order, where each ``render`` takes no arguments (callers that
+    need per-tab args, e.g. the page's date range, close over them — see
+    ``provider_focus.render``'s own ``after`` wrapping).
+    """
+    built: set[int] = set()
+
+    with ui.tabs().classes("w-full") as tabs:
+        tab_refs = [ui.tab(title) for title, _ in tab_specs]
+
+    with (
+        ui.tab_panels(tabs, value=tab_refs[0])
+        .classes("w-full")
+        .style("background:transparent;")
+    ):
+        panels = [ui.tab_panel(tab_ref) for tab_ref in tab_refs]
+
+    def _build(index: int) -> None:
+        if index in built:
+            return
+        built.add(index)
+        with panels[index]:
+            tab_specs[index][1]()
+
+    by_name = {title: i for i, (title, _) in enumerate(tab_specs)}
+
+    def _on_change(e: ValueChangeEventArguments[Any]) -> None:
+        # e.value is the tab's name (a plain str, per Tabs._value_to_event_value)
+        # for every tab built here — the broader annotation is Tabs' own generic.
+        index = by_name.get(e.value) if isinstance(e.value, str) else None
+        if index is not None:
+            _build(index)
+
+    tabs.on_value_change(_on_change)
+    _build(0)
+
+
 # ── Plotly ───────────────────────────────────────────────────────────────────
+MAX_SERIES = len(CATEGORICAL_SLOTS)
+OTHER_SERIES = "Other"
+
+
+def cap_series(df: pd.DataFrame, series: str, y_col: str) -> pd.DataFrame:
+    """Fold all but the top ``MAX_SERIES - 1`` values of *series* into one "Other"
+    bucket, so the legend stays readable and every slot keeps a distinct colour.
+    Totals are preserved — nothing is dropped, only grouped.
+
+    Shared by every stacked chart whose series count is data-driven (an Assistant
+    reply's arbitrary result set, a provider's service list): there are only
+    ``len(CATEGORICAL_SLOTS)`` hues, and past that Plotly starts recycling them,
+    which reads as two segments being the same thing.
+    """
+    totals = df.groupby(series)[y_col].sum().sort_values(ascending=False)
+    if len(totals) <= MAX_SERIES:
+        return df
+    keep = set(totals.index[: MAX_SERIES - 1])
+    return df.assign(**{series: df[series].where(df[series].isin(keep), OTHER_SERIES)})
+
+
 def style_fig(
     fig: go.Figure,
     *,
@@ -170,6 +408,7 @@ def style_fig(
     has_legend: bool = False,
     currency_axis: str | None = "y",
     category_x: bool = False,
+    title: str | None = None,
 ) -> go.Figure:
     """Flat, quiet chart chrome: transparent canvas, hairline grid, muted axis text.
 
@@ -179,13 +418,17 @@ def style_fig(
     under them (e.g. showing "May 31" under what is actually the June bar). Leave
     it False for a real continuous date axis (e.g. daily spend by `charge_day`),
     where date-aware spacing/zoom is the wanted behavior.
+
+    ``title`` names what's plotted directly on the chart — every other chart in
+    this dashboard sits under a section heading that already says so, but a chart
+    with no surrounding heading (e.g. one dropped into an Assistant reply) needs its own.
     """
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         height=height,
-        margin=dict(l=8, r=8, t=28 if has_legend else 4, b=8),
+        margin=dict(l=8, r=8, t=28 if (has_legend or title) else 4, b=8),
         font=dict(family=FONT_STACK, size=12, color=INK_MUTED),
         showlegend=has_legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title_text="")
@@ -193,6 +436,9 @@ def style_fig(
         else None,
         hoverlabel=dict(bgcolor=SURFACE, bordercolor=BORDER, font_size=12, font_color=INK_PRIMARY),
         bargap=0.5,
+        title=dict(text=title, font=dict(size=13, color=INK_SECONDARY), x=0, xanchor="left")
+        if title
+        else None,
     )
     fig.update_xaxes(
         showgrid=False, zeroline=False, linecolor=BASELINE, color=INK_MUTED, title_text=""
@@ -233,6 +479,16 @@ def months_back(end: date, months: int) -> date:
     return date(ts.year, ts.month, 1)
 
 
+def year_start(end: date) -> date:
+    """Jan 1 of *end*'s year — the YTD anchor.
+
+    One definition shared by the ``YTD`` quick range and the pages' *default* window, so
+    the two can't drift. Keyed off the data's last month, not today: a lake whose latest
+    bill is December of last year should open on that year, not on an empty January.
+    """
+    return date(end.year, 1, 1)
+
+
 def _format_range(state: DateState) -> str:
     s, e = state["start"], state["end"]
     if s.year == e.year:
@@ -262,7 +518,7 @@ def date_range_control(date_state: DateState, on_change: Callable[[], object]) -
                     def _quick(months: int | str | None = months) -> None:
                         end = date_state["bounds_max"]
                         if isinstance(months, str):
-                            start = max(date_state["bounds_min"], date(end.year, 1, 1))
+                            start = max(date_state["bounds_min"], year_start(end))
                         elif months is None:
                             start = date_state["bounds_min"]
                         else:
