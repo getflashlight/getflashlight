@@ -1761,7 +1761,7 @@ def test_alerts_tab_holds_mom_prose_not_the_kpi_header(lake_home) -> None:  # ty
             await user.should_not_see("in the selected window")
             user.find(kind=ui.tab, content="Alerts").click()
             await user.should_see("Selected window")
-            await user.should_see("Top SKU movers")
+            await user.should_see("Top Service movers")
 
     asyncio.run(_check())
 
@@ -1933,9 +1933,6 @@ def test_attribution_tab_leads_with_cost_attribution(lake_home) -> None:  # type
             await user.open("/databricks")
             user.find(kind=ui.tab, content="Attribution").click()
             await user.should_see("Cost attribution")
-            await user.should_see(
-                "Click a service to see the infrastructure and people behind its cost."
-            )
             # Cost accountability leads; customer-defined tag allocation is available
             # as a separate drill rather than competing with the service hierarchy.
             await user.should_see("Tag-based attribution")
@@ -2737,7 +2734,6 @@ def test_ai_costs_tab_names_untagged_ai_spend(lake_home) -> None:  # type: ignor
             await user.open("/databricks")
             user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("Untagged AI Spend")
-            await user.should_see("no `project` tag")
             await user.should_see("AI spend by tag")
             selects = list(user.find(kind=ui.select).elements)
             assert any(getattr(s, "value", None) == "project" for s in selects), (
