@@ -29,7 +29,7 @@ from flashlight.lake import paths
 EFFICIENCY_GROUP = "efficiency"
 
 # The fixed group holding the client-driver fleet-health view. Like EFFICIENCY, not
-# per-provider. Fed by the metrics plane (metrics.driver_health), not BRONZE. No
+# per-provider. Fed by typed Bronze (raw.driver_health), not FOCUS cost records. No
 # cost_metric — this is a compliance/fleet-health signal, not spend or waste.
 DRIVER_HEALTH_GROUP = "driver_health"
 

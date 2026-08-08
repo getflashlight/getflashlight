@@ -140,7 +140,7 @@ def render(
     breakdown_lead: Sequence[Callable[[date, date], None]] = (),
     extra_kpis: Sequence[Callable[[date, date], chrome.KpiCard | None]] = (),
     attribution_tab: Callable[[date, date], None] | None = None,
-    efficiency_tab: Callable[[], None] | None = None,
+    efficiency_tab: Callable[[date, date], None] | None = None,
     efficiency_tab_label: str = "Efficiency & Waste",
     show_policy: bool = True,
     show_alerts: bool = True,
@@ -148,6 +148,9 @@ def render(
     show_monthly_forecast: bool = True,
     show_current_month_projection: bool = True,
     monthly_chart_label: str = "Monthly net cost",
+    invoice_explanations_in_trend: bool = False,
+    show_credit_kpi: bool = True,
+    combine_sku_spend_and_mom: bool = False,
 ) -> None:
     """Render one provider's page.
 
@@ -228,7 +231,16 @@ def render(
         if scope_caption is not None:
             scope_caption(sm, end)
 
-        _kpis(sc, label, start, end, sm, partial=partial, extra_kpis=extra_kpis)
+        _kpis(
+            sc,
+            label,
+            start,
+            end,
+            sm,
+            partial=partial,
+            extra_kpis=extra_kpis,
+            show_credit_kpi=show_credit_kpi,
+        )
 
         # Ordered tab bar: core spend → after_breakdown (Databricks spend detail) →
         # attribution/efficiency/policy → extra_tabs (ops signals) → optional Alerts.
@@ -249,6 +261,13 @@ def render(
                     show_current_month_projection=show_current_month_projection,
                     chart_label=monthly_chart_label,
                 )
+            if invoice_explanations_in_trend:
+                # Keep the two visual explanations together on desktop, like the home
+                # dashboard's trend/share row; narrow screens naturally stack them.
+                with ui.row().classes("w-full gap-4 items-stretch flex-wrap"):
+                    _cost_subcategory(sc, end, sm, panel_class="flex-1 min-w-80")
+                    _commitment(group, end, sm, panel_class="flex-1 min-w-80")
+                _credits(group, end, sm)
 
         def _panel_breakdown() -> None:
             # One panel per section — same as Trend & changes. Helpers that can
@@ -258,12 +277,13 @@ def render(
             for lead in breakdown_lead:
                 lead(sm, end)
             with chrome.panel():
-                _spend_pivot(sc, end, sm)
-            _cost_subcategory(sc, end, sm)
-            _credits(group, end, sm)
-            _commitment(group, end, sm)
+                _spend_pivot(sc, end, sm, include_mom=combine_sku_spend_and_mom)
+            if not invoice_explanations_in_trend:
+                _cost_subcategory(sc, end, sm)
+                _credits(group, end, sm)
+                _commitment(group, end, sm)
             with chrome.panel():
-                _driver_mom(sc, end)
+                _driver_mom(sc, end, sku_mom_scoped=combine_sku_spend_and_mom)
 
         def _panel_attribution() -> None:
             # Own panels — no chrome.panel() wrapper (see views/attribution.py).
@@ -274,7 +294,7 @@ def render(
 
         def _panel_efficiency() -> None:
             if efficiency_tab is not None:
-                efficiency_tab()
+                efficiency_tab(sm, end)
             else:
                 efficiency_waste.render(provider_name_for_group(group), label, sm, end)
 
@@ -358,6 +378,7 @@ def _kpis(
     *,
     partial: bool,
     extra_kpis: Sequence[Callable[[date, date], chrome.KpiCard | None]] = (),
+    show_credit_kpi: bool = True,
 ) -> None:
     bills = _bill_months(scope, sm, end)
     if bills.empty:
@@ -383,7 +404,7 @@ def _kpis(
     # a month that dropped for a one-off discount, not for less usage, reads as one. This
     # was a Redshift-page-only card; every provider's bill can carry a credit, and the
     # home page deliberately excludes credits from its headline and points here for them.
-    credits = _credits_total(scope.group, end, sm)
+    credits = _credits_total(scope.group, end, sm) if show_credit_kpi else 0.0
     if credits:
         cards.append(
             (
@@ -1327,32 +1348,72 @@ def _tag_breakdown(group: str, sku: str, m: pd.Timestamp, prior: pd.Timestamp, m
     _tag_body(default)
 
 
-def _spend_pivot(scope: Scope, end: date, sm: date) -> None:
-    """Top cost drivers as a <dim> × month spend matrix with reconciling row/col totals.
+def _short_redshift_sku_name(description: object, net_cost: float) -> str:
+    """A readable Redshift billing label; the opaque AWS SKU id remains available.
 
-    Pivots on SKU for Databricks (its service names — JOBS, SQL — are too coarse; the
-    SKU id carries the real detail) and on service for everyone else (where names like
-    'Amazon EC2' are meaningful).
+    AWS's FOCUS ``EffectiveCost`` can include a negative reservation accounting
+    line beside the positive ``reserved instance applied`` allocation.  The
+    export does not guarantee a human-readable SKU description for that line,
+    so calling it "Other Redshift usage" makes an accounting offset look like
+    a workload change.  Keep the amount (and thus reconciliation) intact, but
+    say what we actually know: it is a negative billing adjustment whose
+    precise source remains available through the SKU-ID drill-down/export.
+    """
+    text = str(description).lower()
+    if "reserved instance applied" in text:
+        return "Reserved instance applied"
+    if "managed storage" in text:
+        return "Managed storage"
+    if "data scan" in text:
+        return "Data scan"
+    if "concurrency scaling" in text:
+        return "Concurrency scaling"
+    if "snapshot storage" in text:
+        return "Snapshot storage"
+    if "serverless compute" in text:
+        return "Serverless compute"
+    if net_cost < 0:
+        return "Negative billing adjustment"
+    return "Other Redshift usage"
 
-    Note the deliberate disagreement with ``_STACK_BY_SERVICE`` above, which splits the
-    Databricks *monthly bar* by service: a table can carry dozens of SKU rows, a stacked
-    bar cannot, so the coarser dimension wins there and the finer one wins here.
+
+def _spend_pivot(scope: Scope, end: date, sm: date, *, include_mom: bool = False) -> None:
+    """SKU × month spend matrix, with the latest complete-month movement in-line.
+
+    A table can carry the SKU detail a stacked trend chart cannot. When requested by a
+    provider-specific page, its delta columns compare the two latest complete months
+    *within the selected range* and replace that page's separate month-over-month table.
     """
     group = scope.group
-    if group == "databricks":
+    if include_mom or group == "databricks":
         dim, view, label = "sku_id", "spend_by_sku_month", "SKU"
     else:
         dim, view, label = "service_name", "spend_by_service_month", "Service"
-
-    chrome.panel_title(f"{label}s × month — spend")
+    invoice_requested = include_mom and group == "aws"
+    invoice_cost = invoice_requested
+    # A dashboard process can hot-reload this Python change before its persisted
+    # GOLD Parquet has been rebuilt.  Detect that old shape so the page remains
+    # usable and tells the operator exactly why it has not switched basis yet.
+    invoice_refresh_needed = False
+    if invoice_requested:
+        columns = gold_df(f'DESCRIBE "{group}".{view}')
+        invoice_cost = "billed_cost" in set(columns["column_name"])
+        invoice_refresh_needed = not invoice_cost
+    cost_column = "billed_cost" if invoice_cost else "net_cost"
+    cost_label = "invoice cost" if invoice_cost else "amortized cost"
+    chrome.panel_title(f"{label}s × month — {cost_label}")
+    if not gold_view_published(group, view):
+        chrome.section_caption("Spend by SKU isn't published yet — run `flashlight transform`.")
+        return
+    name_select = ", arg_max(sku_description, net_cost) AS sku_name" if include_mom else ""
     df = gold_df(
-        f"SELECT {dim} AS k, charge_month, sum(net_cost) AS net_cost "
+        f"SELECT {dim} AS k, charge_month, sum({cost_column}) AS net_cost{name_select} "
         f'FROM "{group}".{view} '
         + scope.where(view, f"charge_month >= '{sm}'", f"charge_month <= '{end}'")
         + f" GROUP BY {dim}, charge_month"
     )
     if df.empty:
-        _info(f"No {label.lower()} rows in range.")
+        _info("No SKU rows in range.")
         return
 
     current = pd.Timestamp(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
@@ -1362,30 +1423,91 @@ def _spend_pivot(scope: Scope, end: date, sm: date) -> None:
     # Drop the uniform ENTERPRISE_ prefix Databricks puts on every SKU id.
     pivot.index = pivot.index.str.replace("ENTERPRISE_", "", regex=False)
     pivot = pivot.reindex(sorted(pivot.columns), axis=1)  # chronological months
+    month_columns = list(pivot.columns)
     pivot["Total"] = pivot.sum(axis=1)
+
+    complete_months = (
+        [pd.Timestamp(month) for month in month_columns if pd.Timestamp(month) < current]
+        if include_mom
+        else []
+    )
+    if len(complete_months) >= 2:
+        cmp_month, prior = complete_months[-1], complete_months[-2]
+        pivot["Δ vs prior"] = pivot[cmp_month] - pivot[prior]
+        pivot["MoM %"] = (100 * pivot["Δ vs prior"] / pivot[prior]).where(pivot[prior] != 0)
+
     pivot = pivot.sort_values("Total", ascending=False)
     pivot.loc["Total"] = pivot.sum(axis=0)  # column totals reconcile with the row totals
+    if len(complete_months) >= 2:
+        pivot.loc["Total", "MoM %"] = (
+            100 * pivot.loc["Total", "Δ vs prior"] / pivot.loc["Total", prior]
+            if pivot.loc["Total", prior]
+            else None
+        )
 
     def _col(c: object) -> str:
         if c == "Total":
             return "Total"
+        if c in {"Δ vs prior", "MoM %"}:
+            return str(c)
         ts = pd.Timestamp(c)
         return f"{ts:%b %Y}" + (" (partial)" if ts == current else "")
 
-    pivot.columns = [_col(c) for c in pivot.columns]
+    pivot.columns = [
+        (f"Δ {cmp_month:%b} vs {prior:%b}" if c == "Δ vs prior" else _col(c)) for c in pivot.columns
+    ]
     out = pivot.reset_index()
-    money_cols = [c for c in out.columns if c != "k"]
+    rename = {"k": label}
+    search_col = "k"
+    if include_mom:
+        if invoice_refresh_needed:
+            chrome.section_caption(
+                "Invoice cost is configured, but this lake was published before BilledCost "
+                "was added to the SKU view. Run `flashlight transform`, then refresh this page."
+            )
+        elif invoice_cost:
+            chrome.section_caption(
+                "Uses AWS invoice cost (BilledCost). Reservation allocations and their "
+                "offsets remain available in the amortized-cost data, but do not inflate "
+                "this monthly cost view."
+            )
+        else:
+            chrome.section_caption(
+                "Uses amortized cost. Negative billing adjustments reconcile reservation/credit "
+                "accounting; they are not workload usage. Use the SKU ID or CSV to inspect "
+                "the raw line."
+            )
+        names = (
+            df.sort_values("net_cost", ascending=False)
+            .drop_duplicates("k")
+            .set_index("k")["sku_name"]
+        )
+        costs = (
+            df.groupby("k", as_index=True)["net_cost"].sum().reindex(names.index).fillna(0.0)
+        )
+        names = pd.Series(
+            [
+                _short_redshift_sku_name(description, float(cost))
+                for description, cost in zip(names.tolist(), costs.tolist(), strict=True)
+            ],
+            index=names.index,
+        )
+        out.insert(1, "name", out["k"].map(names).fillna(out["k"]))
+        rename = {"name": "SKU", "k": "SKU ID"}
+        search_col = "name"
+    money_cols = [c for c in out.columns if c not in {"k", "name", "MoM %"}]
     chrome.searchable_table(
         out,
         key=f"{group}_pivot",
-        search_col="k",
+        search_col=search_col,
         money_cols=money_cols,
-        rename={"k": label},
+        pct_cols=["MoM %"],
+        rename=rename,
         pagination=15,
     )
 
 
-def _cost_subcategory(scope: Scope, end: date, sm: date) -> None:
+def _cost_subcategory(scope: Scope, end: date, sm: date, *, panel_class: str = "") -> None:
     """Below-SKU cost breakdown, only where a connector stamps ``x_cost_subcategory``
     (Redshift compute/concurrency-scaling/storage/spectrum-scan, and S3
     storage/requests/data-transfer/monitoring/early-delete). Renders nothing for
@@ -1409,7 +1531,9 @@ def _cost_subcategory(scope: Scope, end: date, sm: date) -> None:
     )
     if df.empty:
         return
-    with chrome.panel():
+    with chrome.panel() as panel:
+        if panel_class:
+            panel.classes(panel_class)
         chrome.panel_title("Cost subcategory breakdown")
         with ui.row().classes("w-full gap-4 flex-wrap"):
             for service_name, sub in df.groupby("service_name"):
@@ -1422,26 +1546,17 @@ def _cost_subcategory(scope: Scope, end: date, sm: date) -> None:
                     chrome.plot(chrome.style_fig(pie, has_legend=False, currency_axis=None))
 
 
-def _commitment(group: str, end: date, sm: date) -> None:
+def _commitment(group: str, end: date, sm: date, *, panel_class: str = "") -> None:
     """RI/Savings-Plan commitment coverage — Used vs Unused $. Renders nothing where
     the provider has no commitment data (e.g. Databricks — no system table exposes
     reservation/savings-plan data, see gold.commitment_summary_month's own docstring).
 
-    Three things this has to get right, all learned from real AWS data:
-
-    * **The headline % excludes the current month.** A month two days in shows almost all
-      of its commitment as Unused simply because nothing has drawn it down yet (observed:
-      $38.8k Unused vs $2.5k Used on the 2nd), which reads as a catastrophic 94% waste
-      rate. The percentage uses complete months only — the same discipline ``_driver_mom``
-      applies — while the chart still shows every month in range, current one labelled.
-    * **NULL-status commitment spend is disclosed, not silently dropped.** The chart is
-      rightly Used-vs-Unused only, but those rows still carry real dollars (including
-      negative corrective lines — observed: −$41,284.75), and excluding them from the
-      denominator without saying so overstates the split's coverage.
-    * **A negative total can't produce a percentage.** ``if total`` passes for a negative
-      sum and yields a nonsense figure, so the guard is ``> 0``.
+    The visual deliberately reports only rows AWS explicitly labels Used or Unused.
+    It does not infer a commitment term or purchase timing: FOCUS utilization rows do not
+    carry a reservation start/end date.
     """
-    current = _d(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
+    if not gold_view_published(group, "commitment_summary_month"):
+        return
     window = f"charge_month >= '{sm}' AND charge_month <= '{end}'"
     cm = gold_df(
         "SELECT charge_month, commitment_discount_status, sum(effective_cost) AS cost "
@@ -1452,73 +1567,52 @@ def _commitment(group: str, end: date, sm: date) -> None:
     if cm.empty:
         return
 
-    complete = cm[pd.to_datetime(cm["charge_month"]).dt.date < current]
-    basis = complete if not complete.empty else cm
-    unused = float(basis.loc[basis["commitment_discount_status"] == "Unused", "cost"].sum())
-    total = float(basis["cost"].sum())
-    pct = f"{100 * unused / total:.1f}%" if total > 0 else "—"
-    scope = (
-        "complete months only"
-        if not complete.empty
-        else "this window — no complete month in range yet, so treat it as provisional"
-    )
-    caption = (
-        "Reserved Instance / Savings Plan spend, split by whether it was drawn down. "
-        f"{pct} of commitment spend was Unused ({scope}) — that's recoverable."
-    )
-
-    # The rows the Used/Unused split leaves out. Queried separately rather than folded in,
-    # because they belong in the caption as a caveat, not on the chart as a third bar.
-    # The `negative` figure is per already-aggregated (month, type, category) row — GOLD
-    # sums line items, so an individual negative line that nets positive within its own
-    # group is not visible here, and claiming otherwise would overstate what we can see.
-    other = gold_df(
-        "SELECT coalesce(sum(effective_cost), 0) AS cost, "
-        "coalesce(sum(effective_cost) FILTER (WHERE effective_cost < 0), 0) AS negative "
-        f'FROM "{group}".commitment_summary_month WHERE {window} '
-        "AND commitment_discount_status IS NULL"
-    ).iloc[0]
-    other_cost, negative = float(other["cost"]), float(other["negative"])
-    if other_cost or negative:
-        caption += (
-            f" A further {compact_money(other_cost)} carries no CommitmentDiscountStatus "
-            "and is excluded from this split"
-        )
-        caption += (
-            f" (net of {compact_money(negative)} in negative corrections)." if negative else "."
-        )
-
-    plot_rows = cm.groupby("commitment_discount_status", as_index=False)["cost"].sum()
+    plot_rows = cm.copy()
+    plot_rows["month"] = pd.to_datetime(plot_rows["charge_month"]).dt.strftime("%Y-%m")
+    month_order = sorted(plot_rows["month"].unique())
     fig = px.bar(
         plot_rows,
-        x="commitment_discount_status",
+        x="month",
         y="cost",
         color="commitment_discount_status",
         color_discrete_map={
             "Used": chrome.ACCENT,
             "Unused": chrome.WASTE,
         },
-        labels={"commitment_discount_status": "", "cost": ""},
+        labels={"month": "", "cost": "", "commitment_discount_status": ""},
+        category_orders={
+            "month": month_order,
+            "commitment_discount_status": ["Used", "Unused"],
+        },
     )
-    fig.update_layout(showlegend=False)
-    for _, r in plot_rows.iterrows():
+    fig.update_layout(barmode="stack")
+    totals = plot_rows.groupby("month")["cost"].sum()
+    for month, total in totals.items():
         fig.add_annotation(
-            x=r["commitment_discount_status"],
-            y=r["cost"],
-            text=compact_money(float(r["cost"])),
+            x=month,
+            y=total,
+            text=compact_money(float(total)),
             showarrow=False,
             yshift=10,
             font=dict(size=11, color=chrome.INK_SECONDARY),
         )
-    with chrome.panel():
-        chrome.panel_title("Commitment coverage")
-        chrome.section_caption(caption)
-        if not complete.empty and len(complete) != len(cm):
-            chrome.section_caption(
-                f"Chart includes the in-progress month ({current:%b %Y}), which will look "
-                "under-drawn until it completes."
-            )
-        chrome.plot(chrome.style_fig(fig, has_legend=False, category_x=True))
+    # A commitment is the recurring capacity level, not the changing Used/Unused split.
+    # Use the latest month's total as the current level so earlier bars visibly show
+    # when the account committed less capacity, while each bar still exposes overpay.
+    commitment = float(totals.loc[month_order[-1]])
+    fig.add_hline(
+        y=commitment,
+        line_dash="dash",
+        line_color=chrome.INK_SECONDARY,
+        annotation_text=f"Current commitment {compact_money(commitment)}",
+        annotation_position="top left",
+        annotation_font=dict(size=11, color=chrome.INK_SECONDARY),
+    )
+    with chrome.panel() as panel:
+        if panel_class:
+            panel.classes(panel_class)
+        chrome.panel_title("Commitment use vs. unused spend")
+        chrome.plot(chrome.style_fig(fig, has_legend=True, category_x=True))
 
 
 def _credits_df(group: str, end: date, sm: date) -> pd.DataFrame:
@@ -1557,16 +1651,9 @@ def _credits(group: str, end: date, sm: date) -> None:
     df = _credits_df(group, end, sm)
     if df.empty:
         return
-    total = abs(float(df["net_cost"].sum()))
     display = df.assign(charge_month=pd.to_datetime(df["charge_month"]).dt.strftime("%b %Y"))
     with chrome.panel():
         chrome.panel_title("Discounts & credits")
-        chrome.section_caption(
-            f"−{compact_money(total)} applied in this window, by credit line. Negative = money "
-            "off the bill. Already netted into every other figure on this page (EffectiveCost "
-            "is post-credit), so don't subtract it again. Includes account-level credits the "
-            "provider doesn't tag to a service."
-        )
         chrome.flat_table(
             display,
             key=f"credits_{group}",
@@ -1583,16 +1670,18 @@ def _credits(group: str, end: date, sm: date) -> None:
         )
 
 
-def _driver_mom(scope: Scope, end: date) -> None:
+def _driver_mom(scope: Scope, end: date, *, sku_mom_scoped: bool = False) -> None:
     group = scope.group
     id_col, id_label, _ = driver_dim(group)
+    if sku_mom_scoped:
+        id_col, id_label = "sku_id", "SKU"
     chrome.panel_title(f"{id_label} month-over-month")
     # Compare the latest COMPLETE month (exclude the current, still-accruing month) so
     # we never pit a partial month against a full one. Narrowed pages discover that month
     # from their own scoped rows: a month in which only services outside this page's scope
     # billed is not a month this page can compare.
     current = pd.Timestamp(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
-    month_view = (
+    month_view = "spend_by_sku_month" if sku_mom_scoped else (
         "sku_month_over_month"
         if scope.available("sku_month_over_month")
         else "spend_by_service_month"
@@ -1610,6 +1699,51 @@ def _driver_mom(scope: Scope, end: date) -> None:
     chrome.section_caption(
         f"Top {id_label.lower()}s by net cost · {cmp_month:%b %Y} vs {prior:%b %Y}"
     )
+    if sku_mom_scoped:
+        rows = gold_df(
+            "WITH sku_cost AS ("
+            "SELECT sku_id, arg_max(sku_description, net_cost) AS sku_description, "
+            f"coalesce(sum(net_cost) FILTER (WHERE charge_month = '{cmp_month.date()}'), 0) "
+            "AS net_cost, "
+            f"coalesce(sum(net_cost) FILTER (WHERE charge_month = '{prior.date()}'), 0) "
+            "AS prev_cost "
+            f'FROM "{group}".spend_by_sku_month '
+            + scope.where(
+                "spend_by_sku_month",
+                f"charge_month IN ('{cmp_month.date()}', '{prior.date()}')",
+            )
+            + " GROUP BY sku_id) "
+            "SELECT sku_id, sku_description, net_cost, net_cost - prev_cost AS cost_delta, "
+            "CASE WHEN prev_cost <> 0 THEN 100 * (net_cost - prev_cost) / prev_cost END "
+            "AS cost_pct_change FROM sku_cost ORDER BY net_cost DESC LIMIT 20"
+        )
+        if rows.empty:
+            _info("No SKU movement rows for the latest complete month.")
+            return
+        rows.insert(
+            0,
+            "sku_name",
+            rows.apply(
+                lambda row: _short_redshift_sku_name(
+                    row["sku_description"], float(row["net_cost"])
+                ),
+                axis=1,
+            ),
+        )
+        chrome.heatmap_table(
+            rows[["sku_name", "sku_id", "net_cost", "cost_delta", "cost_pct_change"]],
+            heat_col="cost_pct_change",
+            key=f"{group}_mom",
+            money_cols=["net_cost", "cost_delta"],
+            rename={
+                "sku_name": "SKU",
+                "sku_id": "SKU ID",
+                "net_cost": "Net cost",
+                "cost_delta": "Δ vs prior",
+                "cost_pct_change": "MoM %",
+            },
+        )
+        return
     if group == "databricks":
         mom = gold_df(
             f"SELECT {id_col}, net_cost, cost_delta, cost_pct_change "

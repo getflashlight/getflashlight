@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -38,12 +40,12 @@ def test_redshift_config_disabled_by_default() -> None:
 
 
 def test_redshift_page_enables_policy_and_driver_health_tabs(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    from flashlight.dashboard.views import redshift_focus
+    from flashlight.dashboard.views import provider_focus, redshift_focus
 
     captured: dict[str, object] = {}
     monkeypatch.setattr(redshift_focus, "provider_label", lambda _: "Redshift")
     monkeypatch.setattr(
-        redshift_focus.provider_focus,
+        provider_focus,
         "render",
         lambda _group, _label, **kwargs: captured.update(kwargs),
     )
@@ -51,7 +53,9 @@ def test_redshift_page_enables_policy_and_driver_health_tabs(monkeypatch) -> Non
     redshift_focus.render()
 
     assert captured["show_policy"] is True
-    assert [title for title, _ in captured["extra_tabs"]] == ["Client Driver Health"]
+    extra_tabs = captured["extra_tabs"]
+    assert isinstance(extra_tabs, list)
+    assert [title for title, _ in extra_tabs] == ["Client Driver Health"]
 
 
 def test_sync_history_marks_redshift_as_telemetry_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -89,13 +93,17 @@ def test_fetch_driver_health_maps_connection_log_rows(monkeypatch) -> None:  # t
     execute = MagicMock(side_effect=execute)
     monkeypatch.setattr(connector, "_execute", execute)
 
-    records = list(connector.fetch_driver_health(IngestWindow(date(2026, 7, 25), date(2026, 7, 31))))
+    records = list(
+        connector.fetch_driver_health(IngestWindow(date(2026, 7, 25), date(2026, 7, 31)))
+    )
 
     assert len(records) == 1
     assert records[0].provider_name == "AWS"
     assert records[0].client_driver == "Redshift JDBC Driver 2.0.0.0"
     assert records[0].query_count == 44
-    driver_call = next(call for call in execute.call_args_list if call.kwargs["name"] == "driver_health")
+    driver_call = next(
+        call for call in execute.call_args_list if call.kwargs["name"] == "driver_health"
+    )
     assert "dateadd(day, 1, '2026-07-31')" in driver_call.args[0].lower()
     assert "recordtime >= '2026-07-25'" in driver_call.args[0].lower()
 
@@ -125,7 +133,9 @@ def test_fetch_driver_health_uses_bastion_route_when_configured(monkeypatch) -> 
 
     window = IngestWindow(date(2026, 7, 25), date(2026, 7, 31))
     assert list(connector.fetch_driver_health(window)) == []
-    driver_call = next(call for call in execute.call_args_list if call.kwargs["name"] == "driver_health")
+    driver_call = next(
+        call for call in execute.call_args_list if call.kwargs["name"] == "driver_health"
+    )
     assert driver_call.args[1] == "bastion-connection"
 
 
@@ -1281,7 +1291,9 @@ def test_table_inventory_cache_reuses_catalog_but_keeps_usage_live(monkeypatch, 
 
     def _execute(_sql: str, _conn: object, *, name: str) -> list[dict[str, object]]:
         calls.append(name)
-        return results[name]
+        value = results[name]
+        assert isinstance(value, list)
+        return value
 
     monkeypatch.setattr(connector, "_execute", _execute)
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
@@ -1644,8 +1656,8 @@ def test_cluster_facets_split_instrumented_from_cost_only(monkeypatch, tmp_path)
 
 
 def test_redshift_cluster_cost_view_keeps_components_and_unassigned_visible(
-    monkeypatch, tmp_path
-) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """The Attribution landing grain is the billed cluster, not its redundant service.
 
     Invoice components remain below that cluster: this is what prevents a
