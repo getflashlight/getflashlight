@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import duckdb
 import pandas as pd
@@ -26,6 +26,11 @@ _DATA_DIR = (
 )
 # Match snowflake/synthetic_data/generate.py ($4/credit → ~$3M/year demo).
 CREDIT_PRICE = 4.00
+
+
+class CostBreakdownItem(TypedDict):
+    label: str
+    cost: float
 
 
 def _con() -> duckdb.DuckDBPyConnection:
@@ -162,7 +167,7 @@ def kpi_summary() -> dict[str, Any]:
         con.close()
 
 
-def cost_breakdown() -> list[dict[str, float]]:
+def cost_breakdown() -> list[CostBreakdownItem]:
     """Major cost categories for pie chart — current month spend.
 
     Covers all service types documented in ACCOUNT_USAGE.METERING_HISTORY.
@@ -285,7 +290,7 @@ def cost_breakdown() -> list[dict[str, float]]:
         con.close()
 
 
-def ai_cost_breakdown() -> list[dict[str, float]]:
+def ai_cost_breakdown() -> list[CostBreakdownItem]:
     """AI service breakdown for pie chart — current month."""
     con = _con()
     try:
@@ -298,7 +303,7 @@ def ai_cost_breakdown() -> list[dict[str, float]]:
             "'SNOWFLAKE_INTELLIGENCE','CORTEX_AGENTS','CORTEX_GUARDRAILS') "
             "GROUP BY service_type ORDER BY credits DESC"
         ).fetchdf()
-        results = []
+        results: list[CostBreakdownItem] = []
         if not df.empty:
             for _, row in df.iterrows():
                 label = str(row["service_type"]).replace("_", " ").title()
@@ -320,7 +325,7 @@ def ai_cost_breakdown() -> list[dict[str, float]]:
         con.close()
 
 
-def serverless_cost_breakdown() -> list[dict[str, float]]:
+def serverless_cost_breakdown() -> list[CostBreakdownItem]:
     """Serverless services breakdown for pie chart — current month."""
     con = _con()
     try:
@@ -333,7 +338,7 @@ def serverless_cost_breakdown() -> list[dict[str, float]]:
             "'MATERIALIZED_VIEW','QUERY_ACCELERATION','SNOWPARK_CONTAINER_SERVICES') "
             "GROUP BY service_type ORDER BY credits DESC"
         ).fetchdf()
-        results = []
+        results: list[CostBreakdownItem] = []
         if not df.empty:
             for _, row in df.iterrows():
                 label = str(row["service_type"]).replace("_", " ").title()
@@ -458,7 +463,7 @@ def top_users_hidden_waste(top_n: int = 5) -> pd.DataFrame:
         result = result.sort_values("attributed_waste", ascending=False).head(top_n)
 
         # Build comment based on service type and primary warehouse
-        def _comment(row):
+        def _comment(row: pd.Series) -> str:
             if row["service_type"] == "AI & ML":
                 return f"Oversized model usage on {row['primary_wh']}"
             return f"High idle/spill on {row['primary_wh']}"
