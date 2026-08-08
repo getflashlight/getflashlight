@@ -403,9 +403,9 @@ def build_pages() -> None:
         app.mount("/docs", StaticFiles(directory=settings.docs_dir, html=True), name="docs")
 
     def _render_databricks_page(label: str) -> None:
-        """Client driver health has exactly one producer — Databricks is the only
-        connector implementing ``Connector.fetch_driver_health`` — so it's nested here as
-        an extra tab rather than a top-level nav entry.
+        """Client driver health is a provider-specific extra (currently Databricks and
+        Redshift), so it is nested on each provider page rather than being a top-level
+        nav entry.
 
         AI Costs is nested for the same reason: Databricks is the only connector emitting
         AI-categorized FOCUS rows today, and ``gold.ai_product_family`` maps Databricks'

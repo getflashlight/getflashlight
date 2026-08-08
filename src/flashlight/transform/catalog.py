@@ -29,7 +29,7 @@ from flashlight.lake import paths
 EFFICIENCY_GROUP = "efficiency"
 
 # The fixed group holding the client-driver fleet-health view. Like EFFICIENCY, not
-# per-provider. Fed by the metrics plane (metrics.driver_health), not BRONZE. No
+# per-provider. Fed by typed Bronze (raw.driver_health), not FOCUS cost records. No
 # cost_metric — this is a compliance/fleet-health signal, not spend or waste.
 DRIVER_HEALTH_GROUP = "driver_health"
 
@@ -327,6 +327,25 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
             "tags",
         ),
         measures=("net_cost", "gross_cost", "consumed_quantity"),
+    ),
+    ViewSpec(
+        view="redshift_cluster_cost_month",
+        title="Redshift cluster cost / month",
+        description="Redshift charge-side cost per billed cluster and invoice component. "
+        "The cluster is parsed only from a Redshift cluster ARN; resource-less lines stay "
+        "in `(not assigned to a cluster)`. cost_subcategory is AWS UsageType-derived "
+        "(compute, concurrency_scaling, storage, spectrum_scan, or unclassified).",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=(
+            "provider_name",
+            "service_name",
+            "cluster_id",
+            "cost_subcategory",
+            "sku_id",
+            "sku_description",
+            "charge_month",
+        ),
+        measures=("net_cost", "gross_cost"),
     ),
     ViewSpec(
         view="spend_by_sku_tag_month",

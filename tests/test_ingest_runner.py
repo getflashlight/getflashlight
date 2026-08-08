@@ -41,7 +41,7 @@ def _stub(monkeypatch, outcomes: list[ConnectorOutcome], built: list[bool], ran:
         return 11
 
     monkeypatch.setattr(runner, "build_gold", _build_gold)
-    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None: None)
+    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None, **_kw: None)
 
 
 def test_all_connectors_run_even_after_a_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -103,7 +103,7 @@ def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatc
         return 1
 
     monkeypatch.setattr(runner, "build_gold", _build_gold)
-    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None: None)
+    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None, **_kw: None)
 
     rows = run_ingest(connector="redshift")
     assert ran == ["redshift"]
@@ -173,14 +173,21 @@ def test_supplemental_phases_share_a_bounded_parallel_pool(monkeypatch) -> None:
 
     monkeypatch.setattr(runner, "_run_efficiency", _phase)
     monkeypatch.setattr(runner, "_run_driver_health", _phase)
+    monkeypatch.setattr(runner, "_run_policy_config", _phase)
     monkeypatch.setattr(runner, "_run_ai_usage", _phase)
     monkeypatch.setattr(runner, "_run_storage_locations", _phase)
     monkeypatch.setattr(runner, "_run_compute_instances", _phase)
 
-    runner._run_supplemental(object(), [object()])  # type: ignore[arg-type, list-item]
+    priority_published_after: list[int] = []
+    runner._run_supplemental(  # type: ignore[arg-type, list-item]
+        object(),
+        [object()],
+        on_priority_complete=lambda: priority_published_after.append(completed),
+    )
 
-    assert completed == 5
+    assert completed == 6
     assert 2 <= peak <= 3
+    assert priority_published_after == [2]
 
 
 def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -197,7 +204,9 @@ def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  
     )
     supplemental_configs: list[list[object]] = []
 
-    def _record_supplemental(_w: object, configs: list[object], _p: object = None) -> None:
+    def _record_supplemental(
+        _w: object, configs: list[object], _p: object = None, **_kwargs: object
+    ) -> None:
         supplemental_configs.append(configs)
 
     monkeypatch.setattr(runner, "_run_supplemental", _record_supplemental)
@@ -224,7 +233,7 @@ def test_cost_pull_gold_publish_survives_a_later_phase_dying(monkeypatch) -> Non
         ran,
     )
 
-    def _boom(_w: object, _c: object, _p: object = None) -> None:
+    def _boom(_w: object, _c: object, _p: object = None, **_kwargs: object) -> None:
         raise RuntimeError("simulated mid-run kill")
 
     monkeypatch.setattr(runner, "_run_supplemental", _boom)
@@ -242,7 +251,7 @@ def test_run_ingest_threads_progress_callback_to_every_connector(monkeypatch) ->
     monkeypatch.setattr(runner, "load_connections", lambda _c: [object(), object()])
     monkeypatch.setattr(runner, "build_connector", lambda c: c)
     monkeypatch.setattr(runner, "build_gold", lambda: 0)
-    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None: None)
+    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None, **_kw: None)
 
     received: list[object] = []
 

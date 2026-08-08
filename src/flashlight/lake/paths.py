@@ -54,6 +54,20 @@ def bronze_dir() -> Path:
     return home() / "bronze"
 
 
+def bronze_driver_health_dir() -> Path:
+    """Typed driver-health Bronze, partitioned by provider and charge month.
+
+    Its schema differs from FOCUS cost records, so ``register_bronze`` reads only
+    the FOCUS partitions under :func:`bronze_dir`.
+    """
+    return bronze_dir() / "driver_health"
+
+
+def redshift_policy_config_dir() -> Path:
+    """Typed Bronze Redshift cluster configuration evidence."""
+    return bronze_dir() / "redshift_policy_config"
+
+
 def metrics_dir() -> Path:
     """Efficiency-telemetry root, Hive-partitioned ``provider_name=…/charge_month=…/``.
 
@@ -64,13 +78,11 @@ def metrics_dir() -> Path:
     return home() / "metrics"
 
 
-def driver_health_dir() -> Path:
-    """Driver-health telemetry root, Hive-partitioned ``provider_name=…/charge_month=…/``.
+def legacy_driver_health_dir() -> Path:
+    """Pre-Bronze driver-health location, read-only during the storage cutover.
 
-    A sibling of :func:`metrics_dir`, not nested inside it: ``duck.register_metrics``
-    globs ``metrics_dir()/**/*.parquet`` recursively with ``union_by_name=true`` — a
-    differently-shaped dataset nested inside that tree would silently corrupt that
-    glob/view. Fleet-health/compliance data (client driver versions), not waste.
+    New writes use :func:`bronze_driver_health_dir`; the transform retains this path
+    only for provider/month partitions that have not yet been re-ingested.
     """
     return home() / "driver_health"
 
@@ -78,7 +90,7 @@ def driver_health_dir() -> Path:
 def ai_usage_dir() -> Path:
     """AI serving-usage telemetry root, Hive-partitioned ``provider_name=…/charge_month=…/``.
 
-    A sibling of :func:`metrics_dir` for the same reason :func:`driver_health_dir` is —
+    A sibling of :func:`metrics_dir` so its differently-shaped rows cannot collide with
     ``duck.register_metrics`` globs ``metrics_dir()/**/*.parquet`` recursively with
     ``union_by_name=true``, so a differently-shaped dataset nested in that tree would
     silently corrupt that view. Token/request measurement per served model and requester,
@@ -91,7 +103,7 @@ def storage_locations_dir() -> Path:
     """Unity Catalog storage-location root, Hive-partitioned
     ``provider_name=…/snapshot_month=…/``.
 
-    A sibling of :func:`metrics_dir` for the same reason :func:`driver_health_dir` is —
+    A sibling of :func:`metrics_dir` so its differently-shaped rows cannot collide with
     ``duck.register_metrics`` globs ``metrics_dir()/**/*.parquet`` recursively with
     ``union_by_name=true``, so a differently-shaped dataset nested in that tree would
     silently corrupt that view. Note the partition key is ``snapshot_month``, not
@@ -105,7 +117,7 @@ def compute_instances_dir() -> Path:
     """Compute-instance telemetry root, Hive-partitioned
     ``provider_name=…/charge_month=…/``.
 
-    A sibling of :func:`metrics_dir` for the same reason :func:`driver_health_dir` is —
+    A sibling of :func:`metrics_dir` so its differently-shaped rows cannot collide with
     ``duck.register_metrics`` globs ``metrics_dir()/**/*.parquet`` recursively with
     ``union_by_name=true``, so a differently-shaped dataset nested in that tree would
     silently corrupt that view. Unlike :func:`storage_locations_dir`, the partition key
@@ -212,7 +224,6 @@ def ensure_layout() -> None:
         config_dir(),
         bronze_dir(),
         metrics_dir(),
-        driver_health_dir(),
         ai_usage_dir(),
         storage_locations_dir(),
         compute_instances_dir(),

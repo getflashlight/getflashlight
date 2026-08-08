@@ -92,7 +92,8 @@ def _materialize_sources(con: duckdb.DuckDBPyConnection) -> None:
     for schema_view, temp in (
         ("raw.focus_record", "_bronze_mat"),
         ("metrics.efficiency_record", "_efficiency_mat"),
-        ("metrics.driver_health", "_driver_health_mat"),
+        ("raw.driver_health", "_driver_health_mat"),
+        ("raw.redshift_policy_config", "_redshift_policy_config_mat"),
         ("metrics.ai_usage", "_ai_usage_mat"),
         ("metrics.storage_location", "_storage_location_mat"),
         ("metrics.compute_instance", "_compute_instance_mat"),
@@ -129,7 +130,8 @@ def build_gold() -> int:
         con.execute("CREATE SCHEMA IF NOT EXISTS gold")
         duck.register_bronze(con)  # creates schema raw + raw.focus_record
         duck.register_metrics(con)  # creates schema metrics + metrics.efficiency_record
-        duck.register_driver_health(con)  # creates metrics.driver_health
+        duck.register_driver_health(con)  # creates raw.driver_health from typed Bronze
+        duck.register_redshift_policy_config(con)
         duck.register_ai_usage(con)  # creates metrics.ai_usage
         duck.register_storage_locations(con)  # creates metrics.storage_location
         duck.register_compute_instances(con)  # creates metrics.compute_instance

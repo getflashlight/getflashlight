@@ -128,7 +128,7 @@ def _progress_printer() -> Callable[[str, str, int], None]:
             if event == "start":
                 typer.echo(f"  {name} ...")
             elif event == "done":
-                typer.echo(f"  {name} ... {rows:,} rows done")
+                typer.echo(f"  {name} ... cost pull complete: {rows:,} rows")
             elif event == "failed":
                 typer.secho(f"  {name} ... failed", fg=typer.colors.RED)
             elif event == "efficiency_done":

@@ -37,6 +37,128 @@ def test_redshift_config_disabled_by_default() -> None:
     assert RedshiftConfig.model_validate({"cluster_identifier": "prod"}).enabled is False
 
 
+def test_redshift_page_enables_policy_and_driver_health_tabs(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from flashlight.dashboard.views import redshift_focus
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(redshift_focus, "provider_label", lambda _: "Redshift")
+    monkeypatch.setattr(
+        redshift_focus.provider_focus,
+        "render",
+        lambda _group, _label, **kwargs: captured.update(kwargs),
+    )
+
+    redshift_focus.render()
+
+    assert captured["show_policy"] is True
+    assert [title for title, _ in captured["extra_tabs"]] == ["Client Driver Health"]
+
+
+def test_sync_history_marks_redshift_as_telemetry_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from flashlight.dashboard.views import connections
+
+    config = RedshiftConfig.model_validate(
+        {"name": "Prod", "cluster_identifier": "prod", "enabled": True}
+    )
+    monkeypatch.setattr(connections, "load_all_connections", lambda _: [config])
+
+    assert connections._telemetry_only_connectors() == {"Prod"}
+
+
+def test_fetch_driver_health_maps_connection_log_rows(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Redshift's STL connection-log pull uses the shared fleet-health contract."""
+    from datetime import date
+    from unittest.mock import MagicMock
+
+    from flashlight.ingest.base import IngestWindow
+
+    connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
+    execute = MagicMock(
+        return_value=[
+            {
+                "charge_month": "2026-07-01",
+                "client_driver": "Redshift JDBC Driver 2.0.0.0",
+                "client_application": "nightly-etl",
+                "executed_by": "svc-etl",
+                "query_count": "44",
+            }
+        ]
+    )
+    monkeypatch.setattr(connector, "_execute", execute)
+
+    records = list(connector.fetch_driver_health(IngestWindow(date(2026, 7, 1), date(2026, 7, 31))))
+
+    assert len(records) == 1
+    assert records[0].provider_name == "AWS"
+    assert records[0].client_driver == "Redshift JDBC Driver 2.0.0.0"
+    assert records[0].query_count == 44
+    assert execute.call_args.kwargs["name"] == "driver_health"
+    assert "dateadd(day, 1, '2026-07-31')" in execute.call_args.args[0].lower()
+
+
+def test_fetch_driver_health_uses_bastion_route_when_configured(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from contextlib import nullcontext
+    from datetime import date
+    from unittest.mock import MagicMock
+
+    from flashlight.ingest.base import IngestWindow
+
+    connector = RedshiftConnector(
+        RedshiftConfig.model_validate(
+            {"cluster_identifier": "prod", "db_user": "flashlight", **_BASTION_FIELDS}
+        )
+    )
+    execute = MagicMock(return_value=[])
+    monkeypatch.setattr(connector, "_execute", execute)
+    monkeypatch.setattr(
+        connector,
+        "_lane_connection_factory",
+        lambda _mode: nullcontext(lambda: nullcontext("bastion-connection")),
+    )
+
+    window = IngestWindow(date(2026, 7, 1), date(2026, 7, 31))
+    assert list(connector.fetch_driver_health(window)) == []
+    assert execute.call_args.args[1] == "bastion-connection"
+    assert execute.call_args.kwargs["name"] == "driver_health"
+
+
+def test_fetch_policy_config_maps_control_plane_evidence() -> None:
+    from datetime import date
+    from unittest.mock import MagicMock
+
+    from flashlight.ingest.base import IngestWindow
+
+    connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
+    connector._redshift = MagicMock(
+        describe_clusters=MagicMock(
+            return_value={
+                "Clusters": [
+                    {
+                        "ClusterIdentifier": "prod",
+                        "Encrypted": True,
+                        "PubliclyAccessible": False,
+                        "EnhancedVpcRouting": True,
+                        "AutomatedSnapshotRetentionPeriod": 7,
+                        "Tags": [{"Key": "team", "Value": "data"}],
+                        "ClusterParameterGroups": [{"ParameterGroupName": "prod-params"}],
+                    }
+                ]
+            }
+        ),
+        describe_cluster_parameters=MagicMock(
+            return_value={
+                "Parameters": [{"ParameterName": "require_ssl", "ParameterValue": "true"}]
+            }
+        ),
+    )
+    records = list(connector.fetch_policy_config(IngestWindow(date(2026, 7, 1), date(2026, 7, 31))))
+    assert len(records) == 1
+    assert records[0].encrypted is True
+    assert records[0].publicly_accessible is False
+    assert records[0].require_ssl is True
+    assert records[0].tag_count == 1
+
+
 def test_redshift_config_aws_profile_defaults_unset() -> None:
     config = RedshiftConfig.model_validate({"cluster_identifier": "prod"})
     assert config.aws_profile is None
@@ -1409,10 +1531,130 @@ def test_cluster_facets_split_instrumented_from_cost_only(monkeypatch, tmp_path)
     assert redshift_focus._telemetry_cluster_ids() == ["instrumented-cluster"]
 
 
+def test_redshift_cluster_cost_view_keeps_components_and_unassigned_visible(
+    monkeypatch, tmp_path
+) -> None:  # type: ignore[no-untyped-def]
+    """The Attribution landing grain is the billed cluster, not its redundant service.
+
+    Invoice components remain below that cluster: this is what prevents a
+    query-duration user allocation from silently assigning storage or Spectrum spend.
+    A resource-less Redshift line is a real bill line, so it must stay as an explicit
+    unassigned bucket rather than being guessed onto one configured connector.
+    """
+    from datetime import date, datetime
+    from decimal import Decimal
+
+    from flashlight.core.settings import get_settings
+    from flashlight.dashboard.data import gold_df
+    from flashlight.focus.enums import ChargeCategory, ServiceCategory
+    from flashlight.focus.model import FocusRecord
+    from flashlight.ingest.base import IngestWindow
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
+    get_settings.cache_clear()
+    window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
+
+    def _row(
+        cost: str, component: str | None, *, service: str = "Amazon Redshift", resource: str | None
+    ) -> FocusRecord:
+        return FocusRecord(
+            provider_name="AWS",
+            billing_account_id="123456789012",
+            billing_period_start=date(2026, 1, 1),
+            billing_period_end=date(2026, 2, 1),
+            charge_period_start=datetime(2026, 1, 15),
+            charge_period_end=datetime(2026, 1, 16),
+            charge_category=ChargeCategory.USAGE,
+            service_category=ServiceCategory.DATABASES,
+            service_name=service,
+            effective_cost=Decimal(cost),
+            resource_id=resource,
+            x_cost_subcategory=component,
+            x_source_connector="aws_focus",
+        )
+
+    cluster_arn = "arn:aws:redshift:us-east-1:123456789012:cluster:prod"
+    bronze.write_window(
+        "aws_focus",
+        window,
+        [
+            _row("100", "compute", resource=cluster_arn),
+            _row("30", "storage", resource=cluster_arn),
+            _row("10", "concurrency_scaling", resource=cluster_arn),
+            _row("20", "spectrum_scan", service="Amazon Redshift Spectrum", resource=cluster_arn),
+            _row("5", None, resource=None),
+        ],
+        ingest_run_id="test-run",
+    )
+    build_gold()
+
+    rows = gold_df(
+        'SELECT cluster_id, cost_subcategory, gross_cost FROM "aws".redshift_cluster_cost_month '
+        "ORDER BY cluster_id, cost_subcategory"
+    )
+    observed = {(r.cluster_id, r.cost_subcategory): float(r.gross_cost) for r in rows.itertuples()}
+    assert observed == {
+        ("prod", "compute"): 100.0,
+        ("prod", "concurrency_scaling"): 10.0,
+        ("prod", "spectrum_scan"): 20.0,
+        ("prod", "storage"): 30.0,
+        ("(not assigned to a cluster)", "(unclassified)"): 5.0,
+    }
+
+
+def test_table_inventory_carries_compute_weighted_scan_evidence() -> None:
+    """A table workload score splits query execution across scanned tables, not bills."""
+    from datetime import date
+
+    from flashlight.ingest.base import IngestWindow
+
+    connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
+    records = list(
+        connector._build_table_inventory_records(  # noqa: SLF001 - output contract test
+            IngestWindow(date(2026, 1, 1), date(2026, 1, 31)),
+            "prod",
+            date(2026, 1, 1),
+            [
+                {
+                    "table_id": 42,
+                    "database": "warehouse",
+                    "schema": "analytics",
+                    "table": "events",
+                    "size": 1024,
+                    "encoded": "Y",
+                    "diststyle": "KEY(events_id)",
+                    "unsorted": 0,
+                    "stats_off": 0,
+                    "tbl_rows": 100,
+                }
+            ],
+            [
+                {
+                    "table_id": 42,
+                    "query_count": 3,
+                    "scan_bytes": 1024**3,
+                    "rows_pre_filter": 1000,
+                    "rows_returned": 100,
+                    "weighted_exec_seconds": 30.0,
+                }
+            ],
+            [{"schemaname": "analytics", "tablename": "events", "tableowner": "data"}],
+        )
+    )
+    assert len(records) == 1
+    record = records[0]
+    assert record.entity_id == "prod:warehouse.analytics.events"
+    assert record.cause_detail["table_weighted_exec_seconds"] == pytest.approx(30.0)
+    assert record.cause_detail["table_compute_share_pct"] == pytest.approx(100.0)
+    assert record.cause_detail["table_scan_gb"] == pytest.approx(1.0)
+
+
 def test_redshift_tab_renders_per_cluster_with_action_queue(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
     """End-to-end render smoke test: the /aws page's Redshift tab must show the
-    instrumented cluster's savings action queue and list the cost-only cluster as
-    not yet instrumented, without raising.
+    instrumented cluster's savings action queue and give the cost-only cluster its own
+    explicit instrumentation state, without raising.
     """
     import asyncio
     from datetime import date, datetime
@@ -1493,12 +1735,13 @@ def test_redshift_tab_renders_per_cluster_with_action_queue(monkeypatch, tmp_pat
             build_pages()
             await user.open("/aws")
             await user.should_see("Redshift spend")
-            user.find(kind=ui.tab, content="Optimization").click()
+            user.find(kind=ui.tab, content="Efficiency & Waste").click()
             await user.should_see("Cluster: prod-cluster")
             await user.should_see("Savings opportunities")
             await user.should_see("Detection coverage for this cluster")
+            await user.should_see("Cluster: orphan-cluster")
+            await user.should_see("What this cluster is billed for")
             await user.should_see("Not yet instrumented")
-            await user.should_see("orphan-cluster")
 
             # ui.table renders rows as data, not as text nodes should_see can match —
             # inspect the root action queue for its unpriced Spectrum workload group.

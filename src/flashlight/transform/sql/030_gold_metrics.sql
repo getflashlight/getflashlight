@@ -91,6 +91,10 @@ SELECT
     )                                                      AS sku_description,
     charge_month,
     sum(cost)                                            AS net_cost,
+    -- Invoice/cash basis.  `net_cost` above is EffectiveCost (amortized); keep
+    -- BilledCost alongside it so a consumer can show what AWS actually charged
+    -- in the month without reinterpreting reservation allocation rows as spend.
+    sum(billed_cost)                                     AS billed_cost,
     sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
     sum(consumed_quantity)                               AS consumed_quantity,
     max(consumed_unit)                                   AS consumed_unit,
@@ -156,6 +160,49 @@ GROUP BY provider_name, service_name, coalesce(sku_id, '(unknown)'),
          coalesce(resource_type, '(none)'), coalesce(resource_id, '(none)'),
          coalesce(resource_name, resource_id, '(unattributed)'),
          coalesce(sub_account_id, '(none)'), coalesce(region_id, '(none)'), charge_month;
+
+
+-- ── Redshift attribution: cluster × invoice component ─────────────────────────
+--
+-- Redshift's AWS bill is not useful at its first ``ServiceName`` grain: the /aws
+-- page is already scoped to Redshift, and "Amazon Redshift" tells an operator
+-- nothing about which warehouse to investigate.  Preserve the charge-side grain
+-- needed for a cluster-first attribution journey instead.  A Redshift cluster ARN
+-- is the only trustworthy cluster identity on the bill; resource-less lines stay in
+-- the explicit `(not assigned to a cluster)` bucket rather than being guessed onto
+-- a configured connector.
+--
+-- `cost_subcategory` is stamped by aws_focus from AWS UsageType.  It must remain a
+-- component below the cluster: storage and Spectrum cannot honestly be allocated to
+-- database users by query duration, while compute and concurrency scaling can.
+CREATE OR REPLACE VIEW gold.redshift_cluster_cost_month AS
+SELECT
+    provider_name,
+    service_name,
+    CASE
+        WHEN resource_id LIKE '%:cluster:%'
+            THEN regexp_extract(resource_id, ':cluster:([^:]+)$', 1)
+        ELSE '(not assigned to a cluster)'
+    END                                                   AS cluster_id,
+    coalesce(x_cost_subcategory, '(unclassified)')       AS cost_subcategory,
+    coalesce(sku_id, '(unknown)')                         AS sku_id,
+    arg_max(
+        regexp_replace(charge_description, 'arn:aws:\\S+', 'a reservation'), cost
+    )                                                      AS sku_description,
+    charge_month,
+    sum(cost)                                            AS net_cost,
+    sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
+    bool_or(is_partial_period)                            AS is_partial_period
+FROM silver.focus_provider_bill
+WHERE service_name IN ('Amazon Redshift', 'Amazon Redshift Spectrum')
+GROUP BY provider_name, service_name,
+         CASE
+             WHEN resource_id LIKE '%:cluster:%'
+                 THEN regexp_extract(resource_id, ':cluster:([^:]+)$', 1)
+             ELSE '(not assigned to a cluster)'
+         END,
+         coalesce(x_cost_subcategory, '(unclassified)'), coalesce(sku_id, '(unknown)'),
+         charge_month;
 
 
 -- ── "Which project/team does a SKU's spend belong to?" — SKU × tag drill ─────────

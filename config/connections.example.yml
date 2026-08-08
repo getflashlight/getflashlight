@@ -43,7 +43,10 @@ connectors:
   # activity, WLM health, table inventory/usage) still runs fully regardless, since
   # none of that needs cost data. Runs read-only queries against Redshift system
   # tables (STL_*/SVL_*/SVCS_*) via the Data API (IAM-based, no persistent DB
-  # credentials). Configure a provisioned cluster_identifier.
+  # credentials). It also reads STL_CONNECTION_LOG for Client Driver Health; that
+  # specific optional signal is visible only to a Redshift superuser, so a permission
+  # failure there is logged and does not block the rest of the ingestion. Configure a
+  # provisioned cluster_identifier.
   # `name` matters here more than anywhere else — a `name` per cluster is what
   # keeps multiple Redshift connections distinct in BRONZE/the dashboard.
   - type: redshift

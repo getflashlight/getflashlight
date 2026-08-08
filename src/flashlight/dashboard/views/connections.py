@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
+from collections import deque
 from collections.abc import Callable
 from datetime import date
 from pathlib import Path
@@ -41,7 +41,6 @@ from flashlight.ingest.config import (
     RedshiftConfig,
     effective_connector_name,
     load_all_connections,
-    load_connections,
     save_connections,
     scoped_env_name,
 )
@@ -69,32 +68,41 @@ _TYPE_ICONS: dict[str, str] = {
 # Keep card and sidebar provider marks in sync via the shared dashboard assets.
 _CONNECTOR_LOGOS = chrome.CONNECTOR_LOGOS
 
-# Matches the progress printer's own "  {name} ... {rows:,} rows done" / "  {name}
-# ... failed" lines (cli.py's _progress_printer) — not its "  {name} ..." start
-# line, which has nothing after "...". Used to tick the sync dialog's "N of M cost
-# pulls done" counter as the live tail streams in.
-#
-# This line only fires after a connector's fetch() (the BRONZE/cost pull) —
-# run_ingest() (ingest/runner.py) runs _run_efficiency()/_run_driver_health()/
-# build_gold() afterward. _run_efficiency now reports its own per-connector
-# "  {name} ... efficiency: N records" / "  {name} ... efficiency failed" lines
-# (visible in the tail below, same as any other line) so a connector whose
-# fetch() is a no-op — Redshift, whose cost already flows through aws_focus,
-# while fetch_efficiency() does the real, often much slower work — doesn't read
-# as silently finished the moment this counter ticks. Those lines deliberately
-# don't match this regex (they're not "N rows done"/bare "failed"), so this
-# counter stays scoped to cost pulls, as the label says. _run_driver_health()
-# still doesn't report through the progress callback — same gap, smaller blast
-# radius (one connector today).
-_CONNECTOR_DONE_RE = re.compile(r"^\s*.+ \.\.\. (?:[\d,]+ rows done|failed)\s*$")
-
 # Redshift's own connect-level timeout (redshift.py's _DB_CONNECT_TIMEOUT_SECS) bounds
 # a single socket connect, but a Test connection click can chain several steps
 # (describe_clusters, an SSH tunnel, the DB connect, a Data API poll) — this is the
 # overall ceiling so the button never spins forever regardless of which step is slow.
 _TEST_CONNECTION_TIMEOUT_SECS = 30
 
+# ``ui.log`` creates a NiceGUI label (and therefore a browser DOM node) for each
+# line.  An ingest can be very chatty, especially at debug level or while a
+# warehouse returns paged results.  Keeping a small, recent tail is enough for
+# progress feedback; the complete transcript is already persisted by
+# ``ingest_runner`` and remains available through the download button.
+_LIVE_LOG_LINES = 300
+_LIVE_LOG_FLUSH_SECS = 0.25
+
 Collector = Callable[[], tuple[BaseModel, dict[str, str]] | None]
+
+
+def _telemetry_only_connectors() -> set[str]:
+    """Names whose ``rows`` run-log value intentionally excludes telemetry.
+
+    Run history's row count is the canonical cost-record count written by
+    ``Connector.fetch``.  A Redshift cluster has no such records because AWS
+    FOCUS is the account-wide billing source; its useful output is collected
+    afterwards by the supplemental telemetry pulls.  Preserve the numeric run
+    log while keeping its UI label truthful.
+    """
+    try:
+        configs = load_all_connections(str(paths.connections_path()))
+    except (ConfigError, OSError):
+        return set()
+    return {
+        effective_connector_name(config)
+        for config in configs
+        if isinstance(config, RedshiftConfig)
+    }
 
 
 def _with_hint(field: ui.input, hint: str | None) -> ui.input:
@@ -572,7 +580,7 @@ def render() -> None:
                 ui.button(
                     "View log",
                     icon="visibility",
-                    on_click=lambda: _watch(running.total, running.connector),
+                    on_click=lambda: _watch(running.connector),
                 ).props("flat no-caps")
 
     sync_status_row()
@@ -871,6 +879,7 @@ def render() -> None:
                 chrome.empty_state("history", "No syncs yet", "Run a sync to see its history here.")
                 return
             runs_detail = read_runs(limit=1000)
+            telemetry_only_connectors = _telemetry_only_connectors()
             connector_filter.set_options(["All", *sorted(runs_detail["connector"].unique())])
             if connector_filter.value != "All":
                 matching = set(
@@ -895,11 +904,20 @@ def render() -> None:
                 connectors_df = runs_detail[runs_detail["run_id"] == run_id].sort_values(
                     "connector"
                 )
+                all_telemetry_only = (
+                    not connectors_df.empty
+                    and set(connectors_df["connector"]).issubset(telemetry_only_connectors)
+                )
+                row_summary = (
+                    "telemetry-only sync"
+                    if all_telemetry_only
+                    else f"{int(run['rows']):,} cost rows"
+                )
                 log_path = paths.sync_log_path(run_id)
                 with ui.row().classes("w-full items-center gap-2"):
                     expansion = (
                         ui.expansion(
-                            f"{'✗' if failed else '✓'}  {started} · {int(run['rows']):,} rows · "
+                            f"{'✗' if failed else '✓'}  {started} · {row_summary} · "
                             f"{int(run['connectors'])} connector(s)"
                         )
                         .classes("flex-1")
@@ -925,7 +943,12 @@ def render() -> None:
                                     f"color:{chrome.WASTE if row_failed else chrome.OPPORTUNITY}; "
                                     "width:60px"
                                 )
-                                ui.label(f"{int(row['rows']):,} rows").classes("text-xs").style(
+                                row_count_label = (
+                                    "telemetry-only"
+                                    if row["connector"] in telemetry_only_connectors
+                                    else f"{int(row['rows']):,} cost rows"
+                                )
+                                ui.label(row_count_label).classes("text-xs").style(
                                     f"color:{chrome.INK_MUTED}; width:110px"
                                 )
                             if detail:
@@ -971,9 +994,11 @@ def render() -> None:
                     f"color:{chrome.INK_PRIMARY}"
                 )
                 log_widget = (
-                    ui.log(max_lines=5000).classes("w-full").style("height:50vh; font-size:12px;")
+                    ui.log(max_lines=_LIVE_LOG_LINES)
+                    .classes("w-full")
+                    .style("height:50vh; font-size:12px;")
                 )
-                for line in text.splitlines():
+                for line in text.splitlines()[-_LIVE_LOG_LINES:]:
                     log_widget.push(line)
                 with ui.row().classes("w-full justify-end gap-2"):
                     ui.button(
@@ -992,87 +1017,92 @@ def render() -> None:
 
     connector_filter.on_value_change(_filter_history)
 
-    async def _watch(total: int, connector: str | None) -> None:
+    async def _watch(connector: str | None) -> None:
         """Open the live-tail dialog and follow the current sync to completion —
         whether *this* call is what just started it, or it's already running
         from an earlier click and this is the "Sync in progress" banner's "View
         log" button reattaching to it. Either way the dialog opens immediately
         and tails the subprocess live instead of showing a bare spinner and
         dumping everything at the end — a sync can run for minutes, and "is it
-        doing anything?" was the whole complaint. A "N of M cost pulls done"
-        counter (parsed from the same progress lines the tail already shows —
-        see _CONNECTOR_DONE_RE's own comment for why it's phrased around the
-        cost pull specifically, not the whole sync) and a "Download log" button
-        (the accumulated text, client-side — no server route or on-disk log
-        file needed) ride along for free.
+        doing anything?" was the whole complaint. The rendered transcript is a
+        bounded, batched tail; the complete log stays on disk and can be downloaded
+        without copying it into this browser session.
 
         Cancelling this coroutine (dialog closed, tab navigated away) only
         detaches this one viewer — the sync itself runs in ingest_runner's own
         module-level background task and keeps going either way; see its
         module docstring for why that split exists.
         """
-        lines: list[str] = list(ingest_runner.recent_lines())
-        done = sum(1 for line in lines if _CONNECTOR_DONE_RE.match(line))
+        run = ingest_runner.current_run()
+        log_path = paths.sync_log_path(run.run_id) if run is not None else None
+        lines = ingest_runner.recent_lines()[-_LIVE_LOG_LINES:]
+        pending_lines: deque[str] = deque(maxlen=_LIVE_LOG_LINES)
+        client_gone = False
+
+        def _mark_client_gone(event: object) -> None:
+            """Stop pushing a tail into a dialog the user has dismissed."""
+            nonlocal client_gone
+            if not getattr(event, "value", False):
+                client_gone = True
 
         with ui.dialog() as log_dialog, ui.card().style("width:700px; max-width:95vw;"):
             ui.label(f"Syncing {connector or 'all connections'}...").classes(
                 "text-sm font-semibold"
             ).style(f"color:{chrome.INK_PRIMARY}")
-            progress_label = (
-                ui.label(f"{done} / {total} cost pulls done")
-                .classes("text-xs")
-                .style(f"color:{chrome.INK_SECONDARY}")
-            )
             log_widget = (
-                ui.log(max_lines=2000).classes("w-full").style("height:50vh; font-size:12px;")
+                ui.log(max_lines=_LIVE_LOG_LINES)
+                .classes("w-full")
+                .style("height:50vh; font-size:12px;")
             )
             for line in lines:
                 log_widget.push(line)
             with ui.row().classes("w-full justify-end gap-2"):
-                ui.button(
-                    "Download log",
-                    icon="download",
-                    on_click=lambda: ui.download(
-                        "\n".join(lines).encode(),
-                        f"flashlight-sync-{connector or 'all'}.log",
-                    ),
-                ).props("flat no-caps")
+                if log_path is not None:
+                    ui.button(
+                        "Download full log",
+                        icon="download",
+                        on_click=lambda p=log_path: ui.download(p),
+                    ).props("flat no-caps")
                 ui.button("Close", on_click=log_dialog.close).props("flat no-caps")
+        log_dialog.on_value_change(_mark_client_gone)
         log_dialog.open()
 
-        client_gone = False
+        def _flush_log() -> None:
+            """Send at most four DOM update batches per second to this browser."""
+            if client_gone or log_widget.is_deleted:
+                pending_lines.clear()
+                return
+            while pending_lines:
+                log_widget.push(pending_lines.popleft())
+
+        # Ingest output is produced by a detached subprocess tail, so pushing a
+        # line per callback can outpace a browser's websocket/DOM work. Coalescing
+        # short bursts makes the dialog responsive without hiding progress.
+        flush_timer = ui.timer(_LIVE_LOG_FLUSH_SECS, _flush_log)
 
         def _on_line(line: str) -> None:
-            nonlocal done, client_gone
-            lines.append(line)
-            if client_gone:
+            nonlocal client_gone
+            if client_gone or log_widget.is_deleted:
                 # The browser tab/dialog is gone (navigated away, closed, reloaded)
-                # but the subprocess keeps streaming — every element under it was
-                # already torn down, so further pushes would just re-raise this
-                # same RuntimeError once per remaining line.
-                return
-            try:
-                log_widget.push(line)
-                if _CONNECTOR_DONE_RE.match(line):
-                    done += 1
-                    progress_label.set_text(f"{done} / {total} cost pulls done")
-            except RuntimeError:
+                # but the subprocess keeps streaming. Do not attempt an update:
+                # NiceGUI warns (rather than raising) for a deleted element.
                 client_gone = True
+                return
+            pending_lines.append(line)
 
         unsubscribe = ingest_runner.subscribe(_on_line)
         try:
             result = await ingest_runner.wait_for_current()
         finally:
             unsubscribe()
+            flush_timer.cancel()
 
         if client_gone or result is None:
             return
 
-        # Unlike the interim per-line updates above, this fires only once the
-        # subprocess has actually exited — so unlike those, "done" here really does
-        # mean the whole sync (cost + efficiency + driver-health + GOLD rebuild).
+        _flush_log()
+
         returncode, _run_id = result
-        progress_label.set_text(f"Sync finished — exit code {returncode}")
         ui.notify(
             "Sync completed" if returncode == 0 else "Sync failed — see output above",
             type="positive" if returncode == 0 else "negative",
@@ -1096,7 +1126,6 @@ def render() -> None:
             ui.notify("A sync is already running", type="warning")
             return
         start, end = range_state["start"], range_state["end"]
-        total = 1 if connector is not None else len(load_connections(str(paths.connections_path())))
         try:
             await ingest_runner.start_sync(
                 paths.connections_path(),
@@ -1110,6 +1139,6 @@ def render() -> None:
             return
         sync_status_row.refresh()
         connections_body.refresh()
-        await _watch(total, connector)
+        await _watch(connector)
 
     sync_button.on_click(lambda: _sync())

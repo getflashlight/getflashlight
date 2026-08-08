@@ -14,6 +14,7 @@ worked — a connector with broken creds fails those the same way).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -43,12 +44,14 @@ from flashlight.lake import (
     compute_instances,
     driver_health,
     metrics,
+    redshift_policy_config,
     runlog,
     storage_locations,
 )
 from flashlight.lake.ai_usage_schema import AiUsageRecord
 from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
+from flashlight.lake.redshift_policy_config_schema import RedshiftPolicyConfigRecord
 from flashlight.lake.storage_location_schema import StorageLocationRecord
 from flashlight.transform.runner import build_gold
 
@@ -248,13 +251,22 @@ def run_ingest(
         published = build_gold()
         logger.info("transform_done", gold_views=published, phase="cost")
 
-    # The five supplemental planes are independent reads and write to distinct Parquet
-    # roots. Run the phases concurrently so a slow warehouse query (for example driver
-    # health) does not make the REST-only storage inventory wait behind it. Each phase is
-    # deliberately given one worker internally: this outer pool is the global bound, so
-    # a single sync never fans out to five nested pools and exceeds ingest_max_workers.
-    # Their individual helpers still use per-connector concurrency when called directly.
-    _run_supplemental(window, succeeded_connectors, on_progress)
+    # Driver health and policy configuration are the fast, independently useful
+    # governance signals. Publish them before starting the potentially long-running
+    # efficiency pull: Redshift's STL activity aggregation can take minutes on a busy
+    # cluster, and should not keep already-written driver-health Bronze invisible in
+    # GOLD for that whole time.
+    def _publish_priority_telemetry() -> None:
+        if not no_transform and succeeded_connectors:
+            published = build_gold()
+            logger.info("transform_done", gold_views=published, phase="priority_telemetry")
+
+    _run_supplemental(
+        window,
+        succeeded_connectors,
+        on_progress,
+        on_priority_complete=_publish_priority_telemetry,
+    )
 
     # Final holistic rebuild — same idempotent build_gold() as above, now
     # picking up whatever fresh efficiency/waste, driver-health, AI-usage,
@@ -282,11 +294,26 @@ def _run_supplemental(
     window: IngestWindow,
     connectors: list[Connector],
     on_progress: ProgressCallback | None = None,
+    *,
+    on_priority_complete: Callable[[], None] | None = None,
 ) -> None:
-    """Run independent best-effort telemetry phases under one global concurrency cap."""
+    """Run supplemental telemetry under one global concurrency cap.
+
+    Driver health and policy configuration run first because they have a short,
+    predictable latency and can be published before a deep system-table efficiency
+    query finishes. The remaining planes are still independent and concurrent.
+    """
+    priority_phases = (
+        lambda: _run_driver_health(window, connectors, max_workers=1),
+        lambda: _run_policy_config(window, connectors, max_workers=1),
+    )
+    with ThreadPoolExecutor(max_workers=_max_workers(len(priority_phases))) as pool:
+        list(pool.map(lambda phase: phase(), priority_phases))
+    if on_priority_complete is not None:
+        on_priority_complete()
+
     phases = (
         lambda: _run_efficiency(window, connectors, on_progress, max_workers=1),
-        lambda: _run_driver_health(window, connectors, max_workers=1),
         lambda: _run_ai_usage(window, connectors, max_workers=1),
         lambda: _run_storage_locations(window, connectors, max_workers=1),
         lambda: _run_compute_instances(window, connectors, max_workers=1),
@@ -382,6 +409,21 @@ def _run_driver_health(
     written = driver_health.write_driver_health(window, all_records)
     logger.info("driver_health_written", rows=written)
     return written
+
+
+def _run_policy_config(
+    window: IngestWindow, connectors: list[Connector], *, max_workers: int | None = None
+) -> int:
+    def _pull(connector: Connector) -> list[RedshiftPolicyConfigRecord]:
+        try:
+            return list(connector.fetch_policy_config(window))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("policy_config_pull_failed", connector=connector.name, error=str(exc))
+            return []
+
+    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
+        records = [record for batch in pool.map(_pull, connectors) for record in batch]
+    return redshift_policy_config.write(window, records)
 
 
 def _run_ai_usage(

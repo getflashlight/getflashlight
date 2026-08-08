@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """The deterministic policy-compliance rule pool.
 
 Config-driven, same convention as :mod:`waste_rules`: add a ``PolicyRule`` with
@@ -124,7 +125,7 @@ POLICY_RULES: tuple[PolicyRule, ...] = (
         label="SQL warehouse tagged",
         remedy="Add cost-allocation tags (e.g. team, project, environment) to this "
         "SQL warehouse so its spend can be attributed at a granular level.",
-        applies_sql="entity_type = 'sql_warehouse'",
+        applies_sql="provider_name <> 'AWS' AND entity_type = 'sql_warehouse'",
         not_applicable_sql="tag_count IS NULL",
         compliant_sql="tag_count > 0",
         detail_sql="CASE WHEN tag_count IS NULL THEN 'tag telemetry unavailable' "
@@ -136,7 +137,7 @@ POLICY_RULES: tuple[PolicyRule, ...] = (
         remedy="Set an auto-stop timeout on this SQL warehouse, no longer than the org "
         "threshold, so idle time stops billing — the warehouse counterpart to cluster "
         "auto-termination.",
-        applies_sql="entity_type = 'sql_warehouse'",
+        applies_sql="provider_name <> 'AWS' AND entity_type = 'sql_warehouse'",
         # NULL = the warehouse_meta join found no config row (unmeasured), not a
         # confirmed-absent timeout — same honesty gate as tag_count above.
         not_applicable_sql="auto_stop_minutes IS NULL",
@@ -197,6 +198,17 @@ POLICY_RULES: tuple[PolicyRule, ...] = (
     ),
 )
 
+# Typed-Bronze Redshift controls are compiled below rather than from the efficiency
+# CTE, but share this label registry with the policy dashboard.
+POLICY_LABELS = {r.category: r.label for r in POLICY_RULES} | {
+    "redshift_encryption": "Redshift encryption enabled",
+    "redshift_public_access": "Redshift not publicly accessible",
+    "redshift_enhanced_vpc_routing": "Redshift enhanced VPC routing",
+    "redshift_snapshot_retention": "Redshift snapshot retention",
+    "redshift_require_ssl": "Redshift SSL required",
+    "redshift_cluster_tagging": "Redshift cluster tagged",
+}
+
 
 def build_policy_record_sql() -> str:
     """Compile the ACTIVE rules into the ``gold.policy_record`` view SQL.
@@ -223,6 +235,44 @@ FROM e
 WHERE {applies_sql.format(**fill)}"""
         for r, applies_sql in active
     )
+    redshift_branches = """
+UNION ALL
+SELECT 'AWS', strptime(snapshot_month, '%Y-%m')::date, 'redshift_cluster', cluster_id,
+       coalesce(cluster_name, cluster_id), NULL, NULL, 'redshift_encryption',
+       CASE WHEN encrypted IS NULL THEN 'not_applicable' WHEN encrypted THEN 'compliant' ELSE 'non_compliant' END,
+       CASE WHEN encrypted IS NULL THEN 'encryption telemetry unavailable' WHEN encrypted THEN 'encryption enabled' ELSE 'cluster is not encrypted' END
+FROM raw.redshift_policy_config
+UNION ALL
+SELECT 'AWS', strptime(snapshot_month, '%Y-%m')::date, 'redshift_cluster', cluster_id,
+       coalesce(cluster_name, cluster_id), NULL, NULL, 'redshift_public_access',
+       CASE WHEN publicly_accessible IS NULL THEN 'not_applicable' WHEN NOT publicly_accessible THEN 'compliant' ELSE 'non_compliant' END,
+       CASE WHEN publicly_accessible IS NULL THEN 'public-access telemetry unavailable' WHEN NOT publicly_accessible THEN 'not publicly accessible' ELSE 'cluster is publicly accessible' END
+FROM raw.redshift_policy_config
+UNION ALL
+SELECT 'AWS', strptime(snapshot_month, '%Y-%m')::date, 'redshift_cluster', cluster_id,
+       coalesce(cluster_name, cluster_id), NULL, NULL, 'redshift_enhanced_vpc_routing',
+       CASE WHEN enhanced_vpc_routing IS NULL THEN 'not_applicable' WHEN enhanced_vpc_routing THEN 'compliant' ELSE 'non_compliant' END,
+       CASE WHEN enhanced_vpc_routing IS NULL THEN 'enhanced VPC routing telemetry unavailable' WHEN enhanced_vpc_routing THEN 'enhanced VPC routing enabled' ELSE 'enhanced VPC routing disabled' END
+FROM raw.redshift_policy_config
+UNION ALL
+SELECT 'AWS', strptime(snapshot_month, '%Y-%m')::date, 'redshift_cluster', cluster_id,
+       coalesce(cluster_name, cluster_id), NULL, NULL, 'redshift_snapshot_retention',
+       CASE WHEN automated_snapshot_retention_days IS NULL THEN 'not_applicable' WHEN automated_snapshot_retention_days >= {min_redshift_snapshot_retention_days} THEN 'compliant' ELSE 'non_compliant' END,
+       CASE WHEN automated_snapshot_retention_days IS NULL THEN 'snapshot-retention telemetry unavailable' ELSE automated_snapshot_retention_days || ' day(s) retained' END
+FROM raw.redshift_policy_config
+UNION ALL
+SELECT 'AWS', strptime(snapshot_month, '%Y-%m')::date, 'redshift_cluster', cluster_id,
+       coalesce(cluster_name, cluster_id), NULL, NULL, 'redshift_require_ssl',
+       CASE WHEN require_ssl IS NULL THEN 'not_applicable' WHEN require_ssl THEN 'compliant' ELSE 'non_compliant' END,
+       CASE WHEN require_ssl IS NULL THEN 'require_ssl telemetry unavailable' WHEN require_ssl THEN 'require_ssl=true' ELSE 'require_ssl=false' END
+FROM raw.redshift_policy_config
+UNION ALL
+SELECT 'AWS', strptime(snapshot_month, '%Y-%m')::date, 'redshift_cluster', cluster_id,
+       coalesce(cluster_name, cluster_id), NULL, NULL, 'redshift_cluster_tagging',
+       CASE WHEN tag_count IS NULL THEN 'not_applicable' WHEN tag_count > 0 THEN 'compliant' ELSE 'non_compliant' END,
+       CASE WHEN tag_count IS NULL THEN 'tag telemetry unavailable' WHEN tag_count > 0 THEN tag_count || ' tag(s) set' ELSE 'no tags set' END
+FROM raw.redshift_policy_config
+""".format(**fill)
     return f"""
 CREATE OR REPLACE VIEW gold.policy_record AS
 WITH e AS (
@@ -247,5 +297,6 @@ WITH e AS (
                                                            AS auto_stop_minutes
     FROM metrics.efficiency_record
 )
-{branches};
+{branches}
+{redshift_branches};
 """

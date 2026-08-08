@@ -105,8 +105,8 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   provider page carries the **same five core tabs** — Trend & changes, Breakdown,
   Attribution (`views/attribution.py`), Efficiency & Waste (`views/efficiency_waste.py`) and
   Policy Compliance (`views/policy.py`) — plus per-provider extras (Databricks: AI Costs
-  (`views/ai_costs.py`), Backing storage (`views/backing_storage.py`), Backing compute
-  (`views/backing_compute.py`) and Client Driver Health, its only producer). Home is
+  (`views/ai_costs.py`), Backing storage (`views/backing_storage.py`) and Backing compute
+  (`views/backing_compute.py`)); Redshift also has Client Driver Health. Home is
   the only cross-provider page; the old `/utilization` and `/leaderboard` pages are gone
   (`router._RETIRED_ROUTES` 307s them to Home). Redshift
   has no GOLD group of its own (its cost flows into `aws.*`; only its efficiency/waste
@@ -169,8 +169,9 @@ uv run ruff check src tests scripts && uv run mypy src tests scripts && uv run p
   its own dashboard page, and efficiency/waste is a **core tab on every one of them** —
   including providers with no telemetry, which get a named empty state rather than a
   hidden tab ("never measured" must not look like "nothing to find"). Only AI Costs,
-  Backing storage, Backing compute and driver health are Databricks-only extras — the
-  first and last because Databricks is their sole *producer*, Backing storage/Backing
+  Backing storage and Backing compute are Databricks-only extras; Client Driver Health
+  is an extra for Databricks and Redshift. The first is Databricks-only because it is
+  its sole *producer*; Backing storage/Backing
   compute because each has two producers (`aws_focus` for the AWS cost, `databricks` for
   the Databricks-side map — Unity Catalog's bucket map, or `system.compute.node_timeline`'s
   instance/cluster map) but a single *subject*, which serves the same purpose: keep a

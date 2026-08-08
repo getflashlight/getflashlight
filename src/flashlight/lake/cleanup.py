@@ -23,6 +23,8 @@ logger = get_logger(__name__)
 def _data_dirs() -> Iterator[tuple[str, Path]]:
     """The (label, path) of every dir that holds generated lake data — not config."""
     yield "bronze", paths.bronze_dir()
+    # Pre-Bronze driver health is read during the migration but no longer written.
+    yield "legacy_driver_health", paths.legacy_driver_health_dir()
     yield "gold", paths.gold_dir()
     yield "gold.staging", paths.gold_staging_dir()
     yield "runs", paths.runs_dir()
