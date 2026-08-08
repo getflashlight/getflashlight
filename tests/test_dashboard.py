@@ -434,8 +434,8 @@ def test_provider_page_renders_when_lake_predates_a_catalogued_view(lake_home) -
     ``duck.register_gold`` only registers files that exist, so a view added to the
     catalog after the last ``flashlight transform`` is absent from the DuckDB catalog
     entirely and querying it raises — which took down the whole provider route when
-    ``spend_untagged_by_service_month``/``spend_forecast_month`` shipped. The panels
-    reading them now check ``gold_view_published`` first (see provider_focus.py,
+    ``spend_by_service_month``/``spend_forecast_month`` shipped. The panels reading
+    them now check ``gold_view_published`` first (see provider_focus.py,
     attribution.py).
     """
     from flashlight.lake import bronze, paths
@@ -450,7 +450,7 @@ def test_provider_page_renders_when_lake_predates_a_catalogued_view(lake_home) -
     build_gold()
 
     # Roll the published lake back to what an older transform would have left behind.
-    for view in ("spend_untagged_by_service_month", "spend_forecast_month"):
+    for view in ("spend_by_service_month", "spend_forecast_month"):
         (paths.gold_dir() / "gcp" / f"{view}.parquet").unlink()
 
     from nicegui import ui
@@ -464,7 +464,7 @@ def test_provider_page_renders_when_lake_predates_a_catalogued_view(lake_home) -
             await user.open("/gcp")
             await user.should_see("GCP spend")
             user.find(kind=ui.tab, content="Attribution").click()
-            await user.should_see("Untagged-by-service isn't published yet")
+            await user.should_see("Spend by service isn't published yet")
             await user.should_see("run `flashlight transform`")
 
     asyncio.run(_check())

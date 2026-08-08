@@ -52,3 +52,4 @@ demo/lake/meta/dashboard_storage/
 .cursor/mcp.json
 docs/cli.md
 site/
+config/assistant.yml
