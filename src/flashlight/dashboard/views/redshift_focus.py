@@ -24,35 +24,26 @@ connector only supplies efficiency/waste telemetry. So this page:
   page's own :func:`_spend_partition`.
 - **Attribution**: :func:`_attribution_section`, a Redshift-scoped cost hierarchy
   (service → cluster → user allocation) narrowed by ``service_name``.
-- **Efficiency & Waste**: faceted per cluster (:func:`_waste_section`) — one section per
-  billed Redshift cluster. Clusters with telemetry show their findings; clusters without
-  it show an explicit, cluster-specific instrumentation gap. ``entity_id`` for
+- **Workload Findings**: faceted per cluster (:func:`_workload_findings_section`) — one
+  section per billed Redshift cluster. Clusters with telemetry show only Redshift-native
+  findings; clusters without it show an explicit, cluster-specific instrumentation gap. ``entity_id`` for
   ``entity_type='sql_warehouse'`` under ``provider_name='AWS'`` is the cluster
   identifier itself, and every other Redshift entity_type is ``<cluster_id>:...``
   prefixed, see ``ingest/connectors/redshift.py``). Clusters that bill on this
   account (visible in the cost section's "Spend by cluster") but have no
   ``redshift`` connector entry get their own explicit setup state, never a
   silently omitted or account-level answer. Each cluster's findings come from
-  ``efficiency.waste_record`` filtered
-  to ``provider_name = 'AWS'`` plus either a ``redshift_``-prefixed category
-  (Redshift-only rules) or ``entity_type IN ('sql_warehouse', 'sql_warehouse_user')``
-  — the two categories shared with Databricks (``idle``,
-  ``sql_warehouse_user_concentration``) key off those entity types, and under
-  ``provider_name = 'AWS'`` only the Redshift connector emits them (S3's own signal
-  uses ``entity_type = 'storage'``), so the combination stays Redshift-only despite
-  ``entity_type`` names being shared in *name* with Databricks' own entity type
-  (just under a different ``provider_name``). ``efficiency_waste.coverage_summary``
-  also cross-references ``efficiency.efficiency_entity_month`` (every rule this connector
-  evaluates, not just the ones that fired) so a rule that found nothing reads differently
-  from one whose telemetry never arrived this window. It is compact diagnostic text; the
-  single table per cluster is the same drill-down action queue used by every provider.
+  ``efficiency.waste_record`` filtered to ``provider_name = 'AWS'`` and a
+  ``redshift_``-prefixed category. Generic shared-compute rules are deliberately
+  excluded: their Databricks-oriented remedies do not apply to Redshift. Each cluster
+  shows only its actionable findings; generic billed-spend and utilization/detection-
+  coverage summaries are omitted because Redshift telemetry is diagnostic rather than
+  a per-entity utilization reading.
 
   This tab is why the page does NOT also carry ``efficiency_waste.render()`` the way every
-  other provider page does: ``_waste_section`` is scoped per *cluster*, which is finer than
+  other provider page does: ``_workload_findings_section`` is scoped per *cluster*, which is finer than
   per provider, so a provider-scoped tab beside it would render the union of these sections
-  — the same ``waste_record`` rows twice. What it does borrow is
-  ``efficiency_waste.coverage_caption``, passed the same per-cluster ``scope`` predicate, so
-  the "what didn't we measure?" statement is cluster-scoped like everything around it.
+  — the same ``waste_record`` rows twice.
 """
 
 from __future__ import annotations
@@ -68,10 +59,10 @@ from nicegui import ui
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import gold_df, gold_view_published, provider_label
 from flashlight.dashboard.data import to_date as _d
-from flashlight.dashboard.summary import action_group_rows
 from flashlight.dashboard.theme import compact_money
 from flashlight.dashboard.views import attribution, driver_health, efficiency_waste, provider_focus
 from flashlight.dashboard.views.provider_focus import Scope
+from flashlight.efficiency.waste_rules import WASTE_RULES
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 
 _GROUP = "aws"
@@ -81,6 +72,9 @@ _SKU_SCOPE = (
     f"sku_id IN (SELECT DISTINCT sku_id FROM {_GROUP}.resource_month "
     f"WHERE service_name IN ({_SERVICE_IN}))"
 )
+_REDSHIFT_RULE_BY_CATEGORY = {
+    rule.category: rule for rule in WASTE_RULES if rule.category.startswith("redshift_")
+}
 
 # Views this page reads WIDER than its own service scope, on purpose. Declared rather
 # than inferred because the first three *do* carry service_name — `credits_month`
@@ -143,8 +137,8 @@ def render() -> None:
         breakdown_lead=(_spend_partition,),
         extra_kpis=(_commitment_utilization_kpi, _spectrum_kpi, _active_clusters_kpi),
         attribution_tab=_attribution_section,
-        efficiency_tab=_waste_section,
-        efficiency_tab_label="Efficiency & Waste",
+        efficiency_tab=_workload_findings_section,
+        efficiency_tab_label="Workload Findings",
         # The shared policy view already carries AWS/Redshift entity rows. It must be
         # visible even when a check is not yet measurable: that is an explicit
         # coverage gap, not a clean compliance result.
@@ -910,8 +904,9 @@ def _telemetry_cluster_ids() -> list[str]:
     return list(df["entity_id"]) if not df.empty else []
 
 
-def _waste_section(sm: date, end: date) -> None:
-    chrome.section_title("Efficiency & waste")
+def _workload_findings_section(sm: date, end: date) -> None:
+    """Redshift-native findings only; generic shared-compute savings are excluded."""
+    chrome.section_title("Redshift workload findings")
 
     # The bill is the primary cluster universe: a reader needs an answer for all four
     # billed clusters, not only the subset that already has a telemetry connector. A
@@ -929,7 +924,7 @@ def _waste_section(sm: date, end: date) -> None:
         return
 
     if len(clusters) == 1:
-        _cluster_efficiency_section(clusters[0], clusters[0] in telemetry_clusters, sm, end)
+        _cluster_efficiency_section(clusters[0], clusters[0] in telemetry_clusters)
     else:
         with ui.tabs().classes("w-full") as tabs:
             tab_refs = [ui.tab(cluster_id) for cluster_id in clusters]
@@ -941,25 +936,19 @@ def _waste_section(sm: date, end: date) -> None:
             for cluster_id, tab_ref in zip(clusters, tab_refs, strict=True):
                 with ui.tab_panel(tab_ref):
                     _cluster_efficiency_section(
-                        cluster_id, cluster_id in telemetry_clusters, sm, end
+                        cluster_id, cluster_id in telemetry_clusters
                     )
 
 
-def _cluster_efficiency_section(
-    cluster_id: str, instrumented: bool, sm: date, end: date
-) -> None:
+def _cluster_efficiency_section(cluster_id: str, instrumented: bool) -> None:
     """Render one billed cluster's complete efficiency answer or its precise gap."""
-    ui.label(f"Cluster: {cluster_id}").classes("text-base font-semibold mt-4").style(
-        f"color:{chrome.INK_PRIMARY}"
-    )
-    _cluster_billing_context(cluster_id, sm, end)
     if not instrumented:
         with chrome.panel():
             chrome.panel_title("Not yet instrumented")
             chrome.section_caption(
                 "This cluster has billed Redshift spend, but no `redshift` connector entry. "
                 "Add one connection for this cluster in connections.yml to enable its "
-                "Efficiency & Waste findings."
+                "Redshift workload findings."
             )
         return
 
@@ -976,57 +965,12 @@ def _cluster_efficiency_section(
     if not completed_months:
         chrome.empty_state(
             "calendar_month",
-            "No completed efficiency month yet",
+            "No completed telemetry month yet",
             "This cluster has telemetry, but its current month is still accruing. Findings "
-            "appear after the month closes so partial-month costs do not distort savings.",
+            "appear after the month closes so partial-month signals are not misleading.",
         )
         return
     _cluster_waste_section(cluster_id, completed_months[-1])
-
-
-def _cluster_billing_context(cluster_id: str, sm: date, end: date) -> None:
-    """Useful cost context for every billed cluster, even before telemetry exists.
-
-    Cost can show where the money lands, but it cannot honestly classify waste. Keeping
-    this separate from the telemetry-derived findings gives an uninstrumented cluster a
-    useful first screen without presenting invoice data as an optimization verdict.
-    """
-    cluster = _sql_str(cluster_id)
-    where = (
-        f"regexp_extract(resource_id, ':cluster:(.+)$', 1) = '{cluster}' "
-        f"AND charge_month >= '{sm}' AND charge_month <= '{end}'"
-    )
-    summary = gold_df(
-        f"SELECT coalesce(sum(net_cost), 0) AS net_cost, "
-        f"count(DISTINCT charge_month) AS billed_months "
-        f"FROM {_GROUP}.resource_month WHERE {where}"
-    )
-    net_cost = float(summary["net_cost"].iloc[0]) if not summary.empty else 0.0
-    billed_months = int(summary["billed_months"].iloc[0]) if not summary.empty else 0
-    chrome.kpi_row(
-        [
-            ("Billed spend", compact_money(net_cost), "Selected date range", "volume"),
-            ("Billed months", str(billed_months), "Cost coverage", "volume"),
-        ],
-        columns=2,
-    )
-    sku = gold_df(
-        f"SELECT sku_description, sum(net_cost) AS net_cost FROM {_GROUP}.resource_month "
-        f"WHERE {where} GROUP BY sku_description ORDER BY net_cost DESC LIMIT 5"
-    )
-    if sku.empty:
-        return
-    with chrome.panel():
-        chrome.panel_title("What this cluster is billed for")
-        chrome.section_caption(
-            "Invoice context only — efficiency and waste findings require Redshift telemetry."
-        )
-        chrome.flat_table(
-            sku,
-            key=f"redshift_cluster_billing_{_slug(cluster_id)}",
-            money_cols=["net_cost"],
-            rename={"sku_description": "Billed item", "net_cost": "Net cost"},
-        )
 
 
 def _cluster_waste_section(cluster_id: str, month: str) -> None:
@@ -1034,61 +978,72 @@ def _cluster_waste_section(cluster_id: str, month: str) -> None:
         f"(entity_id = '{_sql_str(cluster_id)}' "
         f"OR starts_with(entity_id, '{_sql_str(cluster_id)}:'))"
     )
-    coverage = gold_df(
-        "SELECT DISTINCT charge_month, entity_type FROM efficiency.efficiency_entity_month "
-        f"WHERE provider_name = '{_PROVIDER}' AND {scope} AND charge_month = '{month}'"
-    )
-    if coverage.empty:
-        return  # shouldn't happen — cluster_id came from this same view
-
-    measured_types = set(coverage.loc[coverage["charge_month"].astype(str) == month, "entity_type"])
-
     records = gold_df(
         f"SELECT * FROM efficiency.waste_record WHERE provider_name = '{_PROVIDER}' "
-        f"AND {scope} AND charge_month = '{month}' ORDER BY recoverable_cost DESC"
+        f"AND {scope} AND charge_month = '{month}' "
+        "AND waste_category LIKE 'redshift_%' ORDER BY confidence DESC, waste_category"
     )
+    with chrome.panel():
+        chrome.panel_title("Findings")
+        if records.empty:
+            chrome.section_caption("No Redshift workload findings in the latest completed month.")
+            return
+        body = ui.column().classes("w-full gap-2")
 
-    action_groups = action_group_rows(records)
-    waste_total = action_groups.loc[action_groups["lens"] == "WASTE", "potential_savings"].sum()
-    opp_total = action_groups.loc[action_groups["lens"] == "OPPORTUNITY", "potential_savings"].sum()
-    chrome.kpi_row(
-        [
-            (
-                "Waste (recoverable)",
-                compact_money(float(waste_total)),
-                "Idle time, underutilized capacity",
-                "unattributed",
-            ),
-            (
-                "Opportunity (recoverable)",
-                compact_money(float(opp_total)),
-                "Workloads movable to cheaper compute",
-                "decrease",
-            ),
-        ],
-        columns=2,
-    )
+        @ui.refreshable
+        def _body(category: str | None = None) -> None:
+            body.clear()
+            with body:
+                if category is None:
+                    root_rows = (
+                        records.groupby("waste_category", as_index=False)
+                        .agg(
+                            resource_count=("entity_id", "nunique"),
+                            has_high_confidence=(
+                                "confidence",
+                                lambda values: (values == "high").any(),
+                            ),
+                        )
+                        .assign(
+                            Finding=lambda rows: rows["waste_category"].map(
+                                lambda value: _REDSHIFT_RULE_BY_CATEGORY[str(value)].label
+                            ),
+                            Confidence=lambda rows: rows["has_high_confidence"].map(
+                                lambda high: "High" if high else "Candidate"
+                            ),
+                        )
+                        .sort_values(["has_high_confidence", "Finding"], ascending=[False, True])
+                    )
 
-    # Same "what didn't we measure?" statement every other provider's Efficiency & Waste
-    # tab leads with, passed this cluster's own scope so it agrees with the panels around
-    # it. On real data this reads "0 of N measured" — Redshift's telemetry is per table and
-    # per query shape, neither of which has a per-entity utilization reading.
-    efficiency_waste.coverage_caption(_PROVIDER, scope_sql=scope)
+                    def _open_finding(row: dict[str, object]) -> None:
+                        _body.refresh(str(row["waste_category"]))
 
-    # Compact diagnostic summary; the action queue below is the only table for this
-    # cluster, drilled workload/remedy → entity → evidence just like Attribution.
-    efficiency_waste.coverage_summary(
-        _PROVIDER,
-        records,
-        measured_types,
-        scope_note="for this cluster",
-    )
-    tracking = gold_df(
-        "SELECT * FROM efficiency.waste_resolution_month "
-        f"WHERE provider_name = '{_PROVIDER}' AND {scope}"
-    ) if gold_view_published("efficiency", "waste_resolution_month") else pd.DataFrame()
-    efficiency_waste.action_queue(
-        records,
-        tracking,
-        key=f"redshift_actions_{_slug(cluster_id)}",
-    )
+                    chrome.searchable_table(
+                        root_rows[["Finding", "resource_count", "Confidence"]],
+                        row_data=root_rows,
+                        key=f"redshift_findings_{_slug(cluster_id)}_root",
+                        search_col="Finding",
+                        int_cols=["resource_count"],
+                        rename={"resource_count": "Affected resources"},
+                        on_row_click=_open_finding,
+                    )
+                    return
+
+                ui.button("← All findings", on_click=lambda: _body.refresh()).props(
+                    "flat dense no-caps"
+                ).style(f"color:{chrome.ACCENT};")
+                findings = records.loc[records["waste_category"] == category]
+                display = pd.DataFrame(
+                    {
+                        "Resource": findings["entity_name"].fillna(findings["entity_id"]),
+                        "Evidence": findings["detail"],
+                        "Confidence": findings["confidence"].str.capitalize(),
+                    }
+                )
+                chrome.searchable_table(
+                    display,
+                    key=f"redshift_findings_{_slug(cluster_id)}_{_slug(category)}",
+                    search_col="Resource",
+                )
+
+        _body()

@@ -73,27 +73,31 @@ def test_fetch_driver_health_maps_connection_log_rows(monkeypatch) -> None:  # t
     from flashlight.ingest.base import IngestWindow
 
     connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
-    execute = MagicMock(
-        return_value=[
-            {
-                "charge_month": "2026-07-01",
-                "client_driver": "Redshift JDBC Driver 2.0.0.0",
-                "client_application": "nightly-etl",
-                "executed_by": "svc-etl",
-                "query_count": "44",
-            }
-        ]
-    )
+    def execute(_sql: str, *_args: object, name: str) -> list[dict[str, str]]:
+        if name == "driver_health":
+            return [
+                {
+                    "charge_month": "2026-07-01",
+                    "client_driver": "Redshift JDBC Driver 2.0.0.0",
+                    "client_application": "nightly-etl",
+                    "executed_by": "svc-etl",
+                    "query_count": "44",
+                }
+            ]
+        return []
+
+    execute = MagicMock(side_effect=execute)
     monkeypatch.setattr(connector, "_execute", execute)
 
-    records = list(connector.fetch_driver_health(IngestWindow(date(2026, 7, 1), date(2026, 7, 31))))
+    records = list(connector.fetch_driver_health(IngestWindow(date(2026, 7, 25), date(2026, 7, 31))))
 
     assert len(records) == 1
     assert records[0].provider_name == "AWS"
     assert records[0].client_driver == "Redshift JDBC Driver 2.0.0.0"
     assert records[0].query_count == 44
-    assert execute.call_args.kwargs["name"] == "driver_health"
-    assert "dateadd(day, 1, '2026-07-31')" in execute.call_args.args[0].lower()
+    driver_call = next(call for call in execute.call_args_list if call.kwargs["name"] == "driver_health")
+    assert "dateadd(day, 1, '2026-07-31')" in driver_call.args[0].lower()
+    assert "recordtime >= '2026-07-25'" in driver_call.args[0].lower()
 
 
 def test_fetch_driver_health_uses_bastion_route_when_configured(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -108,7 +112,10 @@ def test_fetch_driver_health_uses_bastion_route_when_configured(monkeypatch) -> 
             {"cluster_identifier": "prod", "db_user": "flashlight", **_BASTION_FIELDS}
         )
     )
-    execute = MagicMock(return_value=[])
+    def execute(_sql: str, *_args: object, name: str) -> list[dict[str, str]]:
+        return []
+
+    execute = MagicMock(side_effect=execute)
     monkeypatch.setattr(connector, "_execute", execute)
     monkeypatch.setattr(
         connector,
@@ -116,10 +123,10 @@ def test_fetch_driver_health_uses_bastion_route_when_configured(monkeypatch) -> 
         lambda _mode: nullcontext(lambda: nullcontext("bastion-connection")),
     )
 
-    window = IngestWindow(date(2026, 7, 1), date(2026, 7, 31))
+    window = IngestWindow(date(2026, 7, 25), date(2026, 7, 31))
     assert list(connector.fetch_driver_health(window)) == []
-    assert execute.call_args.args[1] == "bastion-connection"
-    assert execute.call_args.kwargs["name"] == "driver_health"
+    driver_call = next(call for call in execute.call_args_list if call.kwargs["name"] == "driver_health")
+    assert driver_call.args[1] == "bastion-connection"
 
 
 def test_fetch_policy_config_maps_control_plane_evidence() -> None:
@@ -1298,9 +1305,23 @@ def test_detail_sql_scopes_step_views_to_window_query_ids() -> None:
     patterns = redshift._QUERY_PATTERN_QUERY_PATH.read_text()
     users = redshift._USER_ACTIVITY_QUERY_PATH.read_text()
 
-    assert "FROM svl_query_report r\n    JOIN q ON q.query = r.query" in patterns
+    assert "top_patterns AS" in patterns
+    assert "candidate_queries AS" in patterns
+    assert "FROM svl_query_report r\n    JOIN candidate_queries q ON q.query = r.query" in patterns
     user_scope = "FROM svl_query_report r\n    JOIN q ON q.query = r.query AND q.userid = r.userid"
     assert user_scope in users
+
+
+def test_table_usage_sql_is_bounded_to_the_effective_system_log_window() -> None:
+    from flashlight.ingest.connectors import redshift
+
+    sql = (
+        redshift._TABLE_USAGE_SQL.replace(":start_date", "'2026-08-02'")
+        .replace(":end_date", "'2026-08-09'")
+    )
+
+    assert "s.starttime >= '2026-08-02'" in sql
+    assert "s.starttime < '2026-08-09'" in sql
 
 
 def test_execute_rolls_back_shared_connection_after_a_failed_query() -> None:
@@ -1826,18 +1847,15 @@ def test_redshift_tab_renders_per_cluster_with_action_queue(monkeypatch, tmp_pat
             build_pages()
             await user.open("/aws")
             await user.should_see("Redshift spend")
-            user.find(kind=ui.tab, content="Efficiency & Waste").click()
-            await user.should_see("Cluster: prod-cluster")
-            await user.should_see("Savings opportunities")
-            await user.should_see("Detection coverage for this cluster")
-            await user.should_see("Cluster: orphan-cluster")
-            await user.should_see("What this cluster is billed for")
+            user.find(kind=ui.tab, content="Workload Findings").click()
+            await user.should_see("Redshift workload findings")
+            await user.should_see("Findings")
             await user.should_see("Not yet instrumented")
 
             # ui.table renders rows as data, not as text nodes should_see can match —
             # inspect the root action queue for its unpriced Spectrum workload group.
             tables = user.find(kind=ui.table).elements
             all_rows = " ".join(str(t.rows) for t in tables)
-            assert "Tables — Move to cheaper compute" in all_rows
+            assert "External table driving Spectrum scan cost" in all_rows
 
     asyncio.run(_check())

@@ -84,9 +84,6 @@ _USER_ACTIVITY_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_user_activ
 _SPECTRUM_TABLE_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_spectrum_table_usage.sql"
 _DRIVER_HEALTH_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_driver_health.sql"
 _TABLE_USAGE_DAILY_QUERY_PATH = Path(__file__).parent / "sql" / "redshift_table_usage_daily.sql"
-_EXTERNAL_TABLE_CATALOG_QUERY_PATH = (
-    Path(__file__).parent / "sql" / "redshift_external_table_catalog.sql"
-)
 _EXTERNAL_QUERY_DAILY_QUERY_PATH = (
     Path(__file__).parent / "sql" / "redshift_external_query_daily.sql"
 )
@@ -125,9 +122,10 @@ _TABLE_INVENTORY_CACHE_TTL = timedelta(days=1)
 
 # Table-access history, joined to the table inventory by table_id (STL_SCAN.tbl ==
 # SVV_TABLE_INFO.table_id, same join key the runbook's table_usage load script uses).
-# No :start_date filter — STL_SCAN's own retention (typically 2-5 days unless the
-# customer exports STL logs) already bounds this; filtering further would only lose
-# signal, not gain honesty.
+# This must be bounded to the effective system-log window.  Some clusters retain or
+# export STL_SCAN history far beyond Redshift's usual short retention; without this
+# predicate an ordinary seven-day efficiency pull aggregates every retained scan.
+# The interval is half-open so adjacent daily pulls do not overlap.
 _TABLE_USAGE_SQL = """
 -- Recent retained workload only.  STL_SCAN does not include concurrency-scaling
 -- queries, so these figures diagnose main-cluster table compute; they must never be
@@ -142,6 +140,8 @@ WITH scans AS (
         max(s.starttime) AS last_access_at
     FROM stl_scan s
     WHERE s.userid > 1
+      AND s.starttime >= :start_date
+      AND s.starttime < :end_date
       AND s.perm_table_name NOT IN ('Internal Worktable', 'S3', 'Runtime Filter')
     GROUP BY s.query, s.tbl
 ), per_query AS (
@@ -210,6 +210,10 @@ FROM pg_tables
 # translate into a cheap plan). See fetch_efficiency.
 _EARLIEST_RETAINED_SQL = "SELECT min(starttime) AS earliest_retained_query_ts FROM stl_query"
 
+# Redshift system-log retention is short. Cap collection regardless of an arbitrary
+# billing ingest range so production telemetry never asks the system views for months.
+_SYSTEM_LOG_MAX_LOOKBACK_DAYS = 7
+
 
 def _opt_float(value: object) -> float | None:
     if value is None or value == "":
@@ -251,6 +255,14 @@ def _activity_unmeasurable(window_end: date, earliest_retained: date | None) -> 
     they don't cover the window's earlier days too.
     """
     return earliest_retained is None or earliest_retained > window_end
+
+
+def _system_log_window(window: IngestWindow) -> IngestWindow:
+    """Cap Redshift system-log collection to the source's seven-day retention."""
+    return IngestWindow(
+        start=max(window.start, window.end - timedelta(days=_SYSTEM_LOG_MAX_LOOKBACK_DAYS - 1)),
+        end=window.end,
+    )
 
 
 def _unmeasurable_activity() -> dict[str, Any]:
@@ -311,11 +323,6 @@ class RedshiftConnector(Connector):
         with narrower system-table permissions.  The ingest runner treats it as the
         same best-effort, non-cost signal as Databricks driver health.
         """
-        sql = (
-            _DRIVER_HEALTH_QUERY_PATH.read_text()
-            .replace(":start_date", f"'{window.start}'")
-            .replace(":end_date", f"'{window.end}'")
-        )
         # Match fetch_efficiency's connection selection.  A private cluster that
         # requires a bastion cannot reach the Data API merely because this is a
         # smaller, independent pull.
@@ -325,11 +332,45 @@ class RedshiftConnector(Connector):
             mode = "direct_sql"
         else:
             mode = "data_api"
+        system_window = _system_log_window(window)
+        if system_window.start != window.start:
+            logger.info(
+                "redshift_driver_health_skipped",
+                reason="requested_window_exceeds_system_log_cap",
+                requested_start=str(window.start),
+                effective_start=str(system_window.start),
+                window_end=str(system_window.end),
+                max_lookback_days=_SYSTEM_LOG_MAX_LOOKBACK_DAYS,
+            )
+            return
+        logger.info(
+            "redshift_driver_health_query_window",
+            requested_start=str(window.start),
+            effective_start=str(system_window.start),
+            window_end=str(system_window.end),
+            max_lookback_days=_SYSTEM_LOG_MAX_LOOKBACK_DAYS,
+        )
+
+        def collect(conn: Any = None) -> list[dict[str, Any]]:
+            logger.info(
+                "redshift_driver_health_collection_started",
+                effective_start=str(system_window.start),
+                window_end=str(system_window.end),
+            )
+            sql = (
+                _DRIVER_HEALTH_QUERY_PATH.read_text()
+                .replace(":start_date", f"'{system_window.start}'")
+                .replace(":end_date", f"'{system_window.end}'")
+            )
+            if conn is None:
+                return self._execute(sql, name="driver_health")
+            return self._execute(sql, conn, name="driver_health")
+
         if mode == "data_api":
-            rows = self._execute(sql, name="driver_health")
+            rows = collect()
         else:
             with self._lane_connection_factory(mode) as lane_conn, lane_conn() as conn:
-                rows = self._execute(sql, conn, name="driver_health")
+                rows = collect(conn)
         for row in rows:
             charge_month = _opt_date(row.get("charge_month"))
             if charge_month is None:
@@ -441,35 +482,14 @@ class RedshiftConnector(Connector):
                         "redshift_external_query_daily_failed", error=str(exc), day=str(current)
                     )
                 current = next_day
-            try:
-                rows = self._execute(
-                    _EXTERNAL_TABLE_CATALOG_QUERY_PATH.read_text(),
-                    conn,
-                    name="external_table_catalog",
-                )
-                records.extend(
-                    RedshiftTableObservabilityRecord(
-                        cluster_id=self._config.cluster_identifier,
-                        observation_date=window.end,
-                        record_kind="external_catalog",
-                        external_schema=row.get("external_schema"),
-                        external_table=row.get("external_table"),
-                        redshift_database_name=row.get("redshift_database_name"),
-                        table_type=row.get("tabletype"),
-                        table_location=row.get("table_location"),
-                        input_format=row.get("input_format"),
-                        output_format=row.get("output_format"),
-                        serialization_lib=row.get("serialization_lib"),
-                        compressed=_opt_int(row.get("compressed")),
-                        table_parameters=row.get("table_parameters"),
-                        partition_count=_opt_int(row.get("partition_count")),
-                        sample_partition_location=row.get("sample_partition_location"),
-                        x_source_connector=self.name,
-                    )
-                    for row in rows
-                )
-            except ConnectorError as exc:
-                logger.warning("redshift_external_table_catalog_failed", error=str(exc))
+            # ``SVV_EXTERNAL_TABLES`` can require a slow catalog-wide metadata walk
+            # (Glue/Lake Formation/Hive) even without partition enumeration. Keep the
+            # source SQL for a future scoped or Glue-backed inventory job, but do not
+            # let it delay the normal Redshift efficiency collection.
+            logger.info(
+                "redshift_external_table_catalog_skipped",
+                reason="catalog_inventory_deferred",
+            )
             return records
 
         if mode == "data_api":
@@ -529,6 +549,8 @@ class RedshiftConnector(Connector):
     def fetch_efficiency(self, window: IngestWindow) -> Iterator[EfficiencyRecord]:
         month = window.start.replace(day=1)
         entity_id = self._config.cluster_identifier
+        system_window = _system_log_window(window)
+        window_capped = system_window.start != window.start
 
         if self._config.bastion_host is not None:
             mode = "bastion_tunnel"
@@ -540,8 +562,10 @@ class RedshiftConnector(Connector):
             "redshift_efficiency_start",
             mode=mode,
             entity_id=entity_id,
-            window_start=str(window.start),
-            window_end=str(window.end),
+            requested_window_start=str(window.start),
+            effective_window_start=str(system_window.start),
+            window_end=str(system_window.end),
+            max_lookback_days=_SYSTEM_LOG_MAX_LOOKBACK_DAYS,
         )
 
         cost = self._cost_breakdown(window, entity_id)
@@ -557,11 +581,13 @@ class RedshiftConnector(Connector):
         # connection to share.
         with self._lane_connection_factory(mode) as lane_conn:
             activity, activity_records, table_records = self._run_lanes(
-                window, entity_id, month, cost, lane_conn
+                system_window, entity_id, month, cost, lane_conn
             )
 
         allocation_available = not (
-            activity.get("activity_window_unmeasurable") or activity.get("activity_measured_since")
+            window_capped
+            or activity.get("activity_window_unmeasurable")
+            or activity.get("activity_measured_since")
         )
         table_records, spectrum_allocated = self._allocate_spectrum_cost(
             table_records, cost.get("spectrum_scan"), allocation_available
@@ -597,6 +623,7 @@ class RedshiftConnector(Connector):
             # implying full-window coverage over what's really a shorter measured
             # span.
             "activity_measured_since": activity.get("activity_measured_since"),
+            "activity_window_capped": window_capped or None,
         }
         total_cost = sum(v for v in cost.values() if v is not None)
         yield EfficiencyRecord(
@@ -808,7 +835,11 @@ class RedshiftConnector(Connector):
         def _usage() -> list[dict[str, Any]]:
             with lane_conn() as conn:
                 try:
-                    return self._execute(_TABLE_USAGE_SQL, conn, name="table_usage")
+                    sql = (
+                        _TABLE_USAGE_SQL.replace(":start_date", f"'{window.start}'")
+                        .replace(":end_date", f"'{window.end + timedelta(days=1)}'")
+                    )
+                    return self._execute(sql, conn, name="table_usage")
                 except ConnectorError as exc:
                     logger.warning("redshift_table_usage_failed", error=str(exc))
                     return []

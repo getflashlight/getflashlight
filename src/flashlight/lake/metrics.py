@@ -1,10 +1,12 @@
-"""Metrics-plane writes: partition-replace per (provider, charge-month window).
+"""Metrics-plane writes: partition-replace per (provider, connector, charge-month).
 
 The waste-plane sibling of :mod:`flashlight.lake.bronze`. Same kernel — purge the
 window's partition dirs, then a single DuckDB ``COPY`` with ``PARTITION_BY`` — but
-keyed on ``provider_name=<p>/charge_month=<YYYY-MM>/`` and over the already-aggregated
-:class:`~flashlight.efficiency.model.EfficiencyRecord` rows. Re-running a window is
-idempotent and self-purging, exactly as for BRONZE.
+keyed on ``provider_name=<p>/x_source_connector=<source>/charge_month=<YYYY-MM>/``
+and over the already-aggregated :class:`~flashlight.efficiency.model.EfficiencyRecord`
+rows. Re-running a window is idempotent and self-purging, exactly as for BRONZE. In
+particular, a refresh of one Redshift cluster cannot purge a sibling cluster's AWS
+telemetry for the same billing month.
 
 Source-aggregated rows are unique per (entity × month), so there is no within-batch
 dedupe step (unlike BRONZE's ``dedupe``).
@@ -41,7 +43,7 @@ def _copy_options() -> str:
     settings = get_settings()
     opts = [
         "FORMAT parquet",
-        "PARTITION_BY (provider_name, charge_month)",
+        "PARTITION_BY (provider_name, x_source_connector, charge_month)",
         f"COMPRESSION '{settings.parquet_compression}'",
         "APPEND",
     ]
@@ -50,26 +52,36 @@ def _copy_options() -> str:
     return ", ".join(opts)
 
 
-def _purge_window(providers: set[str], window: IngestWindow) -> None:
-    """Remove each provider's partition dirs across the window — the delete-window step."""
+def _purge_window(partitions: set[tuple[str, str]], window: IngestWindow) -> None:
+    """Remove only each provider/connector's month partitions in the window."""
     months = _window_months(window.start, window.end)
-    for provider in providers:
-        provider_dir = paths.metrics_dir() / f"provider_name={provider}"
+    for provider, connector in partitions:
+        connector_dir = (
+            paths.metrics_dir()
+            / f"provider_name={provider}"
+            / f"x_source_connector={connector}"
+        )
         for month in months:
-            partition = provider_dir / f"charge_month={month}"
+            partition = connector_dir / f"charge_month={month}"
             if partition.exists():
                 shutil.rmtree(partition)
-                logger.info("metrics_partition_purged", provider=provider, charge_month=month)
+                logger.info(
+                    "metrics_partition_purged",
+                    provider=provider,
+                    connector=connector,
+                    charge_month=month,
+                )
 
 
 def write_efficiency(window: IngestWindow, records: list[EfficiencyRecord]) -> int:
     """Partition-replace ``[window]`` with ``records``. Returns rows written.
 
-    Purges each present provider's window partitions first (authoritative), then writes
-    the fresh, source-aggregated pull as zstd Parquet partitioned by provider + month.
+    Purges each present provider/connector's window partitions first (authoritative), then
+    writes the fresh, source-aggregated pull as zstd Parquet partitioned by provider,
+    connector, and month.
     """
-    providers = {str(r.provider_name) for r in records}
-    _purge_window(providers, window)
+    partitions = {(str(r.provider_name), r.x_source_connector) for r in records}
+    _purge_window(partitions, window)
     if not records:
         logger.info("metrics_window_empty")
         return 0

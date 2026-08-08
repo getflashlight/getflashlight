@@ -279,16 +279,20 @@ def _run_supplemental(
     All of these writes stay in BRONZE until the single transform at the end of
     :func:`run_ingest`.
     """
-    priority_phases = (
-        lambda: _run_driver_health(window, connectors, max_workers=1),
-        lambda: _run_policy_config(window, connectors, max_workers=1),
-    )
+    priority_phases = (lambda: _run_policy_config(window, connectors, max_workers=1),)
     with ThreadPoolExecutor(max_workers=_max_workers(len(priority_phases))) as pool:
         list(pool.map(lambda phase: phase(), priority_phases))
 
+    # Redshift efficiency and table-observability both interrogate STL/SVL system
+    # history. Keep those two heavy planes serial: running them together makes two
+    # large STL_SCAN aggregations compete inside the production cluster. Driver
+    # health follows them and is skipped automatically when the requested window
+    # exceeds Redshift's short log-retention cap.
+    _run_efficiency(window, connectors, on_progress, max_workers=1)
+    _run_redshift_table_observability(window, connectors, max_workers=1)
+    _run_driver_health(window, connectors, max_workers=1)
+
     phases = (
-        lambda: _run_efficiency(window, connectors, on_progress, max_workers=1),
-        lambda: _run_redshift_table_observability(window, connectors, max_workers=1),
         lambda: _run_ai_usage(window, connectors, max_workers=1),
         lambda: _run_storage_locations(window, connectors, max_workers=1),
         lambda: _run_compute_instances(window, connectors, max_workers=1),

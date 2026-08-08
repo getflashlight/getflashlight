@@ -74,7 +74,7 @@ def redshift_table_observability_dir() -> Path:
 
 
 def metrics_dir() -> Path:
-    """Efficiency-telemetry root, Hive-partitioned ``provider_name=…/charge_month=…/``.
+    """Efficiency-telemetry root, Hive-partitioned by provider, connector, and month.
 
     The waste-plane sibling of :func:`bronze_dir` — holds the aggregated
     ``EfficiencyRecord`` rows the GOLD waste view classifies. Separate from BRONZE
