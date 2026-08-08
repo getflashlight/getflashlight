@@ -24,7 +24,8 @@ one FOCUS-normalized bill, plus how much of it is recoverable waste.
 It installs with `pip install getflashlight` — **no Docker, no database server**.
 Persistence is Parquet under `FLASHLIGHT_HOME`, queried by an in-memory **DuckDB**.
 
-> v1 visualizes current spend. It does not (yet) recommend optimizations.
+> Flashlight identifies recoverable-spend candidates; it never applies cloud changes or
+> performs automatic remediation.
 
 **Cross-platform.** The lake home defaults to the OS user-data dir
 (`platformdirs`) — `~/Library/Application Support/flashlight` on macOS,
@@ -35,31 +36,65 @@ publish retries the per-file rename to ride out a reader's brief open handle.
 
 ## Architecture
 
-```
-sources ──▶ flashlight ingest ──▶ Parquet lake (FLASHLIGHT_HOME) ──▶ readers
- AWS FOCUS export    (writer)     bronze/  partitioned, source of truth   flashlight mcp serve
- Databricks tables                gold/    *.parquet ◀── the only surface  flashlight dashboard serve
- AWS Cost Explorer                         consumers read                 (each: own in-mem DuckDB)
+```mermaid
+flowchart LR
+    subgraph sources[Cloud sources]
+        aws_export["AWS FOCUS Data Export"]
+        aws_ce["AWS Cost Explorer"]
+        databricks["Databricks system tables"]
+        redshift["Amazon Redshift telemetry"]
+    end
+
+    subgraph writer[Writer process]
+        ingest["flashlight ingest<br/>the sole writer"]
+    end
+
+    subgraph lake[Parquet lake • FLASHLIGHT_HOME]
+        bronze["BRONZE<br/>canonical FOCUS records"]
+        silver["SILVER<br/>normalized in-memory model"]
+        gold["GOLD<br/>published metric views"]
+    end
+
+    subgraph readers[Read-only consumers]
+        dashboard["flashlight dashboard serve<br/>human interface"]
+        mcp["flashlight mcp serve<br/>agent interface"]
+    end
+
+    aws_export --> ingest
+    aws_ce --> ingest
+    databricks --> ingest
+    redshift --> ingest
+    ingest --> bronze
+    bronze --> silver
+    silver --> gold
+    gold --> dashboard
+    gold --> mcp
 ```
 
-Three independent processes: `ingest` is the sole writer; `mcp serve` and
-`dashboard serve` are read-only. Concurrency is "many readers over immutable
-Parquet, publish by atomic per-file rename" — no locks, no server.
+Flashlight has one writer and any number of readers. `flashlight ingest` writes
+source data and publishes completed GOLD views. `flashlight dashboard serve` and
+`flashlight mcp serve` each open their own in-memory DuckDB connection over that
+published data; neither process changes the lake.
 
-* **BRONZE** `bronze/` — canonical FOCUS records, Hive-partitioned by connector +
-  charge month; partition-replace makes re-ingest idempotent and self-purging.
-* **SILVER** (in-memory only) — the cleaned, normalized view every GOLD metric is
-  derived from: one canonical `cost` column (EffectiveCost), charge-period grain.
-  Never persisted.
-* **GOLD** `gold/*.parquet` — the metrics contract the dashboard and MCP both read,
-  so a chart and an agent never disagree. Built by `transform` via DuckDB `COPY`.
+| Layer | Location | Purpose |
+| --- | --- | --- |
+| **BRONZE** | `bronze/` | Canonical FOCUS records, partitioned by connector and charge month. Re-ingestion replaces the requested partitions, so retries are idempotent. |
+| **SILVER** | In memory | Cleaned, normalized source model. Every cost metric derives from its single canonical `EffectiveCost` column at charge-period grain. |
+| **GOLD** | `gold/*.parquet` | Published metric contract for both the dashboard and MCP server. It is built with DuckDB and atomically published, so readers do not observe half-written results. |
+
+There is no database server, REST API, or migration layer. Parquet is the persistent
+store; `FocusRecord` is the canonical ingestion schema.
 
 ## Quick start
 
 ```bash
-pip install getflashlight          # or: uv sync (from this repo)
-flashlight sample               # download the FinOps FOCUS sample + seed it (no config)
-flashlight dashboard serve      # dashboard → http://127.0.0.1:8501
+pip install getflashlight
+
+# Load public FOCUS sample data into the local lake.
+flashlight sample
+
+# Open the dashboard at http://127.0.0.1:8501.
+flashlight dashboard serve
 ```
 
 `flashlight sample [--rows 1000|10000]` is the zero-config way to see the dashboard
@@ -67,14 +102,18 @@ with real data — it loads the CSV straight into Parquet via a vectorized DuckD
 projection (no per-row Python). For your own sources instead:
 
 ```bash
-flashlight init                 # scaffold the lake home + config/*.yml
-flashlight ingest               # pull configured connectors → BRONZE, rebuild GOLD
+# Create <FLASHLIGHT_HOME>/config/ with commented starter files.
+flashlight init
+
+# Pull enabled connectors, then publish fresh GOLD metrics.
+flashlight ingest
 ```
 
 * Dashboard: `http://127.0.0.1:8501` (NiceGUI; consumer surface for humans)
-* MCP: `http://localhost:8002` (`flashlight mcp serve`; streamable-http, for agents) —
+* MCP: `http://localhost:8002` (`flashlight mcp serve`; streamable HTTP, for agents) —
   also startable and watchable from the dashboard's **MCP server** page. The port has no
-  authentication, so keep `FLASHLIGHT_MCP_HOST` on `127.0.0.1` unless you mean to expose it.
+  authentication, so set `FLASHLIGHT_MCP_HOST=127.0.0.1` unless you intentionally provide
+  a private, authenticated network boundary.
 * CLI: `flashlight init | ingest | transform | mcp serve | dashboard serve | aws create-export`
 * Config: `<home>/config/{connections,policies,assistant}.yml` — never any secrets; those
   go to your OS keychain or the env vars the config names.
@@ -122,7 +161,7 @@ explicit **unattributed** bucket rather than hidden.
 |---|---|---|
 | `aws_focus` | AWS Data Exports (FOCUS 1.x Parquet in S3), or Cost Explorer via `cost_source="cost_explorer"` | S3 export: already FOCUS, light coercion. Cost Explorer: coarser account-level totals, mapped in Python |
 | `databricks` | Databricks system tables | **vendored Databricks → FOCUS 1.3 SQL** (below) |
-| `redshift` | Redshift Data API + Cost Explorer (efficiency/waste only, no cost mapping) | — |
+| `redshift` | Redshift Data API or read-only SQL (efficiency telemetry only; cost arrives through AWS FOCUS) | — |
 | `bigquery` / `snowflake` | — | stubs (planned) |
 
 ### Databricks mapping (based on the Databricks FOCUS query)
