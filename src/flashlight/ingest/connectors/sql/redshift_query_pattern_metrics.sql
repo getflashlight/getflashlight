@@ -4,8 +4,7 @@
 -- redshift_efficiency.sql can't give: that query answers "is the cluster spilling
 -- overall", this one answers "which query pattern".
 --
--- Provisioned-cluster system tables only (STL_*/SVL_*) — see redshift_efficiency.sql's
--- header for the Serverless caveat, same here.
+-- Provisioned-cluster system tables only (STL_*/SVL_*).
 --
 -- NOT YET VALIDATED against a live cluster — column names follow AWS's published
 -- system-table docs (docs.aws.amazon.com/redshift/latest/dg/c_intro_STL_tables.html).

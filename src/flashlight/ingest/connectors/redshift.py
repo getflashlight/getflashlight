@@ -236,13 +236,6 @@ class RedshiftConnector(Connector):
             access_key_env=config.access_key_env,
             secret_key_env=config.secret_key_env,
         )
-        self._redshift_serverless = aws_client(
-            "redshift-serverless",
-            region=config.region,
-            profile=config.aws_profile,
-            access_key_env=config.access_key_env,
-            secret_key_env=config.secret_key_env,
-        )
 
     def fetch(self, window: IngestWindow) -> Iterator[FocusRecord]:
         """No-op: Redshift cost already flows through ``aws_focus``. See module docstring."""
@@ -250,8 +243,7 @@ class RedshiftConnector(Connector):
 
     def fetch_efficiency(self, window: IngestWindow) -> Iterator[EfficiencyRecord]:
         month = window.start.replace(day=1)
-        entity_id = self._config.cluster_identifier or self._config.workgroup_name
-        assert entity_id is not None  # RedshiftConfig requires exactly one
+        entity_id = self._config.cluster_identifier
 
         if self._config.bastion_host is not None:
             mode = "bastion_tunnel"
@@ -267,7 +259,7 @@ class RedshiftConnector(Connector):
             window_end=str(window.end),
         )
 
-        cost = self._cost_breakdown(window)
+        cost = self._cost_breakdown(window, entity_id)
         reserved = self._reserved_node_coverage()
         # The activity chain (probe -> cluster_activity -> gated query_patterns/
         # user_activity/spectrum_table_usage) and the table-inventory chain
@@ -283,11 +275,21 @@ class RedshiftConnector(Connector):
                 window, entity_id, month, cost, lane_conn
             )
 
+        allocation_available = not (
+            activity.get("activity_window_unmeasurable") or activity.get("activity_measured_since")
+        )
+        table_records, spectrum_allocated = self._allocate_spectrum_cost(
+            table_records, cost.get("spectrum_scan"), allocation_available
+        )
+
         cause: dict[str, Any] = {
             "compute_cost": cost.get("compute"),
             "concurrency_scaling_cost": cost.get("concurrency_scaling"),
             "storage_cost": cost.get("storage"),
-            "spectrum_scan_cost": cost.get("spectrum_scan"),
+            # The cluster-level total is only emitted where table allocation could
+            # not safely reconcile it. Otherwise the per-table rows carry the same
+            # invoice charge exactly once.
+            "spectrum_scan_cost": None if spectrum_allocated else cost.get("spectrum_scan"),
             "wlm_queue_wait_ms_p95": activity.get("wlm_queue_wait_ms_p95"),
             "wlm_queue_wait_ms_p99": activity.get("wlm_queue_wait_ms_p99"),
             "wlm_wait_to_exec_ratio": activity.get("wlm_wait_to_exec_ratio"),
@@ -315,7 +317,7 @@ class RedshiftConnector(Connector):
         yield EfficiencyRecord(
             provider_name="AWS",
             charge_month=month,
-            # Reused, not a new entity type: a Redshift cluster/workgroup is
+            # Reused, not a new entity type: a Redshift cluster is
             # SQL-warehouse-shaped (shared compute, cost-attributable per owner,
             # no honest per-entity utilization%) — see EntityType's own
             # docstring and CLAUDE.md's "SQL warehouses have no per-entity
@@ -529,8 +531,47 @@ class RedshiftConnector(Connector):
             )
         )
 
+    @staticmethod
+    def _allocate_spectrum_cost(
+        records: list[EfficiencyRecord], spectrum_cost: float | None, measurable: bool
+    ) -> tuple[list[EfficiencyRecord], bool]:
+        """Allocate a target-scoped Spectrum invoice charge by scanned bytes.
+
+        The scan telemetry comes from short-retention system tables.  A partial or
+        unavailable window cannot honestly divide a whole billing-period charge, so
+        this deliberately fails closed and leaves the cluster-level finding in place.
+        """
+        if not measurable or spectrum_cost is None or spectrum_cost <= 0:
+            return records, False
+        spectrum_rows = [
+            rec
+            for rec in records
+            if rec.entity_id.find(":spectrum:") != -1
+            and isinstance(rec.cause_detail.get("spectrum_scanned_gb"), (int, float))
+            and float(rec.cause_detail["spectrum_scanned_gb"]) > 0
+        ]
+        total_scanned = sum(float(rec.cause_detail["spectrum_scanned_gb"]) for rec in spectrum_rows)
+        if not spectrum_rows or total_scanned <= 0:
+            return records, False
+
+        allocated: list[EfficiencyRecord] = []
+        for rec in records:
+            if rec not in spectrum_rows:
+                allocated.append(rec)
+                continue
+            scanned = float(rec.cause_detail["spectrum_scanned_gb"])
+            pct = scanned / total_scanned
+            cause = {
+                **rec.cause_detail,
+                "spectrum_allocated_cost": spectrum_cost * pct,
+                "spectrum_allocation_pct": pct * 100.0,
+                "spectrum_allocation_status": "allocated",
+            }
+            allocated.append(rec.model_copy(update={"cause_detail": cause}))
+        return allocated, True
+
     def test_connection(self) -> str:
-        """Resolves the configured cluster/workgroup via AWS, then exercises whichever
+        """Resolves the configured cluster via AWS, then exercises whichever
         connection mode ``RedshiftConfig`` selects with a throwaway ``SELECT 1`` — the
         dashboard's "Test connection" button's one call. Mirrors ``fetch_efficiency``'s
         own mode dispatch below (``bastion_host`` -> SSH tunnel, ``db_password_env`` ->
@@ -538,12 +579,8 @@ class RedshiftConnector(Connector):
         same path successfully.
         """
         cfg = self._config
-        if cfg.cluster_identifier:
-            endpoint = self._cluster_endpoint()
-            resolved = f"cluster resolved to {endpoint['host']}:{endpoint['port']}"
-        else:
-            workgroup = self._workgroup_status()
-            resolved = f"workgroup resolved (status={workgroup.get('status', '?')})"
+        endpoint = self._cluster_endpoint()
+        resolved = f"cluster resolved to {endpoint['host']}:{endpoint['port']}"
 
         # ponytail: two describe_clusters calls on this path (here + inside
         # _bastion_connection/_direct_connection) — a manual one-click test, not the
@@ -806,11 +843,9 @@ class RedshiftConnector(Connector):
         self, window: IngestWindow, cluster_id: str, month: date, conn: Any = None
     ) -> Iterator[EfficiencyRecord]:
         """Which external table is driving Spectrum scan spend, per table — the
-        drill-down the cluster-level ``redshift_spectrum_scan_cost`` $ figure can't
-        give on its own (see redshift_spectrum_table_usage.sql). Unpriced by design:
-        the cluster-level finding already carries the real $ for this cluster's
-        Spectrum spend, so pricing this too would double-count it. Best-effort, same
-        failure handling as the other efficiency fetches.
+        raw usage that is later allocated from an already-ingested, target-scoped
+        Spectrum invoice charge when the activity window is complete. Best-effort,
+        same failure handling as the other efficiency fetches.
         """
         sql = (
             _SPECTRUM_TABLE_QUERY_PATH.read_text()
@@ -893,8 +928,6 @@ class RedshiftConnector(Connector):
         kwargs: dict[str, Any] = {"Database": self._config.database, "Sql": sql}
         if self._config.cluster_identifier:
             kwargs["ClusterIdentifier"] = self._config.cluster_identifier
-        if self._config.workgroup_name:
-            kwargs["WorkgroupName"] = self._config.workgroup_name
         if self._config.db_user:
             kwargs["DbUser"] = self._config.db_user
         if self._config.secret_arn:
@@ -1126,21 +1159,6 @@ class RedshiftConnector(Connector):
         endpoint = clusters[0].get("Endpoint", {})
         return {"host": endpoint["Address"], "port": endpoint["Port"]}
 
-    def _workgroup_status(self) -> dict[str, Any]:
-        """Serverless equivalent of ``_cluster_endpoint``'s ``describe_clusters`` —
-        resolves ``self._config.workgroup_name`` via ``redshift-serverless``'s
-        ``GetWorkgroup``. Used only by ``test_connection`` today; ``fetch_efficiency``'s
-        Data API path resolves the workgroup server-side via ``WorkgroupName`` and never
-        needs this client-side lookup.
-        """
-        assert self._config.workgroup_name is not None  # caller checks this
-        try:
-            return self._redshift_serverless.get_workgroup(  # type: ignore[no-any-return]
-                workgroupName=self._config.workgroup_name
-            )["workgroup"]
-        except Exception as exc:  # noqa: BLE001
-            raise ConnectorError(self.name, f"get_workgroup failed: {exc}") from exc
-
     def _bastion_credentials(self) -> dict[str, str]:
         """DB credentials for the bastion connection — static password if configured,
         else the default short-lived IAM-authenticated credential.
@@ -1170,8 +1188,8 @@ class RedshiftConnector(Connector):
         return {"user": resp["DbUser"], "password": resp["DbPassword"]}
 
     # ── Cost breakdown (read from already-ingested aws_focus BRONZE) ─────────
-    def _cost_breakdown(self, window: IngestWindow) -> dict[str, float]:
-        """Real $ per cost subcategory for Redshift services this window.
+    def _cost_breakdown(self, window: IngestWindow, cluster_identifier: str) -> dict[str, float]:
+        """Real, target-scoped $ per cost subcategory for this Redshift cluster.
 
         Reads BRONZE FOCUS rows written by ``aws_focus`` for this same window —
         no Cost Explorer call. ``aws_focus`` already stamps ``x_cost_subcategory``
@@ -1192,11 +1210,13 @@ class RedshiftConnector(Connector):
                     "SELECT x_cost_subcategory, sum(effective_cost) AS cost "
                     "FROM raw.focus_record "
                     "WHERE service_name IN (?, ?) "
+                    "AND resource_id LIKE ? "
                     "AND charge_month >= ? AND charge_month <= ? "
                     "AND charge_period_start >= ? AND charge_period_start < ? "
                     "GROUP BY x_cost_subcategory",
                     [
                         *REDSHIFT_SERVICE_NAMES,
+                        f"%:cluster:{cluster_identifier}",
                         window.start.strftime("%Y-%m"),
                         window.end.strftime("%Y-%m"),
                         window.start,
@@ -1209,9 +1229,9 @@ class RedshiftConnector(Connector):
             logger.warning("redshift_cost_bronze_read_failed", error=str(exc))
             return {}
 
-        # Only the buckets this connector's cause_detail carries — "serverless"/
-        # "other" from _classify_redshift_cost_category aren't meaningful here (this
-        # connector targets provisioned RA3 clusters, see the module docstring).
+        # Only the buckets this connector's cause_detail carries.  Resource-less
+        # account commitments/credits remain in the invoice views but are intentionally
+        # not assigned to one cluster's telemetry.
         buckets = {"compute": 0.0, "concurrency_scaling": 0.0, "storage": 0.0, "spectrum_scan": 0.0}
         for subcategory, cost in rows:
             amount = _opt_float(cost)

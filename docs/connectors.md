@@ -259,7 +259,7 @@ calls `describe_clusters` regardless — that's a separate, unrelated signal.
 
 | Signal | Grain | Source |
 |---|---|---|
-| Cluster $ breakdown (compute/concurrency-scaling/storage/Spectrum), reserved-node coverage, WLM queue wait (p95/p99, wait-to-exec ratio), overall disk-spill rate | one row per cluster/workgroup × month | `aws_focus` BRONZE rows + `describe_reserved_nodes` + `redshift_efficiency.sql` (STL_WLM_QUERY, SVCS_CONCURRENCY_SCALING_USAGE) |
+| Cluster $ breakdown (compute/concurrency-scaling/storage/Spectrum), reserved-node coverage, WLM queue wait (p95/p99, wait-to-exec ratio), overall disk-spill rate | one row per provisioned cluster × month | `aws_focus` BRONZE rows + `describe_reserved_nodes` + `redshift_efficiency.sql` (STL_WLM_QUERY, SVCS_CONCURRENCY_SCALING_USAGE) |
 | Query-pattern runtime/spill/skew — which repeated query shape (hashed, not stored verbatim) is slow, spilling, or skewed | `query_pattern` × month, top-200 by runtime | `redshift_query_pattern_metrics.sql` (STL_QUERY, STL_WLM_QUERY, SVL_QUERY_REPORT) |
 | Per-user CPU/scan/spill pressure and cost-concentration share | `sql_warehouse_user` × month, top-50 by exec time | `redshift_user_activity.sql` (SVL_QUERY_METRICS_SUMMARY, SVL_QUERY_REPORT) |
 | Table inventory (size/encoding/maintenance-staleness) + usage (query count, last access, days since last access) | `table` × month, generous cap (5000 — a pathological-catalog safety valve, not a curation cut, since the waste rules and dashboard pagination do the real narrowing) | SVV_TABLE_INFO + STL_SCAN |

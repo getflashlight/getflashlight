@@ -101,7 +101,7 @@ GROUP BY provider_name, service_name, coalesce(sku_id, '(unknown)'), charge_mont
 
 -- ── "Where inside a service did the money go, below SKU granularity?" ───────────
 -- Only populated where a connector stamps x_cost_subcategory (currently: Redshift
--- compute vs concurrency-scaling vs storage vs Spectrum scan vs serverless, derived
+-- compute vs concurrency-scaling vs storage vs Spectrum scan, derived
 -- from AWS UsageType in aws_focus.py). Rows without a subcategory are absent here by
 -- construction — reconcile against spend_by_service_month for the full total.
 CREATE OR REPLACE VIEW gold.spend_by_cost_subcategory_month AS

@@ -5,8 +5,7 @@
 -- other columns carry CPU/scan/spill pressure detail for the "which user" drill-down
 -- the cluster-level snapshot in redshift_efficiency.sql can't give.
 --
--- Provisioned-cluster system tables only (STL_*/SVL_*) — see redshift_efficiency.sql's
--- header for the Serverless caveat, same here.
+-- Provisioned-cluster system tables only (STL_*/SVL_*).
 --
 -- NOT YET VALIDATED against a live cluster — column names follow AWS's published
 -- SVL_QUERY_METRICS_SUMMARY docs. Re-run `flashlight ingest` against a real cluster and

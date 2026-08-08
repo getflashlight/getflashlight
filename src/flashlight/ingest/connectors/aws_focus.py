@@ -508,7 +508,6 @@ class AwsFocusConnector(Connector):
 _REDSHIFT_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("spectrum_scan", ("spectrum", "data scan")),
     ("concurrency_scaling", ("concurrency",)),
-    ("serverless", ("serverless",)),
     ("storage", ("storage", "backup", "snapshot")),
     ("committed", ("unused commitment",)),
     ("compute", ("compute", "node", "cluster", "instance")),
@@ -517,7 +516,7 @@ _REDSHIFT_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 def _classify_redshift_cost_category(charge_description: str | None, sku_id: str | None) -> str:
     """Bucket a Redshift charge below SKU granularity: compute / concurrency-scaling /
-    storage / spectrum-scan / serverless / other.
+    storage / spectrum-scan / other.
 
     Text-match heuristic over FOCUS-carried fields (mirrors the S3 intelligent-tiering
     signal in ``fetch_efficiency`` above) — AWS FOCUS exports carry no dedicated cost-

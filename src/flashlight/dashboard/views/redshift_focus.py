@@ -107,6 +107,9 @@ def scope() -> Scope:
         dimension="service_name",
         values=tuple(sorted(REDSHIFT_SERVICE_NAMES)),
         account_wide=_ACCOUNT_WIDE,
+        # The provider-wide GOLD forecast carries no service_name. Fit the same
+        # conservative hold/run-rate from Redshift-only daily actuals instead.
+        scoped_forecast=True,
     )
 
 
@@ -133,75 +136,42 @@ def render() -> None:
         # services actually ingested), and the nav row beside it reads the same source.
         provider_label(_GROUP),
         scope=scope(),
-        scope_caption=_scope_caption,
         breakdown_lead=(_spend_partition,),
+        extra_kpis=(_spectrum_kpi, _active_clusters_kpi),
         attribution_tab=_attribution_section,
         efficiency_tab=_waste_section,
+        efficiency_tab_label="Optimization",
+        show_policy=False,
+        show_alerts=False,
+        show_daily_trend=False,
+        # Shared categorical actuals and the shared hatched projection marker match
+        # Databricks. This operating-spend series intentionally excludes credits.
+        monthly_chart_label="Monthly operating cost",
     )
 
 
-def _scope_caption(sm: date, end: date) -> None:
-    """Name the narrowing — and the spend it therefore leaves out.
-
-    The hidden-spend line matters because the scope is a hardcoded service list, not a
-    reflection of what was ingested: widen ``include_services`` in connections.yml and
-    the extra spend lands in ``aws.*`` but appears on no page at all. Saying so is the
-    difference between a scoped page and a quietly incomplete one.
-
-    Amazon S3 and Amazon Elastic Compute Cloud are special: bronze still pulls them for
-    the storage/compute planes, but ``silver.focus_provider_bill`` keeps both out of
-    ``aws.*`` GOLD entirely, so neither will ever show up in the hidden-services query
-    below. Point at Databricks Storage / Databricks Compute when those planes have
-    dollars for this window.
-    """
-    chrome.section_caption(
-        "Scoped from the AWS bill to Redshift's own FOCUS service names: "
-        f"{', '.join(sorted(REDSHIFT_SERVICE_NAMES))}."
+def _spectrum_kpi(sm: date, end: date) -> chrome.KpiCard | None:
+    """Existing Spectrum invoice charge, never a second S3/storage total."""
+    df = gold_df(
+        f"SELECT coalesce(sum(net_cost), 0) AS c FROM {_GROUP}.spend_by_cost_subcategory_month "
+        f"WHERE service_name IN ({_SERVICE_IN}) AND cost_subcategory = 'spectrum_scan' "
+        f"AND charge_month >= '{sm}' AND charge_month <= '{end}'"
     )
-    storage_note = ""
-    if gold_view_published("storage", "backing_storage_month"):
-        s3 = gold_df(
-            "SELECT coalesce(sum(net_cost), 0) AS c FROM storage.backing_storage_month "
-            f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}'"
-        )
-        if not s3.empty and float(s3["c"].iloc[0]):
-            storage_note = (
-                " Amazon S3 is ingested for Databricks Storage "
-                "(see Databricks → Databricks Storage); it is not in aws.* GOLD."
-            )
-    compute_note = ""
-    if gold_view_published("compute", "backing_compute_month"):
-        ec2 = gold_df(
-            "SELECT coalesce(sum(net_cost), 0) AS c FROM compute.backing_compute_month "
-            f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}'"
-        )
-        if not ec2.empty and float(ec2["c"].iloc[0]):
-            compute_note = (
-                " Amazon EC2 is ingested for Databricks Compute "
-                "(see Databricks → Databricks Compute); it is not in aws.* GOLD."
-            )
+    cost = float(df["c"].iloc[0]) if not df.empty else 0.0
+    if not cost:
+        return None
+    return ("Spectrum scans", compact_money(cost), "Included in Net Spend", "volume")
 
-    hidden = gold_df(
-        "SELECT service_name, sum(net_cost) AS net_cost "
-        f"FROM {_GROUP}.spend_by_service_month "
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
-        f"AND service_name NOT IN ({_SERVICE_IN}) "
-        "GROUP BY service_name HAVING sum(net_cost) <> 0 ORDER BY sum(net_cost) DESC"
+
+def _active_clusters_kpi(sm: date, end: date) -> chrome.KpiCard | None:
+    df = gold_df(
+        f"SELECT count(DISTINCT regexp_extract(resource_id, ':cluster:(.+)$', 1)) AS n "
+        f"FROM {_GROUP}.resource_month WHERE service_name IN ({_SERVICE_IN}) "
+        "AND resource_id LIKE '%:cluster:%' "
+        f"AND charge_month >= '{sm}' AND charge_month <= '{end}'"
     )
-    if hidden.empty:
-        note = (storage_note + compute_note).strip()
-        if note:
-            chrome.section_caption(note)
-        return
-    total = float(hidden["net_cost"].sum())
-    names = ", ".join(str(s) for s in hidden["service_name"].head(5))
-    more = f" and {len(hidden) - 5} more" if len(hidden) > 5 else ""
-    chrome.section_caption(
-        f"This page hides {compact_money(total)} of other AWS spend in this window "
-        f"({names}{more}) — it is outside every figure below. The `aws_focus` connector "
-        "ingests only `include_services`, so a widened service list lands in the lake "
-        f"and in Home's AWS total, but not on this page.{storage_note}{compute_note}"
-    )
+    count = int(df["n"].iloc[0]) if not df.empty and not pd.isna(df["n"].iloc[0]) else 0
+    return ("Billed clusters", f"{count}", "Provisioned clusters in this window", "volume")
 
 
 def _spend_partition(sm: date, end: date) -> None:
@@ -248,7 +218,6 @@ def _spend_partition(sm: date, end: date) -> None:
         "SELECT CASE WHEN resource_id LIKE '%:cluster:%' "
         "THEN regexp_extract(resource_id, ':cluster:(.+)$', 1) "
         "WHEN resource_id LIKE '%:snapshot:%' THEN '(snapshot storage)' "
-        "WHEN resource_id LIKE '%-serverless:%' THEN '(Serverless workgroup)' "
         "ELSE '(other Redshift resource)' END AS cluster, "
         f"sum(net_cost) AS net_cost FROM {_GROUP}.resource_month {_invoice_scope} "
         "GROUP BY 1 ORDER BY net_cost DESC"
@@ -282,11 +251,61 @@ def _spend_partition(sm: date, end: date) -> None:
                 rename={"sku_id": "SKU", "description": "Description", "net_cost": "Net cost"},
             )
 
+    _spectrum_table_allocation(sm, end)
+
     # Credits, cost subcategory, commitment coverage and invoice reconciliation used to
     # be called from here. They're the shared Breakdown tab's panels now and render
     # immediately below this one — the account-wide three by declaration in
     # _ACCOUNT_WIDE, which is what keeps the credit figure the account-level bucket
     # above nets against identical to the one itemized under it.
+
+
+def _spectrum_table_allocation(sm: date, end: date) -> None:
+    """Show the invoice-reconciled Spectrum allocation, never an S3 storage bill."""
+    rows = gold_df(
+        "SELECT entity_name AS external_table, "
+        "try_cast(json_extract_string(cause_detail, '$.spectrum_scan_count') AS BIGINT) AS scans, "
+        "try_cast(json_extract_string(cause_detail, '$.spectrum_scanned_gb') AS DOUBLE) "
+        "AS scanned_gb, "
+        "try_cast(json_extract_string(cause_detail, '$.spectrum_returned_gb') AS DOUBLE) "
+        "AS returned_gb, "
+        "try_cast(json_extract_string(cause_detail, '$.spectrum_allocated_cost') AS DOUBLE) "
+        "AS allocated_cost "
+        "FROM efficiency.efficiency_entity_month "
+        "WHERE provider_name = 'AWS' AND entity_type = 'table' "
+        f"AND charge_month >= '{sm}' AND charge_month <= '{end}' "
+        "AND json_extract_string(cause_detail, '$.spectrum_allocation_status') = 'allocated' "
+        "ORDER BY allocated_cost DESC"
+    )
+    if rows.empty:
+        return
+    rows["return_pct"] = (100.0 * rows["returned_gb"] / rows["scanned_gb"]).round(1)
+    rows["estimated_recovery"] = (rows["allocated_cost"] * 0.3).round(2)
+    chrome.panel_title("Spectrum scan cost by external table")
+    chrome.section_caption(
+        "Allocated from the existing, target-scoped Redshift Spectrum invoice charge by "
+        "measured scanned bytes; this is not an additional S3 storage cost."
+    )
+    chrome.searchable_table(
+        rows[
+            [
+                "external_table",
+                "scans",
+                "scanned_gb",
+                "return_pct",
+                "allocated_cost",
+                "estimated_recovery",
+            ]
+        ],
+        key="redshift_spectrum_table_cost",
+        search_col="external_table",
+        money_cols=["allocated_cost", "estimated_recovery"],
+        rename={
+            "external_table": "External table", "scans": "Scans", "scanned_gb": "Scanned GB",
+            "return_pct": "Returned %", "allocated_cost": "Allocated Spectrum charge",
+            "estimated_recovery": "Estimated recovery",
+        },
+    )
 
 
 def _attribution_section(sm: date, end: date) -> None:
@@ -362,7 +381,7 @@ def _tags_section(sm: date, end: date) -> None:
 
 
 def _cost_cluster_ids() -> set[str]:
-    """Real cluster identities visible in the AWS bill (not the snapshot/serverless/
+    """Real cluster identities visible in the AWS bill (not the snapshot/
     other buckets `_breakdown_section`'s own table lumps separately) — the universe of
     clusters that *could* have optimization telemetry, whether or not they do.
     """

@@ -170,7 +170,7 @@ def shell(active_path: str, *, full_height: bool = False) -> ui.column:
 
         sidebar_toggle = ui.button(icon="chevron_left", on_click=_toggle_sidebar).props(
             "flat dense round"
-        ).classes("fl-sidebar-toggle").tooltip("Collapse or expand sidebar")
+        ).classes("fl-sidebar-toggle")
 
         with ui.column().classes("w-full h-full no-wrap"):
             with ui.column().classes("w-full gap-0"):

@@ -33,6 +33,7 @@ from nicegui import run, ui
 from pydantic import BaseModel, ValidationError
 
 from flashlight import scaffold
+from flashlight.core.exceptions import ConfigError
 from flashlight.dashboard import chrome, ingest_runner
 from flashlight.ingest.config import (
     AwsFocusConfig,
@@ -46,7 +47,7 @@ from flashlight.ingest.config import (
 )
 from flashlight.ingest.connection_credentials import load_secret, save_secret
 
-# test_connection() is read-only (describe_clusters/GetWorkgroup + a throwaway
+# test_connection() is read-only (describe_clusters + a throwaway
 # SELECT 1) — it doesn't cross the "ingest is the sole writer" boundary above,
 # so calling it in-process (unlike a real sync) is fine.
 from flashlight.ingest.connectors.redshift import RedshiftConnector
@@ -314,35 +315,18 @@ def _redshift_form(existing: BaseModel | None) -> Collector:
             )
 
         with ui.tab_panel(tab_aws):
-            # cluster_identifier/workgroup_name + region are required in every
+            # cluster_identifier + region are required in every
             # connection mode above — they're the entity Redshift telemetry is
             # measured against (describe_clusters, reserved-node coverage), not
             # something only the Data API path needs — grouped here with the AWS
             # credentials that resolve them, since both are "which AWS resource, and
             # how do I authenticate to AWS" rather than "how do I connect to SQL".
-            _subheading("Cluster", "The cluster or workgroup this connection measures.")
-            cluster_type = (
-                ui.toggle(
-                    {"provisioned": "Provisioned cluster", "serverless": "Serverless workgroup"},
-                    value="serverless" if existing and existing.workgroup_name else "provisioned",
-                )
-                .props("no-caps")
-                .classes("w-full")
-            )
+            _subheading("Cluster", "The provisioned cluster this connection measures.")
             with ui.row().classes("w-full gap-3"):
                 cluster_id = _half(
                     "Cluster identifier", existing.cluster_identifier or "" if existing else ""
                 )
-                workgroup = _half(
-                    "Workgroup name", existing.workgroup_name or "" if existing else ""
-                )
                 region = _half("Region", existing.region or "" if existing else "")
-            cluster_id.bind_visibility_from(
-                cluster_type, "value", backward=lambda v: v == "provisioned"
-            )
-            workgroup.bind_visibility_from(
-                cluster_type, "value", backward=lambda v: v == "serverless"
-            )
 
             _subheading(
                 "AWS credentials", "Optional — falls back to the default AWS credential chain."
@@ -365,8 +349,7 @@ def _redshift_form(existing: BaseModel | None) -> Collector:
         with ui.tab_panel(tab_ssh):
             ui.label(
                 "Only used when Connection mode (General tab) is Default — ignored "
-                "otherwise, and requires a Provisioned cluster (Serverless workgroups "
-                "don't support it)."
+                "otherwise, and connects to the provisioned cluster above."
             ).classes("text-xs -mt-2").style(f"color:{chrome.INK_MUTED}")
             with ui.row().classes("w-full gap-3"):
                 bastion_host = _half(
@@ -416,12 +399,7 @@ def _redshift_form(existing: BaseModel | None) -> Collector:
         try:
             cfg = RedshiftConfig(
                 name=name.value or None,
-                cluster_identifier=(
-                    cluster_id.value or None if cluster_type.value == "provisioned" else None
-                ),
-                workgroup_name=(
-                    workgroup.value or None if cluster_type.value == "serverless" else None
-                ),
+                cluster_identifier=cluster_id.value or None,
                 database=database.value or "dev",
                 db_user=db_user.value or None,
                 secret_arn=secret_arn.value or None if not is_direct else None,
@@ -532,7 +510,7 @@ def _summary(cfg: BaseModel) -> str:
     if isinstance(cfg, DatabricksConfig):
         return cfg.host
     if isinstance(cfg, RedshiftConfig):
-        return cfg.cluster_identifier or cfg.workgroup_name or ""
+        return cfg.cluster_identifier
     return ""
 
 
@@ -601,7 +579,16 @@ def render() -> None:
 
     @ui.refreshable
     def connections_body() -> None:
-        all_connections = load_all_connections(str(paths.connections_path()))
+        try:
+            all_connections = load_all_connections(str(paths.connections_path()))
+        except ConfigError as exc:
+            with chrome.panel():
+                chrome.empty_state(
+                    "error_outline",
+                    "Connection configuration needs migration",
+                    str(exc),
+                )
+            return
         if not all_connections:
             with chrome.panel():
                 chrome.empty_state(

@@ -1,11 +1,7 @@
 -- Redshift efficiency aggregation — one row for the whole ingest window.
 --
--- Provisioned-cluster system tables only (STL_*/SVL_*). Redshift Serverless exposes
--- SYS_* views instead and has no separate "concurrency scaling" billing concept
--- (RPU-based autoscaling is all-in) — this query targets the deck's actual
--- architecture (a provisioned RA3 cluster). ponytail: add a Serverless branch
--- (SYS_QUERY_HISTORY) if/when that workload needs its own metering — today it's a
--- small share of spend, not the target.
+-- Provisioned-cluster system tables only (STL_*/SVL_*). Flashlight supports
+-- provisioned Redshift clusters only.
 --
 -- NOT YET VALIDATED against a live cluster — column names follow AWS's published
 -- system-table docs (docs.aws.amazon.com/redshift/latest/dg/c_intro_STL_tables.html).

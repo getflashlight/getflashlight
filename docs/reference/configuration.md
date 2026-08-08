@@ -10,7 +10,7 @@ type is configured.
 | --- | --- | --- |
 | `aws_focus` | S3 bucket/prefix for export, or Cost Explorer mode | `access_key_env`, `secret_key_env`, or normal AWS credential chain |
 | `databricks` | `host`; optional `sql_warehouse_id` | `token_env` |
-| `redshift` | `cluster_identifier` **or** `workgroup_name`; `database` | AWS variables/profile, Data API secret, or optional database/bastion fields |
+| `redshift` | provisioned `cluster_identifier`; `database` | AWS variables/profile, Data API secret, or optional database/bastion fields |
 
 See the generated `connections.yml` for the full commented schema and source-specific
 examples. It is intentionally the closest documentation to the versioned validation

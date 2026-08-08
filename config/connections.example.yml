@@ -43,7 +43,7 @@ connectors:
   # activity, WLM health, table inventory/usage) still runs fully regardless, since
   # none of that needs cost data. Runs read-only queries against Redshift system
   # tables (STL_*/SVL_*/SVCS_*) via the Data API (IAM-based, no persistent DB
-  # credentials). Set exactly one of cluster_identifier / workgroup_name.
+  # credentials). Configure a provisioned cluster_identifier.
   # `name` matters here more than anywhere else — a `name` per cluster is what
   # keeps multiple Redshift connections distinct in BRONZE/the dashboard.
   - type: redshift
@@ -51,7 +51,6 @@ connectors:
     name: Prod (main)
     region: us-east-1
     cluster_identifier: my-redshift-cluster
-    # workgroup_name: my-serverless-workgroup   # alternative to cluster_identifier
     database: dev
     # Named AWS profile (~/.aws/credentials or ~/.aws/config, incl. SSO profiles) —
     # takes priority over access_key_env/secret_key_env below when set. Convenient

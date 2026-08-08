@@ -17,22 +17,19 @@ _BASTION_FIELDS = {
 }
 
 
-def test_redshift_config_requires_exactly_one_target() -> None:
+def test_redshift_config_requires_provisioned_cluster() -> None:
     with pytest.raises(ValidationError):
         RedshiftConfig.model_validate({"region": "us-east-1"})  # neither set
-    with pytest.raises(ValidationError):
-        RedshiftConfig.model_validate(  # both set
-            {"cluster_identifier": "prod", "workgroup_name": "prod-wg"}
-        )
 
 
-def test_redshift_config_accepts_cluster_or_workgroup() -> None:
+def test_redshift_config_rejects_legacy_workgroup() -> None:
+    with pytest.raises(ValidationError, match="Redshift Serverless is no longer supported"):
+        RedshiftConfig.model_validate({"workgroup_name": "prod-wg"})
+
+
+def test_redshift_config_accepts_cluster() -> None:
     cluster_cfg = RedshiftConfig.model_validate({"cluster_identifier": "prod"})
     assert cluster_cfg.cluster_identifier == "prod"
-    assert cluster_cfg.workgroup_name is None
-
-    workgroup_cfg = RedshiftConfig.model_validate({"workgroup_name": "prod-wg"})
-    assert workgroup_cfg.workgroup_name == "prod-wg"
 
 
 def test_redshift_config_disabled_by_default() -> None:
@@ -56,8 +53,8 @@ def test_redshift_config_accepts_aws_profile() -> None:
     assert config.aws_profile == "my-sso-profile"
 
 
-def test_bastion_requires_cluster_identifier_not_workgroup() -> None:
-    with pytest.raises(ValidationError, match="cluster_identifier"):
+def test_bastion_rejects_legacy_workgroup() -> None:
+    with pytest.raises(ValidationError, match="Redshift Serverless is no longer supported"):
         RedshiftConfig.model_validate(
             {"workgroup_name": "prod-wg", "db_user": "flashlight_ro", **_BASTION_FIELDS}
         )
@@ -145,8 +142,8 @@ def test_direct_db_password_env_requires_db_user() -> None:
         )
 
 
-def test_direct_db_password_env_requires_cluster_identifier_not_workgroup() -> None:
-    with pytest.raises(ValidationError, match="cluster_identifier"):
+def test_direct_db_password_env_rejects_legacy_workgroup() -> None:
+    with pytest.raises(ValidationError, match="Redshift Serverless is no longer supported"):
         RedshiftConfig.model_validate(
             {
                 "workgroup_name": "prod-wg",
@@ -615,7 +612,7 @@ def test_classify_redshift_cost_category() -> None:
     assert (
         _classify_redshift_cost_category("Concurrency Scaling usage", None) == "concurrency_scaling"
     )
-    assert _classify_redshift_cost_category("Serverless RPU-Hours", None) == "serverless"
+    assert _classify_redshift_cost_category("Serverless RPU-Hours", None) == "other"
     assert _classify_redshift_cost_category(None, "backup-storage-sku") == "storage"
     assert _classify_redshift_cost_category("Compute node usage", None) == "compute"
     assert _classify_redshift_cost_category("something unrecognized", None) == "other"
@@ -632,6 +629,46 @@ def test_classify_redshift_cost_category_real_billing_text() -> None:
         )
         == "compute"
     )
+
+
+def test_spectrum_cost_allocation_reconciles_to_target_charge() -> None:
+    from datetime import date
+
+    from flashlight.efficiency.model import EfficiencyRecord, EntityType
+
+    records = [
+        EfficiencyRecord(
+            provider_name="AWS", charge_month=date(2026, 1, 1), entity_type=EntityType.TABLE,
+            entity_id="prod:spectrum:lake.events", cause_detail={"spectrum_scanned_gb": 80.0},
+        ),
+        EfficiencyRecord(
+            provider_name="AWS", charge_month=date(2026, 1, 1), entity_type=EntityType.TABLE,
+            entity_id="prod:spectrum:lake.clicks", cause_detail={"spectrum_scanned_gb": 20.0},
+        ),
+    ]
+    allocated, available = RedshiftConnector._allocate_spectrum_cost(records, 200.0, True)
+
+    assert available is True
+    costs = [float(r.cause_detail["spectrum_allocated_cost"]) for r in allocated]
+    assert costs == pytest.approx([160.0, 40.0])
+    assert sum(costs) == pytest.approx(200.0)
+
+
+def test_spectrum_cost_allocation_fails_closed_for_partial_window() -> None:
+    from datetime import date
+
+    from flashlight.efficiency.model import EfficiencyRecord, EntityType
+
+    records = [
+        EfficiencyRecord(
+            provider_name="AWS", charge_month=date(2026, 1, 1), entity_type=EntityType.TABLE,
+            entity_id="prod:spectrum:lake.events", cause_detail={"spectrum_scanned_gb": 80.0},
+        )
+    ]
+    allocated, available = RedshiftConnector._allocate_spectrum_cost(records, 200.0, False)
+
+    assert available is False
+    assert "spectrum_allocated_cost" not in allocated[0].cause_detail
     assert (
         _classify_redshift_cost_category("Redshift, ra3.4xlarge reserved instance applied", None)
         == "compute"
@@ -683,21 +720,6 @@ def test_test_connection_data_api_provisioned() -> None:
     assert "cluster resolved to prod.example.com:5439" in message
     assert "Data API" in message
 
-
-def test_test_connection_serverless_data_api() -> None:
-    from unittest.mock import MagicMock
-
-    config = RedshiftConfig.model_validate({"workgroup_name": "default", "database": "dev"})
-    connector = RedshiftConnector(config)
-    connector._redshift_serverless = MagicMock(
-        get_workgroup=MagicMock(return_value={"workgroup": {"status": "AVAILABLE"}})
-    )
-    connector._data = _FakeDataApiClient({"SELECT 1": (["?column?"], [[1]])})
-
-    message = connector.test_connection()
-
-    assert "workgroup resolved (status=AVAILABLE)" in message
-    assert "Data API" in message
 
 
 def test_cluster_endpoint_wraps_unexpected_exception() -> None:
@@ -797,8 +819,9 @@ def test_fetch_efficiency_yields_all_entity_types(monkeypatch, tmp_path) -> None
                 charge_category=ChargeCategory.USAGE,
                 service_category=ServiceCategory.DATABASES,
                 service_name="Amazon Redshift",
-                effective_cost=Decimal("500.0"),
-                x_cost_subcategory="compute",
+                    effective_cost=Decimal("500.0"),
+                    resource_id="arn:aws:redshift:us-east-1:123456789012:cluster:prod",
+                    x_cost_subcategory="compute",
                 x_source_connector="aws_focus",
             ),
         ],
@@ -1470,7 +1493,7 @@ def test_redshift_tab_renders_per_cluster_with_action_queue(monkeypatch, tmp_pat
             build_pages()
             await user.open("/aws")
             await user.should_see("Redshift spend")
-            user.find(kind=ui.tab, content="Efficiency & Waste").click()
+            user.find(kind=ui.tab, content="Optimization").click()
             await user.should_see("Cluster: prod-cluster")
             await user.should_see("Savings opportunities")
             await user.should_see("Detection coverage for this cluster")

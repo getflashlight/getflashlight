@@ -261,7 +261,7 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
         title="Spend by cost subcategory / month",
         description="Net spend below SKU granularity, where a connector stamps "
         "x_cost_subcategory (currently: Redshift compute/concurrency-scaling/storage/"
-        "spectrum-scan/serverless, derived from AWS UsageType). Rows without a "
+        "spectrum-scan, derived from AWS UsageType). Rows without a "
         "subcategory are absent; reconcile against spend_by_service_month for the total.",
         cost_metric=CostMetric.EFFECTIVE_COST,
         dimensions=("provider_name", "service_name", "cost_subcategory", "charge_month"),
@@ -670,7 +670,7 @@ EFFICIENCY_BASE_VIEWS: tuple[ViewSpec, ...] = (
         "apart from 'this entity_type's telemetry never arrived this window'.",
         cost_metric=None,
         dimensions=("provider_name", "x_source_connector", "entity_type", "entity_id",
-                    "charge_month"),
+                    "entity_name", "cause_detail", "charge_month"),
         measures=(),
     ),
 )
