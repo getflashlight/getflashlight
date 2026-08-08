@@ -57,8 +57,6 @@ CREATE OR REPLACE MACRO gold.ai_product_family(service_name) AS
         WHEN 'GENIE' THEN 'genie'
         WHEN 'AI_BI_DASHBOARD' THEN 'ai_bi_dashboard'
         WHEN 'AI_BI_DASHBOARDS' THEN 'ai_bi_dashboard'
-        WHEN 'LAKEHOUSE_MONITORING' THEN 'lakehouse_monitoring'
-        WHEN 'DATA_QUALITY_MONITORING' THEN 'lakehouse_monitoring'
         WHEN 'MODEL_TRAINING' THEN 'foundation_model_training'
     END;
 
@@ -122,10 +120,9 @@ WITH ai_rows AS (
     -- (2) But the vendored Databricks FOCUS query categorizes exactly EIGHT products as 'AI
     --     and Machine Learning' (databricks_focus_1_3.sql:405-415), and real AI products sit
     --     outside that list: AI/BI Genie bills as warehouse-shaped usage and is filed under
-    --     Databases, and the monitoring products are ML-driven but filed elsewhere too.
-    --     Anyone asking "what is AI costing me?" means Genie as well. Editing the vendored
-    --     query to recategorize them is not an option (CLAUDE.md: don't hand-edit its logic —
-    --     it's re-pulled upstream), so this view names them itself.
+    --     Databases. Anyone asking "what is AI costing me?" means Genie as well. Editing the
+    --     vendored query to recategorize it is not an option (CLAUDE.md: don't hand-edit its
+    --     logic — it's re-pulled upstream), so this view names it itself.
     --
     --     PREDICTIVE_OPTIMIZATION is deliberately NOT in this list — it's Databricks
     --     auto-tuning table layout/clustering, not an AI product a user runs; despite being
@@ -139,13 +136,21 @@ WITH ai_rows AS (
     -- inert. Verify with:
     --     SELECT DISTINCT billing_origin_product FROM system.billing.usage ORDER BY 1;
     -- and add the real spelling here and to gold.ai_product_family above if it differs.
-    WHERE service_category = 'AI and Machine Learning'
-       OR service_name IN (
-              'AI_BI_GENIE', 'GENIE',
-              'AI_BI_DASHBOARD', 'AI_BI_DASHBOARDS',
-              'LAKEHOUSE_MONITORING', 'DATA_QUALITY_MONITORING',
-              'MODEL_TRAINING'
+    -- Keep these explicit exclusions even though the vendored query currently files them
+    -- outside the AI category: a future upstream recategorization must not silently put
+    -- storage-tuning or data-quality/monitoring DBUs on AI Costs.
+    WHERE service_name NOT IN (
+            'PREDICTIVE_OPTIMIZATION',
+            'LAKEHOUSE_MONITORING', 'DATA_QUALITY_MONITORING'
           )
+      AND (
+          service_category = 'AI and Machine Learning'
+          OR service_name IN (
+                 'AI_BI_GENIE', 'GENIE',
+                 'AI_BI_DASHBOARD', 'AI_BI_DASHBOARDS',
+                 'MODEL_TRAINING'
+             )
+      )
 )
 SELECT
     provider_name,

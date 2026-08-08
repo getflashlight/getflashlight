@@ -24,7 +24,7 @@ the selected window — so narrowing the range still changes what's shown, just 
 inflating the count by how many months of history exist.
 
 "Non-compliant entities" is a two-level drill-through, same pattern as Attribution's
-"Untagged infrastructure" (``views/attribution.py``): it opens at the *policy* grain —
+"Cost attribution" (``views/attribution.py``): it opens at the *policy* grain —
 one row per policy_category, how many entities failed it — because "which policy is
 worst" is the question a reader asks before "which specific entity". Clicking a policy
 drills into the entities that failed it.
@@ -217,7 +217,7 @@ def _render_entity_level(
 
 def _non_compliant_panel(records: pd.DataFrame) -> None:
     """The "Non-compliant entities" drill-through panel — policy grain first, entities
-    on click, same pattern as Attribution's "Untagged infrastructure" drill-through."""
+    on click, same pattern as Attribution's "Cost attribution" drill-through."""
     with chrome.panel():
         title = ui.label("Non-compliant entities").classes("text-sm font-medium mb-2").style(
             f"color:{chrome.INK_SECONDARY}"

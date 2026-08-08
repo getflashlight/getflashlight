@@ -14,9 +14,9 @@ need one.
 
 Cost (AWS) and Redshift-cluster connections are separate connector types (one
 account-wide cost pull typically backs several Redshift clusters — see
-``AwsFocusConfig``/``RedshiftConfig`` in ``ingest/config.py``), but the "Data
-sources" list below groups every Redshift entry under its AWS cost source so
-the two read as one picture instead of an unrelated flat list.
+``AwsFocusConfig``/``RedshiftConfig`` in ``ingest/config.py``). The list makes
+that dependency explicit: AWS FOCUS is presented as shared AWS cost data, then
+Redshift and Databricks identify whether that data is ready for their reports.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
 
@@ -54,7 +54,7 @@ from flashlight.lake import paths
 from flashlight.lake.runlog import read_run_groups, read_runs
 
 _TYPE_LABELS: dict[str, str] = {
-    "aws_focus": "AWS cost source",
+    "aws_focus": "AWS FOCUS cost source",
     "databricks": "Databricks",
     "redshift": "Redshift usage",
 }
@@ -63,6 +63,13 @@ _TYPE_ICONS: dict[str, str] = {
     "aws_focus": "cloud",
     "databricks": "hub",
     "redshift": "storage",
+}
+
+# Both connector marks are bundled in the app so they render reliably in the
+# dashboard and sidebar without a third-party request at page load.
+_CONNECTOR_LOGOS: dict[str, str] = {
+    "databricks": "/dashboard-assets/databricks.png",
+    "redshift": "/dashboard-assets/redshift.svg",
 }
 
 # Matches the progress printer's own "  {name} ... {rows:,} rows done" / "  {name}
@@ -621,18 +628,26 @@ def render() -> None:
             (i, c) for i, c in enumerate(all_connections) if isinstance(c, DatabricksConfig)
         ]
 
-        def _row_content(i: int, cfg: BaseModel, *, sub: bool = False) -> None:
+        def _row_content(i: int, cfg: BaseModel) -> None:
             ctype: str = getattr(cfg, "type")  # noqa: B009 - always present, 3 known config classes
             cfg_enabled: bool = getattr(cfg, "enabled")
             cfg_name = effective_connector_name(cfg)
             with ui.row().classes("w-full items-center justify-between py-2"):
-                with ui.row().classes("items-center gap-3 pl-6" if sub else "items-center gap-3"):
-                    if not sub:
+                with ui.row().classes("items-center gap-3"):
+                    if ctype in _CONNECTOR_LOGOS:
+                        ui.image(_CONNECTOR_LOGOS[ctype]).classes("w-5 h-5 flex-none").props(
+                            "fit=contain"
+                        )
+                    else:
                         ui.icon(_TYPE_ICONS.get(ctype, "cloud"), size="1.25rem").style(
                             f"color:{chrome.ACCENT}"
                         )
                     with ui.column().classes("gap-0.5"):
-                        label_classes = "text-sm font-medium" if sub else "text-base font-semibold"
+                        label_classes = (
+                            "text-sm font-medium"
+                            if ctype == "redshift"
+                            else "text-base font-semibold"
+                        )
                         ui.label(f"{_TYPE_LABELS.get(ctype, ctype)}: {cfg_name}").classes(
                             label_classes
                         ).style(f"color:{chrome.INK_PRIMARY}")
@@ -671,33 +686,62 @@ def render() -> None:
                                 ),
                             ).style(f"color:{chrome.WASTE}")
 
-        def _row(i: int, cfg: BaseModel) -> None:
-            with chrome.panel():
-                _row_content(i, cfg)
+        # An AWS FOCUS source is not merely another connection alongside Redshift
+        # and Databricks: it supplies the AWS cost side of both Redshift spend and
+        # Databricks Total Cost of Ownership. Keep that relationship visible here,
+        # while retaining each connector's own sync/edit controls on its row.
+        aws_focus_ready = any(getattr(cfg, "enabled") for _, cfg in aws_entries)
 
-        def _grouped_card(
-            aws_row: tuple[int, BaseModel], redshift_rows: Sequence[tuple[int, BaseModel]]
-        ) -> None:
-            """One card for the AWS cost source and every Redshift cluster it feeds —
-            a divider between sub-rows, not separate cards, since they aren't
-            independent: this is the one cost pull backing all of these clusters.
-            """
-            i, aws_cfg = aws_row
-            with chrome.panel():
-                _row_content(i, aws_cfg)
-                for ri, r in redshift_rows:
-                    ui.separator().style(f"background:{chrome.BORDER}")
-                    _row_content(ri, r, sub=True)
+        def _section(label: str) -> None:
+            ui.label(label).classes("text-sm font-medium").style(f"color:{chrome.INK_SECONDARY}")
+
+        def _cost_data_status() -> None:
+            if aws_focus_ready:
+                with ui.row().classes("items-center gap-3 pt-3 pb-1"):
+                    ui.icon("check_circle", size="1.25rem").style(f"color:{chrome.OPPORTUNITY}")
+                    ui.label("Cost data: AWS FOCUS connected").classes("text-sm").style(
+                        f"color:{chrome.INK_SECONDARY}"
+                    )
+            else:
+                with ui.row().classes("items-center gap-3 pt-3 pb-1"):
+                    ui.icon("error_outline", size="1.25rem").style(f"color:{chrome.WASTE}")
+                    ui.label("Cost data: AWS FOCUS required").classes("text-sm").style(
+                        f"color:{chrome.INK_SECONDARY}"
+                    )
+
+        def _tco_readiness() -> None:
+            with ui.row().classes("items-center gap-3 pb-2"):
+                # Empty icon slot keeps this supporting label beneath the
+                # Databricks connection's text rather than beneath its logo.
+                ui.element("div").classes("w-5 h-5 flex-none")
+                ui.label(
+                    "Total Cost of Ownership: Ready"
+                    if aws_focus_ready
+                    else "Total Cost of Ownership: AWS FOCUS required"
+                ).classes("text-xs").style(f"color:{chrome.INK_MUTED}")
 
         if aws_entries:
-            _grouped_card(aws_entries[0], redshift_entries)
-            for i, aws_cfg in aws_entries[1:]:
-                _row(i, aws_cfg)
-        else:
-            for i, r_cfg in redshift_entries:
-                _row(i, r_cfg)
-        for i, db_cfg in databricks_entries:
-            _row(i, db_cfg)
+            _section("AWS Cost Data")
+            for i, aws_cfg in aws_entries:
+                with chrome.panel():
+                    _row_content(i, aws_cfg)
+
+        if redshift_entries:
+            _section("AWS Redshift")
+            with chrome.panel():
+                _cost_data_status()
+                for position, (i, redshift_cfg) in enumerate(redshift_entries):
+                    if position:
+                        ui.separator().style(f"background:{chrome.BORDER}")
+                    _row_content(i, redshift_cfg)
+
+        if databricks_entries:
+            _section("Databricks")
+            for i, db_cfg in databricks_entries:
+                with chrome.panel():
+                    _cost_data_status()
+                    _row_content(i, db_cfg)
+                    _tco_readiness()
 
     def _delete(index: int, all_connections: list[BaseModel]) -> None:
         updated = [c for j, c in enumerate(all_connections) if j != index]

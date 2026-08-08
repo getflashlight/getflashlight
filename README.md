@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="docs/assets/logo.svg" width="380" alt="Flashlight — a flashlight beam catching a dollar sign">
+  <img src="docs/assets/logo.svg" width="112" alt="Flashlight — the signal in the noise">
 </p>
 
 <h1 align="center">Flashlight</h1>
 
-<p align="center"><em>Finds what's burning money in the dark.</em></p>
+<p align="center"><em>Make cloud spend easy to see.</em></p>
 
 <p align="center">
   <a href="https://github.com/ychaparala/getflashlight/actions/workflows/ci.yml"><img src="https://github.com/ychaparala/getflashlight/actions/workflows/ci.yml/badge.svg" alt="CI"></a>

@@ -1,23 +1,24 @@
-"""Attribution — what one provider's spend is tagged to.
+"""Attribution — who and what is responsible for one provider's spend.
 
 The "Attribution" tab on every provider page (``provider_focus``, ``redshift_focus``).
 Panels, top to bottom:
 
-* **Untagged infrastructure** (:func:`untagged_infrastructure`) — ONE table, drilled
+* **Cost attribution** (:func:`cost_attribution`) — ONE table, drilled
   through in place rather than stacked as separate service/resource panels. Three
   levels, breadcrumbed:
 
-  1. *Service* (``<group>.spend_untagged_by_service_month``) — where tagging is missing.
-  2. *Resource* (``<group>.spend_untagged_by_resource_month``) — what to open and tag,
-     under the clicked service; dollars reconcile to that service's untagged total.
+  1. *Service* (``<group>.spend_by_service_month``) — where the money is going.
+  2. *Resource* (``<group>.resource_month``) — the billed infrastructure under that
+     service; charges reconcile exactly to the selected service.
   3. *Drivers* (``efficiency.utilization_entity_month``, ``entity_type='sql_warehouse_user'``)
      — only reachable from a **shared, sub-metered** resource (see below); who is
      actually running the shared compute this resource billed for.
 
-* **Spend by tag key** (:func:`tag_breakdown`) — what *is* tagged. The same
-  drill-through shape as above, one level: click a key row to replace the ranking with
-  that key's values (breadcrumbed back), instead of a ranking table sitting above a
-  second panel with its own key-picker dropdown.
+* **Tag-based attribution** (:func:`tag_breakdown`) — a second, independent
+  drill-down over every tag key found on the customer's charges. Selecting a key
+  shows its values (for example team, project, environment, or customer-defined
+  tags). A charge carrying multiple tags appears under each of those keys, so tag-key
+  totals are intentionally not summed together.
 
 Billing granularity is NOT one fact ("tag the resource") — it is three
 (:func:`_tier_for_service`), and only one of them can drill to level 3:
@@ -47,20 +48,11 @@ serverless notebooks into its coarse "interactive" bucket for a *cost rollup*; n
 bill at a real per-notebook grain (see ``databricks_efficiency.sql``'s ``notebook`` branch)
 so they're **dedicated** here, not shared.
 
-None of this is narrated on screen as prose — the tier only decides whether a resource
-row drills further, silently. A tier caption, a "$X across N resources" recap, a
-"click a row for drivers" hint and a Policy-override count used to sit above the
-resource table; four lines of prose that mostly repeated what the table and breadcrumb
-already show, removed. Policy Compliance still owns entity-level tagging rules and its
-own, separate remedy text.
-
-``spend_tag_coverage_month`` remains the provider-level denominator for agents. Policy
-Compliance still owns entity-level tagging rules; this tab does not send users *only*
-there — many bill gaps have no Policy row.
-
-Per-tag-key spend is never totalled (a resource with two tags is counted under both —
-the honest denominator is ``spend_tag_coverage_month.tagged_cost``). Methodology belongs
-behind :func:`chrome.info_icon`, not a standing caption.
+The hierarchy always uses charge-side cost (credits excluded): service → resource →
+user allocations. A user allocation is calculated from the same resource/month charge
+and that user's measured query-duration share. Any resource-month without telemetry is
+shown as unallocated, rather than silently disappearing, so every drill-down total
+continues to match its parent.
 """
 
 from __future__ import annotations
@@ -74,7 +66,6 @@ from nicegui import ui
 
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import gold_df, gold_view_published, provider_name_for_group
-from flashlight.dashboard.theme import compact_money
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 
 _TAG_COLS = ["tag_key_normalized", "tag_key_variants", "net_cost", "tag_value_count"]
@@ -85,12 +76,11 @@ _TAG_RENAME = {
     "tag_value_count": "Values",
 }
 
-_UNTAGGED_COLS = ["service_name", "untagged_cost", "gross_cost", "tagged_pct"]
-_UNTAGGED_RENAME = {
+_SERVICE_COLS = ["service_name", "gross_cost", "share_pct"]
+_SERVICE_RENAME = {
     "service_name": "Service",
-    "untagged_cost": "Untagged",
-    "gross_cost": "Charges",
-    "tagged_pct": "Tagged %",
+    "gross_cost": "Cost",
+    "share_pct": "Share of total",
 }
 
 _RESOURCE_COLS = [
@@ -99,7 +89,7 @@ _RESOURCE_COLS = [
     "resource_type",
     "sub_account_id",
     "region_id",
-    "untagged_cost",
+    "gross_cost",
 ]
 _RESOURCE_RENAME = {
     "resource_name": "Resource",
@@ -107,13 +97,13 @@ _RESOURCE_RENAME = {
     "resource_type": "Type",
     "sub_account_id": "Workspace",
     "region_id": "Region",
-    "untagged_cost": "Untagged",
+    "gross_cost": "Cost",
 }
 
-_DRIVER_COLS = ["owner_user", "billed_cost", "duration_share_pct", "secondary_signals"]
+_DRIVER_COLS = ["owner_user", "allocated_cost", "duration_share_pct", "secondary_signals"]
 _DRIVER_RENAME = {
     "owner_user": "User",
-    "billed_cost": "Est. cost",
+    "allocated_cost": "Cost",
     "duration_share_pct": "Query-duration share",
     "secondary_signals": "Detail",
 }
@@ -162,7 +152,7 @@ def render(group: str, end: date, sm: date) -> None:
     Draws its own panels — callers must NOT wrap this in ``chrome.panel()`` (the same
     convention ``provider_focus``'s ``extra_tabs`` follow).
     """
-    untagged_infrastructure(group, end, sm)
+    cost_attribution(group, end, sm)
     tag_breakdown(group, end, sm)
 
 
@@ -181,9 +171,12 @@ class _Drill:
     service: str | None = None
     resource_id: str | None = None
     resource_name: str | None = None
+    resource_type: str | None = None
+    sub_account_id: str | None = None
+    region_id: str | None = None
 
 
-def untagged_infrastructure(
+def cost_attribution(
     group: str, end: date, sm: date, *, scope_sql: str = ""
 ) -> None:
     """ONE drill-through panel: service → resource → (shared warehouses only) drivers.
@@ -194,7 +187,7 @@ def untagged_infrastructure(
     provider = provider_name_for_group(group)
 
     with chrome.panel():
-        title = ui.label("Untagged infrastructure").classes(
+        title = ui.label("Cost attribution").classes(
             "text-sm font-medium mb-2"
         ).style(f"color:{chrome.INK_SECONDARY}")
         body = ui.column().classes("w-full gap-2")
@@ -203,11 +196,11 @@ def untagged_infrastructure(
         def _body(state: _Drill) -> None:
             body.clear()
             title.text = (
-                "Untagged infrastructure"
+                "Cost attribution"
                 if state.level == "service"
-                else f"Untagged infrastructure — {state.service}"
+                else f"Cost attribution — {state.service}"
                 if state.level == "resource"
-                else f"Untagged infrastructure — {state.service} — {state.resource_name}"
+                else f"Cost attribution — {state.service} — {state.resource_name}"
             )
             with body:
                 if state.level == "service":
@@ -226,7 +219,9 @@ def untagged_infrastructure(
                     )
                 else:
                     assert state.service is not None and state.resource_id is not None
-                    _render_driver_level(provider, end, sm, state=state, refresh=_body.refresh)
+                    _render_driver_level(
+                        group, provider, end, sm, state=state, refresh=_body.refresh
+                    )
 
         _body(_Drill())
 
@@ -234,7 +229,7 @@ def untagged_infrastructure(
 def _breadcrumb[T](*steps: tuple[str, T | None], refresh: Callable[[T], object]) -> None:
     """``"← A / B"`` — every step but the last is a link back to that state.
 
-    Generic over the drill state type so :func:`untagged_infrastructure`'s ``_Drill``
+    Generic over the drill state type so :func:`cost_attribution`'s ``_Drill``
     and :func:`tag_breakdown`'s ``_TagDrill`` share one implementation.
     """
     with ui.row().classes("items-center gap-2 text-xs"):
@@ -252,63 +247,44 @@ def _breadcrumb[T](*steps: tuple[str, T | None], refresh: Callable[[T], object])
 def _render_service_level(
     group: str, end: date, sm: date, *, scope_sql: str, refresh: Callable[[_Drill], object]
 ) -> None:
-    """Level 1: services with untagged charges — KPI row + ranked table."""
-    if not gold_view_published(group, "spend_untagged_by_service_month"):
+    """Level 1: every charged service, ranked by the same charge basis as resources."""
+    if not gold_view_published(group, "spend_by_service_month"):
         chrome.section_caption(
-            "Untagged-by-service isn't published yet — run `flashlight transform`."
+            "Spend by service isn't published yet — run `flashlight transform`."
         )
         return
 
     extra = f" AND {scope_sql}" if scope_sql else ""
     rows = _df(
-        "SELECT service_name, "
-        "sum(gross_cost) AS gross_cost, "
-        "sum(tagged_cost) AS tagged_cost, "
-        "sum(untagged_cost) AS untagged_cost "
-        f'FROM "{group}".spend_untagged_by_service_month '
+        "SELECT service_name, sum(gross_cost) AS gross_cost "
+        f'FROM "{group}".spend_by_service_month '
         f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}'{extra} "
         "GROUP BY service_name"
     )
     if rows.empty:
-        chrome.section_caption("No charges in range to measure tag coverage against.")
+        chrome.section_caption("No charges in range.")
         return
 
-    # Strict gap filter — exclude floating $0 / fully-tagged noise.
-    gaps = rows.loc[rows["untagged_cost"] > 0].copy()
     gross = float(rows["gross_cost"].sum())
-    untagged = float(gaps["untagged_cost"].sum()) if not gaps.empty else 0.0
-    n_gap = len(gaps)
-    share = f"{100 * untagged / gross:.0f}% of charges" if gross > 0 else "—"
 
-    chrome.stat_row(
-        [
-            ("Untagged", compact_money(untagged), share, "unattributed"),
-            ("Services with gaps", f"{n_gap:,}", f"of {len(rows):,} with charges"),
-        ]
-    )
-
-    if gaps.empty:
-        chrome.section_caption("Every service in range carries at least one tag.")
-        return
-
-    gaps = gaps.assign(
-        tagged_pct=(100 * gaps["tagged_cost"] / gaps["gross_cost"]).where(
-            gaps["gross_cost"] > 0
-        )
-    ).sort_values("untagged_cost", ascending=False)
-    cols = [c for c in _UNTAGGED_COLS if c in gaps]
-    chrome.section_caption("Click a service to see the resources behind it.")
-
+    rows = rows.loc[rows["gross_cost"] != 0].copy()
+    # ``gross`` is a scalar.  Pandas ``Series.where`` expects a same-shaped
+    # condition, so branch here instead of handing it a scalar bool (which broke
+    # the tab as soon as there was more than one service).
+    rows = rows.assign(
+        share_pct=100 * rows["gross_cost"] / gross if gross != 0 else None
+    ).sort_values("gross_cost", ascending=False)
+    cols = [c for c in _SERVICE_COLS if c in rows]
     def _on_click(row: dict[str, object]) -> None:
         refresh(_Drill(level="resource", service=str(row["service_name"])))
 
     chrome.searchable_table(
-        gaps[cols],
-        key=f"{group}_untagged_svc",
+        rows[cols],
+        key=f"{group}_attribution_svc",
         search_col="service_name",
-        money_cols=["untagged_cost", "gross_cost"],
-        pct_cols=["tagged_pct"],
-        rename=_UNTAGGED_RENAME,
+        money_cols=["gross_cost"],
+        pct_cols=["share_pct"],
+        rename=_SERVICE_RENAME,
         max_rows=_MAX_ROWS,
         on_row_click=_on_click,
     )
@@ -323,7 +299,7 @@ def _render_resource_level(
     scope_sql: str,
     refresh: Callable[[_Drill], object],
 ) -> None:
-    """Level 2: ranked untagged resources for one service.
+    """Level 2: billed resources for one service.
 
     Used to carry a tier caption, a "$X across N resources" recap, a "click a row for
     drivers" hint and a Policy-override count above the table — four lines of prose
@@ -338,27 +314,28 @@ def _render_resource_level(
 
     tier = _tier_for_service(service_name)
 
-    if not gold_view_published(group, "spend_untagged_by_resource_month"):
+    if not gold_view_published(group, "resource_month"):
         chrome.section_caption(
-            "Untagged-by-resource isn't published yet — run `flashlight transform`."
+            "Spend by resource isn't published yet — run `flashlight transform`."
         )
         return
 
     extra = f" AND {scope_sql}" if scope_sql else ""
     rows = _df(
         "SELECT resource_name, resource_id, resource_type, "
-        "sub_account_id, region_id, sum(untagged_cost) AS untagged_cost "
-        f'FROM "{group}".spend_untagged_by_resource_month '
+        "sub_account_id, region_id, sum(gross_cost) AS gross_cost "
+        f'FROM "{group}".resource_month '
         f"WHERE service_name = '{_q(service_name)}' "
         f"AND charge_month >= '{sm}' AND charge_month <= '{end}'{extra} "
         "GROUP BY resource_name, resource_id, resource_type, "
         "sub_account_id, region_id "
-        "ORDER BY untagged_cost DESC"
+        "ORDER BY gross_cost DESC"
     )
     if rows.empty:
         chrome.section_caption(
-            f"No untagged resources for `{service_name}` in range "
-            "(or this lake predates the resource view)."
+            f"No resources for `{service_name}` in range "
+            "(run `flashlight transform` after upgrading if this lake predates "
+            "gross resource cost)."
         )
         return
 
@@ -391,14 +368,17 @@ def _render_resource_level(
                     service=service_name,
                     resource_id=rid,
                     resource_name=str(row["resource_name"]),
+                    resource_type=str(row["resource_type"]),
+                    sub_account_id=str(row.get("sub_account_id", "(none)")),
+                    region_id=str(row.get("region_id", "(none)")),
                 )
             )
 
     chrome.searchable_table(
         display[cols],
-        key=f"{group}_untagged_res",
+        key=f"{group}_attribution_res",
         search_col="resource_name",
-        money_cols=["untagged_cost"],
+        money_cols=["gross_cost"],
         rename=_RESOURCE_RENAME,
         max_rows=_MAX_ROWS,
         on_row_click=on_click,
@@ -406,7 +386,13 @@ def _render_resource_level(
 
 
 def _render_driver_level(
-    provider: str, end: date, sm: date, *, state: _Drill, refresh: Callable[[_Drill], object]
+    group: str,
+    provider: str,
+    end: date,
+    sm: date,
+    *,
+    state: _Drill,
+    refresh: Callable[[_Drill], object],
 ) -> None:
     """Level 3: estimated per-user drivers of one shared, sub-metered resource.
 
@@ -415,6 +401,10 @@ def _render_driver_level(
     """
     assert state.service is not None
     assert state.resource_id is not None
+    assert state.resource_name is not None
+    assert state.resource_type is not None
+    assert state.sub_account_id is not None
+    assert state.region_id is not None
     _breadcrumb(
         ("← All services", _Drill()),
         (state.service, _Drill(level="resource", service=state.service)),
@@ -422,37 +412,71 @@ def _render_driver_level(
         refresh=refresh,
     )
     chrome.caption_info(
-        "Estimated by query-duration share, latest month with telemetry in range.",
-        "DBUs/slot-seconds aren't billed per query, so this allocates the resource's real "
-        "billed cost by each user's share of measured query duration that month. Always "
-        "an estimate under concurrency (candidate confidence), never claimed exact.",
+        "Estimated from query-duration share; unmeasured months remain unallocated.",
+        "For every month in the selected range, each user's measured query-duration share "
+        "is multiplied by this warehouse's actual charge. DBUs/slot-seconds are not billed "
+        "per query, so this is an estimate under concurrency. The unallocated row is the "
+        "remainder from months with no query telemetry, keeping this table equal to the "
+        "warehouse total above.",
     )
 
     resource_id = _q(state.resource_id)
+    # Allocate from resource_month rather than telemetry.billed_cost.  The former is
+    # the exact charge basis used by levels 1 and 2; telemetry's own cost is useful
+    # operational evidence but can cover a different pull window.  A residual row
+    # makes missing telemetry explicit and preserves parent/child reconciliation.
     rows = _df(
-        "SELECT owner_user, billed_cost, primary_signal_value AS duration_share_pct, "
-        "secondary_signals FROM efficiency.utilization_entity_month "
-        f"WHERE provider_name = '{_q(provider)}' AND entity_type = 'sql_warehouse_user' "
-        f"AND entity_id LIKE '{resource_id}:%' "
-        "AND charge_month = (SELECT max(charge_month) FROM efficiency.utilization_entity_month "
-        f"WHERE provider_name = '{_q(provider)}' AND entity_type = 'sql_warehouse_user' "
-        f"AND entity_id LIKE '{resource_id}:%' "
-        f"AND charge_month >= '{sm}' AND charge_month <= '{end}') "
-        "ORDER BY billed_cost DESC"
+        "WITH resource_cost AS ("
+        " SELECT charge_month, sum(gross_cost) AS resource_cost "
+        f' FROM "{group}".resource_month '
+        f" WHERE service_name = '{_q(state.service)}' AND resource_id = '{resource_id}' "
+        f" AND resource_name = '{_q(state.resource_name)}' "
+        f" AND resource_type = '{_q(state.resource_type)}' "
+        f" AND sub_account_id = '{_q(state.sub_account_id)}' "
+        f" AND region_id = '{_q(state.region_id)}' "
+        f" AND charge_month >= '{sm}' AND charge_month <= '{end}' "
+        " GROUP BY charge_month"
+        "), raw_user_share AS ("
+        " SELECT charge_month, owner_user, max(primary_signal_value) / 100.0 AS duration_share, "
+        " max(secondary_signals) AS secondary_signals "
+        " FROM efficiency.utilization_entity_month "
+        f" WHERE provider_name = '{_q(provider)}' AND entity_type = 'sql_warehouse_user' "
+        f" AND entity_id LIKE '{resource_id}:%' "
+        f" AND charge_month >= '{sm}' AND charge_month <= '{end}' "
+        " GROUP BY charge_month, owner_user"
+        "), user_share AS ("
+        " SELECT *, sum(duration_share) OVER (PARTITION BY charge_month) AS total_duration_share "
+        " FROM raw_user_share"
+        "), allocations AS ("
+        " SELECT u.owner_user, r.resource_cost * u.duration_share / "
+        " nullif(u.total_duration_share, 0) AS allocated_cost, "
+        " u.duration_share, u.secondary_signals FROM resource_cost r "
+        " JOIN user_share u USING (charge_month)"
+        "), user_totals AS ("
+        " SELECT owner_user, sum(allocated_cost) AS allocated_cost, "
+        " 100.0 * sum(allocated_cost) / "
+        " nullif((SELECT sum(resource_cost) FROM resource_cost), 0) AS duration_share_pct, "
+        " max(secondary_signals) AS secondary_signals FROM allocations GROUP BY owner_user"
+        "), remainder AS ("
+        " SELECT 'Unallocated (no query telemetry)' AS owner_user, "
+        " greatest(0, coalesce((SELECT sum(resource_cost) FROM resource_cost), 0) - "
+        " coalesce((SELECT sum(allocated_cost) FROM allocations), 0)) AS allocated_cost, "
+        " NULL::DOUBLE AS duration_share_pct, 'No measured query activity' AS secondary_signals"
+        ") SELECT * FROM user_totals UNION ALL SELECT * FROM remainder "
+        " ORDER BY allocated_cost DESC"
     )
     if rows.empty:
         chrome.section_caption(
-            "No per-user telemetry for this resource in range — the efficiency pull may "
-            "not have run, or this warehouse had no measured query activity."
+            "No billable resource cost for this warehouse in range."
         )
         return
 
     cols = [c for c in _DRIVER_COLS if c in rows]
     chrome.searchable_table(
         rows[cols],
-        key=f"untagged_drivers_{resource_id}",
+        key=f"attribution_drivers_{resource_id}",
         search_col="owner_user",
-        money_cols=["billed_cost"],
+        money_cols=["allocated_cost"],
         pct_cols=["duration_share_pct"],
         rename=_DRIVER_RENAME,
         max_rows=_MAX_ROWS,
@@ -460,19 +484,29 @@ def _render_driver_level(
 
 
 def _tag_key_rows(group: str, end: date, sm: date) -> pd.DataFrame:
-    """Spend per folded tag key for the latest month in range, or empty.
+    """Charge-side spend per folded tag key across the selected date range.
 
-    Latest month rather than the whole range on purpose: ``variant_count`` and
-    ``tag_key_variants`` describe how a key is spelled *right now*, and a key renamed
-    mid-range would otherwise read as two permanently-colliding spellings.
+    The tag panel follows the same global date filter as cost attribution. Variants
+    deliberately merge all spellings observed in that range; a separate spelling row
+    would fragment a customer's own team/project dimension.
     """
     if not gold_view_published(group, "spend_by_tag_key_month"):
         return pd.DataFrame()
     return _df(
-        f'SELECT * FROM "{group}".spend_by_tag_key_month WHERE charge_month = ('
-        f'SELECT max(charge_month) FROM "{group}".spend_by_tag_key_month '
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}') "
-        "ORDER BY net_cost DESC"
+        "WITH key_cost AS ("
+        " SELECT tag_key_normalized, string_agg(DISTINCT tag_key_variants, ' · ') "
+        " AS tag_key_variants, sum(net_cost) AS net_cost "
+        f' FROM "{group}".spend_by_tag_key_month '
+        f" WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
+        " GROUP BY tag_key_normalized"
+        "), value_count AS ("
+        " SELECT replace(lower(trim(tag_key)), '-', '_') AS tag_key_normalized, "
+        " count(DISTINCT tag_value) AS tag_value_count "
+        f' FROM "{group}".spend_by_tag_month '
+        f" WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
+        " GROUP BY replace(lower(trim(tag_key)), '-', '_')"
+        ") SELECT k.*, v.tag_value_count FROM key_cost k "
+        " JOIN value_count v USING (tag_key_normalized) ORDER BY net_cost DESC"
     )
 
 
@@ -494,7 +528,7 @@ def tag_keys(group: str, end: date, sm: date) -> None:
     """
     rows = _tag_key_rows(group, end, sm)
     if rows.empty:
-        _no_tagged_spend_panel("Spend by tag key — no tagged spend")
+        _no_tagged_spend_panel("Tag-based attribution — no tagged spend")
         return
     cols = [c for c in _TAG_COLS if c in rows]
     with chrome.panel():
@@ -521,7 +555,7 @@ def _tag_value_rows(group: str, tag_key_normalized: str, end: date, sm: date) ->
     ranking above already folded those two into one row.
     """
     return _df(
-        "SELECT tag_value, sum(net_cost) AS net_cost FROM "
+        "SELECT tag_value, sum(gross_cost) AS net_cost FROM "
         f'"{group}".spend_by_tag_month '
         f"WHERE replace(lower(trim(tag_key)), '-', '_') = '{_q(tag_key_normalized)}' "
         f"AND charge_month >= '{sm}' AND charge_month <= '{end}' "
@@ -543,7 +577,7 @@ def tag_breakdown(group: str, end: date, sm: date) -> None:
 
     Replaces the old shape (a ranking table, then a separate "Spend by tag value"
     panel with its own key-picker dropdown) with the same click-a-row-to-drill pattern
-    :func:`untagged_infrastructure` uses.
+    :func:`cost_attribution` uses.
     """
     rows = _tag_key_rows(group, end, sm)
     if rows.empty:
@@ -551,7 +585,7 @@ def tag_breakdown(group: str, end: date, sm: date) -> None:
         return
 
     with chrome.panel():
-        title = ui.label("Spend by tag key").classes(
+        title = ui.label("Tag-based attribution").classes(
             "text-sm font-medium mb-2"
         ).style(f"color:{chrome.INK_SECONDARY}")
         body = ui.column().classes("w-full gap-2")
@@ -560,9 +594,9 @@ def tag_breakdown(group: str, end: date, sm: date) -> None:
         def _body(state: _TagDrill) -> None:
             body.clear()
             title.text = (
-                "Spend by tag key"
+                "Tag-based attribution"
                 if state.level == "key"
-                else f"Spend by tag key — {state.tag_key}"
+                else f"Tag-based attribution — {state.tag_key}"
             )
             with body:
                 if state.level == "key":

@@ -344,12 +344,11 @@ def _kpis(
     lst = float(bills["list_cost"].sum())
     sav = float(bills["savings"].sum())
     disc = f"{100 * sav / lst:.1f}%" if lst else "—"
-    span = f"{start:%b %d} → {end:%b %d}" + (" · partial" if partial else "")
     # Net and realized discount are one fact: `net + savings = list`. A separate discount
     # tile crowded the row; the percentage lives in the Net Spend subtitle with the list
     # denominator (a bare % has no base) and the date span. Green only when there is a
     # real discount — otherwise the card is just the net figure.
-    net_sub = f"{disc} off {compact_money(lst)} list · {span}"
+    net_sub = f"{disc} savings vs. {compact_money(lst)} list"
     net_card: chrome.KpiCard = (
         ("Net Spend", compact_money(net), net_sub, "savings")
         if lst and sav
@@ -395,7 +394,7 @@ _RUN_RATE_LOW_CONFIDENCE_DAYS = 7
 def _run_rate_card(
     *, month: date, forecast_cost: float, actual_to_date: float | None, history_days: int
 ) -> chrome.KpiCard | None:
-    """The Projected / Month-to-date KPI, suppressed or demoted by how much history backs it.
+    """The Projected KPI, suppressed when too little history backs it.
 
     Gated here rather than in ``040_gold_forecast.sql`` on purpose: a two-day mean *is* a
     valid mean, so NULLing it in GOLD would destroy a number an agent may legitimately
@@ -404,27 +403,14 @@ def _run_rate_card(
     ``spend_forecast_month``'s catalog description carries the same warning so agents get
     it too.
 
-    Under a week of history the run-rate is too noisy to be the hero number — lead with
-    actual-to-date ("Month to date") and keep the extrapolation in the subtitle. At a
-    week+, the projection is the card.
+    Under a week of history the run-rate is too noisy to present as a standalone KPI.
+    The chart still shows its clearly hatched projected remainder; at a week+, the
+    projection is the card.
     """
     if history_days < _RUN_RATE_MIN_DAYS:
         return None
     if history_days < _RUN_RATE_LOW_CONFIDENCE_DAYS:
-        if actual_to_date is not None:
-            return (
-                "Month to date",
-                compact_money(actual_to_date),
-                f"{month:%b %Y} · day {history_days} · run rate ~{compact_money(forecast_cost)}",
-                "partial",
-            )
-        # No actual to lead with — still show the run rate, muted, without claiming MTD.
-        return (
-            "Projected",
-            compact_money(forecast_cost),
-            f"{month:%b %Y} · day {history_days} · run rate",
-            "partial",
-        )
+        return None
     actual = f" · {compact_money(actual_to_date)} so far" if actual_to_date is not None else ""
     return (
         "Projected",
@@ -459,10 +445,18 @@ def _run_rate_row(scope: Scope) -> tuple[date, float, float | None, int] | None:
     if row.empty or row["forecast_cost"].iloc[0] is None:
         return None
     actual = row["actual_to_date"].iloc[0]
+    forecast_cost = float(row["forecast_cost"].iloc[0])
+    actual_cost = None if pd.isna(actual) else float(actual)
+    if scope.group == "databricks":
+        backing_forecast, backing_actual = _databricks_backing_run_rate(
+            pd.Timestamp(row["charge_month"].iloc[0]).date(), int(row["history_days"].iloc[0])
+        )
+        forecast_cost += backing_forecast
+        actual_cost = (actual_cost or 0.0) + backing_actual
     return (
         pd.Timestamp(row["charge_month"].iloc[0]).date(),
-        float(row["forecast_cost"].iloc[0]),
-        None if pd.isna(actual) else float(actual),
+        forecast_cost,
+        actual_cost,
         int(row["history_days"].iloc[0]),
     )
 
@@ -497,7 +491,12 @@ def _trend(scope: Scope, label: str, start: date, end: date, *, accent: str) -> 
     if trend.empty:
         _info(f"No daily {label} rows in range.")
         return
-    chrome.panel_title("Daily spend")
+    # This series comes only from the Databricks bill. Mapped S3/EC2 infrastructure
+    # costs are currently available at monthly granularity, so calling this total
+    # Databricks spend would imply a completeness it does not have.
+    chrome.panel_title(
+        "Daily Databricks usage (DBUs)" if scope.group == "databricks" else "Daily spend"
+    )
     fig = px.area(trend, x="charge_day", y="net_cost", labels={"charge_day": "", "net_cost": ""})
     fig.update_traces(line_color=accent, fillcolor=rgba_hex(accent, 0.18))
     chrome.plot(chrome.style_fig(fig, has_legend=False))
@@ -546,6 +545,12 @@ def _forecast_series(scope: Scope) -> tuple[pd.DataFrame, str]:
             "`flashlight ingest --start <date>` (or raise FLASHLIGHT_INGEST_LOOKBACK_DAYS, "
             "default 35) and re-run `flashlight transform`."
         )
+    if scope.group == "databricks":
+        # The DBU forecast is generated in databricks.spend_forecast_month. Add the
+        # identically scoped, AWS-billed infrastructure forecast here so projected bars
+        # reconcile to the actual full-footprint stacks beside them.
+        priced = priced.copy()
+        priced["forecast_cost"] += _databricks_backing_trend_addition(priced)
     return priced.assign(month=pd.to_datetime(priced["charge_month"]).dt.strftime("%Y-%m")), ""
 
 
@@ -627,6 +632,48 @@ def _databricks_backing_monthly(end: date, sm: date) -> pd.DataFrame:
         df["service_name"] = service
         frames.append(df)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _databricks_backing_run_rate(month: date, history_days: int) -> tuple[float, float]:
+    """Forecast the mapped AWS infrastructure alongside a DBU run rate.
+
+    The backing views are monthly, so their accrued current-month total is extended using
+    the same completed-day count as the DBU forecast.  This keeps the chart's partial
+    actual bar and its hatched remainder on one *full Databricks footprint* basis.
+    """
+    if history_days <= 0:
+        return 0.0, 0.0
+    backing = _databricks_backing_monthly(month, month)
+    if backing.empty:
+        return 0.0, 0.0
+    actual = float(backing["net_cost"].sum())
+    days_in_month = (pd.Timestamp(month) + pd.offsets.MonthBegin(1) - pd.Timestamp(month)).days
+    return round(actual / history_days * days_in_month, 2), actual
+
+
+def _databricks_backing_trend_addition(forecast: pd.DataFrame) -> float:
+    """Trailing-three-month backing-cost mean for a DBU trend forecast.
+
+    A trend row starts in the month after its DBU anchor.  Use only backing months before
+    that anchor, matching the DBU forecast's complete-month rule, then add the same
+    level forecast to each future month.
+    """
+    if forecast.empty:
+        return 0.0
+    first_forecast_month = pd.Timestamp(forecast["charge_month"].min())
+    anchor = (first_forecast_month - pd.offsets.MonthBegin(1)).date()
+    backing = _databricks_backing_monthly(anchor, date(1900, 1, 1))
+    if backing.empty:
+        return 0.0
+    monthly = (
+        backing.assign(charge_month=pd.to_datetime(backing["charge_month"]))
+        .loc[lambda df: df["charge_month"] < pd.Timestamp(anchor)]
+        .groupby("charge_month")["net_cost"]
+        .sum()
+        .sort_index()
+        .tail(3)
+    )
+    return float(monthly.mean()) if not monthly.empty else 0.0
 
 
 def _forecast_marker() -> dict[str, object]:
@@ -740,17 +787,6 @@ def _monthly_drill(scope: Scope, label: str, end: date, sm: date, *, accent: str
     else:
         title = "Monthly net cost"
     chrome.panel_title(title)
-    if not backing.empty:
-        # Named here, not just left implicit in the legend: the forecast trace (when
-        # present) only ever projects DBU — spend_forecast_month is built on
-        # silver.focus_provider_bill, which has no Storage/Compute planes of its own to
-        # forecast — so a reader comparing an actual bar's height to the projected bar
-        # right after it must know the two aren't the same quantity.
-        chrome.section_caption(
-            "Includes Databricks-managed Backing storage (AWS-billed S3) and Backing "
-            "compute (AWS-billed EC2)."
-            + (" The forecast bars project DBU only." if not forecast.empty else "")
-        )
     if forecast_note:
         # Only the "why there's no forecast" states (unpublished / not scopable / <3 months).
         chrome.section_caption(forecast_note)

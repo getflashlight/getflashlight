@@ -143,6 +143,11 @@ SELECT
     coalesce(region_id, '(none)')                        AS region_id,
     charge_month,
     sum(cost)                                            AS net_cost,
+    -- Keep the charge-side amount beside net_cost so a resource rollup can
+    -- reconcile exactly to spend_by_service_month.gross_cost.  In particular,
+    -- a person/warehouse allocation should not appear to lose a credit merely
+    -- because the service-level total is presented as charges.
+    sum(cost) FILTER (WHERE NOT is_credit)               AS gross_cost,
     sum(consumed_quantity)                               AS consumed_quantity,
     max(consumed_unit)                                   AS consumed_unit,
     bool_or(is_partial_period)                           AS is_partial_period
@@ -195,6 +200,7 @@ SELECT
     f.provider_name,
     f.charge_month,
     sum(f.cost)                                          AS net_cost,
+    sum(f.cost) FILTER (WHERE NOT f.is_credit)           AS gross_cost,
     bool_or(f.is_partial_period)                         AS is_partial_period
 FROM silver.focus_provider_bill f
 CROSS JOIN unnest(json_keys(f.tags)) AS t(tag_key)

@@ -68,5 +68,5 @@ def footprint_card(sm: date, end: date) -> chrome.KpiCard | None:
         return None
 
     total = dbu + aws_infra
-    sub = f"{compact_money(dbu)} DBU + {compact_money(aws_infra)} AWS infra · two bills"
-    return ("Total Databricks footprint", compact_money(total), sub, "unattributed")
+    sub = "Includes Databricks usage and AWS infrastructure"
+    return ("Total cost of ownership", compact_money(total), sub, "unattributed")

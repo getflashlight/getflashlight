@@ -69,7 +69,6 @@ _PRODUCT_LABELS = {
     "agent_evaluation": "Agent Evaluation",
     "genie": "AI/BI Genie",
     "ai_bi_dashboard": "AI/BI Dashboards",
-    "lakehouse_monitoring": "Lakehouse Monitoring",
 }
 _REMEDY_BY_CATEGORY = {r.category: r.remedy for r in WASTE_RULES}
 
@@ -79,7 +78,7 @@ _UNTAGGED = "(untagged)"
 _MAX_ROWS = 40
 _TREND_MONTHS = 6
 
-KPI_SUB = "Part of Net Spend · detail on AI Costs"
+KPI_SUB = "Included in Net Spend"
 
 
 def _df(sql: str) -> pd.DataFrame:
@@ -104,13 +103,6 @@ def _product_label(family: object) -> str:
     if family is None or pd.isna(family):
         return _UNMAPPED_LABEL
     return _PRODUCT_LABELS.get(str(family), str(family))
-
-
-def _range_sub(sm: date, end: date) -> str:
-    """Page-range sub-line, matching chrome.date_range_control's formatting."""
-    if sm.year == end.year:
-        return f"{sm:%b %-d} – {end:%b %-d, %Y}"
-    return f"{sm:%b %-d, %Y} – {end:%b %-d, %Y}"
 
 
 def _fold_tag_key(key: str) -> str:
@@ -199,7 +191,6 @@ def render(sm: date, end: date) -> None:
         return
 
     rows = rows.assign(product=rows["ai_product_family"].map(_product_label))
-    range_sub = _range_sub(sm, end)
     tokens = _token_rows(sm, end)
     tag_keys = _tag_keys_in(rows)
     default_tag: str | None = None
@@ -218,7 +209,7 @@ def render(sm: date, end: date) -> None:
     def _kpis_for(tag_key: str | None) -> None:
         kpi_slot.clear()
         with kpi_slot:
-            _kpis(_with_tag(tag_key), range_sub, tokens, tag_key=tag_key)
+            _kpis(_with_tag(tag_key), tokens)
 
     def _on_tag(key: str | None) -> None:
         _kpis_for.refresh(key)
@@ -281,15 +272,11 @@ def _token_rows(sm: date, end: date) -> _Tokens:
 
 def _kpis(
     rows: pd.DataFrame,
-    range_sub: str,
     tokens: _Tokens,
-    *,
-    tag_key: str | None,
 ) -> None:
     net = float(rows["net_cost"].fillna(0).sum())
     endpoints = int(rows["resource_id"].nunique())
     untagged = float(rows.loc[rows["tag_display"] == _UNTAGGED, "net_cost"].sum())
-    untagged_sub = f"no `{tag_key}` tag" if tag_key else "no cost-allocation tags"
 
     if tokens.measured:
         ep = tokens.endpoints
@@ -317,14 +304,14 @@ def _kpis(
 
     chrome.kpi_row(
         [
-            ("AI Spend", compact_money(net), range_sub),
-            ("AI Resources", f"{endpoints:,}", "endpoints, indexes, Genie spaces"),
+            ("AI Spend", compact_money(net), ""),
+            ("AI Resources", f"{endpoints:,}", ""),
             token_kpi,
             rate_kpi,
             (
                 "Untagged AI Spend",
                 compact_money(untagged),
-                untagged_sub,
+                "",
                 "unattributed",
             ),
         ]

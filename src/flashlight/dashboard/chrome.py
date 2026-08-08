@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from datetime import date
 from typing import Any
+from urllib.parse import quote
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -58,15 +59,24 @@ SEMANTIC: dict[str, str] = {
     "forecast": FORECAST,
 }
 
-# A plain vector monogram, not NiceGUI's emoji-to-SVG-text favicon helper — that
-# renders the glyph via a generic font-family, which some browsers (Safari) fail to
-# substitute with a color-emoji font and show a generic placeholder icon instead.
-FAVICON_SVG = (
-    f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    f'<rect width="64" height="64" rx="14" fill="{ACCENT}"/>'
-    f'<text x="32" y="45" font-size="34" font-family="Arial,sans-serif" '
-    f'font-weight="700" fill="#ffffff" text-anchor="middle">F</text></svg>'
+# Flashlight's mark is the signal in a field of noise: one point brought into focus.
+# Keep it as vector geometry rather than a font glyph so it stays recognizable in a
+# favicon and does not depend on the browser's available fonts.
+LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" '
+    'aria-label="Flashlight — signal in the noise">'
+    f'<g fill="{INK_MUTED}" opacity=".72">'
+    '<circle cx="16" cy="16" r="3.5"/><circle cx="32" cy="16" r="3.5"/>'
+    '<circle cx="48" cy="16" r="3.5"/><circle cx="16" cy="32" r="3.5"/>'
+    '<circle cx="48" cy="32" r="3.5"/><circle cx="16" cy="48" r="3.5"/>'
+    '<circle cx="32" cy="48" r="3.5"/><circle cx="48" cy="48" r="3.5"/>'
+    '</g>'
+    f'<circle cx="32" cy="32" r="10" fill="none" stroke="{ACCENT}" stroke-width="2" opacity=".45"/>'
+    f'<circle cx="32" cy="32" r="6" fill="{ACCENT}"/>'
+    '</svg>'
 )
+LOGO_DATA_URL = f"data:image/svg+xml,{quote(LOGO_SVG)}"
+FAVICON_SVG = LOGO_SVG
 
 # Declared so Safari (and iOS "Add to Home Screen") uses this instead of probing
 # /apple-touch-icon.png at the site root on spec. Both point at the same route —
@@ -116,6 +126,21 @@ body, .q-page, .nicegui-content {{
    mcp_server.py's "quick add" command). Center it vertically for that one shape only —
    untouched everywhere else. */
 .fl-code-oneline .nicegui-code-copy {{ top: 50%; transform: translateY(-50%); }}
+.q-drawer--mini .fl-sidebar-heading,
+.q-drawer--mini .fl-sidebar-label {{ display: none !important; }}
+.q-drawer--mini .fl-sidebar-row {{
+    width: 40px !important; height: 40px; min-height: 40px; margin: 2px auto;
+    justify-content: center; padding: 0 !important;
+}}
+.q-drawer--mini .fl-sidebar-row.fl-sidebar-active {{
+    background: rgba(57,135,229,0.22) !important;
+}}
+.q-drawer--standard .fl-sidebar-group-divider {{ display: none; }}
+.q-drawer--mini .fl-sidebar-group-divider {{ margin: 10px 8px; }}
+.fl-sidebar-toggle {{
+    position: absolute !important; left: 8px; bottom: 10px; z-index: 1;
+    background: {SURFACE}; border: 1px solid {BORDER};
+}}
 </style>
 """
 
@@ -169,7 +194,12 @@ def caption_info(text: str, tooltip: str) -> None:
 
 def kpi(title: str, value: str, sub: str, *, color: str = INK_PRIMARY) -> None:
     with panel():
-        ui.label(title).classes("text-sm").style(f"color:{INK_MUTED}")
+        # Reserve two lines for every heading.  Several KPI names intentionally wrap
+        # (for example, "Total Databricks footprint"), and without a shared title
+        # height the headline figures in the same row sit on different baselines.
+        ui.label(title).classes("text-sm").style(
+            f"color:{INK_MUTED};min-height:2.5rem;line-height:1.25rem"
+        )
         ui.label(value).classes("text-3xl font-semibold").style(
             f"color:{color};line-height:1.2;margin:4px 0 2px;"
         )

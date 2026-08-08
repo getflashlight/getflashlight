@@ -22,10 +22,8 @@ connector only supplies efficiency/waste telemetry. So this page:
   not one service); each says so in its own caption, and they're declared in
   :data:`_ACCOUNT_WIDE` so the scope leaves them alone. Breakdown is also led by this
   page's own :func:`_spend_partition`.
-- **Attribution**: :func:`_attribution_section`. Tag-key ranking is account-wide (no
-  ``service_name`` on those views); untagged infrastructure (service→resource→driver)
-  and the tag-value drill are Redshift-scoped — the former via ``service_name``, the
-  latter via ``sku_id`` on ``spend_by_sku_tag_month``.
+- **Attribution**: :func:`_attribution_section`, a Redshift-scoped cost hierarchy
+  (service → cluster → user allocation) narrowed by ``service_name``.
 - **Efficiency & Waste**: faceted per cluster (:func:`_waste_section`) — one section per
   Redshift cluster that has efficiency telemetry (``entity_id`` for
   ``entity_type='sql_warehouse'`` under ``provider_name='AWS'`` is the cluster
@@ -288,26 +286,13 @@ def _spend_partition(sm: date, end: date) -> None:
 
 
 def _attribution_section(sm: date, end: date) -> None:
-    """Attribution for the AWS account this page's Redshift spend bills to.
-
-    Untagged infrastructure (the service→resource→driver drill) is Redshift-scoped via
-    ``service_name`` — Redshift's own service names are in ``attribution``'s
-    ``shared_subgrain`` tier, so a cluster's untagged spend still drills into its
-    estimated per-user drivers. Tag-key ranking is account-wide. Tag-value drill is
-    this page's own SKU-scoped :func:`_tags_section`.
-    """
-    chrome.section_caption(
-        "Tag-key ranking is account-wide (no service dimension on that view). "
-        "Untagged infrastructure and the tag-value panel are Redshift-scoped. "
-        "In practice the whole bill is Redshift anyway — aws_focus ingests only "
-        "include_services, Redshift by default."
+    """Redshift-scoped service → cluster → user cost attribution."""
+    attribution.cost_attribution(
+        _GROUP, end, sm, scope_sql=scope().predicate("spend_by_service_month")
     )
-    attribution.untagged_infrastructure(
-        _GROUP, end, sm, scope_sql=scope().predicate("spend_untagged_by_service_month")
-    )
-    attribution.tag_keys(_GROUP, end, sm)
-    with chrome.panel():
-        _tags_section(sm, end)
+    # The AWS GOLD group is Redshift-scoped by aws_focus's default service filter,
+    # so this customer-tag drill has the same bill scope as the cost hierarchy.
+    attribution.tag_breakdown(_GROUP, end, sm)
 
 
 def _tags_section(sm: date, end: date) -> None:

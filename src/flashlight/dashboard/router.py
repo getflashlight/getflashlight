@@ -77,6 +77,11 @@ def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
 # though "aws" would win alphabetically.
 _NAV_GROUP_ORDER: tuple[str, ...] = ("databricks",)
 
+_SIDEBAR_PROVIDER_LOGOS: dict[str, str] = {
+    "databricks": "/dashboard-assets/databricks.png",
+    "aws": "/dashboard-assets/redshift.svg",
+}
+
 
 def _nav_groups() -> list[str]:
     """Provider groups in nav order: :data:`_NAV_GROUP_ORDER` first, then the rest
@@ -98,18 +103,29 @@ def _nav_label(group: str) -> str:
 
 def _logo() -> None:
     with ui.row().classes("items-center gap-2"):
-        ui.icon("flashlight_on", size="1.3rem").style(f"color:{chrome.ACCENT}")
+        ui.image(chrome.LOGO_DATA_URL).classes("w-5 h-5 flex-none").props("fit=contain no-spinner")
         ui.label("Flashlight").classes("text-sm font-semibold").style(f"color:{chrome.INK_PRIMARY}")
 
 
-def _nav_row(*, label: str, icon: str, href: str, active: bool) -> None:
-    row = ui.row().classes("items-center gap-2 w-full px-2 py-2 cursor-pointer").style(
+def _nav_row(
+    *, label: str, icon: str, href: str, active: bool, logo_source: str | None = None
+) -> None:
+    row = ui.row().classes(
+        "fl-sidebar-row items-center gap-2 w-full px-2 py-2 cursor-pointer"
+        + (" fl-sidebar-active" if active else "")
+    ).style(
         f"border-radius:8px;background:{chrome.SURFACE if active else 'transparent'};"
     )
     with row:
-        ui.icon(icon, size="1.1rem").style(f"color:{chrome.INK_SECONDARY}")
-        ui.link(label, href).classes("text-sm no-underline").style(f"color:{chrome.INK_PRIMARY}")
+        if logo_source:
+            ui.image(logo_source).classes("w-5 h-5 flex-none").props("fit=contain no-spinner")
+        else:
+            ui.icon(icon, size="1.1rem").style(f"color:{chrome.INK_SECONDARY}")
+        ui.link(label, href).classes("fl-sidebar-label text-sm no-underline").style(
+            f"color:{chrome.INK_PRIMARY}"
+        )
     row.on("click", lambda: ui.navigate.to(href))
+    row.tooltip(label)
 
 
 def shell(active_path: str, *, full_height: bool = False) -> ui.column:
@@ -131,29 +147,57 @@ def shell(active_path: str, *, full_height: bool = False) -> ui.column:
     groups = _nav_groups()
     # value=True (rather than the default None) skips NiceGUI's post-connect
     # run_javascript round trip that asks the browser whether the drawer
-    # should start open based on viewport width — there's no responsive
-    # collapse UI here, the nav is always shown, and that round trip is what
-    # throws "JavaScript did not respond within 1.0 s" on a slow first paint.
-    with ui.left_drawer(value=True, fixed=True).style(
+    # should start open based on viewport width. The compact-rail control below
+    # owns the sidebar state, avoiding that fragile first-paint trip.
+    drawer = ui.left_drawer(value=True, fixed=True).props("mini-width=64")
+    with drawer.style(
         f"background:{chrome.PAGE};border-right:1px solid {chrome.BORDER};padding:16px 8px;"
     ):
-        ui.label("OVERVIEW").classes("text-xs font-semibold px-2 mb-1").style(
-            f"color:{chrome.INK_MUTED}"
-        )
-        for href, label, icon in _fixed_nav():
-            _nav_row(label=label, icon=icon, href=href, active=active_path == href)
-        if groups:
-            ui.label("BY PROVIDER").classes("text-xs font-semibold px-2 mb-1 mt-3").style(
-                f"color:{chrome.INK_MUTED}"
-            )
-            for group in groups:
-                href = f"/{group}"
-                _nav_row(
-                    label=_nav_label(group),
-                    icon="cloud",
-                    href=href,
-                    active=active_path == href,
+        # A small edge control reads as a sidebar-width affordance, rather than as
+        # another destination in the navigation list.
+        sidebar_is_compact = False
+
+        def _toggle_sidebar() -> None:
+            nonlocal sidebar_is_compact
+            sidebar_is_compact = not sidebar_is_compact
+            if sidebar_is_compact:
+                drawer.props("mini")
+                sidebar_toggle.props("icon=chevron_right")
+            else:
+                drawer.props(remove="mini")
+                sidebar_toggle.props("icon=chevron_left")
+
+        sidebar_toggle = ui.button(icon="chevron_left", on_click=_toggle_sidebar).props(
+            "flat dense round"
+        ).classes("fl-sidebar-toggle").tooltip("Collapse or expand sidebar")
+
+        with ui.column().classes("w-full h-full no-wrap"):
+            with ui.column().classes("w-full gap-0"):
+                ui.label("OVERVIEW").classes(
+                    "fl-sidebar-heading text-xs font-semibold px-2 mb-1"
+                ).style(
+                    f"color:{chrome.INK_MUTED}"
                 )
+                for href, label, icon in _fixed_nav():
+                    _nav_row(label=label, icon=icon, href=href, active=active_path == href)
+                if groups:
+                    ui.separator().classes("fl-sidebar-group-divider").style(
+                        f"background:{chrome.BORDER}"
+                    )
+                    ui.label("BY PROVIDER").classes(
+                        "fl-sidebar-heading text-xs font-semibold px-2 mb-1 mt-3"
+                    ).style(
+                        f"color:{chrome.INK_MUTED}"
+                    )
+                    for group in groups:
+                        href = f"/{group}"
+                        _nav_row(
+                            label=_nav_label(group),
+                            icon="cloud",
+                            href=href,
+                            active=active_path == href,
+                            logo_source=_SIDEBAR_PROVIDER_LOGOS.get(group),
+                        )
 
     with ui.header().classes("items-center justify-between px-6 py-3").style(
         f"background:{chrome.PAGE};border-bottom:1px solid {chrome.BORDER};"
@@ -187,6 +231,19 @@ def shell(active_path: str, *, full_height: bool = False) -> ui.column:
 # matches in registration order — so the catch-all got there first.
 _ICON_ROUTES = ("/favicon.ico", "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png")
 _icon_routes_registered = False
+_dashboard_assets_registered = False
+
+
+def register_dashboard_assets() -> None:
+    """Expose small, bundled dashboard images at a stable application URL."""
+    global _dashboard_assets_registered
+    if _dashboard_assets_registered:
+        return
+
+    from nicegui import app
+
+    app.add_static_files("/dashboard-assets", Path(__file__).parent / "assets")
+    _dashboard_assets_registered = True
 
 
 def icon_response() -> Response:
@@ -291,6 +348,7 @@ def build_pages() -> None:
     # swallow /favicon.ico, the apple-touch-icon probes, and the retired page URLs
     # stale tabs/bookmarks still ask for.
     register_icon_routes()
+    register_dashboard_assets()
     register_retired_route_redirects()
 
     @ui.page("/")

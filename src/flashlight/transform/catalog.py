@@ -270,7 +270,8 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
     ViewSpec(
         view="resource_month",
         title="Spend by resource / month",
-        description="Finest consumer grain: net spend and consumed quantity per (SKU, resource, "
+        description="Finest consumer grain: net and gross spend plus consumed quantity per "
+        "(SKU, resource, "
         "resource_type, workspace, region), by month — drives the SKU→resource drill-down "
         "(e.g. which SQL warehouse moved). consumed_quantity is the billable usage unit "
         "(e.g. DBUs), not an operation/query count.",
@@ -288,7 +289,7 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
             "region_id",
             "charge_month",
         ),
-        measures=("net_cost", "consumed_quantity"),
+        measures=("net_cost", "gross_cost", "consumed_quantity"),
     ),
     ViewSpec(
         view="ai_spend_month",
@@ -299,8 +300,8 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
         "another category — AI/BI Genie above all, which bills as warehouse-shaped usage. "
         "ai_product_family names the product ('model_serving', 'vector_search', 'ai_gateway', "
         "'ai_functions', 'foundation_model_training', 'agent_bricks', 'ai_runtime', "
-        "'agent_evaluation', 'genie', 'ai_bi_dashboard', 'lakehouse_monitoring'; NULL for a "
-        "product not yet mapped — Predictive Optimization included, since it's Databricks "
+        "'agent_evaluation', 'genie', 'ai_bi_dashboard'; NULL for a "
+        "product not yet mapped — including Predictive Optimization, since it's Databricks "
         "auto-tuning table layout, not AI spend). "
         "For the endpoint-shaped products resource_id IS the serving/vector-search endpoint "
         "id, which is the join key to the `ai` group's token views. project_tag is the "
@@ -365,11 +366,11 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
     ViewSpec(
         view="spend_by_tag_month",
         title="Spend by tag / month",
-        description="Net spend per cost-allocation tag (key/value), by month. Untagged spend "
+        description="Net/gross spend per cost-allocation tag (key/value), by month. Untagged spend "
         "is absent here; see the service/SKU views for totals.",
         cost_metric=CostMetric.EFFECTIVE_COST,
         dimensions=("tag_key", "tag_value", "provider_name", "charge_month"),
-        measures=("net_cost",),
+        measures=("net_cost", "gross_cost"),
     ),
     ViewSpec(
         view="spend_forecast_month",

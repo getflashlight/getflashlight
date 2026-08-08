@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
+import sys
+from pathlib import Path
 
 from flashlight.core.logging import get_logger
 from flashlight.core.settings import get_settings
@@ -73,8 +76,51 @@ def prepare_storage_path() -> None:
         os.environ["NICEGUI_STORAGE_PATH"] = str(storage_dir)
 
 
-def serve_dashboard() -> None:
-    """Run the dashboard on the configured host/port (blocks until stopped)."""
+def _serve_with_reload() -> None:
+    """Restart a normal dashboard child whenever package source changes.
+
+    NiceGUI/Uvicorn's own ``reload=True`` uses a multiprocessing child that cannot
+    re-enter this console-script launch path (it reports "You must call ui.run()").
+    Watching here instead restarts a fresh, ordinary ``serve_dashboard()`` process,
+    which works identically whether Flashlight is launched through ``uv`` or installed
+    as a console script.
+    """
+    from watchfiles import watch
+
+    source_root = Path(__file__).resolve().parents[2]
+    command = [
+        sys.executable,
+        "-c",
+        "from flashlight.dashboard.launch import serve_dashboard; serve_dashboard()",
+    ]
+    child: subprocess.Popen[bytes] | None = None
+
+    def start() -> subprocess.Popen[bytes]:
+        logger.info("dashboard_dev_starting", watch_path=str(source_root))
+        return subprocess.Popen(command)
+
+    try:
+        child = start()
+        for changes in watch(source_root):
+            logger.info("dashboard_dev_reloading", changed_files=len(changes))
+            child.terminate()
+            child.wait()
+            child = start()
+    finally:
+        if child is not None and child.poll() is None:
+            child.terminate()
+            child.wait()
+
+
+def serve_dashboard(*, dev: bool = False) -> None:
+    """Run the dashboard on the configured host/port (blocks until stopped).
+
+    ``dev`` watches the package source and restarts a normal dashboard child. It remains
+    off by default because production use needs one predictable server process.
+    """
+    if dev:
+        _serve_with_reload()
+        return
     settings = get_settings()
 
     # Preflight: a busy port otherwise surfaces as an opaque "address already in

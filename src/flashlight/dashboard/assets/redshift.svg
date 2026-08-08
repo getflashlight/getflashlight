@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Amazon Redshift">
+  <path fill="#8C4FFF" d="M5 8.5 16 2l11 6.5v15L16 30 5 23.5z"/>
+  <path fill="#B999FF" d="M16 2v28l11-6.5v-15z"/>
+  <path fill="#fff" opacity=".9" d="M10 11h12v2H10zm0 4h12v2H10zm0 4h12v2H10z"/>
+</svg>

@@ -1891,7 +1891,7 @@ def test_attribution_tier_for_service_matches_real_billing_grain() -> None:
         assert attribution._tier_for_service(service) == "unclassified", service  # noqa: SLF001
 
 
-def test_attribution_tab_leads_with_untagged_infrastructure(lake_home) -> None:  # type: ignore[no-untyped-def]
+def test_attribution_tab_leads_with_cost_attribution(lake_home) -> None:  # type: ignore[no-untyped-def]
     """Attribution's one drill-through panel — the service level, on first render.
 
     Replaces the old two-stacked-panels design (a standing "Untagged resources" table
@@ -1925,21 +1925,14 @@ def test_attribution_tab_leads_with_untagged_infrastructure(lake_home) -> None: 
             build_pages()
             await user.open("/databricks")
             user.find(kind=ui.tab, content="Attribution").click()
-            await user.should_see("Untagged infrastructure")
-            await user.should_see("Click a service to see the resources behind it.")
-            # Tag key/value are one drill-through panel now too — the value level
-            # (and its old "Spend by tag value" title/dropdown) only appears after a
-            # key row is clicked, same client-side-only limitation as above.
-            await user.should_see("Spend by tag key")
-            await user.should_see("Click a key to see its values.")
-            # Removed with the tiered redesign — no bill-level coverage KPI standing
-            # caption, no auto-opened second "Untagged resources" panel/title, no
-            # single generic remedy shown before any service is even picked, and no
-            # standing "Spend by tag value" panel/dropdown before a key is picked.
-            await user.should_not_see("carry a cost-allocation tag")
-            await user.should_not_see("Untagged resources —")
-            await user.should_not_see("Waste & opportunity by owner")
-            await user.should_not_see("Spend by tag value")
+            await user.should_see("Cost attribution")
+            await user.should_see(
+                "Click a service to see the infrastructure and people behind its cost."
+            )
+            # Cost accountability leads; customer-defined tag allocation is available
+            # as a separate drill rather than competing with the service hierarchy.
+            await user.should_see("Tag-based attribution")
+            await user.should_not_see("Untagged infrastructure")
 
     asyncio.run(_check())
 
@@ -1996,13 +1989,19 @@ def test_attribution_untagged_resource_and_driver_views_reconcile(lake_home) -> 
     build_gold()
 
     res = gold_df(
-        "SELECT resource_id, sum(untagged_cost) AS untagged_cost "
-        'FROM "databricks".spend_untagged_by_resource_month '
+        "SELECT resource_id, sum(gross_cost) AS gross_cost "
+        'FROM "databricks".resource_month '
         "WHERE service_name = 'SQL' GROUP BY resource_id"
     )
-    assert res.loc[res["resource_id"] == "wh-shared", "untagged_cost"].iloc[0] == pytest.approx(
+    assert res.loc[res["resource_id"] == "wh-shared", "gross_cost"].iloc[0] == pytest.approx(
         80.0
     )
+    service_total = gold_df(
+        "SELECT sum(gross_cost) AS gross_cost FROM \"databricks\".spend_by_service_month "
+        "WHERE service_name = 'SQL'"
+    )
+    resource_total = float(res["gross_cost"].sum())
+    assert resource_total == pytest.approx(float(service_total["gross_cost"].iloc[0]))
 
     drivers = gold_df(
         "SELECT owner_user, billed_cost, primary_signal_value AS duration_share_pct "
@@ -2013,6 +2012,24 @@ def test_attribution_untagged_resource_and_driver_views_reconcile(lake_home) -> 
     assert list(drivers["owner_user"]) == ["carol"]
     assert float(drivers["billed_cost"].iloc[0]) == pytest.approx(60.0)
     assert float(drivers["duration_share_pct"].iloc[0]) == pytest.approx(75.0)
+
+    # Attribution allocates from the resource charge (80), not telemetry's source
+    # cost (60), and makes the telemetry-free remainder visible.  Thus the children
+    # reconcile exactly to the selected warehouse even when sources differ.
+    allocation = gold_df(
+        "WITH resource_cost AS ("
+        " SELECT sum(gross_cost) AS resource_cost FROM \"databricks\".resource_month "
+        " WHERE service_name = 'SQL' AND resource_id = 'wh-shared'"
+        "), shares AS ("
+        " SELECT owner_user, primary_signal_value / 100.0 AS duration_share "
+        " FROM efficiency.utilization_entity_month "
+        " WHERE provider_name = 'Databricks' AND entity_type = 'sql_warehouse_user' "
+        " AND entity_id LIKE 'wh-shared:%'"
+        ") SELECT sum(resource_cost * duration_share) AS allocated_cost "
+        " FROM resource_cost CROSS JOIN shares"
+    )
+    assert float(allocation["allocated_cost"].iloc[0]) == pytest.approx(60.0)
+    assert 80.0 - float(allocation["allocated_cost"].iloc[0]) == pytest.approx(20.0)
 
 
 def test_attribution_tag_value_level_reads_the_folded_key(lake_home) -> None:  # type: ignore[no-untyped-def]
@@ -2427,7 +2444,7 @@ def test_redshift_page_carries_the_shared_trend_panels(lake_home) -> None:  # ty
             # arithmetic a reader doesn't need two tiles for); the list total survives as
             # the denominator, which is the part a bare percentage can't carry.
             await user.should_see("Net Spend")
-            await user.should_see("off $1.5K list")
+            await user.should_see("savings vs. $1.5K list")
             await user.should_not_see("AWS Redshift list")
             await user.should_see("Alerts")
             # MoM prose used to sit under the KPIs; it lives on the Alerts tab now.
@@ -3717,9 +3734,9 @@ def test_footprint_card_combines_dbu_storage_and_compute(lake_home) -> None:  # 
     card = footprint_card(date(2026, 5, 1), date(2026, 5, 31))
     assert card is not None
     title, value, sub = card[0], card[1], card[2]
-    assert title == "Total Databricks footprint"
+    assert title == "Total cost of ownership"
     assert value == "$200"  # 100 DBU + 40 storage + 60 compute
-    assert "DBU" in sub and "AWS infra" in sub
+    assert sub == "Includes Databricks usage and AWS infrastructure"
 
     # Net Spend itself must be exactly the DBU figure, untouched.
     dbu = float(

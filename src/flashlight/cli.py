@@ -93,11 +93,17 @@ def mcp_serve() -> None:
 
 
 @dashboard_app.command("serve")
-def dashboard_serve() -> None:
+def dashboard_serve(
+    dev: bool = typer.Option(
+        False,
+        "--dev",
+        help="Reload the dashboard when Python source files change (development only)",
+    ),
+) -> None:
     """Run the dashboard for humans (reads the GOLD Parquet read-only)."""
     from flashlight.dashboard.launch import serve_dashboard
 
-    serve_dashboard()
+    serve_dashboard(dev=dev)
 
 
 def _progress_printer() -> Callable[[str, str, int], None]:

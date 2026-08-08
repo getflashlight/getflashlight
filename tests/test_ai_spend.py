@@ -102,11 +102,15 @@ def test_only_ai_categorized_spend_lands(lake_home: object) -> None:
     assert rows[0]["resource_name"] == "chat-endpoint"
 
 
-def test_genie_and_other_uncategorized_ai_products_are_included(lake_home: object) -> None:
+def test_explicit_ai_products_are_included_but_monitoring_and_predictive_optimization_are_not(
+    lake_home: object,
+) -> None:
     """AI/BI Genie bills as warehouse-shaped usage, so the vendored FOCUS query files it
     under a NON-AI service_category — its eight-product AI list doesn't include it. Anyone
-    asking "what is AI costing me?" means Genie too, so the view unions these in by
-    service_name. A plain SQL warehouse must still stay out.
+    asking "what is AI costing me?" means Genie, AI/BI Dashboard, and Model Training too, so
+    the view unions those in by service_name. Monitoring/data-quality and Predictive
+    Optimization are not AI products a user runs, so they — and a plain SQL warehouse — must
+    stay out.
     """
     rows = _build(
         [
@@ -118,15 +122,42 @@ def test_genie_and_other_uncategorized_ai_products_are_included(lake_home: objec
                 resource_id="genie-space-1",
             ),
             _row(
-                service_name="LAKEHOUSE_MONITORING",
+                service_name="GENIE",
                 cost="30",
-                service_category=ServiceCategory.MANAGEMENT_AND_GOVERNANCE,
-                resource_id="mon-1",
+                service_category=ServiceCategory.DATABASES,
+                resource_id="genie-space-2",
+            ),
+            _row(
+                service_name="AI_BI_DASHBOARD",
+                cost="40",
+                service_category=ServiceCategory.DATABASES,
+                resource_id="dashboard-1",
+            ),
+            _row(
+                service_name="AI_BI_DASHBOARDS",
+                cost="50",
+                service_category=ServiceCategory.DATABASES,
+                resource_id="dashboard-2",
+            ),
+            _row(
+                service_name="MODEL_TRAINING",
+                cost="60",
+                service_category=ServiceCategory.DATABASES,
+                resource_id="training-1",
+            ),
+            _row(
+                service_name="LAKEHOUSE_MONITORING",
+                cost="70",
+                resource_id="monitor-1",
+            ),
+            _row(
+                service_name="DATA_QUALITY_MONITORING",
+                cost="80",
+                resource_id="quality-1",
             ),
             _row(
                 service_name="PREDICTIVE_OPTIMIZATION",
                 cost="20",
-                service_category=ServiceCategory.STORAGE,
                 resource_id="po-1",
             ),
             # The control: an ordinary SQL warehouse is not AI spend.
@@ -138,13 +169,33 @@ def test_genie_and_other_uncategorized_ai_products_are_included(lake_home: objec
             ),
         ]
     )
-    by_family = {r["ai_product_family"]: r["net_cost"] for r in rows}
-    assert by_family == {
-        "genie": pytest.approx(90.0),
-        "lakehouse_monitoring": pytest.approx(30.0),
-        "predictive_optimization": pytest.approx(20.0),
+    by_service = {r["service_name"]: r for r in rows}
+    assert {
+        service: row["ai_product_family"] for service, row in by_service.items()
+    } == {
+        "AI_BI_GENIE": "genie",
+        "GENIE": "genie",
+        "AI_BI_DASHBOARD": "ai_bi_dashboard",
+        "AI_BI_DASHBOARDS": "ai_bi_dashboard",
+        "MODEL_TRAINING": "foundation_model_training",
     }
-    assert "SQL" not in {r["service_name"] for r in rows}
+    assert {
+        service: row["net_cost"] for service, row in by_service.items()
+    } == {
+        "AI_BI_GENIE": pytest.approx(90.0),
+        "GENIE": pytest.approx(30.0),
+        "AI_BI_DASHBOARD": pytest.approx(40.0),
+        "AI_BI_DASHBOARDS": pytest.approx(50.0),
+        "MODEL_TRAINING": pytest.approx(60.0),
+    }
+    assert {
+        "PREDICTIVE_OPTIMIZATION",
+        "LAKEHOUSE_MONITORING",
+        "DATA_QUALITY_MONITORING",
+        "SQL",
+    }.isdisjoint(
+        by_service
+    )
 
 
 def test_ai_product_family_maps_each_product_and_leaves_unknown_null(lake_home: object) -> None:

@@ -174,8 +174,8 @@ def test_run_rate_card_suppressed_below_three_days() -> None:
         ), f"a {days}-day mean extended over a month is noise, not a projection"
 
 
-def test_run_rate_card_leads_with_mtd_under_a_week() -> None:
-    """Under a week the run-rate is noise as a hero — lead with actual, demote the forecast."""
+def test_run_rate_card_is_suppressed_under_a_week() -> None:
+    """Under a week neither an MTD tile nor an unreliable forecast is a KPI."""
     from flashlight.dashboard.views.provider_focus import _run_rate_card
 
     card = _run_rate_card(
@@ -184,14 +184,7 @@ def test_run_rate_card_leads_with_mtd_under_a_week() -> None:
         actual_to_date=12_000.0,
         history_days=4,
     )
-    assert card is not None
-    assert len(card) == 4, "must carry a variant so it renders visually de-emphasized"
-    assert card[3] == "partial"
-    assert card[0] == "Month to date"
-    assert "12K" in card[1]
-    assert "day 4" in card[2]
-    assert "run rate ~$90K" in card[2]
-    assert "low confidence" not in card[0].lower()
+    assert card is None
 
 
 def test_run_rate_card_is_plain_with_a_week_of_history() -> None:
@@ -214,8 +207,42 @@ def test_run_rate_card_tolerates_a_missing_actual() -> None:
     card = _run_rate_card(
         month=date(2026, 8, 1), forecast_cost=90_000.0, actual_to_date=None, history_days=4
     )
-    assert card is not None
-    assert card[0] == "Projected"
-    assert card[3] == "partial"
-    assert "day 4" in card[2]
-    assert "Month to date" not in card[0]
+    assert card is None
+
+
+def test_databricks_backing_costs_are_added_to_forecasts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Storage and compute carry through to both forecast shapes, not just actual bars."""
+    import pandas as pd
+
+    from flashlight.dashboard.views import provider_focus
+
+    backing = pd.DataFrame(
+        {
+            "charge_month": pd.to_datetime(
+                ["2026-01-01", "2026-02-01", "2026-03-01", "2026-08-01"]
+            ),
+            "net_cost": [10.0, 20.0, 30.0, 100.0],
+            "service_name": ["Databricks Storage"] * 4,
+        }
+    )
+    monkeypatch.setattr(
+        provider_focus,
+        "_databricks_backing_monthly",
+        lambda end, sm: backing[
+            (backing["charge_month"] >= pd.Timestamp(sm))
+            & (backing["charge_month"] <= pd.Timestamp(end))
+        ],
+    )
+
+    run_rate, actual = provider_focus._databricks_backing_run_rate(date(2026, 8, 1), 5)
+    assert actual == 100.0  # The current month's mapped AWS cost only.
+    assert run_rate == 620.0  # $100 / 5 completed days × 31 days in August.
+
+    trend = pd.DataFrame(
+        {
+            "charge_month": pd.to_datetime(["2026-05-01", "2026-06-01"]),
+            "forecast_cost": [1.0, 1.0],
+        }
+    )
+    # May forecasts from an April anchor, so the Jan–Mar backing mean is added.
+    assert provider_focus._databricks_backing_trend_addition(trend) == 20.0
