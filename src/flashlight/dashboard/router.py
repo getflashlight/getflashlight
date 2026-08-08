@@ -127,7 +127,6 @@ def _nav_row(
             f"color:{chrome.INK_PRIMARY}"
         )
     row.on("click", lambda: ui.navigate.to(href))
-    row.tooltip(label)
 
 
 def shell(active_path: str, *, full_height: bool = False) -> ui.column:

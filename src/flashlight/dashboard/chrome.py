@@ -618,6 +618,7 @@ def searchable_table(
     df: pd.DataFrame,
     *,
     key: str,
+    row_data: pd.DataFrame | None = None,
     search_col: str | None = None,
     money_cols: Sequence[str] = (),
     pct_cols: Sequence[str] = (),
@@ -631,14 +632,18 @@ def searchable_table(
     """A paginated, optionally search-filterable ``ui.table`` with CSV export.
 
     ``max_rows`` caps the *displayed* rows; the CSV export always carries the
-    full set. ``on_row_click`` gets the raw (pre-format) row dict.
+    full set. ``on_row_click`` gets the raw (pre-format) row dict. Pass
+    ``row_data`` when the rendered columns are a subset of the fields needed by a
+    click-through; it must be row-aligned with *df*.
     """
+    if row_data is not None and len(row_data) != len(df):
+        raise ValueError("row_data must have one row for every displayed table row")
     shown = df if max_rows is None else df.head(max_rows)
     columns, rows = _fmt_columns(
         shown, money_cols=money_cols, pct_cols=pct_cols, int_cols=int_cols,
         num_cols=num_cols, rename=rename,
     )
-    raw_rows = df.to_dict("records")
+    raw_rows = (row_data if row_data is not None else df).to_dict("records")
 
     with ui.row().classes("items-center justify-between w-full mb-2"):
         search: ui.input | None = None
@@ -649,10 +654,6 @@ def searchable_table(
                 .props("dense outlined clearable")
                 .classes("w-64")
                 .style(f"color:{INK_PRIMARY}")
-            )
-        if max_rows is not None and len(df) > max_rows:
-            section_caption(
-                f"Showing top {max_rows} of {len(df):,} — download the CSV for the full list."
             )
         ui.button(
             "Download CSV",

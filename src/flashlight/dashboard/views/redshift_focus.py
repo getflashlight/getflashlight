@@ -63,6 +63,8 @@ from nicegui import ui
 
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import gold_df, gold_view_published, provider_label
+from flashlight.dashboard.data import to_date as _d
+from flashlight.dashboard.summary import action_group_rows
 from flashlight.dashboard.theme import compact_money
 from flashlight.dashboard.views import attribution, efficiency_waste, provider_focus
 from flashlight.dashboard.views.provider_focus import Scope
@@ -394,6 +396,24 @@ def _telemetry_cluster_ids() -> list[str]:
 def _waste_section() -> None:
     chrome.section_title("Redshift optimization")
 
+    current_month = _d(
+        gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"]
+    )
+    record_months = gold_df(
+        f"SELECT DISTINCT charge_month FROM efficiency.waste_record "
+        f"WHERE provider_name = '{_PROVIDER}'"
+    )
+    completed_months = efficiency_waste.completed_record_months(record_months, current_month)
+    if not completed_months:
+        chrome.empty_state(
+            "calendar_month",
+            "No completed efficiency month yet",
+            "Efficiency findings are shown only after the month closes, so partial-month "
+            "costs do not make an optimization opportunity look smaller than it is.",
+        )
+        return
+    month = completed_months[-1]
+
     clusters = _telemetry_cluster_ids()
     if not clusters:
         cost_clusters = _cost_cluster_ids()
@@ -411,7 +431,7 @@ def _waste_section() -> None:
         return
 
     if len(clusters) == 1:
-        _cluster_waste_section(clusters[0])
+        _cluster_waste_section(clusters[0], month)
     else:
         with ui.tabs().classes("w-full") as tabs:
             tab_refs = [ui.tab(cluster_id) for cluster_id in clusters]
@@ -422,7 +442,7 @@ def _waste_section() -> None:
         ):
             for cluster_id, tab_ref in zip(clusters, tab_refs, strict=True):
                 with ui.tab_panel(tab_ref):
-                    _cluster_waste_section(cluster_id)
+                    _cluster_waste_section(cluster_id, month)
 
     uninstrumented = sorted(_cost_cluster_ids() - set(clusters))
     if uninstrumented:
@@ -439,19 +459,18 @@ def _waste_section() -> None:
                 )
 
 
-def _cluster_waste_section(cluster_id: str) -> None:
+def _cluster_waste_section(cluster_id: str, month: str) -> None:
     scope = (
         f"(entity_id = '{_sql_str(cluster_id)}' "
         f"OR starts_with(entity_id, '{_sql_str(cluster_id)}:'))"
     )
     coverage = gold_df(
         "SELECT DISTINCT charge_month, entity_type FROM efficiency.efficiency_entity_month "
-        f"WHERE provider_name = '{_PROVIDER}' AND {scope}"
+        f"WHERE provider_name = '{_PROVIDER}' AND {scope} AND charge_month = '{month}'"
     )
     if coverage.empty:
         return  # shouldn't happen — cluster_id came from this same view
 
-    month = str(sorted(coverage["charge_month"].astype(str).unique())[-1])
     measured_types = set(coverage.loc[coverage["charge_month"].astype(str) == month, "entity_type"])
 
     records = gold_df(
@@ -462,10 +481,7 @@ def _cluster_waste_section(cluster_id: str) -> None:
     ui.label(f"Cluster: {cluster_id}").classes("text-base font-semibold mt-4").style(
         f"color:{chrome.INK_PRIMARY}"
     )
-    month_label = pd.Timestamp(month).strftime("%b %Y")
-    chrome.section_caption(f"Showing {month_label} — the latest month with telemetry.")
-
-    action_groups = efficiency_waste.action_group_rows(records)
+    action_groups = action_group_rows(records)
     waste_total = action_groups.loc[action_groups["lens"] == "WASTE", "potential_savings"].sum()
     opp_total = action_groups.loc[action_groups["lens"] == "OPPORTUNITY", "potential_savings"].sum()
     chrome.kpi_row(
@@ -500,4 +516,12 @@ def _cluster_waste_section(cluster_id: str) -> None:
         measured_types,
         scope_note="for this cluster",
     )
-    efficiency_waste.action_queue(records, key=f"redshift_actions_{_slug(cluster_id)}")
+    tracking = gold_df(
+        "SELECT * FROM efficiency.waste_resolution_month "
+        f"WHERE provider_name = '{_PROVIDER}' AND {scope}"
+    ) if gold_view_published("efficiency", "waste_resolution_month") else pd.DataFrame()
+    efficiency_waste.action_queue(
+        records,
+        tracking,
+        key=f"redshift_actions_{_slug(cluster_id)}",
+    )

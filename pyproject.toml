@@ -1,5 +1,4 @@
 [project]
-# PyPI name is getflashlight (flashlight is squatted); import + CLI stay `flashlight`
 name = "getflashlight"
 version = "0.2.0"
 description = "FOCUS-based multi-cloud spend-visualization platform"
@@ -78,6 +77,7 @@ docs = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
