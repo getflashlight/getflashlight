@@ -23,12 +23,12 @@ import pytest
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
+from scripts import profile_assistant_turn as prof
 
 from flashlight.core.settings import get_settings
 from flashlight.focus.enums import ChargeCategory, ComputeClass, ProviderName, ServiceCategory
 from flashlight.focus.model import FocusRecord
 from flashlight.ingest.base import IngestWindow
-from scripts import profile_assistant_turn as prof
 
 
 @pytest.fixture

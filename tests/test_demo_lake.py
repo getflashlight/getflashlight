@@ -9,9 +9,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from scripts.build_demo_lake import verify_demo_lake
 
 from flashlight.core.settings import get_settings
-from scripts.build_demo_lake import verify_demo_lake
 
 _DEMO_LAKE = Path(__file__).parents[1] / "demo" / "lake"
 
