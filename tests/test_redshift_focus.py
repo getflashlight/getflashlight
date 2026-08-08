@@ -1470,6 +1470,7 @@ def test_redshift_tab_renders_per_cluster_with_coverage_table(monkeypatch, tmp_p
             build_pages()
             await user.open("/aws")
             await user.should_see("Redshift spend")
+            user.find(kind=ui.tab, content="Efficiency & Waste").click()
             await user.should_see("Cluster: prod-cluster")
             await user.should_see("Optimization rule coverage")
             await user.should_see("Not yet instrumented")

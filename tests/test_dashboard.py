@@ -152,6 +152,7 @@ def test_provider_page_renders_commitment_panel_when_present(lake_home) -> None:
     bronze.write_window("t", window, [used, unused], ingest_run_id="r1")
     build_gold()
 
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.dashboard.router import build_pages
@@ -160,6 +161,7 @@ def test_provider_page_renders_commitment_panel_when_present(lake_home) -> None:
         async with user_simulation() as user:
             build_pages()
             await user.open("/aws")
+            user.find(kind=ui.tab, content="Breakdown").click()
             await user.should_see("Commitment coverage")
 
     asyncio.run(_check())
@@ -353,6 +355,7 @@ def test_redshift_page_itemizes_credits(lake_home) -> None:  # type: ignore[no-u
             build_pages()
             await user.open("/aws")
             await user.should_see("Credits & Discounts")  # KPI card
+            user.find(kind=ui.tab, content="Breakdown").click()
             await user.should_see("Discounts & credits")  # the table's own panel
             # ui.table rows are data, not text nodes should_see can match.
             rows = " ".join(str(t.rows) for t in user.find(kind=ui.table).elements)
@@ -450,6 +453,7 @@ def test_provider_page_renders_when_lake_predates_a_catalogued_view(lake_home) -
     for view in ("spend_untagged_by_service_month", "spend_forecast_month"):
         (paths.gold_dir() / "gcp" / f"{view}.parquet").unlink()
 
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.dashboard.router import build_pages
@@ -459,6 +463,7 @@ def test_provider_page_renders_when_lake_predates_a_catalogued_view(lake_home) -
             build_pages()
             await user.open("/gcp")
             await user.should_see("GCP spend")
+            user.find(kind=ui.tab, content="Attribution").click()
             await user.should_see("Untagged-by-service isn't published yet")
             await user.should_see("run `flashlight transform`")
 
@@ -1165,6 +1170,7 @@ def test_policy_page_scopes_to_the_page_date_range(lake_home) -> None:  # type: 
     from datetime import date as _date
     from decimal import Decimal as _Decimal
 
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.efficiency.model import EfficiencyRecord, EntityType
@@ -1219,7 +1225,7 @@ def test_policy_page_scopes_to_the_page_date_range(lake_home) -> None:  # type: 
             build_pages()
             await user.open("/databricks")
             await user.should_see("Policy Compliance")
-            user.find("Policy Compliance").click()
+            user.find(kind=ui.tab, content="Policy Compliance").click()
             # Default range is YTD, which covers May 2026 — the finding is visible.
             # (Table cell contents render client-side and aren't visible to
             # user_simulation — the KPI row is, so that's what's asserted on.)
@@ -1358,6 +1364,7 @@ def test_policy_non_compliant_panel_opens_at_the_policy_grain(lake_home) -> None
     from datetime import date as _date
     from decimal import Decimal as _Decimal
 
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.efficiency.model import EfficiencyRecord, EntityType
@@ -1409,7 +1416,7 @@ def test_policy_non_compliant_panel_opens_at_the_policy_grain(lake_home) -> None
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("Policy Compliance").click()
+            user.find(kind=ui.tab, content="Policy Compliance").click()
             await user.should_see("Click a policy to see the entities behind it.")
             # Entity-level breadcrumb text must NOT be showing yet — confirms the
             # panel opened at the policy grain, not already drilled in.
@@ -1715,6 +1722,7 @@ def test_alerts_tab_holds_mom_prose_not_the_kpi_header(lake_home) -> None:  # ty
     Asserts both halves: the landing panel no longer carries the old "in the selected
     window" header caption, and the Alerts tab surfaces the window total.
     """
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.dashboard.router import build_pages
@@ -1744,7 +1752,7 @@ def test_alerts_tab_holds_mom_prose_not_the_kpi_header(lake_home) -> None:  # ty
             await user.should_see("Net Spend")
             await user.should_see("Alerts")
             await user.should_not_see("in the selected window")
-            user.find("Alerts").click()
+            user.find(kind=ui.tab, content="Alerts").click()
             await user.should_see("Selected window")
             await user.should_see("Top SKU movers")
 
@@ -1755,6 +1763,7 @@ def test_efficiency_tab_states_its_measurement_coverage(lake_home) -> None:  # t
     """Coverage is the honesty frame the old /utilization page led with, kept as one line:
     'not applicable' and 'unmeasured' must be visible, a reading pegged at 100% must read as
     a ceiling rather than praise, and an unflagged entity must not read as a clean bill."""
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     _seed(
@@ -1772,6 +1781,7 @@ def test_efficiency_tab_states_its_measurement_coverage(lake_home) -> None:  # t
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
+            user.find(kind=ui.tab, content="Efficiency & Waste").click()
             # 2 of the 4 entity-months carry a reading; the other two are one
             # not-applicable (shared warehouse) and one unmeasured (silent notebook).
             await user.should_see("2 of 4 entity-months")
@@ -1835,6 +1845,7 @@ def test_efficiency_tab_names_missing_telemetry_instead_of_hiding_the_tab(lake_h
     """A provider whose connector pulls FOCUS cost only still gets the tab, with an empty
     state that names the fix — hiding it would make 'never measured' look like 'nothing to
     find'."""
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     gcp = _rec(15)
@@ -1848,6 +1859,7 @@ def test_efficiency_tab_names_missing_telemetry_instead_of_hiding_the_tab(lake_h
             build_pages()
             await user.open("/gcp")
             await user.should_see("Efficiency & Waste")
+            user.find(kind=ui.tab, content="Efficiency & Waste").click()
             await user.should_see("No efficiency telemetry for GCP")
             await user.should_see("Databricks connector")
             await user.should_see("coverage gap, not a verdict")
@@ -1890,6 +1902,7 @@ def test_attribution_tab_leads_with_untagged_infrastructure(lake_home) -> None: 
     The resource-level query and the driver-level join are pinned directly against GOLD
     in :func:`test_attribution_untagged_resource_and_driver_views_reconcile` instead.
     """
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     tagged = _db_cost_row()
@@ -1911,6 +1924,7 @@ def test_attribution_tab_leads_with_untagged_infrastructure(lake_home) -> None: 
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
+            user.find(kind=ui.tab, content="Attribution").click()
             await user.should_see("Untagged infrastructure")
             await user.should_see("Click a service to see the resources behind it.")
             # Tag key/value are one drill-through panel now too — the value level
@@ -2301,6 +2315,7 @@ def test_commitment_panel_discloses_null_status_spend(lake_home) -> None:  # typ
     """Rows with no CommitmentDiscountStatus carry real dollars (and negative corrective
     lines). They're rightly off the Used/Unused chart, but dropping them from the
     denominator silently overstates how much of the commitment the split covers."""
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.lake import bronze
@@ -2341,6 +2356,7 @@ def test_commitment_panel_discloses_null_status_spend(lake_home) -> None:  # typ
         async with user_simulation() as user:
             build_pages()
             await user.open("/aws")
+            user.find(kind=ui.tab, content="Breakdown").click()
             await user.should_see("Commitment coverage")
             await user.should_see("no CommitmentDiscountStatus")
             await user.should_see("negative corrections")
@@ -2513,6 +2529,7 @@ def test_policy_tab_names_unevaluable_rows_instead_of_implying_compliance(lake_h
     Filtering by provider alone would render "— compliant · 0 non-compliant", which is
     indistinguishable from a clean bill of health. The tab has to say what happened.
     """
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     redshift_cost = _rec(15)
@@ -2536,6 +2553,7 @@ def test_policy_tab_names_unevaluable_rows_instead_of_implying_compliance(lake_h
             build_pages()
             await user.open("/aws")
             await user.should_see("Policy Compliance")
+            user.find(kind=ui.tab, content="Policy Compliance").click()
             await user.should_see("Nothing could be evaluated")
             await user.should_see("This is a telemetry coverage gap, not compliance")
             # The count that was invisible on every provider before.
@@ -2577,6 +2595,7 @@ def test_policy_tab_is_provider_filtered(lake_home) -> None:  # type: ignore[no-
 def test_policy_tab_empty_state_names_the_provider(lake_home) -> None:  # type: ignore[no-untyped-def]
     """A provider with no policy telemetry at all gets a named empty state, not a hidden
     tab — same discipline as Efficiency & Waste."""
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     gcp = _rec(15)
@@ -2590,6 +2609,7 @@ def test_policy_tab_empty_state_names_the_provider(lake_home) -> None:  # type: 
             build_pages()
             await user.open("/gcp")
             await user.should_see("Policy Compliance")
+            user.find(kind=ui.tab, content="Policy Compliance").click()
             await user.should_see("No policy signals for GCP")
             await user.should_see("coverage gap, not a clean bill of health")
 
@@ -2639,6 +2659,7 @@ def test_ai_costs_tab_shows_spend_and_says_tokens_were_never_measured(lake_home)
 
     Panel titles follow the page date range — no pinned ``· May 2026`` / ``last N month(s)``.
     """
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     _seed([], cost_rows=[_db_cost_row(), _ai_cost_row(tags={"project": "rag-search"})])
@@ -2650,7 +2671,7 @@ def test_ai_costs_tab_shows_spend_and_says_tokens_were_never_measured(lake_home)
             build_pages()
             await user.open("/databricks")
             await user.should_see("AI Costs")
-            user.find("AI Costs").click()
+            user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("AI Spend")
             await user.should_see("By AI product")
             await user.should_see("By resource")
@@ -2690,7 +2711,7 @@ def test_ai_costs_tab_names_untagged_ai_spend(lake_home) -> None:  # type: ignor
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("AI Costs").click()
+            user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("Untagged AI Spend")
             await user.should_see("no `project` tag")
             await user.should_see("AI spend by tag")
@@ -2706,6 +2727,7 @@ def test_ai_costs_tab_names_untagged_ai_spend(lake_home) -> None:  # type: ignor
 def test_ai_costs_tab_empty_state_distinguishes_no_ai_spend_from_no_measurement(lake_home) -> None:  # type: ignore[no-untyped-def]
     """A Databricks bill with no AI rows is an absence of AI *spend* — a different fact
     from an absence of token measurement, so it gets its own wording."""
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     _seed([], cost_rows=[_db_cost_row()])
@@ -2716,7 +2738,7 @@ def test_ai_costs_tab_empty_state_distinguishes_no_ai_spend_from_no_measurement(
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("AI Costs").click()
+            user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("No AI spend found")
             await user.should_see("categorization comes from the billing data itself")
 
@@ -2726,6 +2748,7 @@ def test_ai_costs_tab_empty_state_distinguishes_no_ai_spend_from_no_measurement(
 def test_ai_costs_tab_survives_a_lake_published_before_the_view_existed(lake_home) -> None:  # type: ignore[no-untyped-def]
     """An older lake has no ai_spend_month.parquet. The tab must say so and move on, not
     take the whole provider page down — the gold_view_published guard."""
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.lake import paths
@@ -2739,7 +2762,7 @@ def test_ai_costs_tab_survives_a_lake_published_before_the_view_existed(lake_hom
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("AI Costs").click()
+            user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("flashlight transform")
             # The rest of the page still works.
             await user.should_see("Trend & changes")
@@ -2816,6 +2839,7 @@ def test_ai_costs_tab_shows_tokens_per_project_and_per_user(lake_home) -> None: 
     Asserted on panel titles and captions — ui.table rows are a data prop should_see
     can't reach (row-level correctness is pinned in test_ai_usage_views).
     """
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     _seed_ai(
@@ -2832,7 +2856,7 @@ def test_ai_costs_tab_shows_tokens_per_project_and_per_user(lake_home) -> None: 
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("AI Costs").click()
+            user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("AI spend by tag")
             await user.should_see("Tokens by user")
             await user.should_see("Model unit economics")
@@ -2847,6 +2871,7 @@ def test_ai_costs_tab_shows_tokens_per_project_and_per_user(lake_home) -> None: 
 def test_ai_costs_tab_names_cost_that_cannot_be_split_by_tokens(lake_home) -> None:  # type: ignore[no-untyped-def]
     """Provisioned endpoints still surface on Tokens by user with a blank allocated cost —
     never coalesced to $0. Row-level blankness is pinned in test_ai_usage_views."""
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     _seed_ai(
@@ -2860,7 +2885,7 @@ def test_ai_costs_tab_names_cost_that_cannot_be_split_by_tokens(lake_home) -> No
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("AI Costs").click()
+            user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("Tokens by user")
             await user.should_not_see("Blank cost = not token-metered")
 
@@ -2873,6 +2898,7 @@ def test_ai_costs_tab_omits_token_panels_when_serving_pull_is_empty(lake_home) -
     ``endpoint_month`` can be non-empty from the bill side alone; Tokens still reads —,
     and the user/model panels stay off the page. Bill tag values still render.
     """
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     _seed_ai([], [_db_cost_row(), _ai_cost_row(tags={"project": "rag"})])
@@ -2883,7 +2909,7 @@ def test_ai_costs_tab_omits_token_panels_when_serving_pull_is_empty(lake_home) -
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("AI Costs").click()
+            user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("AI Spend")
             await user.should_see("no serving telemetry")
             await user.should_see("AI spend by tag")
@@ -2910,7 +2936,7 @@ def test_ai_costs_tab_includes_genie(lake_home) -> None:  # type: ignore[no-unty
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("AI Costs").click()
+            user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("By AI product")
             # ui.table rows are a client-side data prop should_see can't reach, so the
             # product label is asserted against the table's own rows.
@@ -2947,7 +2973,7 @@ def test_ai_costs_tab_shows_one_row_per_project_not_one_per_attribution_source(l
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("AI Costs").click()
+            user.find(kind=ui.tab, content="AI Costs").click()
             await user.should_see("AI spend by tag")
             tables = [
                 t.rows
@@ -3052,7 +3078,7 @@ def test_backing_storage_tab_lists_each_managed_bucket_with_its_owner_once(lake_
             build_pages()
             await user.open("/databricks")
             await user.should_see("Databricks Storage")
-            user.find("Databricks Storage").click()
+            user.find(kind=ui.tab, content="Databricks Storage").click()
             await user.should_see("Databricks Storage (billed by AWS)")
             await user.should_see("Databricks-managed storage")
             # The second, duplicate panel is gone.
@@ -3182,6 +3208,7 @@ def test_backing_storage_tab_says_empty_map_is_not_zero_storage_cost(lake_home) 
     like "nothing to find"). The total S3 denominator is still stated so the reader knows
     how much spend was examined.
     """
+    from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.dashboard.router import build_pages
@@ -3204,7 +3231,7 @@ def test_backing_storage_tab_says_empty_map_is_not_zero_storage_cost(lake_home) 
         async with user_simulation() as user:
             build_pages()
             await user.open("/databricks")
-            user.find("Databricks Storage").click()
+            user.find(kind=ui.tab, content="Databricks Storage").click()
             await user.should_see(NO_LOCATIONS_MSG)
             # ...and the denominator is still stated, as one line rather than a table of
             # every unrelated bucket.
@@ -3712,3 +3739,117 @@ def test_footprint_card_combines_dbu_storage_and_compute(lake_home) -> None:  # 
         str(r.service_name): float(r.net_cost) for r in backing.itertuples(index=False)
     }
     assert by_service == {"Databricks Storage": 40.0, "Databricks Compute": 60.0}
+
+
+# ── gold_session() — request-scoped connection reuse ──────────────────────────
+# "Speed up dashboard page loads": gold_df() re-registered the whole GOLD lake on
+# every single call (~50 times for one /databricks render — see chrome.lazy_tab_panels'
+# own docstring for the measured split). gold_session() scopes one already-registered
+# connection to a page render instead, with none of a process-wide cache's cross-request
+# lock contention (see data.py's module docstring for why that alternative was rejected).
+
+
+def test_gold_session_reuses_one_connection_across_gold_df_calls(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Every gold_df() call inside one gold_session() shares its connection — one
+    duck.connect()/register_gold() pair for the whole block, not one per call.
+    Outside any session, gold_df() is unchanged: one connection per call."""
+    from flashlight.dashboard import data
+    from flashlight.lake import bronze, duck
+    from flashlight.transform.runner import build_gold
+
+    bronze.write_window(
+        "t", IngestWindow(date(2026, 5, 1), date(2026, 5, 31)), [_rec(15)], ingest_run_id="r1"
+    )
+    build_gold()
+
+    calls = {"connect": 0, "register": 0}
+    real_connect = duck.connect
+    real_register = duck.register_gold
+
+    def counting_connect():  # type: ignore[no-untyped-def]
+        calls["connect"] += 1
+        return real_connect()
+
+    def counting_register(con):  # type: ignore[no-untyped-def]
+        calls["register"] += 1
+        real_register(con)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(duck, "connect", counting_connect)
+        mp.setattr(duck, "register_gold", counting_register)
+
+        with data.gold_session():
+            for _ in range(3):
+                data.gold_df('SELECT * FROM "aws".monthly_bill')
+        assert calls == {"connect": 1, "register": 1}, "one connection for the whole session"
+
+        data.gold_df('SELECT * FROM "aws".monthly_bill')
+        data.gold_df('SELECT * FROM "aws".monthly_bill')
+        assert calls == {"connect": 3, "register": 3}, (
+            "outside a session, gold_df() still opens/registers per call"
+        )
+
+
+def test_gold_session_nested_call_reuses_the_outer_connection(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """A gold_session() entered while another is already active (e.g. one page's
+    render calling into another page's helper) reuses the outer connection — it
+    must not open a second one and close it out from under the outer block."""
+    from flashlight.dashboard import data
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    bronze.write_window(
+        "t", IngestWindow(date(2026, 5, 1), date(2026, 5, 31)), [_rec(15)], ingest_run_id="r1"
+    )
+    build_gold()
+
+    with data.gold_session():
+        outer = data._session_con.get()  # noqa: SLF001
+        assert outer is not None
+        with data.gold_session():
+            assert data._session_con.get() is outer, "nested session reuses the outer connection"  # noqa: SLF001
+            data.gold_df('SELECT * FROM "aws".monthly_bill')
+        # The inner block's exit must not have closed the connection the outer
+        # block still owns.
+        data.gold_df('SELECT * FROM "aws".monthly_bill')
+    assert data._session_con.get() is None  # noqa: SLF001
+
+
+def test_gold_sessions_are_isolated_across_concurrent_threads(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Two page renders dispatched to different threads (Starlette's own dispatch
+    for sync page handlers) must never see each other's connection — the property
+    that lets gold_session() skip the lock a process-wide cached connection would
+    need."""
+    import threading
+
+    from flashlight.dashboard import data
+    from flashlight.lake import bronze
+    from flashlight.transform.runner import build_gold
+
+    bronze.write_window(
+        "t", IngestWindow(date(2026, 5, 1), date(2026, 5, 31)), [_rec(15)], ingest_run_id="r1"
+    )
+    build_gold()
+
+    seen: dict[str, object] = {}
+    barrier = threading.Barrier(2, timeout=5)
+    errors: list[BaseException] = []
+
+    def render(name: str) -> None:
+        try:
+            with data.gold_session():
+                seen[name] = data._session_con.get()  # noqa: SLF001
+                barrier.wait()  # hold both sessions open at once, overlapping in time
+                data.gold_df('SELECT * FROM "aws".monthly_bill')
+        except BaseException as exc:  # noqa: BLE001 - surfaced via `errors` below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=render, args=(name,)) for name in ("a", "b")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    assert seen["a"] is not None and seen["b"] is not None
+    assert seen["a"] is not seen["b"], "each thread's session must get its own connection"

@@ -17,6 +17,7 @@ from typing import Any
 import pandas as pd
 import plotly.graph_objects as go
 from nicegui import ui
+from nicegui.events import ValueChangeEventArguments
 
 # ── Chart chrome & ink — dark-mode tokens (dataviz skill, references/palette.md) ──
 PAGE = "#0d0d0d"
@@ -286,6 +287,56 @@ def provider_card(
             ui.label(note).classes("text-xs").style(f"color:{INK_MUTED}")
         if href:
             ui.link(f"Open {name} →", href).classes("text-xs").style(f"color:{ACCENT}")
+
+
+# ── Tabs ─────────────────────────────────────────────────────────────────────
+def lazy_tab_panels(tab_specs: Sequence[tuple[str, Callable[[], None]]]) -> None:
+    """A tab bar + panels where only the active tab's content is ever built.
+
+    ``ui.tab_panels`` mounts every ``ui.tab_panel``'s Python content immediately —
+    NiceGUI only CSS-hides the inactive ones (Quasar's ``v-show``), so a page with N
+    tabs pays for every tab's queries and charts on load, whether or not it's ever
+    opened (confirmed on ``/databricks``: ~50 GOLD queries and every chart/table for
+    9 tabs, to show 1). This builds the first tab immediately — so the page isn't
+    blank on load — and defers every other tab's *args to the moment the user
+    actually switches to it, building each at most once (switching back to an
+    already-built tab is a free show/hide, not a re-query).
+
+    *tab_specs* mirrors ``provider_focus.py``'s existing shape: ``(title, render)``
+    pairs, in tab-bar order, where each ``render`` takes no arguments (callers that
+    need per-tab args, e.g. the page's date range, close over them — see
+    ``provider_focus.render``'s own ``after`` wrapping).
+    """
+    built: set[int] = set()
+
+    with ui.tabs().classes("w-full") as tabs:
+        tab_refs = [ui.tab(title) for title, _ in tab_specs]
+
+    with (
+        ui.tab_panels(tabs, value=tab_refs[0])
+        .classes("w-full")
+        .style("background:transparent;")
+    ):
+        panels = [ui.tab_panel(tab_ref) for tab_ref in tab_refs]
+
+    def _build(index: int) -> None:
+        if index in built:
+            return
+        built.add(index)
+        with panels[index]:
+            tab_specs[index][1]()
+
+    by_name = {title: i for i, (title, _) in enumerate(tab_specs)}
+
+    def _on_change(e: ValueChangeEventArguments[Any]) -> None:
+        # e.value is the tab's name (a plain str, per Tabs._value_to_event_value)
+        # for every tab built here — the broader annotation is Tabs' own generic.
+        index = by_name.get(e.value) if isinstance(e.value, str) else None
+        if index is not None:
+            _build(index)
+
+    tabs.on_value_change(_on_change)
+    _build(0)
 
 
 # ── Plotly ───────────────────────────────────────────────────────────────────

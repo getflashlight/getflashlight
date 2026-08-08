@@ -254,7 +254,7 @@ def render(
             if efficiency_tab is not None:
                 efficiency_tab()
             else:
-                efficiency_waste.render(provider_name_for_group(group), label)
+                efficiency_waste.render(provider_name_for_group(group), label, sm, end)
 
         def _panel_policy() -> None:
             policy.render(provider_name_for_group(group), label, end, sm)
@@ -290,18 +290,11 @@ def render(
             *extra_tabs,
             ("Alerts", _panel_alerts),
         ]
-        with ui.tabs().classes("w-full") as tabs:
-            tab_refs = [ui.tab(title) for title, _ in tab_specs]
-        with (
-            ui.tab_panels(tabs, value=tab_refs[0])
-            .classes("w-full")
-            .style("background:transparent;")
-        ):
-            # after_breakdown / extra_tabs draw their own section titles/panels
-            # internally, so no chrome.panel() wrapper around their callables.
-            for tab_ref, (_, render_fn) in zip(tab_refs, tab_specs, strict=True):
-                with ui.tab_panel(tab_ref):
-                    render_fn()
+        # Only the active tab's content is built (chrome.lazy_tab_panels) — every
+        # other tab's queries/charts wait until the user actually clicks it, rather
+        # than all ~9 tabs paying for themselves on every load (see that helper's
+        # docstring for the measured cost this avoids on /databricks).
+        chrome.lazy_tab_panels(tab_specs)
 
     body()
 

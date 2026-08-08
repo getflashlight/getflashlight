@@ -59,7 +59,6 @@ CREATE OR REPLACE MACRO gold.ai_product_family(service_name) AS
         WHEN 'AI_BI_DASHBOARDS' THEN 'ai_bi_dashboard'
         WHEN 'LAKEHOUSE_MONITORING' THEN 'lakehouse_monitoring'
         WHEN 'DATA_QUALITY_MONITORING' THEN 'lakehouse_monitoring'
-        WHEN 'PREDICTIVE_OPTIMIZATION' THEN 'predictive_optimization'
         WHEN 'MODEL_TRAINING' THEN 'foundation_model_training'
     END;
 
@@ -123,10 +122,15 @@ WITH ai_rows AS (
     -- (2) But the vendored Databricks FOCUS query categorizes exactly EIGHT products as 'AI
     --     and Machine Learning' (databricks_focus_1_3.sql:405-415), and real AI products sit
     --     outside that list: AI/BI Genie bills as warehouse-shaped usage and is filed under
-    --     Databases, and the monitoring/optimization products are ML-driven but filed
-    --     elsewhere too. Anyone asking "what is AI costing me?" means Genie as well. Editing
-    --     the vendored query to recategorize them is not an option (CLAUDE.md: don't
-    --     hand-edit its logic — it's re-pulled upstream), so this view names them itself.
+    --     Databases, and the monitoring products are ML-driven but filed elsewhere too.
+    --     Anyone asking "what is AI costing me?" means Genie as well. Editing the vendored
+    --     query to recategorize them is not an option (CLAUDE.md: don't hand-edit its logic —
+    --     it's re-pulled upstream), so this view names them itself.
+    --
+    --     PREDICTIVE_OPTIMIZATION is deliberately NOT in this list — it's Databricks
+    --     auto-tuning table layout/clustering, not an AI product a user runs; despite being
+    --     ML-driven internally it isn't AI spend by any reasonable reading, so it stays out
+    --     of this view (and out of gold.ai_product_family below).
     --
     -- WHY GUESSING THESE ENUM SPELLINGS IS SAFE, unlike guessing a column name: a wrong
     -- VALUE in an IN list simply matches nothing, while a wrong column name breaks the whole
@@ -140,7 +144,6 @@ WITH ai_rows AS (
               'AI_BI_GENIE', 'GENIE',
               'AI_BI_DASHBOARD', 'AI_BI_DASHBOARDS',
               'LAKEHOUSE_MONITORING', 'DATA_QUALITY_MONITORING',
-              'PREDICTIVE_OPTIMIZATION',
               'MODEL_TRAINING'
           )
 )

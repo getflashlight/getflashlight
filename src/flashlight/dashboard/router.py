@@ -27,6 +27,7 @@ from flashlight.dashboard.data import (
     NO_DATA_MSG,
     gold_df,
     gold_last_updated,
+    gold_session,
     has_data,
     provider_label,
 )
@@ -294,7 +295,9 @@ def build_pages() -> None:
 
     @ui.page("/")
     def _home() -> None:
-        with shell("/"):
+        # One registered connection for the whole render, reused by every gold_df()
+        # call inside it — see data.gold_session's docstring.
+        with gold_session(), shell("/"):
             if not has_data():
                 no_data_page("Flashlight")
             else:
@@ -427,7 +430,10 @@ def build_pages() -> None:
         if group not in discover_provider_groups():
             raise HTTPException(status_code=404)
         label = provider_label(group)
-        with shell(f"/{group}"):
+        # One registered connection for the whole render, reused by every gold_df()
+        # call inside it (the Databricks page alone issues ~50 today) — see
+        # data.gold_session's docstring.
+        with gold_session(), shell(f"/{group}"):
             if not has_data():
                 no_data_page(f"{label} spend")
             elif group == "aws":

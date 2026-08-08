@@ -1,20 +1,62 @@
 """Dashboard data access — GOLD Parquet → pandas.
 
-Queries run through a throwaway in-memory DuckDB with ``<group>.<view>`` registered
-(:func:`flashlight.lake.duck.register_gold`). No caching — DuckDB-over-Parquet reads
-are already fast, and a new ``flashlight ingest`` publish should be visible on the
-next query with no invalidation logic to get wrong.
+Queries run through DuckDB with ``<group>.<view>`` registered
+(:func:`flashlight.lake.duck.register_gold`). No cross-request caching — a new
+``flashlight ingest`` publish should be visible on the next page render with no
+invalidation logic to get wrong — but :func:`gold_session` scopes one registered
+connection to a single page render, so its ~40-60 ``gold_df()`` calls share one
+already-registered connection instead of each re-registering the whole lake from
+scratch (see ``router.py``'s page handlers, which wrap their body in it).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, date, datetime
 
+import duckdb
 import pandas as pd
 
 from flashlight.ingest._redshift_service_names import REDSHIFT_SERVICE_NAMES
 from flashlight.lake import duck, paths
+
+# Set only inside a `with gold_session():` block (one per page render — see
+# router.py). `None` outside one, which is what makes gold_df() fall back to its
+# original open-register-close-per-call behavior for callers that render no page
+# (scripts, tests, MCP-adjacent helpers). Deliberately a plain module-level
+# ContextVar, not a global — contextvars propagate correctly through Starlette's
+# per-request thread-pool dispatch of sync page handlers, so two concurrent page
+# renders each see their own connection here, never each other's, with no lock
+# shared across requests (unlike a process-wide cached connection would need).
+_session_con: ContextVar[duckdb.DuckDBPyConnection | None] = ContextVar(
+    "gold_session_con", default=None
+)
+
+
+@contextmanager
+def gold_session() -> Iterator[None]:
+    """Scope one registered DuckDB connection to everything run inside this block.
+
+    Every ``gold_df()`` call inside the block transparently reuses it instead of
+    opening a fresh connection and re-registering every GOLD file for every call —
+    registration happens once per page render rather than once per panel query. A
+    nested call (a helper that itself entered a session, or a page that renders
+    another page's helpers) reuses the outer session's connection rather than
+    opening — and closing — a second one out from under the outer block.
+    """
+    if _session_con.get() is not None:
+        yield
+        return
+    con = duck.connect()
+    duck.register_gold(con)
+    token = _session_con.set(con)
+    try:
+        yield
+    finally:
+        _session_con.reset(token)
+        con.close()
 
 
 def to_date(value: object) -> date:
@@ -107,7 +149,17 @@ def provider_label(group: str) -> str:
 
 
 def gold_df(sql: str) -> pd.DataFrame:
-    """Run *sql* over the GOLD views."""
+    """Run *sql* over the GOLD views.
+
+    Reuses the connection an enclosing :func:`gold_session` already registered, if
+    there is one (the case for every dashboard page render — see ``router.py``).
+    Falls back to opening, registering and closing its own connection when called
+    with no session active, so this keeps working unchanged for callers outside a
+    page render (scripts, tests, ad-hoc REPL use).
+    """
+    session_con = _session_con.get()
+    if session_con is not None:
+        return session_con.execute(sql).df()
     con = duck.connect()
     try:
         duck.register_gold(con)

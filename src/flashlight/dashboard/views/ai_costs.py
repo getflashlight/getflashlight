@@ -70,7 +70,6 @@ _PRODUCT_LABELS = {
     "genie": "AI/BI Genie",
     "ai_bi_dashboard": "AI/BI Dashboards",
     "lakehouse_monitoring": "Lakehouse Monitoring",
-    "predictive_optimization": "Predictive Optimization",
 }
 _REMEDY_BY_CATEGORY = {r.category: r.remedy for r in WASTE_RULES}
 
