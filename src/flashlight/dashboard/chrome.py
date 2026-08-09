@@ -86,6 +86,7 @@ CONNECTOR_LOGOS: dict[str, str] = {
         "https://upload.wikimedia.org/wikipedia/commons/7/73/Amazon-Redshift-Logo.svg"
         "?utm_source=commons.wikimedia.org&utm_campaign=index&utm_content=original"
     ),
+    "snowflake": "/dashboard-assets/snowflake.svg",
 }
 
 # Declared so Safari (and iOS "Add to Home Screen") uses this instead of probing
