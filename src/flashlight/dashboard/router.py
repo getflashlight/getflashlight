@@ -43,15 +43,8 @@ def range_has_partial_month(end: date) -> bool:
 
 # ── Nav ──────────────────────────────────────────────────────────────────────
 def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
-    """The always-present nav rows, minus the pages a public demo must not offer
-    (Connections: edits connections.yml + spawns an ingest subprocess; Assistant: BYOK key
-    storage + outbound LLM calls; MCP server: spawns a process that opens an
-    unauthenticated port — which ``mcp/server.py`` refuses to do in demo mode anyway) —
-    see ``build_pages``'s matching route gate. Plus a Docs entry when a static docs site
-    is mounted.
-    """
-    # Home (read-only) first, write surfaces after it — the demo filter below strips the
-    # tail. Home is the only cross-provider page there is: utilization and the owner/tag
+    """The always-present navigation rows, plus Docs when a static site is mounted."""
+    # Home first. It is the only cross-provider page: utilization and the owner/tag
     # leaderboards used to sit here too, and are now tabs on each provider page (see
     # _RETIRED_ROUTES).
     nav = [
@@ -60,12 +53,6 @@ def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
         ("/assistant", "Assistant", "assistant"),
         ("/mcp-server", "MCP server", "hub"),
     ]
-    if get_settings().demo:
-        nav = [
-            item
-            for item in nav
-            if item[0] not in ("/connections", "/assistant", "/mcp-server")
-        ]
     if get_settings().docs_dir:
         nav.append(("/docs", "Docs", "menu_book"))
     return tuple(nav)
@@ -372,38 +359,27 @@ def build_pages() -> None:
 
     # Every literal top-level route must be registered explicitly: `/{group}` below is a
     # catch-all, so an unregistered `/foo` lands in _provider_page and 404s there instead.
-    # Connections (edits connections.yml, spawns an ingest subprocess) and Assistant
-    # (BYOK key storage, outbound LLM calls, in-process MCP tool calls including
-    # run_sql) are the dashboard's only write/mutation surfaces — routes aren't
-    # registered at all in demo mode, so they 404 instead of just being hidden from
-    # nav (see _fixed_nav above). /usage belongs to this group too: it reads the assistant
-    # turn log, its only inbound link is a button on the assistant page, and its Parquet
-    # root doesn't exist in the demo image — so leaving it registered meant the demo
-    # advertised a page that 404s. /mcp-server joins them: it launches a subprocess that
-    # opens an unauthenticated port serving ad-hoc SQL, which `mcp serve` itself refuses
-    # to do under FLASHLIGHT_DEMO — so the page would only ever show that refusal.
-    if not settings.demo:
-        from flashlight.dashboard.views import assistant, connections, mcp_server, usage
+    from flashlight.dashboard.views import assistant, connections, mcp_server, usage
 
-        @ui.page("/connections")
-        def _connections() -> None:
-            with shell("/connections"):
-                connections.render()
+    @ui.page("/connections")
+    def _connections() -> None:
+        with shell("/connections"):
+            connections.render()
 
-        @ui.page("/assistant")
-        async def _assistant() -> None:
-            with shell("/assistant", full_height=True):
-                await assistant.render()
+    @ui.page("/assistant")
+    async def _assistant() -> None:
+        with shell("/assistant", full_height=True):
+            await assistant.render()
 
-        @ui.page("/usage")
-        def _usage() -> None:
-            with shell("/usage"):
-                usage.render()
+    @ui.page("/usage")
+    def _usage() -> None:
+        with shell("/usage"):
+            usage.render()
 
-        @ui.page("/mcp-server")
-        async def _mcp_server() -> None:
-            with shell("/mcp-server"):
-                await mcp_server.render()
+    @ui.page("/mcp-server")
+    async def _mcp_server() -> None:
+        with shell("/mcp-server"):
+            await mcp_server.render()
 
     if settings.docs_dir and Path(settings.docs_dir).is_dir():
         from fastapi.staticfiles import StaticFiles

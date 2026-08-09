@@ -31,7 +31,6 @@ model.
 | DuckDB temporary directory | `FLASHLIGHT_DUCKDB_TEMP_DIR` | Lake-home temp directory |
 | MCP host / port | `FLASHLIGHT_MCP_HOST`, `FLASHLIGHT_MCP_PORT` | `0.0.0.0`, `8002` |
 | Dashboard host / port | `FLASHLIGHT_DASHBOARD_HOST`, `FLASHLIGHT_DASHBOARD_PORT` | `127.0.0.1`, `8501` |
-| Demo mode | `FLASHLIGHT_DEMO` | `false` |
 | Static docs directory | `FLASHLIGHT_DOCS_DIR` | unset |
 
 Assistant provider settings use `FLASHLIGHT_ASSISTANT_PROVIDER`,

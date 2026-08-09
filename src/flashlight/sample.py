@@ -87,7 +87,9 @@ _DATABRICKS_SKUS: tuple[DemoSku, ...] = (
     DemoSku(
         "MODEL_SERVING",
         "ENTERPRISE_SERVERLESS_REAL_TIME_INFERENCE_US_WEST_OREGON",
-        Decimal("13966"),
+        # Keep the sample's AI page substantial enough to demonstrate endpoint,
+        # requester, token, and remediation drill-throughs (about $14K over its window).
+        Decimal("32829"),
         ServiceCategory.AI_AND_MACHINE_LEARNING,
         ComputeClass.SERVERLESS,
     ),
@@ -894,37 +896,38 @@ def _records(
                     x_source_connector=DATABRICKS_CONNECTOR,
                 )
             )
-        requester_weights = (Decimal("0.46"), Decimal("0.31"), Decimal("0.23"))
         for endpoint_index, endpoint in enumerate(data.endpoints):
-            for requester_index, requester_weight in enumerate(requester_weights):
-                person = data.people[(endpoint_index + requester_index) % len(data.people)]
-                token_scale = 1 + endpoint_index * 3 + requester_index * 2 + index
-                usage.append(
-                    AiUsageRecord(
-                        provider_name="Databricks",
-                        charge_month=month,
-                        endpoint_id=endpoint.id,
-                        endpoint_name=endpoint.name,
-                        served_entity_id=f"model-{endpoint.id}",
-                        model_name=f"northstar-{endpoint.name}-model",
-                        model_version="3",
-                        model_kind="CUSTOM_MODEL",
-                        serving_mode="pay_per_token",
-                        requester=str(person.email),
-                        usage_context_project=endpoint.project,
-                        scale_to_zero_enabled=endpoint not in data.endpoints[:2],
-                        workload_size="Small",
-                        workload_type="CPU",
-                        request_count=420 * token_scale,
-                        error_request_count=7 * (requester_index + 1),
-                        input_tokens=int(120_000 * token_scale * float(requester_weight)),
-                        output_tokens=int(26_000 * token_scale * float(requester_weight)),
-                        error_input_tokens=900 * (requester_index + 1),
-                        error_output_tokens=180 * (requester_index + 1),
-                        total_duration_ms=3_000_000 * token_scale,
-                        x_source_connector=DATABRICKS_CONNECTOR,
-                    )
+            # One canonical owning requester per endpoint keeps allocated token cost
+            # exactly equal to the endpoint's FOCUS charge, while endpoints themselves
+            # retain visibly different users, models, token volumes, and request shapes.
+            person = data.people[endpoint_index]
+            token_scale = 2 + endpoint_index * 4 + index
+            usage.append(
+                AiUsageRecord(
+                    provider_name="Databricks",
+                    charge_month=month,
+                    endpoint_id=endpoint.id,
+                    endpoint_name=endpoint.name,
+                    served_entity_id=f"model-{endpoint.id}",
+                    model_name=f"northstar-{endpoint.name}-model",
+                    model_version=str(2 + endpoint_index % 2),
+                    model_kind="CUSTOM_MODEL",
+                    serving_mode="pay_per_token",
+                    requester=str(person.email),
+                    usage_context_project=endpoint.project,
+                    scale_to_zero_enabled=endpoint not in data.endpoints[:2],
+                    workload_size="Small" if endpoint_index < 3 else "Medium",
+                    workload_type="CPU" if endpoint_index < 4 else "GPU_SMALL",
+                    request_count=420 * token_scale,
+                    error_request_count=7 * (endpoint_index + 1),
+                    input_tokens=120_000 * token_scale,
+                    output_tokens=26_000 * token_scale,
+                    error_input_tokens=900 * (endpoint_index + 1),
+                    error_output_tokens=180 * (endpoint_index + 1),
+                    total_duration_ms=3_000_000 * token_scale,
+                    x_source_connector=DATABRICKS_CONNECTOR,
                 )
+            )
 
     storage = [
         StorageLocationRecord(
