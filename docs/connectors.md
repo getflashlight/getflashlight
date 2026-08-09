@@ -5,7 +5,8 @@
 | `aws_focus` | AWS Data Exports (FOCUS 1.2 Parquet in S3), or Cost Explorer via `cost_source="cost_explorer"` | S3 export: already FOCUS, light coercion. Cost Explorer: coarser account-level `SERVICE` totals, mapped in Python | S3 Intelligent-Tiering candidates |
 | `databricks` | Databricks system tables | **vendored Databricks → FOCUS 1.3 SQL** (below) | jobs/clusters/warehouses/tables + driver fleet health |
 | `redshift` | Redshift Data API + Cost Explorer (efficiency/waste only) | no cost mapping — `fetch()` is a deliberate no-op; see below | query patterns, WLM, spill, tables |
-| `bigquery` / `snowflake` | — | stubs (planned) | — |
+| `snowflake` | Snowflake ORGANIZATION_USAGE | Python FOCUS mapper from `USAGE_IN_CURRENCY_DAILY` | driver fleet health (`support_status`) |
+| `bigquery` | — | stub (planned) | — |
 
 Connectors are configured in `connections.yml` (scaffolded by `flashlight init`);
 credentials come from `.env` via the `*_env` fields. Each connection also takes an
@@ -151,8 +152,9 @@ also shows up as separate cloud infra lines.
   `:account_prices` parameter) to materialize a FOCUS table, export it to
   Parquet/Delta, and ingest via `aws_focus`'s S3 FOCUS export path — no live API needed.
 - **Template for other warehouses.** It's the reference pattern for *source-side*
-  FOCUS mapping; the planned `snowflake`/`bigquery` connectors follow the same shape
-  (run a warehouse-native FOCUS query, then map the rows).
+  FOCUS mapping; the planned `bigquery` connector follows the same shape
+  (run a warehouse-native FOCUS query, then map the rows). The `snowflake`
+  connector is live and maps ORGANIZATION_USAGE in Python instead.
 - **Fork & extend.** The upstream mapping is explicitly "best-effort"; edit the
   vendored copy to add columns or refine the `billing_origin_product` taxonomy. To
   refresh it, re-pull the upstream file and re-apply the header.

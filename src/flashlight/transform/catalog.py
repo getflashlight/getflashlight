@@ -703,12 +703,14 @@ DRIVER_HEALTH_BASE_VIEWS: tuple[ViewSpec, ...] = (
         title="Client driver health",
         description="Query volume per (client_driver, client_application, executed_by, "
         "month) — which JDBC/ODBC driver versions and applications are hitting the "
-        "warehouse, and who's running them. No dollar figure and no automated "
-        "'stale version' verdict — there's no reference table of current versions in "
-        "this data; humans read the leaderboard and judge.",
+        "warehouse, and who's running them. No dollar figure. Snowflake rows may "
+        "carry support_status (supported/unsupported/unknown) from Snowflake's "
+        "published minimum-version table; Databricks leaves it NULL and the "
+        "dashboard judges fleet-relative staleness instead. cluster_id is set for "
+        "Redshift provisioned clusters.",
         cost_metric=None,
         dimensions=("provider_name", "charge_month", "client_driver", "client_application",
-                    "executed_by"),
+                    "executed_by", "cluster_id", "support_status"),
         measures=("query_count",),
     ),
 )
