@@ -40,10 +40,15 @@ connectors:
   # already-ingested BRONZE rows for the same window instead of a second API call —
   # if aws_focus isn't enabled yet, or hasn't ingested this window, the cluster's $
   # figures are just absent/zero; every other signal (query patterns, per-user
-  # activity, WLM health, table inventory/usage) still runs fully regardless, since
-  # none of that needs cost data. Runs read-only queries against Redshift system
+  # activity, WLM health, CloudWatch CPU/disk capacity, table inventory/usage) still
+  # runs fully regardless, since none of that needs cost data. CPU/disk capacity is
+  # best-effort (grant cloudwatch:GetMetricStatistics); without it, WLM telemetry
+  # still ingests normally. Runs read-only queries against Redshift system
   # tables (STL_*/SVL_*/SVCS_*) via the Data API (IAM-based, no persistent DB
-  # credentials). Set exactly one of cluster_identifier / workgroup_name.
+  # credentials). It also reads STL_CONNECTION_LOG for Client Driver Health; that
+  # specific optional signal is visible only to a Redshift superuser, so a permission
+  # failure there is logged and does not block the rest of the ingestion. Configure a
+  # provisioned cluster_identifier.
   # `name` matters here more than anywhere else — a `name` per cluster is what
   # keeps multiple Redshift connections distinct in BRONZE/the dashboard.
   - type: redshift
@@ -51,7 +56,6 @@ connectors:
     name: Prod (main)
     region: us-east-1
     cluster_identifier: my-redshift-cluster
-    # workgroup_name: my-serverless-workgroup   # alternative to cluster_identifier
     database: dev
     # Named AWS profile (~/.aws/credentials or ~/.aws/config, incl. SSO profiles) —
     # takes priority over access_key_env/secret_key_env below when set. Convenient

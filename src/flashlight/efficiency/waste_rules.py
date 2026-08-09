@@ -606,7 +606,7 @@ _RULES_RAW: tuple[WasteRule, ...] = (
         recoverable_cost_sql="0",
         confidence_sql="'high'",  # the property value itself is a fact, not a heuristic
     ),
-    # ── Active: Redshift cluster/workgroup signal (redshift.fetch_efficiency) ───────
+    # ── Active: Redshift provisioned-cluster signal (redshift.fetch_efficiency) ─────
     # entity_type='sql_warehouse' is reused, not new (see EntityType docstring: shared
     # SQL compute, cost-attributable but no honest per-entity utilization%) — these
     # rules key off cause_detail fields only the Redshift connector populates, so they
@@ -802,13 +802,13 @@ _RULES_RAW: tuple[WasteRule, ...] = (
         "|| CASE WHEN coalesce(spectrum_returned_gb, 0) > 0 AND spectrum_scanned_gb > 0 "
         "THEN ', ' || round(100 * spectrum_returned_gb / spectrum_scanned_gb)::INT "
         "|| '% returned (pruning efficiency)' ELSE '' END "
-        "|| ' across ' || coalesce(spectrum_scan_count, 0) || ' queries'",
-        # Unpriced by design — the cluster-level redshift_spectrum_scan_cost above
-        # already carries the real $ for this cluster's Spectrum spend (30% of the
-        # actual billed Spectrum cost); pricing this per-table breakdown too would
-        # double-count the same dollars against the same OPPORTUNITY lens.
-        recoverable_cost_sql="0",
-        confidence_sql="'candidate'",
+        "|| ' across ' || coalesce(spectrum_scan_count, 0) || ' queries'"
+        "|| CASE WHEN spectrum_allocated_cost IS NOT NULL "
+        "THEN ', allocated Spectrum charge $' || round(spectrum_allocated_cost, 2) ELSE '' END",
+        recoverable_cost_sql="round(coalesce(spectrum_allocated_cost, 0) * 0.3, 2)",
+        confidence_sql=(
+            "CASE WHEN spectrum_allocated_cost IS NOT NULL THEN 'candidate' ELSE 'high' END"
+        ),
     ),
     # ── Blocked: needs a new entity grain + doesn't cleanly reconcile to billed_cost ─
     WasteRule(
@@ -896,7 +896,7 @@ _COVERAGE: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "snappy_to_zstd_compression": (_DBX, ("table",)),  # Delta compression_codec
     # AWS — S3.
     "s3_intelligent_tiering": (_AWS, ("storage",)),
-    # AWS — Redshift cluster / workgroup.
+    # AWS — provisioned Redshift cluster.
     "redshift_concurrency_scaling_overage": (_AWS, ("sql_warehouse",)),
     "redshift_ri_coverage_gap": (_AWS, ("sql_warehouse",)),
     "redshift_spectrum_scan_cost": (_AWS, ("sql_warehouse",)),
@@ -1138,6 +1138,12 @@ WITH e AS (
                                                            AS spectrum_scanned_gb,
         TRY_CAST(json_extract_string(cause_detail, '$.spectrum_returned_gb') AS DOUBLE)
                                                            AS spectrum_returned_gb,
+        TRY_CAST(json_extract_string(cause_detail, '$.spectrum_allocated_cost') AS DOUBLE)
+                                                           AS spectrum_allocated_cost,
+        TRY_CAST(json_extract_string(cause_detail, '$.spectrum_allocation_pct') AS DOUBLE)
+                                                           AS spectrum_allocation_pct,
+        json_extract_string(cause_detail, '$.spectrum_allocation_status')
+                                                           AS spectrum_allocation_status,
         native_quantity
     FROM metrics.efficiency_record
 )

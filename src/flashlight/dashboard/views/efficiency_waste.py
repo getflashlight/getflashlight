@@ -14,14 +14,10 @@ mostly absence of measurement, and a tab that didn't say so would read as a clea
 health. The rest of the measurement stage (per-signal readings, $/native-unit rates) stays in
 GOLD for the assistant and MCP rather than being a second set of panels here.
 
-The second and final table is :func:`resolution_panel`, a filterable view of
-``efficiency.waste_resolution_month``. It answers whether a flagged finding stopped
-reappearing and whether billed cost actually dropped. Ownership is shown beside every
-entity in both tables, rather than in a separate leaderboard.
-
-Both are gated behind :func:`~flashlight.dashboard.data.gold_view_published` like every
-other view here, so a lake that hasn't re-transformed since these views were added degrades
-to nothing rendered, not an error.
+The optional resolution view contributes an entity's all-time first-seen date to the same
+drill-down. Both views are gated behind
+:func:`~flashlight.dashboard.data.gold_view_published`, so a lake that hasn't
+re-transformed since they were added degrades to nothing rendered, not an error.
 """
 
 from __future__ import annotations
@@ -36,6 +32,12 @@ from nicegui import ui
 
 from flashlight.dashboard import chrome
 from flashlight.dashboard.data import gold_df, gold_view_published
+from flashlight.dashboard.data import to_date as _d
+from flashlight.dashboard.summary import (
+    action_group_rows,
+    action_potential_by_month,
+    entity_action_rows,
+)
 from flashlight.dashboard.theme import compact_money, delta_variant
 from flashlight.efficiency.waste_rules import (
     WASTE_RULES,
@@ -141,16 +143,16 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
     Attribution, Policy Compliance). Only :func:`recoverable_trend_chart` reads them: the
     entity leaderboard below deliberately keeps showing "the latest month with telemetry"
     regardless of the picker (documented where ``month`` is computed) because coverage is
-    sparse enough that a narrow window can easily contain zero measured months, and
-    :func:`resolution_panel` deliberately shows all-time history — clipping a finding's
-    first-seen month to the picker would hide exactly the "has this been open a long time"
-    signal it exists to show.
+    sparse enough that a narrow window can easily contain zero measured months. The
+    all-time first-seen date displayed beside an entity is intentionally not clipped by
+    the picker, so it retains the "has this been open a long time" signal.
     """
-    chrome.section_title("Efficiency & waste")
-    chrome.section_caption(
-        "Recoverable spend — what you're billed for but don't use. This is the "
-        "inefficiency slice, not the total bill."
-    )
+    with ui.row().classes("items-center gap-2"):
+        chrome.section_title("Efficiency & waste")
+        ui.label("Metrics below use the previous full month").classes("text-xs").style(
+            f"color:{chrome.INK_MUTED}"
+        )
+    coverage_caption(provider_name)
 
     if not gold_view_published("efficiency", "waste_record"):
         ui.label(_STALE_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
@@ -159,7 +161,7 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
     # No recoverable_cost floor here — waste_record only ever contains rows a rule
     # actually fired for (each branch is `WHERE {where_sql}`), so a $0 row is a real,
     # confirmed finding this provider can't honestly price, not a "nothing found" row.
-    # lens_table keeps those visible (sunk to the bottom) instead of dropping them.
+    # The action queue retains those rows after drilling into an entity.
     records = _df(
         f"SELECT * FROM efficiency.waste_record WHERE provider_name = '{_q(provider_name)}' "
         "ORDER BY recoverable_cost DESC"
@@ -168,14 +170,23 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
         _empty_state(label)
         return
 
-    months = sorted(records["charge_month"].astype(str).unique())
+    current_month = _d(
+        _df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"]
+    )
+    months = completed_record_months(records, current_month)
+    if not months:
+        chrome.empty_state(
+            "calendar_month",
+            "No completed efficiency month yet",
+            "Efficiency findings are shown only after the month closes, so partial-month "
+            "costs do not make an optimization opportunity look smaller than it is.",
+        )
+        return
     month = months[-1]
     month_rows = records[records["charge_month"].astype(str) == month]
     month_label = pd.Timestamp(month).strftime("%b %Y")
 
-    coverage_caption(provider_name)
-
-    action_groups = action_group_rows(month_rows)
+    action_groups = _display_action_groups(month_rows)
     waste_total = action_groups.loc[action_groups["lens"] == "WASTE", "potential_savings"].sum()
     opp_total = action_groups.loc[action_groups["lens"] == "OPPORTUNITY", "potential_savings"].sum()
     high_total = action_groups.loc[action_groups["lens"] == "WASTE", "high_confidence"].sum()
@@ -185,7 +196,6 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
 
     # WASTE and OPPORTUNITY are separate lenses (a cluster can be both — different
     # remedies), so they are shown separately, never summed into one headline.
-    chrome.section_caption(f"Showing {month_label} — the latest month with telemetry.")
     chrome.kpi_row(
         [
             (
@@ -205,20 +215,36 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
         ],
     )
 
-    recoverable_trend_chart(records, sm, end)
-
-    coverage_summary(
-        provider_name,
-        month_rows,
-        measured_entity_types(provider_name, month),
-        scope_note=f"for {label}",
-    )
+    last_complete_day = (pd.Timestamp(current_month) - pd.Timedelta(days=1)).date()
+    recoverable_trend_chart(records, sm, min(end, last_complete_day))
 
     # One action queue, drilled in place just like Attribution.  The two lenses remain
     # distinct rows at its root: a cluster can be both underused and movable, and those
     # are alternative remedies rather than an additive savings total.
-    action_queue(month_rows, key=f"actions_{provider_name.lower().replace(' ', '_')}")
-    resolution_panel(provider_name)
+    tracking = (
+        _resolution_rows(provider_name)
+        if gold_view_published("efficiency", "waste_resolution_month")
+        else pd.DataFrame()
+    )
+    action_queue(
+        month_rows,
+        tracking,
+        key=f"actions_{provider_name.lower().replace(' ', '_')}",
+    )
+
+
+def completed_record_months(records: pd.DataFrame, current_month: date) -> list[str]:
+    """Available record months strictly before the still-accruing calendar month.
+
+    The action queue is a monthly decision surface, so its snapshot must never use the
+    current partial month.  Keeping this as a small pure helper also makes the KPI delta
+    and trend cutoff share exactly the same definition of a completed month.
+    """
+    if records.empty or "charge_month" not in records:
+        return []
+    cutoff = pd.Timestamp(current_month).replace(day=1)
+    record_months = pd.to_datetime(records["charge_month"], errors="coerce").dropna()
+    return sorted(record_months[record_months < cutoff].dt.strftime("%Y-%m-%d").unique())
 
 
 # ── Month-over-month delta (KPI row) ────────────────────────────────────────────────
@@ -243,17 +269,20 @@ def mom_recoverable_delta(records: pd.DataFrame, months: list[str], lens: str) -
     trend for either lens — waste growing is bad, and a growing, unaddressed opportunity
     pool is also the bill trending the wrong way — so the sign convention matches
     ``theme.delta_variant``'s cost-delta reading (increase = red, decrease = green)
-    unmodified; this is not the "savings" framing :func:`resolution_summary` needs below.
+    unmodified.
     """
     if len(months) < 2:
         return None
-    cur = records.loc[
-        (records["charge_month"].astype(str) == months[-1]) & (records["lens"] == lens),
-        "recoverable_cost",
+    potential = action_potential_by_month(
+        records, pd.Timestamp(months[-2]).date(), pd.Timestamp(months[-1]).date()
+    )
+    cur = potential.loc[
+        (potential["charge_month"].astype(str) == months[-1]) & (potential["lens"] == lens),
+        "potential_savings",
     ].sum()
-    prior = records.loc[
-        (records["charge_month"].astype(str) == months[-2]) & (records["lens"] == lens),
-        "recoverable_cost",
+    prior = potential.loc[
+        (potential["charge_month"].astype(str) == months[-2]) & (potential["lens"] == lens),
+        "potential_savings",
     ].sum()
     return round(float(cur) - float(prior), 2)
 
@@ -263,15 +292,9 @@ def _trend_by_month(records: pd.DataFrame, sm: date, end: date) -> pd.DataFrame:
     """*records* (the caller's full-history rows) narrowed to the page's selected date
     range and rolled up to ``(charge_month, lens)`` — pure aggregation, split out from
     :func:`recoverable_trend_chart` for testing without a NiceGUI context."""
-    empty = pd.DataFrame(columns=["charge_month", "lens", "recoverable_cost"])
-    if records.empty:
-        return empty
-    charge_month = pd.to_datetime(records["charge_month"])
-    in_range = (charge_month >= pd.Timestamp(sm)) & (charge_month <= pd.Timestamp(end))
-    scoped = records.loc[in_range]
-    if scoped.empty:
-        return empty
-    return scoped.groupby(["charge_month", "lens"], as_index=False)["recoverable_cost"].sum()
+    return action_potential_by_month(records, sm, end).rename(
+        columns={"potential_savings": "recoverable_cost"}
+    )
 
 
 def recoverable_trend_chart(records: pd.DataFrame, sm: date, end: date) -> None:
@@ -282,7 +305,7 @@ def recoverable_trend_chart(records: pd.DataFrame, sm: date, end: date) -> None:
 
     Bars are grouped, never stacked: stacking WASTE on top of OPPORTUNITY would draw one
     bar height that sums two different remedies into a number neither lens owns — the
-    same "never sum across lens" rule the KPI row and :func:`lens_table` already keep.
+    same "never sum across lens" rule the KPI row and action queue already keep.
 
     Renders nothing with fewer than two measured months in range — a single bar draws no
     trend, and this chart is supplementary context under an already-informative KPI row,
@@ -344,6 +367,7 @@ _ACTION_ENTITY_COLS = [
     "potential_savings",
     "confidence",
     "findings",
+    "first_seen_month",
 ]
 _ACTION_ENTITY_RENAME = {
     "entity_name": "Entity",
@@ -352,15 +376,26 @@ _ACTION_ENTITY_RENAME = {
     "potential_savings": "Potential savings",
     "confidence": "Confidence",
     "findings": "Findings",
+    "first_seen_month": "Flagged since",
 }
-_ACTION_FINDING_COLS = ["waste_category", "detail", "remedy", "recoverable_cost", "confidence"]
+_ACTION_FINDING_COLS = [
+    "waste_category",
+    "detail",
+    "remedy",
+    "rule_estimate",
+    "potential_savings",
+    "confidence",
+]
 _ACTION_FINDING_RENAME = {
     "waste_category": "Finding",
     "detail": "Evidence",
     "remedy": "Recommended action",
-    "recoverable_cost": "Potential savings",
+    "rule_estimate": "Rule estimate",
+    "potential_savings": "Potential savings",
     "confidence": "Confidence",
 }
+_REMEDY_BY_CATEGORY = {rule.category: rule.remedy for rule in WASTE_RULES}
+_MAX_ROWS = 40
 
 
 @dataclass(frozen=True)
@@ -372,58 +407,20 @@ class _ActionDrill:
     entity_name: str | None = None
 
 
-def _action_entity_rows(rows: pd.DataFrame, entity_type: str, lens: str) -> pd.DataFrame:
-    """One action row per entity, using its largest priced recommendation.
-
-    Multiple rules can describe the same entity and must remain visible after drilling
-    in, but adding their dollar figures would overstate what one optimization can save.
-    """
-    scoped = rows[(rows["entity_type"] == entity_type) & (rows["lens"] == lens)].copy()
-    if scoped.empty:
-        return pd.DataFrame(columns=_ACTION_ENTITY_COLS)
-    scoped["recoverable_cost"] = pd.to_numeric(scoped["recoverable_cost"], errors="coerce").fillna(
-        0
-    )
-    scoped["billed_cost"] = pd.to_numeric(scoped["billed_cost"], errors="coerce").fillna(0)
-    ordered = scoped.sort_values("recoverable_cost", ascending=False)
-    best = ordered.drop_duplicates("entity_id").copy()
-    counts = scoped.groupby("entity_id").size().rename("findings")
-    best = best.join(counts, on="entity_id")
-    best = best.rename(columns={"recoverable_cost": "potential_savings"})
-    return best.sort_values("potential_savings", ascending=False)
-
-
 def _workload_label(entity_type: str, lens: str) -> str:
     entity_label = _ENTITY_LABELS.get(entity_type, entity_type.replace("_", " ").title())
     return f"{entity_label} — {_LENS_LABELS.get(lens, lens.title())}"
 
 
-def action_group_rows(month_rows: pd.DataFrame) -> pd.DataFrame:
-    """Actionable savings by workload and remedy, safe from finding-level double counts."""
-    if month_rows.empty:
+def _display_action_groups(month_rows: pd.DataFrame) -> pd.DataFrame:
+    """Shared action potential with the presentation-only workload label added."""
+    rows = action_group_rows(month_rows).copy()
+    if rows.empty:
         return pd.DataFrame(columns=_ACTION_GROUP_COLS)
-    parts: list[dict[str, object]] = []
-    for (entity_type, lens), _ in month_rows.groupby(["entity_type", "lens"], dropna=False):
-        entities = _action_entity_rows(month_rows, str(entity_type), str(lens))
-        if entities.empty:
-            continue
-        potential = float(entities["potential_savings"].sum())
-        high = float(entities.loc[entities["confidence"] == "high", "potential_savings"].sum())
-        parts.append(
-            {
-                "entity_type": str(entity_type),
-                "lens": str(lens),
-                "workload": _workload_label(str(entity_type), str(lens)),
-                "potential_savings": potential,
-                "entities": int(len(entities)),
-                "high_confidence": high,
-            }
-        )
-    return (
-        pd.DataFrame(parts).sort_values("potential_savings", ascending=False)
-        if parts
-        else pd.DataFrame(columns=_ACTION_GROUP_COLS)
+    rows["workload"] = rows.apply(
+        lambda row: _workload_label(str(row["entity_type"]), str(row["lens"])), axis=1
     )
+    return rows
 
 
 def _action_breadcrumb(
@@ -441,8 +438,52 @@ def _action_breadcrumb(
                 ).style(f"color:{chrome.ACCENT};padding:0 2px;min-height:0;")
 
 
-def action_queue(month_rows: pd.DataFrame, *, key: str) -> None:
-    """The primary action table: workload/remedy → entity → evidence and next step."""
+def _add_tracking_context(entities: pd.DataFrame, tracking: pd.DataFrame) -> pd.DataFrame:
+    """Attach all-time first-seen context without changing action-potential amounts."""
+    if entities.empty or tracking.empty:
+        return entities.assign(first_seen_month=pd.NaT)
+    keys = ["entity_type", "entity_id", "lens"]
+    first_seen = (
+        tracking.assign(first_seen_month=pd.to_datetime(tracking["first_seen_month"]))
+        .groupby(keys, as_index=False)["first_seen_month"]
+        .min()
+    )
+    return entities.merge(first_seen, how="left", on=keys)
+
+
+def entity_finding_rows(
+    month_rows: pd.DataFrame, entity_type: str, lens: str, entity_id: str
+) -> pd.DataFrame:
+    """Evidence rows whose displayed potential exactly sums to their parent entity.
+
+    Every finding keeps its original rule estimate for auditability. Only the best-priced
+    recommendation receives the action-potential amount, because multiple findings on the
+    same entity/lane are overlapping signals, not additive savings.
+    """
+    findings = month_rows[
+        (month_rows["entity_type"] == entity_type)
+        & (month_rows["lens"] == lens)
+        & (month_rows["entity_id"].astype(str) == entity_id)
+    ].copy()
+    if findings.empty:
+        return findings.assign(
+            rule_estimate=pd.Series(dtype=float), potential_savings=pd.Series(dtype=float)
+        )
+    findings["rule_estimate"] = pd.to_numeric(
+        findings["recoverable_cost"], errors="coerce"
+    ).fillna(0)
+    findings["potential_savings"] = 0.0
+    best_index = findings["rule_estimate"].idxmax()
+    findings.loc[best_index, "potential_savings"] = findings.loc[best_index, "rule_estimate"]
+    return findings.assign(remedy=findings["waste_category"].map(_REMEDY_BY_CATEGORY))
+
+
+def action_queue(month_rows: pd.DataFrame, tracking: pd.DataFrame, *, key: str) -> None:
+    """One reconcilable work queue: workload/remedy → entity → evidence.
+
+    Each level retains the conservative best-action roll-up.  Individual rule estimates
+    are audit evidence, not values that can be summed into a second savings commitment.
+    """
     with chrome.panel():
         title = (
             ui.label("Savings opportunities")
@@ -458,11 +499,11 @@ def action_queue(month_rows: pd.DataFrame, *, key: str) -> None:
                 if state.level == "workload":
                     title.text = "Savings opportunities"
                     chrome.section_caption(
-                        "Click a workload to see the affected entities. Potential savings uses the "
-                        "single best priced action per entity; different remedy lanes are "
-                        "not added together."
+                        "Click through to reconcile the exact potential savings at every level. "
+                        "Potential savings uses one best priced action per entity; different "
+                        "remedy lanes are not added together."
                     )
-                    rows = action_group_rows(month_rows)
+                    rows = _display_action_groups(month_rows)
                     if rows.empty:
                         chrome.section_caption(
                             "No actionable findings in the latest measured month."
@@ -481,6 +522,7 @@ def action_queue(month_rows: pd.DataFrame, *, key: str) -> None:
                     chrome.searchable_table(
                         rows[_ACTION_GROUP_COLS],
                         key=f"{key}_workloads",
+                        row_data=rows,
                         search_col="workload",
                         money_cols=["potential_savings", "high_confidence"],
                         int_cols=["entities"],
@@ -495,7 +537,9 @@ def action_queue(month_rows: pd.DataFrame, *, key: str) -> None:
                 _action_breadcrumb(
                     ("← All opportunities", _ActionDrill()), (workload, None), refresh=_body.refresh
                 )
-                entities = _action_entity_rows(month_rows, state.entity_type, state.lens)
+                entities = _add_tracking_context(
+                    entity_action_rows(month_rows, state.entity_type, state.lens), tracking
+                )
                 if state.level == "entity":
                     title.text = f"Savings opportunities — {workload}"
 
@@ -513,6 +557,7 @@ def action_queue(month_rows: pd.DataFrame, *, key: str) -> None:
                     chrome.searchable_table(
                         entities[_ACTION_ENTITY_COLS],
                         key=f"{key}_entities",
+                        row_data=entities,
                         search_col="entity_name",
                         money_cols=["billed_cost", "potential_savings"],
                         int_cols=["findings"],
@@ -535,23 +580,18 @@ def action_queue(month_rows: pd.DataFrame, *, key: str) -> None:
                     (state.entity_name, None),
                     refresh=_body.refresh,
                 )
-                findings = month_rows[
-                    (month_rows["entity_type"] == state.entity_type)
-                    & (month_rows["lens"] == state.lens)
-                    & (month_rows["entity_id"].astype(str) == state.entity_id)
-                ].copy()
-                findings = findings.assign(
-                    remedy=findings["waste_category"].map(_REMEDY_BY_CATEGORY)
+                findings = entity_finding_rows(
+                    month_rows, state.entity_type, state.lens, state.entity_id
                 )
                 chrome.section_caption(
-                    "Each row is a detected signal. Treat alternative actions for this entity "
-                    "as non-additive."
+                    "Potential savings reconciles to the entity total: it is assigned to the "
+                    "best-priced recommendation. Other rule estimates are supporting evidence."
                 )
                 chrome.searchable_table(
                     findings[_ACTION_FINDING_COLS],
                     key=f"{key}_findings",
                     search_col="waste_category",
-                    money_cols=["recoverable_cost"],
+                    money_cols=["rule_estimate", "potential_savings"],
                     rename=_ACTION_FINDING_RENAME,
                     max_rows=_MAX_ROWS,
                 )
@@ -559,490 +599,11 @@ def action_queue(month_rows: pd.DataFrame, *, key: str) -> None:
         _body(_ActionDrill())
 
 
-# ── Owner attribution rollup ─────────────────────────────────────────────────────────
-# "Whose is it?" — the design doc's third pipeline stage (measurement → verdict →
-# attribution rollup), published to gold.waste_by_owner_month
-# (056_gold_owner_leaderboard.sql) since before this tab existed but never rendered here.
-_OWNER_COLS = [
-    "owner_display",
-    "owner_key",
-    "recoverable_cost",
-    "recoverable_cost_high_confidence",
-    "entity_count",
-    "finding_count",
-]
-_OWNER_RENAME = {
-    "owner_display": "Owner",
-    "owner_key": "Key",
-    "recoverable_cost": "Recoverable",
-    "recoverable_cost_high_confidence": "…high confidence",
-    "entity_count": "Entities",
-    "finding_count": "Findings",
-}
-
-
-@dataclass(frozen=True)
-class _OwnerDrill:
-    """One position in the owner → entities breadcrumb. A local copy of the same tiny
-    value-object shape ``attribution._Drill``/``policy._Drill`` each define for
-    themselves — this module follows that established convention (a shared import would
-    save a few lines at the cost of coupling three unrelated tabs' navigation state)."""
-
-    level: str = "owners"
-    owner_key: str | None = None
-    owner_display: str | None = None
-    lens: str = "WASTE"
-
-
-def _owner_breadcrumb(
-    *steps: tuple[str, _OwnerDrill | None], refresh: Callable[[_OwnerDrill], object]
-) -> None:
-    """``"← A / B"`` — every step but the last is a link back to that state."""
-    with ui.row().classes("items-center gap-2 text-xs"):
-        for i, (label, target) in enumerate(steps):
-            if i:
-                ui.label("/").style(f"color:{chrome.INK_MUTED}")
-            if target is not None:
-                ui.button(label, on_click=lambda t=target: refresh(t)).props(
-                    "flat dense no-caps"
-                ).style(f"color:{chrome.ACCENT};padding:0 2px;min-height:0;")
-            else:
-                ui.label(label).style(f"color:{chrome.INK_SECONDARY}")
-
-
-def entities_for_owner(month_rows: pd.DataFrame, owner_key: str, lens: str) -> pd.DataFrame:
-    """*month_rows*' own findings for one normalized owner and lens.
-
-    Reuses the leaderboard's already-loaded rows instead of a second SQL round-trip, and
-    folds ``owner_user`` the identical way ``056_gold_owner_leaderboard.sql`` does (trim +
-    casefold) so a click on the folded key ``"alice"`` matches rows spelled
-    ``"Alice"``/``"ALICE "`` on the bill. ``owner_key == "(unattributed)"`` — the view's
-    own literal for both its NULL-owner kinds — matches the blank/NULL-owner rows instead;
-    scoped to ``owner_dimension='owner_user'`` (see :func:`owner_leaderboard`) there is
-    only one such kind in play, so no separate ``owner_kind`` plumbing is needed here.
-    """
-    rows = month_rows[month_rows["lens"] == lens]
-    folded = rows["owner_user"].fillna("").astype(str).str.strip().str.lower()
-    if owner_key == "(unattributed)":
-        return rows[folded == ""]
-    return rows[folded == owner_key]
-
-
-def _owner_rows(provider_name: str, month: str) -> pd.DataFrame:
-    return _df(
-        "SELECT owner_key, owner_display, lens, recoverable_cost, "
-        "recoverable_cost_high_confidence, entity_count, finding_count "
-        "FROM efficiency.waste_by_owner_month "
-        f"WHERE provider_name = '{_q(provider_name)}' AND owner_dimension = 'owner_user' "
-        f"AND charge_month = '{_q(month)}' ORDER BY recoverable_cost DESC"
-    )
-
-
-def _render_owner_level(rows: pd.DataFrame, *, refresh: Callable[[_OwnerDrill], object]) -> None:
-    """Level 1: owners ranked by recoverable $, split by lens (see module docstring for
-    why a combined ranking would blur two different remedies together)."""
-    chrome.section_caption(
-        "'(unattributed)' is shared compute with no per-entity owner by design (a SQL "
-        "warehouse or cluster many people query) — not missing data, and often the "
-        "largest row. Click an owner to see their own findings."
-    )
-    for lens, sub_title in (
-        ("WASTE", "Waste — tune it"),
-        ("OPPORTUNITY", "Opportunity — move it"),
-    ):
-        lens_rows = rows[rows["lens"] == lens]
-        if lens_rows.empty:
-            continue
-        ui.label(sub_title).classes("text-xs font-medium mt-2").style(f"color:{chrome.INK_MUTED}")
-
-        def _on_click(row: dict[str, object], lens: str = lens) -> None:
-            refresh(
-                _OwnerDrill(
-                    level="entities",
-                    owner_key=str(row["owner_key"]),
-                    owner_display=str(row["owner_display"]),
-                    lens=lens,
-                )
-            )
-
-        cols = [c for c in _OWNER_COLS if c in lens_rows]
-        chrome.searchable_table(
-            lens_rows[cols],
-            key=f"owner_{lens.lower()}",
-            search_col="owner_display",
-            money_cols=["recoverable_cost", "recoverable_cost_high_confidence"],
-            int_cols=["entity_count", "finding_count"],
-            rename=_OWNER_RENAME,
-            max_rows=_MAX_ROWS,
-            on_row_click=_on_click,
-        )
-
-
-def _render_owner_entities(
-    month_rows: pd.DataFrame, state: _OwnerDrill, *, refresh: Callable[[_OwnerDrill], object]
-) -> None:
-    """Level 2: one owner's own findings, breadcrumbed back to the ranking."""
-    assert state.owner_key is not None and state.owner_display is not None
-    _owner_breadcrumb(
-        ("← All owners", _OwnerDrill()),
-        (f"{state.owner_display} · {state.lens.title()}", None),
-        refresh=refresh,
-    )
-    rows = entities_for_owner(month_rows, state.owner_key, state.lens)
-    if rows.empty:
-        chrome.section_caption("No findings for this owner in the latest measured month.")
-        return
-    rows = rows.assign(remedy=rows["waste_category"].map(_REMEDY_BY_CATEGORY))
-    cols = [c for c in _COLS if c in rows and c != "provider_name"]
-    chrome.searchable_table(
-        rows[cols],
-        key=f"owner_entities_{state.owner_key}",
-        search_col="entity_name",
-        money_cols=["billed_cost", "recoverable_cost"],
-        rename=_RENAME,
-        max_rows=_MAX_ROWS,
-    )
-
-
-def owner_leaderboard(provider_name: str, month: str, month_rows: pd.DataFrame) -> None:
-    """"Whose is it?" — ``efficiency.waste_by_owner_month``, rendered for the first time.
-
-    ``owner_project`` (the view's other ``owner_dimension``) is deliberately not rendered
-    here: on real data it's populated on ~1% of findings, so a second, mostly-empty table
-    beside this one would repeat the same ``(unattributed)`` row. It stays available to
-    MCP/agents that want it (``query_view('efficiency.waste_by_owner_month')``).
-    """
-    if not gold_view_published("efficiency", "waste_by_owner_month"):
-        return
-    rows = _owner_rows(provider_name, month)
-    if rows.empty:
-        return
-
-    with chrome.panel():
-        title = (
-            ui.label("Recoverable spend by owner")
-            .classes("text-sm font-medium mb-2")
-            .style(f"color:{chrome.INK_SECONDARY}")
-        )
-        body = ui.column().classes("w-full gap-2")
-
-        @ui.refreshable
-        def _body(state: _OwnerDrill) -> None:
-            body.clear()
-            title.text = (
-                "Recoverable spend by owner"
-                if state.level == "owners"
-                else f"Recoverable spend by owner — {state.owner_display}"
-            )
-            with body:
-                if state.level == "owners":
-                    _render_owner_level(rows, refresh=_body.refresh)
-                else:
-                    _render_owner_entities(month_rows, state, refresh=_body.refresh)
-
-        _body(_OwnerDrill())
-
-
-# ── Resolution tracking ──────────────────────────────────────────────────────────────
-# "Is flagged waste getting fixed?" — efficiency.waste_resolution_month (pure
-# re-detection over gold.waste_record history, no user input) — published alongside
-# waste_by_owner_month, also never rendered here until now. The only panel anywhere in
-# the app that answers "is this improving" rather than "what's wrong right now".
-_OPEN_COLS = [
-    "entity_name",
-    "entity_type",
-    "waste_category",
-    "owner_user",
-    "first_seen_month",
-    "recoverable_cost_at_last_seen",
-]
-_OPEN_RENAME = {
-    "entity_name": "Entity",
-    "entity_type": "Type",
-    "waste_category": "Cause",
-    "owner_user": "Owner",
-    "first_seen_month": "Flagged since",
-    "recoverable_cost_at_last_seen": "Recoverable",
-}
-_RESOLVED_COLS = [
-    "entity_name",
-    "entity_type",
-    "waste_category",
-    "owner_user",
-    "last_seen_month",
-    "resolved_month",
-    "realized_savings",
-]
-_RESOLVED_RENAME = {
-    "entity_name": "Entity",
-    "entity_type": "Type",
-    "waste_category": "Cause",
-    "owner_user": "Owner",
-    "last_seen_month": "Last flagged",
-    "resolved_month": "Resolved",
-    "realized_savings": "Realized savings",
-}
-
-
 def _resolution_rows(provider_name: str) -> pd.DataFrame:
     return _df(
         "SELECT * FROM efficiency.waste_resolution_month "
         f"WHERE provider_name = '{_q(provider_name)}'"
     )
-
-
-def resolution_summary(rows: pd.DataFrame) -> dict[str, object]:
-    """Pure aggregation behind :func:`resolution_panel` — split out so the resolved /
-    still-open / oldest-open arithmetic is directly testable without a NiceGUI context,
-    same rationale as :func:`rule_coverage_rows`.
-
-    *rows* is one provider's full ``efficiency.waste_resolution_month`` history (both
-    resolved and still-open spans — never date-filtered, see :func:`resolution_panel`).
-    ``current_month`` is read off the data itself (the latest ``last_seen_month`` present)
-    rather than ``date.today()`` — a lake ingested weeks ago must not compute "3 months
-    open" against today's calendar date when its own telemetry stops a month earlier.
-    """
-    empty: dict[str, object] = {
-        "resolved_count": 0,
-        "realized_savings_total": 0.0,
-        "open_count": 0,
-        "open_recoverable_total": 0.0,
-        "oldest_open_months": None,
-        "current_month": None,
-    }
-    if rows.empty:
-        return empty
-    is_resolved = rows["is_resolved"].astype(bool)
-    resolved, open_ = rows[is_resolved], rows[~is_resolved]
-    current_month = pd.to_datetime(rows["last_seen_month"]).max()
-    oldest_open_months = None
-    if not open_.empty:
-        oldest_first_seen = pd.to_datetime(open_["first_seen_month"]).min()
-        # +1: a finding first seen in the current month itself has been open 1 month,
-        # not 0 — this counts the flagged month itself, not just the gap since it.
-        oldest_open_months = (
-            (current_month.year - oldest_first_seen.year) * 12
-            + (current_month.month - oldest_first_seen.month)
-            + 1
-        )
-    return {
-        "resolved_count": int(len(resolved)),
-        "realized_savings_total": float(resolved["realized_savings"].fillna(0).sum()),
-        "open_count": int(len(open_)),
-        "open_recoverable_total": float(open_["recoverable_cost_at_last_seen"].fillna(0).sum()),
-        "oldest_open_months": oldest_open_months,
-        "current_month": current_month,
-    }
-
-
-def _realized_savings_variant(realized: float) -> str:
-    """Positive realized savings is good news (green); negative — cost rose for other
-    reasons after the finding cleared, see :func:`resolution_panel`'s caption — is a
-    genuine warning (red), never green just because a finding "resolved". Deliberately
-    NOT ``theme.delta_variant``: that helper reads a rising cost as bad, but a rising
-    *savings* figure is the opposite — good news, not a worsening trend.
-    """
-    if realized > 0:
-        return "savings"
-    if realized < 0:
-        return "increase"
-    return "neutral"
-
-
-def resolution_panel(provider_name: str) -> None:
-    """"Is flagged waste getting fixed?" — see the module docstring and the section
-    banner above for what this reads and why it ignores the page's date range."""
-    if not gold_view_published("efficiency", "waste_resolution_month"):
-        return
-    rows = _resolution_rows(provider_name)
-    if rows.empty:
-        return
-    summary = resolution_summary(rows)
-    resolved_count = int(summary["resolved_count"])  # type: ignore[call-overload]
-    open_count = int(summary["open_count"])  # type: ignore[call-overload]
-    realized = float(summary["realized_savings_total"])  # type: ignore[arg-type]
-    open_recoverable = float(summary["open_recoverable_total"])  # type: ignore[arg-type]
-    oldest = summary["oldest_open_months"]
-
-    with chrome.panel():
-        chrome.panel_title("Resolution tracking")
-        chrome.section_caption(
-            "Pure re-detection, not a ticketing system: a finding is 'resolved' when it "
-            "stopped reappearing in gold.waste_record, and realized savings compares "
-            "billed cost the month it was last flagged vs. the month right after (a "
-            "terminated entity counts as a full recovery). Can go negative if cost rose "
-            "for other reasons after the finding cleared."
-        )
-        chrome.kpi_row(
-            [
-                (
-                    "Resolved",
-                    f"{resolved_count:,}",
-                    f"{compact_money(realized)} realized savings, all-time",
-                    _realized_savings_variant(realized) if resolved_count else "neutral",
-                ),
-                (
-                    "Still open",
-                    f"{open_count:,}",
-                    f"{compact_money(open_recoverable)} recoverable"
-                    + (f" · oldest flagged {oldest} mo ago" if oldest else ""),
-                    "unattributed",
-                ),
-            ],
-        )
-
-        status_body = ui.column().classes("w-full gap-2")
-
-        @ui.refreshable
-        def _status(filter_value: str) -> None:
-            status_body.clear()
-            is_resolved = rows["is_resolved"].astype(bool)
-            if filter_value == "Open":
-                shown = rows[~is_resolved].sort_values("first_seen_month")
-            elif filter_value == "Resolved":
-                shown = rows[is_resolved].sort_values("resolved_month", ascending=False)
-            else:
-                shown = rows.assign(_sort=pd.to_datetime(rows["first_seen_month"])).sort_values(
-                    "_sort"
-                )
-            if shown.empty:
-                with status_body:
-                    chrome.section_caption(f"No {filter_value.lower()} findings.")
-                return
-            display = shown.assign(
-                status=shown["is_resolved"].map({True: "Resolved", False: "Open"}),
-                potential_savings=shown["recoverable_cost_at_last_seen"],
-            )
-            cols = [
-                "status",
-                "entity_name",
-                "entity_type",
-                "waste_category",
-                "owner_user",
-                "first_seen_month",
-                "potential_savings",
-                "resolved_month",
-                "realized_savings",
-            ]
-            rename = {
-                "status": "Status",
-                "entity_name": "Entity",
-                "entity_type": "Type",
-                "waste_category": "Cause",
-                "owner_user": "Owner",
-                "first_seen_month": "Flagged since",
-                "potential_savings": "Potential savings",
-                "resolved_month": "Resolved",
-                "realized_savings": "Realized savings",
-            }
-            with status_body:
-                chrome.searchable_table(
-                    display[[c for c in cols if c in display]],
-                    key=f"waste_status_{provider_name.lower().replace(' ', '_')}",
-                    search_col="entity_name",
-                    money_cols=["potential_savings", "realized_savings"],
-                    rename=rename,
-                    max_rows=_MAX_ROWS,
-                )
-
-        ui.select(
-            ["Open", "Resolved", "All"],
-            value="Open",
-            label="Show",
-            on_change=lambda event: _status.refresh(str(event.value)),
-        ).props("dense outlined").classes("w-40")
-        _status("Open")
-
-
-# Displayed in order; descriptor columns that are constant across a lens table collapse
-# into the caption instead of repeating on every row (e.g. placement is always
-# interactive · candidate · → jobs compute).
-_COLS = [
-    "entity_name",
-    "entity_type",
-    "provider_name",
-    "owner_user",
-    "waste_category",
-    "confidence",
-    "detail",
-    "billed_cost",
-    "recoverable_cost",
-    "remedy",
-]
-_CONSTANT_CANDIDATES = [
-    "entity_type",
-    "provider_name",
-    "waste_category",
-    "confidence",
-    "detail",
-    "remedy",
-]
-_RENAME = {
-    "entity_name": "Entity",
-    "entity_type": "Type",
-    "provider_name": "Provider",
-    "owner_user": "Owner",
-    "waste_category": "Cause",
-    "confidence": "Confidence",
-    "detail": "Detail",
-    "billed_cost": "Billed",
-    "recoverable_cost": "Recoverable",
-    "remedy": "How to recover it",
-}
-# waste_category -> its rule's actionable fix text — waste_record (SQL) has no room for
-# free text this long, so it's joined in here from the one place it's authored.
-_REMEDY_BY_CATEGORY = {r.category: r.remedy for r in WASTE_RULES}
-_MIN_RECOVERABLE = 1.0  # sub-dollar rows are noise (and round to "$0" in the table)
-_MAX_ROWS = 40
-
-
-def lens_table(month_rows: pd.DataFrame, lens: str, title: str, key: str) -> None:
-    """One lens's findings table. Public because ``redshift_focus`` renders its own
-    per-cluster pair of these — the alternative was a private cross-module import."""
-    # Impact-first: rank by recoverable $. Confidence is a column + its own KPI; making it
-    # the primary sort buried the big-$ candidate rows under a long tail of tiny high-conf
-    # ones. Sub-dollar-but-positive rows are dropped as noise, but an exact-$0 row is kept
-    # — that's a rule that fired with no honest $ tie (e.g. Redshift doesn't bill per-table
-    # or per-query), a real finding, not nothing found. Sorting by recoverable_cost already
-    # sinks those to the bottom instead of losing them.
-    cost = month_rows["recoverable_cost"]
-    rows = month_rows[
-        (month_rows["lens"] == lens) & ((cost >= _MIN_RECOVERABLE) | (cost == 0))
-    ].sort_values("recoverable_cost", ascending=False)
-    if rows.empty:
-        return
-    rows = rows.assign(remedy=rows["waste_category"].map(_REMEDY_BY_CATEGORY))
-    any_unpriced = bool((rows["recoverable_cost"] == 0).any())
-
-    # Collapse columns that are constant across this table into one context line.
-    constants = [
-        c for c in _CONSTANT_CANDIDATES if c in rows and rows[c].nunique(dropna=False) == 1
-    ]
-    context = " · ".join(str(rows[c].iloc[0]) for c in constants)
-    cols = [c for c in _COLS if c not in constants]
-
-    with chrome.panel():
-        chrome.panel_title(title)
-        chrome.section_caption(
-            f"Ranked by recoverable $. {('All ' + context + '. ') if context else ''}"
-            "underutilized is never shown for shared compute (no per-entity utilization)."
-            + (
-                " $0 rows are confirmed findings with no honest price tie, not nothing"
-                " found — see Detail/How to recover it."
-                if any_unpriced
-                else ""
-            )
-        )
-        chrome.searchable_table(
-            rows[cols],
-            key=f"waste_{key}",
-            search_col="waste_category",
-            money_cols=["billed_cost", "recoverable_cost"],
-            rename=_RENAME,
-            max_rows=_MAX_ROWS,
-        )
-
-
 # ── Rule coverage ─────────────────────────────────────────────────────────────────
 # "What did we even check?" — the counterpart to the lens tables, which can only show
 # rules that fired. Lived in redshift_focus, driven by a hand-maintained rule→group map

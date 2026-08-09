@@ -21,8 +21,6 @@ from flashlight.core.settings import get_settings
 from flashlight.efficiency.model import EfficiencyRecord, EntityType
 from flashlight.focus.enums import (
     ChargeCategory,
-    CommitmentDiscountCategory,
-    CommitmentDiscountStatus,
     ComputeClass,
     ProviderName,
     ServiceCategory,
@@ -121,48 +119,6 @@ def test_provider_page_reachable_after_first_sync_post_boot(lake_home) -> None: 
 
             await user.open("/aws")
             await user.should_see("AWS Redshift spend")
-
-    asyncio.run(_check())
-
-
-def test_provider_page_renders_commitment_panel_when_present(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """The commitment-coverage panel (added alongside FOCUS Contract Commitment
-    support) must render real Used/Unused data when present, and the existing
-    smoke test above already proves it renders nothing (no crash) when absent."""
-    from flashlight.lake import bronze
-    from flashlight.transform.runner import build_gold
-
-    # AWS's own page is entirely rendered by redshift_focus.render() (see
-    # router.py's `group == "aws"` branch) — its bounds check scopes to Redshift's
-    # own FOCUS service names, so the record needs one for the page to render past
-    # that check into the Breakdown tab where the commitment panel lives.
-    window = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
-    used = _rec(15)
-    used.service_name = "Amazon Redshift"
-    used.commitment_discount_id = "cud-1"
-    used.commitment_discount_type = "Savings Plan"
-    used.commitment_discount_category = CommitmentDiscountCategory.SPEND
-    used.commitment_discount_status = CommitmentDiscountStatus.USED
-    unused = _rec(16)
-    unused.service_name = "Amazon Redshift"
-    unused.commitment_discount_id = "cud-2"
-    unused.commitment_discount_type = "Savings Plan"
-    unused.commitment_discount_category = CommitmentDiscountCategory.SPEND
-    unused.commitment_discount_status = CommitmentDiscountStatus.UNUSED
-    bronze.write_window("t", window, [used, unused], ingest_run_id="r1")
-    build_gold()
-
-    from nicegui import ui
-    from nicegui.testing.user_simulation import user_simulation
-
-    from flashlight.dashboard.router import build_pages
-
-    async def _check() -> None:
-        async with user_simulation() as user:
-            build_pages()
-            await user.open("/aws")
-            user.find(kind=ui.tab, content="Breakdown").click()
-            await user.should_see("Commitment coverage")
 
     asyncio.run(_check())
 
@@ -592,7 +548,7 @@ def test_connections_page_sync_button_streams_output_without_crashing(  # type: 
             return self._returncode
 
     async def _fake_create_subprocess_exec(*cmd, **kwargs):  # type: ignore[no-untyped-def]
-        lines = [b"  Prod-Focus ...\n", b"  Prod-Focus ... 42 rows done\n"]
+        lines = [b"  Prod-Focus ...\n", b"  Prod-Focus ... cost pull complete: 42 rows\n"]
         return _FakeProcess(lines, returncode=0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
@@ -631,7 +587,7 @@ def test_connections_page_sync_button_streams_output_without_crashing(  # type: 
                 if isinstance(child, ui.label)
             ]
             assert "  Prod-Focus ..." in log_lines
-            assert "  Prod-Focus ... 42 rows done" in log_lines
+            assert "  Prod-Focus ... cost pull complete: 42 rows" in log_lines
 
     asyncio.run(_check())
     assert not caught, f"sync click triggered unexpected exception(s): {caught}"
@@ -1642,6 +1598,15 @@ _CORE_TABS = (
 
 _ALERTS_TAB = "Alerts"
 
+_REDSHIFT_TABS = (
+    "Trend & changes",
+    "Breakdown",
+    "Attribution",
+    "Efficiency & Waste",
+    "Policy Compliance",
+    "Client Driver Health",
+)
+
 # Databricks: spend detail after Breakdown, Client Driver Health last.
 _DATABRICKS_TABS = (
     "Trend & changes",
@@ -1657,10 +1622,8 @@ _DATABRICKS_TABS = (
 
 
 def test_provider_page_carries_the_core_tabs(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """Every provider page has the same tab set — this is what stops /aws drifting back to
-    its old Tags/Optimization pair, Efficiency & Waste becoming Databricks-only again, or
-    Policy Compliance going back to being a Databricks extra tab (which hid rows every
-    Redshift cluster-month was already producing).
+    """Generic provider pages retain their shared tab set; Redshift adds its
+    focused cost/attribution/optimization workflow and driver-health view.
 
     Loops the *discovered* groups rather than a hard-coded pair, so a provider added later
     can't quietly get a different set. GCP is seeded deliberately: a connector that pulls
@@ -1687,9 +1650,12 @@ def test_provider_page_carries_the_core_tabs(lake_home) -> None:  # type: ignore
             build_pages()
             for group in groups:
                 await user.open(f"/{group}")
-                for tab in _CORE_TABS:
+                tabs = _REDSHIFT_TABS if group == "aws" else _CORE_TABS
+                for tab in tabs:
                     await user.should_see(tab)
                 if group == "databricks":
+                    await user.should_not_see(_ALERTS_TAB)
+                elif group == "aws":
                     await user.should_not_see(_ALERTS_TAB)
                 else:
                     await user.should_see(_ALERTS_TAB)
@@ -2332,61 +2298,6 @@ def test_provider_page_explains_a_suppressed_trend_forecast(lake_home) -> None: 
     asyncio.run(_check())
 
 
-def test_commitment_panel_discloses_null_status_spend(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """Rows with no CommitmentDiscountStatus carry real dollars (and negative corrective
-    lines). They're rightly off the Used/Unused chart, but dropping them from the
-    denominator silently overstates how much of the commitment the split covers."""
-    from nicegui import ui
-    from nicegui.testing.user_simulation import user_simulation
-
-    from flashlight.lake import bronze
-    from flashlight.transform.runner import build_gold
-
-    window = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
-    rows = []
-    for status, cost in (
-        (CommitmentDiscountStatus.USED, "100"),
-        (CommitmentDiscountStatus.UNUSED, "20"),
-    ):
-        row = _rec(15)
-        row.service_name = "Amazon Redshift"
-        row.commitment_discount_id = f"cud-{status}"
-        row.commitment_discount_type = "Savings Plan"
-        row.commitment_discount_category = CommitmentDiscountCategory.SPEND
-        row.commitment_discount_status = status
-        row.effective_cost = Decimal(cost)
-        rows.append(row)
-    # A commitment charge with no status, plus a negative correction — both real AWS
-    # shapes (the real lake carries a −$41,284.75 NULL-status row). Distinct
-    # commitment_discount_types so they stay separate rows in the GOLD aggregate:
-    # summed into one group the negative would net away and become undetectable.
-    for cost, kind in (("500", "Savings Plan"), ("-40", "Reservation")):
-        row = _rec(16)
-        row.service_name = "Amazon Redshift"
-        row.commitment_discount_id = f"cud-nostatus-{kind}"
-        row.commitment_discount_type = kind
-        row.commitment_discount_status = None
-        row.effective_cost = Decimal(cost)
-        rows.append(row)
-    bronze.write_window("t", window, rows, ingest_run_id="r1")
-    build_gold()
-
-    from flashlight.dashboard.router import build_pages
-
-    async def _check() -> None:
-        async with user_simulation() as user:
-            build_pages()
-            await user.open("/aws")
-            user.find(kind=ui.tab, content="Breakdown").click()
-            await user.should_see("Commitment coverage")
-            await user.should_see("no CommitmentDiscountStatus")
-            await user.should_see("negative corrections")
-            # 20 of 120 complete-month commitment spend is Unused.
-            await user.should_see("16.7%")
-
-    asyncio.run(_check())
-
-
 def test_provider_nav_rows_are_bare_labels_with_databricks_first(lake_home) -> None:  # type: ignore[no-untyped-def]
     """The "BY PROVIDER" nav rows read "Databricks" / "AWS Redshift", not
     "<label> spend" (the section heading already says these are spend pages), and
@@ -2413,13 +2324,10 @@ def test_provider_nav_rows_are_bare_labels_with_databricks_first(lake_home) -> N
     assert [_nav_label(group) for group in _nav_groups()] == ["Databricks", "AWS Redshift"]
 
 
-def test_redshift_page_carries_the_shared_trend_panels(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """`/aws` renders the shared Trend & changes panels, not a lone monthly bar.
+def test_redshift_page_uses_monthly_stacked_trend_with_scoped_projection(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Redshift's trend is a monthly invoice composition, not volatile daily spend.
 
-    These are the panels the page lacked while it was a fork of provider_focus: a daily
-    series (which needed `service_name` on spend_trend_daily to exist at this scope at
-    all) and the clickable month drill. If `/aws` ever stops going through
-    provider_focus.render, this is what catches it.
+    Its projection is fitted from Redshift-only costs, never the whole AWS bill.
     """
     from nicegui.testing.user_simulation import user_simulation
 
@@ -2441,8 +2349,8 @@ def test_redshift_page_carries_the_shared_trend_panels(lake_home) -> None:  # ty
         async with user_simulation() as user:
             build_pages()
             await user.open("/aws")
-            await user.should_see("Daily spend")
             await user.should_see("Monthly net cost")
+            await user.should_not_see("Daily spend")
             await user.should_not_see("click a bar to drill in")
             # The discount lives on the Net Spend card subtitle (net + savings = list is
             # arithmetic a reader doesn't need two tiles for); the list total survives as
@@ -2450,7 +2358,7 @@ def test_redshift_page_carries_the_shared_trend_panels(lake_home) -> None:  # ty
             await user.should_see("Net Spend")
             await user.should_see("savings vs. $1.5K list")
             await user.should_not_see("AWS Redshift list")
-            await user.should_see("Alerts")
+            await user.should_not_see("Alerts")
             # MoM prose used to sit under the KPIs; it lives on the Alerts tab now.
             await user.should_not_see("in the selected window")
 
@@ -2484,33 +2392,6 @@ def test_redshift_page_kpis_exclude_non_redshift_aws_spend(lake_home) -> None:  
     assert float(whole["net_cost"].sum()) == pytest.approx(8000.0), "the whole AWS bill"
     # list_cost/savings must narrow with it — they come from the widened service view.
     assert float(scoped["list_cost"].sum()) == pytest.approx(1000.0)
-
-
-def test_redshift_page_names_the_spend_it_hides(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """Non-Redshift AWS spend is ingested but has no page — say so rather than let it
-    silently vanish. Widening `include_services` in connections.yml is exactly how a user
-    gets into this state."""
-    from nicegui.testing.user_simulation import user_simulation
-
-    from flashlight.lake import bronze
-    from flashlight.transform.runner import build_gold
-
-    window = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
-    ec2 = _rec(15)
-    ec2.effective_cost = ec2.billed_cost = Decimal("7000")
-    bronze.write_window("t", window, [_redshift_usage(15, "1000"), ec2], ingest_run_id="r1")
-    build_gold()
-
-    from flashlight.dashboard.router import build_pages
-
-    async def _check() -> None:
-        async with user_simulation() as user:
-            build_pages()
-            await user.open("/aws")
-            await user.should_see("of other AWS spend in this window")
-            await user.should_see("AmazonEC2")
-
-    asyncio.run(_check())
 
 
 def test_out_of_scope_bill_does_not_read_as_a_broken_connection(lake_home) -> None:  # type: ignore[no-untyped-def]
@@ -3256,37 +3137,6 @@ def test_backing_storage_tab_says_empty_map_is_not_zero_storage_cost(lake_home) 
             # ...and the denominator is still stated, as one line rather than a table of
             # every unrelated bucket.
             await user.should_see("none of it currently identified as Databricks-managed")
-
-    asyncio.run(_check())
-
-
-def test_redshift_page_points_hidden_s3_spend_at_the_backing_storage_tab(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """`/aws` is Redshift-scoped; S3 is ingested for the storage plane but kept out of
-    ``aws.*`` GOLD. The scope caption still points at Databricks → Databricks Storage
-    when the storage plane has dollars for the window.
-    """
-    from nicegui.testing.user_simulation import user_simulation
-
-    from flashlight.dashboard.router import build_pages
-    from flashlight.lake import bronze
-    from flashlight.transform.runner import build_gold
-
-    window = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
-    bronze.write_window(
-        "t",
-        window,
-        [_redshift_usage(14, "500"), _s3_usage(15, "300", "arn:aws:s3:::acme-uc-root")],
-        ingest_run_id="r1",
-    )
-    build_gold()
-
-    async def _check() -> None:
-        async with user_simulation() as user:
-            build_pages()
-            await user.open("/aws")
-            await user.should_see("Redshift's own FOCUS service names")
-            await user.should_see("Databricks \u2192 Databricks Storage")
-            await user.should_see("not in aws.* GOLD")
 
     asyncio.run(_check())
 

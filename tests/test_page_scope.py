@@ -31,7 +31,7 @@ def _redshift_scope() -> Scope:
     return Scope(
         group="aws",
         dimension="service_name",
-        values=("Amazon Redshift", "Amazon Redshift Serverless"),
+        values=("Amazon Redshift", "Amazon Redshift Spectrum"),
         account_wide=_REDSHIFT_ACCOUNT_WIDE,
     )
 
@@ -63,11 +63,11 @@ def test_narrowed_scope_filters_a_view_that_carries_the_dimension() -> None:
     assert scope.narrowed is True
     assert scope.available("spend_by_service_month") is True
     assert scope.predicate("spend_by_service_month") == (
-        "service_name IN ('Amazon Redshift', 'Amazon Redshift Serverless')"
+        "service_name IN ('Amazon Redshift', 'Amazon Redshift Spectrum')"
     )
     assert scope.where("spend_by_service_month", "charge_month >= '2026-01-01'") == (
         "WHERE charge_month >= '2026-01-01' "
-        "AND service_name IN ('Amazon Redshift', 'Amazon Redshift Serverless')"
+        "AND service_name IN ('Amazon Redshift', 'Amazon Redshift Spectrum')"
     )
 
 

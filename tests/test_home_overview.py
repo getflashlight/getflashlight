@@ -33,6 +33,26 @@ def test_recoverable_by_provider_uses_action_queue_rollup(monkeypatch) -> None: 
                 "confidence": "candidate",
             },
             {
+                "provider_name": "AWS",
+                "entity_id": "bucket-1",
+                "entity_type": "storage",
+                "lens": "WASTE",
+                "waste_category": "s3_old_object",
+                "recoverable_cost": 999.0,
+                "billed_cost": 1_000.0,
+                "confidence": "high",
+            },
+            {
+                "provider_name": "AWS",
+                "entity_id": "warehouse-1",
+                "entity_type": "sql_warehouse",
+                "lens": "WASTE",
+                "waste_category": "sql_warehouse_low_cache_reuse",
+                "recoverable_cost": 50.0,
+                "billed_cost": 100.0,
+                "confidence": "candidate",
+            },
+            {
                 "provider_name": "Databricks",
                 "entity_id": "cluster-1",
                 "entity_type": "interactive",
@@ -48,3 +68,4 @@ def test_recoverable_by_provider_uses_action_queue_rollup(monkeypatch) -> None: 
     recoverable = home_overview._recoverable_by_provider(date(2026, 6, 1))  # noqa: SLF001
 
     assert recoverable["Databricks"] == pytest.approx(125.0)
+    assert recoverable["AWS"] == pytest.approx(50.0)

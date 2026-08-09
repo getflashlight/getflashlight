@@ -127,7 +127,6 @@ def _nav_row(
             f"color:{chrome.INK_PRIMARY}"
         )
     row.on("click", lambda: ui.navigate.to(href))
-    row.tooltip(label)
 
 
 def shell(active_path: str, *, full_height: bool = False) -> ui.column:
@@ -171,7 +170,7 @@ def shell(active_path: str, *, full_height: bool = False) -> ui.column:
 
         sidebar_toggle = ui.button(icon="chevron_left", on_click=_toggle_sidebar).props(
             "flat dense round"
-        ).classes("fl-sidebar-toggle").tooltip("Collapse or expand sidebar")
+        ).classes("fl-sidebar-toggle")
 
         with ui.column().classes("w-full h-full no-wrap"):
             with ui.column().classes("w-full gap-0"):
@@ -404,9 +403,9 @@ def build_pages() -> None:
         app.mount("/docs", StaticFiles(directory=settings.docs_dir, html=True), name="docs")
 
     def _render_databricks_page(label: str) -> None:
-        """Client driver health has exactly one producer — Databricks is the only
-        connector implementing ``Connector.fetch_driver_health`` — so it's nested here as
-        an extra tab rather than a top-level nav entry.
+        """Client driver health is a provider-specific extra (currently Databricks and
+        Redshift), so it is nested on each provider page rather than being a top-level
+        nav entry.
 
         AI Costs is nested for the same reason: Databricks is the only connector emitting
         AI-categorized FOCUS rows today, and ``gold.ai_product_family`` maps Databricks'

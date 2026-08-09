@@ -26,6 +26,12 @@ from flashlight.lake.assistant_turns import empty_table as empty_assistant_turn_
 from flashlight.lake.compute_instance_schema import empty_table as empty_compute_instance_table
 from flashlight.lake.driver_health_schema import empty_table as empty_driver_health_table
 from flashlight.lake.metrics_schema import empty_table as empty_metrics_table
+from flashlight.lake.redshift_policy_config_schema import (
+    empty_table as empty_redshift_policy_config_table,
+)
+from flashlight.lake.redshift_table_observability_schema import (
+    empty_table as empty_redshift_table_observability_table,
+)
 from flashlight.lake.schema import empty_table
 from flashlight.lake.storage_location_schema import empty_table as empty_storage_location_table
 
@@ -92,10 +98,12 @@ def register_bronze(con: duckdb.DuckDBPyConnection) -> None:
     identical either way, so the SILVER/GOLD SQL resolves against both.
     """
     con.execute("CREATE SCHEMA IF NOT EXISTS raw")
-    files = list(paths.bronze_dir().glob("**/*.parquet"))
+    files = list(paths.bronze_dir().glob("x_source_connector=*/charge_month=*/*.parquet"))
     if files:
         # CREATE VIEW can't be prepared, so the path is inlined (single-quote escaped).
-        glob = str(paths.bronze_dir() / "**" / "*.parquet").replace("'", "''")
+        glob = str(
+            paths.bronze_dir() / "x_source_connector=*" / "charge_month=*" / "*.parquet"
+        ).replace("'", "''")
         con.execute(
             f"CREATE OR REPLACE VIEW raw.focus_record AS SELECT * FROM "
             f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
@@ -134,25 +142,63 @@ def register_metrics(con: duckdb.DuckDBPyConnection) -> None:
 
 
 def register_driver_health(con: duckdb.DuckDBPyConnection) -> None:
-    """Expose ``metrics.driver_health`` over the partitioned driver-health Parquet.
+    """Expose typed driver-health Bronze as ``raw.driver_health``.
 
-    Same ``metrics`` DuckDB schema as :func:`register_metrics`, but a distinct Parquet
-    root (:func:`~flashlight.lake.paths.driver_health_dir`) and view name — kept out of
-    ``metrics_dir()``'s own recursive glob so the two differently-shaped datasets never
-    collide (see that function's docstring). Unioned onto the typed empty table for the
-    same schema-evolution reason as :func:`register_metrics` — see its docstring.
+    New Bronze partitions win over the legacy sibling dataset for the same
+    provider/month, preserving old history until it is replaced by a fresh ingest.
     """
-    con.execute("CREATE SCHEMA IF NOT EXISTS metrics")
+    con.execute("CREATE SCHEMA IF NOT EXISTS raw")
     con.register("_driver_health_empty", empty_driver_health_table())
-    select = "SELECT * FROM _driver_health_empty"
-    files = list(paths.driver_health_dir().glob("**/*.parquet"))
-    if files:
-        glob = str(paths.driver_health_dir() / "**" / "*.parquet").replace("'", "''")
+    primary = "SELECT * FROM _driver_health_empty"
+    if list(paths.bronze_driver_health_dir().glob("**/*.parquet")):
+        glob = str(paths.bronze_driver_health_dir() / "**" / "*.parquet").replace("'", "''")
+        primary = (
+            "SELECT * FROM _driver_health_empty UNION ALL BY NAME SELECT * FROM "
+            f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
+        )
+    legacy = "SELECT * FROM _driver_health_empty"
+    if list(paths.legacy_driver_health_dir().glob("**/*.parquet")):
+        glob = str(paths.legacy_driver_health_dir() / "**" / "*.parquet").replace("'", "''")
+        legacy = (
+            "SELECT * FROM _driver_health_empty UNION ALL BY NAME SELECT * FROM "
+            f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
+        )
+    con.execute(
+        "CREATE OR REPLACE VIEW raw.driver_health AS "
+        f"WITH primary_rows AS ({primary}), legacy_rows AS ({legacy}) "
+        "SELECT * FROM primary_rows UNION ALL BY NAME "
+        "SELECT l.* FROM legacy_rows l WHERE NOT EXISTS ("
+        "SELECT 1 FROM primary_rows p WHERE p.provider_name = l.provider_name "
+        "AND p.charge_month = l.charge_month)"
+    )
+
+
+def register_redshift_policy_config(con: duckdb.DuckDBPyConnection) -> None:
+    """Expose local typed Bronze Redshift controls as ``raw.redshift_policy_config``."""
+    con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+    con.register("_redshift_policy_config_empty", empty_redshift_policy_config_table())
+    select = "SELECT * FROM _redshift_policy_config_empty"
+    if list(paths.redshift_policy_config_dir().glob("**/*.parquet")):
+        glob = str(paths.redshift_policy_config_dir() / "**" / "*.parquet").replace("'", "''")
+        select += (
+            f" UNION ALL BY NAME SELECT * FROM "
+            f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
+        )
+    con.execute(f"CREATE OR REPLACE VIEW raw.redshift_policy_config AS {select}")
+
+
+def register_redshift_table_observability(con: duckdb.DuckDBPyConnection) -> None:
+    """Expose durable daily Redshift table and Spectrum facts in ``raw``."""
+    con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+    con.register("_redshift_table_observability_empty", empty_redshift_table_observability_table())
+    select = "SELECT * FROM _redshift_table_observability_empty"
+    if list(paths.redshift_table_observability_dir().glob("**/*.parquet")):
+        glob = str(paths.redshift_table_observability_dir() / "**" / "*.parquet").replace("'", "''")
         select += (
             " UNION ALL BY NAME SELECT * FROM "
             f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
         )
-    con.execute(f"CREATE OR REPLACE VIEW metrics.driver_health AS {select}")
+    con.execute(f"CREATE OR REPLACE VIEW raw.redshift_table_observability AS {select}")
 
 
 def register_ai_usage(con: duckdb.DuckDBPyConnection) -> None:

@@ -17,14 +17,13 @@ from flashlight.dashboard.data import (
     provider_name_for_group,
 )
 from flashlight.dashboard.data import to_date as _d
-from flashlight.dashboard.summary import cross_provider_movers
+from flashlight.dashboard.summary import action_group_rows, cross_provider_movers
 from flashlight.dashboard.theme import (
     compact_money,
     delta_variant,
     provider_color,
     provider_color_map,
 )
-from flashlight.dashboard.views.efficiency_waste import action_group_rows
 from flashlight.transform.catalog import discover_provider_groups
 
 
@@ -284,6 +283,17 @@ def _recoverable_by_provider(month: date) -> pd.Series:
         return pd.Series(dtype=float)
     if df.empty:
         return pd.Series(dtype=float)
+    # AWS can carry non-Redshift records (for example S3 storage), while the AWS
+    # provider page is explicitly the Redshift view. Keep this headline scoped to the
+    # two Efficiency & Waste surfaces a reader can reconcile it against: Databricks and
+    # Redshift. This is the same Redshift identification contract as redshift_focus:
+    # Redshift-specific rules, plus the two SQL warehouse entity types whose generic
+    # rules are emitted by Redshift under provider_name='AWS'.
+    aws = df["provider_name"].astype(str).eq("AWS")
+    redshift_aws = df["waste_category"].astype(str).str.startswith("redshift_") | df[
+        "entity_type"
+    ].isin(["sql_warehouse", "sql_warehouse_user"])
+    df = df.loc[~aws | redshift_aws]
     values = {
         str(provider): float(action_group_rows(rows)["potential_savings"].sum())
         for provider, rows in df.groupby("provider_name")
@@ -417,10 +427,9 @@ def render() -> None:
                 (
                     "Actionable savings potential",
                     compact_money(total_recoverable) if total_recoverable else "—",
-                    f"{100 * total_recoverable / total_cur:.1f}% of spend · "
-                    "remedy lanes may overlap"
+                    f"{100 * total_recoverable / total_cur:.1f}% of spend · Databricks + Redshift"
                     if total_cur and total_recoverable
-                    else "tune + move options",
+                    else "Databricks + Redshift tune + move options",
                     "unattributed",
                 ),
             ],

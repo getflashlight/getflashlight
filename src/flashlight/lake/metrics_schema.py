@@ -4,8 +4,9 @@ The waste-plane sibling of :mod:`flashlight.lake.schema`: a fixed :class:`pyarro
 mirroring :class:`~flashlight.efficiency.model.EfficiencyRecord`, plus the row/table
 builders the efficiency pull writes. Explicit schema (not inference) keeps types stable
 across partition files. ``cause_detail`` is a JSON **string** (the same choice as
-``tags`` in the BRONZE schema). ``provider_name`` and ``charge_month`` are the Hive
-partition keys (``YYYY-MM``).
+``tags`` in the BRONZE schema). ``provider_name``, ``x_source_connector``, and
+``charge_month`` are the Hive partition keys (``YYYY-MM``). The connector key makes
+one Redshift cluster refresh independent of another cluster's AWS telemetry.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from flashlight.efficiency.model import EfficiencyRecord
 _MONEY = pa.decimal128(20, 6)
 _CENTS = Decimal("0.000001")
 
-#: Non-partition columns first, then the two partition keys last.
+#: Non-partition columns first, then the three partition keys last.
 METRICS_SCHEMA: pa.Schema = pa.schema(
     [
         ("entity_type", pa.string()),
@@ -34,15 +35,15 @@ METRICS_SCHEMA: pa.Schema = pa.schema(
         ("utilization_pct", pa.float64()),
         ("activity_count", pa.int64()),
         ("cause_detail", pa.string()),  # JSON
-        ("x_source_connector", pa.string()),
         # ── Hive partition keys (written as dirs, restored on read) ──────────
         ("provider_name", pa.string()),
+        ("x_source_connector", pa.string()),
         ("charge_month", pa.string()),  # YYYY-MM
     ]
 )
 
 #: Partition columns, in directory nesting order.
-PARTITION_COLUMNS: tuple[str, ...] = ("provider_name", "charge_month")
+PARTITION_COLUMNS: tuple[str, ...] = ("provider_name", "x_source_connector", "charge_month")
 
 
 def _money(value: Decimal) -> Decimal:
