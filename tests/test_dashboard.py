@@ -21,8 +21,6 @@ from flashlight.core.settings import get_settings
 from flashlight.efficiency.model import EfficiencyRecord, EntityType
 from flashlight.focus.enums import (
     ChargeCategory,
-    CommitmentDiscountCategory,
-    CommitmentDiscountStatus,
     ComputeClass,
     ProviderName,
     ServiceCategory,
@@ -121,48 +119,6 @@ def test_provider_page_reachable_after_first_sync_post_boot(lake_home) -> None: 
 
             await user.open("/aws")
             await user.should_see("AWS Redshift spend")
-
-    asyncio.run(_check())
-
-
-def test_provider_page_renders_commitment_panel_when_present(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """The commitment-coverage panel (added alongside FOCUS Contract Commitment
-    support) must render real Used/Unused data when present, and the existing
-    smoke test above already proves it renders nothing (no crash) when absent."""
-    from flashlight.lake import bronze
-    from flashlight.transform.runner import build_gold
-
-    # AWS's own page is entirely rendered by redshift_focus.render() (see
-    # router.py's `group == "aws"` branch) — its bounds check scopes to Redshift's
-    # own FOCUS service names, so the record needs one for the page to render past
-    # that check into the Breakdown tab where the commitment panel lives.
-    window = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
-    used = _rec(15)
-    used.service_name = "Amazon Redshift"
-    used.commitment_discount_id = "cud-1"
-    used.commitment_discount_type = "Savings Plan"
-    used.commitment_discount_category = CommitmentDiscountCategory.SPEND
-    used.commitment_discount_status = CommitmentDiscountStatus.USED
-    unused = _rec(16)
-    unused.service_name = "Amazon Redshift"
-    unused.commitment_discount_id = "cud-2"
-    unused.commitment_discount_type = "Savings Plan"
-    unused.commitment_discount_category = CommitmentDiscountCategory.SPEND
-    unused.commitment_discount_status = CommitmentDiscountStatus.UNUSED
-    bronze.write_window("t", window, [used, unused], ingest_run_id="r1")
-    build_gold()
-
-    from nicegui import ui
-    from nicegui.testing.user_simulation import user_simulation
-
-    from flashlight.dashboard.router import build_pages
-
-    async def _check() -> None:
-        async with user_simulation() as user:
-            build_pages()
-            await user.open("/aws")
-            user.find(kind=ui.tab, content="Breakdown").click()
-            await user.should_see("Commitment coverage")
 
     asyncio.run(_check())
 
@@ -2337,61 +2293,6 @@ def test_provider_page_explains_a_suppressed_trend_forecast(lake_home) -> None: 
             await user.open("/gcp")
             await user.should_see("Next 3 months")
             await user.should_see("3 complete months")
-
-    asyncio.run(_check())
-
-
-def test_commitment_panel_discloses_null_status_spend(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """Rows with no CommitmentDiscountStatus carry real dollars (and negative corrective
-    lines). They're rightly off the Used/Unused chart, but dropping them from the
-    denominator silently overstates how much of the commitment the split covers."""
-    from nicegui import ui
-    from nicegui.testing.user_simulation import user_simulation
-
-    from flashlight.lake import bronze
-    from flashlight.transform.runner import build_gold
-
-    window = IngestWindow(date(2026, 5, 1), date(2026, 5, 31))
-    rows = []
-    for status, cost in (
-        (CommitmentDiscountStatus.USED, "100"),
-        (CommitmentDiscountStatus.UNUSED, "20"),
-    ):
-        row = _rec(15)
-        row.service_name = "Amazon Redshift"
-        row.commitment_discount_id = f"cud-{status}"
-        row.commitment_discount_type = "Savings Plan"
-        row.commitment_discount_category = CommitmentDiscountCategory.SPEND
-        row.commitment_discount_status = status
-        row.effective_cost = Decimal(cost)
-        rows.append(row)
-    # A commitment charge with no status, plus a negative correction — both real AWS
-    # shapes (the real lake carries a −$41,284.75 NULL-status row). Distinct
-    # commitment_discount_types so they stay separate rows in the GOLD aggregate:
-    # summed into one group the negative would net away and become undetectable.
-    for cost, kind in (("500", "Savings Plan"), ("-40", "Reservation")):
-        row = _rec(16)
-        row.service_name = "Amazon Redshift"
-        row.commitment_discount_id = f"cud-nostatus-{kind}"
-        row.commitment_discount_type = kind
-        row.commitment_discount_status = None
-        row.effective_cost = Decimal(cost)
-        rows.append(row)
-    bronze.write_window("t", window, rows, ingest_run_id="r1")
-    build_gold()
-
-    from flashlight.dashboard.router import build_pages
-
-    async def _check() -> None:
-        async with user_simulation() as user:
-            build_pages()
-            await user.open("/aws")
-            user.find(kind=ui.tab, content="Breakdown").click()
-            await user.should_see("Commitment coverage")
-            await user.should_see("no CommitmentDiscountStatus")
-            await user.should_see("negative corrections")
-            # 20 of 120 complete-month commitment spend is Unused.
-            await user.should_see("16.7%")
 
     asyncio.run(_check())
 

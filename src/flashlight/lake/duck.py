@@ -153,13 +153,15 @@ def register_driver_health(con: duckdb.DuckDBPyConnection) -> None:
     if list(paths.bronze_driver_health_dir().glob("**/*.parquet")):
         glob = str(paths.bronze_driver_health_dir() / "**" / "*.parquet").replace("'", "''")
         primary = (
-            f"SELECT * FROM read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
+            "SELECT * FROM _driver_health_empty UNION ALL BY NAME SELECT * FROM "
+            f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
         )
     legacy = "SELECT * FROM _driver_health_empty"
     if list(paths.legacy_driver_health_dir().glob("**/*.parquet")):
         glob = str(paths.legacy_driver_health_dir() / "**" / "*.parquet").replace("'", "''")
         legacy = (
-            f"SELECT * FROM read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
+            "SELECT * FROM _driver_health_empty UNION ALL BY NAME SELECT * FROM "
+            f"read_parquet('{glob}', hive_partitioning=true, union_by_name=true)"
         )
     con.execute(
         "CREATE OR REPLACE VIEW raw.driver_health AS "

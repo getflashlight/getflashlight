@@ -383,6 +383,7 @@ class RedshiftConnector(Connector):
                     str(row["client_application"]) if row.get("client_application") else None
                 ),
                 executed_by=str(row["executed_by"]) if row.get("executed_by") else None,
+                cluster_id=self._config.cluster_identifier,
                 query_count=_opt_int(row.get("query_count")) or 0,
                 x_source_connector=self.name,
             )

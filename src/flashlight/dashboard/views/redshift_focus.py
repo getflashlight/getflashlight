@@ -135,7 +135,7 @@ def render() -> None:
         provider_label(_GROUP),
         scope=scope(),
         breakdown_lead=(_spend_partition,),
-        extra_kpis=(_commitment_utilization_kpi, _spectrum_kpi, _active_clusters_kpi),
+        extra_kpis=(_spectrum_kpi, _active_clusters_kpi),
         attribution_tab=_attribution_section,
         efficiency_tab=_workload_findings_section,
         efficiency_tab_label="Workload Findings",
@@ -166,37 +166,6 @@ def _spectrum_kpi(sm: date, end: date) -> chrome.KpiCard | None:
     if not cost:
         return None
     return ("Spectrum scans", compact_money(cost), "Included in Net Spend", "volume")
-
-
-def _commitment_utilization_kpi(sm: date, end: date) -> chrome.KpiCard | None:
-    """Latest complete month's used share; an in-progress month is not comparable."""
-    if not gold_view_published(_GROUP, "commitment_summary_month"):
-        return None
-    current = _d(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
-    rows = gold_df(
-        "SELECT charge_month, commitment_discount_status, sum(effective_cost) AS cost "
-        f"FROM {_GROUP}.commitment_summary_month "
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
-        f"AND charge_month < '{current}' AND commitment_discount_status IN ('Used', 'Unused') "
-        "GROUP BY charge_month, commitment_discount_status"
-    )
-    if rows.empty:
-        return None
-    latest = pd.Timestamp(rows["charge_month"].max()).date()
-    latest_rows = rows[pd.to_datetime(rows["charge_month"]).dt.date == latest]
-    used = float(latest_rows.loc[latest_rows["commitment_discount_status"] == "Used", "cost"].sum())
-    unused = float(
-        latest_rows.loc[latest_rows["commitment_discount_status"] == "Unused", "cost"].sum()
-    )
-    total = used + unused
-    if total <= 0:
-        return None
-    return (
-        "Commitment utilization",
-        f"{100 * used / total:.1f}%",
-        f"{latest:%b %Y} · {compact_money(used)} used · {compact_money(unused)} unused",
-        "volume",
-    )
 
 
 def _active_clusters_kpi(sm: date, end: date) -> chrome.KpiCard | None:

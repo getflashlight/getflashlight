@@ -18,13 +18,14 @@ from pydantic import BaseModel, field_validator
 
 
 class DriverHealthRecord(BaseModel):
-    """One (driver, application, user)'s query volume for one month, aggregated at source."""
+    """One (cluster, driver, application, user)'s query volume for one month."""
 
     provider_name: str  # Databricks | AWS | … (partition key)
     charge_month: date  # first of month (partition key)
     client_driver: str | None = None  # e.g. "DatabricksJDBCDriver, 2.7.1"
     client_application: str | None = None  # e.g. "Fivetran", "Tableau"
     executed_by: str | None = None
+    cluster_id: str | None = None  # e.g. a Redshift provisioned cluster identifier
     query_count: int = 0
     x_source_connector: str = "unknown"
 
@@ -41,6 +42,7 @@ DRIVER_HEALTH_SCHEMA: pa.Schema = pa.schema(
         ("client_driver", pa.string()),
         ("client_application", pa.string()),
         ("executed_by", pa.string()),
+        ("cluster_id", pa.string()),
         ("query_count", pa.int64()),
         ("x_source_connector", pa.string()),
         # ── Hive partition keys (written as dirs, restored on read) ──────────
@@ -63,6 +65,7 @@ def record_to_row(record: DriverHealthRecord) -> dict[str, object]:
         "client_driver": record.client_driver,
         "client_application": record.client_application,
         "executed_by": record.executed_by,
+        "cluster_id": record.cluster_id,
         "query_count": record.query_count,
         "x_source_connector": record.x_source_connector,
         "provider_name": str(record.provider_name),

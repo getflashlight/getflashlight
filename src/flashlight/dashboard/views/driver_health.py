@@ -8,7 +8,7 @@ reference table of those in this data.
 What *is* computed here, presentation-only, is a self-referential staleness check:
 ``client_driver`` carries a family/version label (for example, ``DatabricksJDBCDriver,
 2.7.1`` or ``Redshift JDBC Driver 2.0.0.0``), so within a family we can tell who's
-behind the newest version already running *somewhere else in the same fleet* this
+behind the newest version already running *somewhere else on the same cluster* this
 month — real drift, independent of whether that "newest seen" is itself the vendor's
 latest release. That's the genuinely actionable read of this tab: not the raw
 leaderboard, but who's lagging their own peers.
@@ -28,6 +28,7 @@ _VERSION_SUFFIX = re.compile(r"^(?P<family>.+?)[, ]+(?P<version>\d+(?:\.\d+)+)$"
 
 _COLS = [
     "client_driver",
+    "cluster_id",
     "executed_by",
     "provider_name",
     "query_count",
@@ -35,6 +36,7 @@ _COLS = [
 ]
 _RENAME = {
     "client_driver": "Driver",
+    "cluster_id": "Cluster",
     "executed_by": "User",
     "provider_name": "Provider",
     "query_count": "Queries",
@@ -42,14 +44,16 @@ _RENAME = {
 }
 _OUTDATED_COLS = [
     "client_driver",
+    "cluster_id",
     "executed_by",
     "newest_seen_version",
     "query_count",
 ]
 _OUTDATED_RENAME = {
     "client_driver": "Driver",
+    "cluster_id": "Cluster",
     "executed_by": "User",
-    "newest_seen_version": "Newest seen in fleet",
+    "newest_seen_version": "Newest seen on cluster",
     "query_count": "Queries",
 }
 
@@ -101,10 +105,11 @@ def _version_key(version: str) -> tuple[int, ...]:
 def _with_staleness(records: pd.DataFrame) -> pd.DataFrame:
     """Add ``driver_family``/``driver_version``/``newest_seen_version``/``status``.
 
-    "Newest seen" is the max version of that (provider, family) across *all*
-    history in ``records``, not just the displayed month — someone who upgraded
-    last quarter still counts as the fleet's newest, even if they haven't queried
-    since.
+    "Newest seen" is the max version of that (provider, cluster, family) across
+    *all* history in ``records``, not just the displayed month — someone who
+    upgraded last quarter still counts as the cluster's newest, even if they
+    haven't queried since. A missing cluster remains comparable within its provider
+    for older records and providers that do not emit a cluster dimension.
     """
     parsed = records["client_driver"].map(_parse_driver)
     records = records.assign(
@@ -112,15 +117,18 @@ def _with_staleness(records: pd.DataFrame) -> pd.DataFrame:
         driver_version=[p[1] for p in parsed],
     )
 
-    version_cols = ["provider_name", "driver_family", "driver_version"]
+    records["cluster_id"] = records["cluster_id"].fillna("")
+    version_cols = ["provider_name", "cluster_id", "driver_family", "driver_version"]
     versions = records.loc[records["driver_version"] != "", version_cols].drop_duplicates()
     versions = versions.assign(_key=versions["driver_version"].map(_version_key))
-    newest_idx = versions.groupby(["provider_name", "driver_family"])["_key"].idxmax()
-    newest_by_family = versions.loc[newest_idx].set_index(["provider_name", "driver_family"])[
-        "driver_version"
-    ]
+    newest_idx = versions.groupby(["provider_name", "cluster_id", "driver_family"])["_key"].idxmax()
+    newest_by_family = versions.loc[newest_idx].set_index(
+        ["provider_name", "cluster_id", "driver_family"]
+    )["driver_version"]
 
-    keys = list(zip(records["provider_name"], records["driver_family"], strict=True))
+    keys = list(
+        zip(records["provider_name"], records["cluster_id"], records["driver_family"], strict=True)
+    )
     records["newest_seen_version"] = [newest_by_family.get(k, "") for k in keys]
 
     def _status(row: pd.Series) -> str:
@@ -177,7 +185,7 @@ def render(provider_name: str = "Databricks", label: str = "Databricks") -> None
         if outdated.empty:
             chrome.section_caption(
                 "Every driver in use this month matches the newest version of its family "
-                "already seen elsewhere in your fleet."
+                "already seen on the same cluster."
             )
         else:
             chrome.flat_table(

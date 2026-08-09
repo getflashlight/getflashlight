@@ -1,6 +1,8 @@
 -- Redshift connection log -> DriverHealthRecord aggregation (fleet-health plane).
 --
--- One row per (driver, application, database user, month), aggregated at source.
+-- One row per (cluster, driver, application, database user, month), aggregated at
+-- source. The configured cluster identifier is stamped by RedshiftConnector because
+-- STL_CONNECTION_LOG is scoped to the one cluster being queried.
 -- STL_CONNECTION_LOG's driver_version contains both the driver's family and version
 -- (for example, "Redshift JDBC Driver 2.0.0.0"); application_name is the optional
 -- client connection property.  Connection logs are superuser-visible and have the

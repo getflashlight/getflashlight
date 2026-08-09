@@ -93,6 +93,7 @@ def test_fetch_driver_health_maps_connection_log_rows(monkeypatch) -> None:  # t
 
     assert len(records) == 1
     assert records[0].provider_name == "AWS"
+    assert records[0].cluster_id == "prod"
     assert records[0].client_driver == "Redshift JDBC Driver 2.0.0.0"
     assert records[0].query_count == 44
     driver_call = next(call for call in execute.call_args_list if call.kwargs["name"] == "driver_health")

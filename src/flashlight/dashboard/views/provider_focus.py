@@ -266,12 +266,11 @@ def render(
                 # dashboard's trend/share row; narrow screens naturally stack them.
                 with ui.row().classes("w-full gap-4 items-stretch flex-wrap"):
                     _cost_subcategory(sc, end, sm, panel_class="flex-1 min-w-80")
-                    _commitment(group, end, sm, panel_class="flex-1 min-w-80")
                 _credits(group, end, sm)
 
         def _panel_breakdown() -> None:
             # One panel per section — same as Trend & changes. Helpers that can
-            # render nothing (subcategory / credits / commitment) wrap themselves
+            # render nothing (subcategory / credits) wrap themselves
             # so an empty bill doesn't leave blank cards. Lead hooks (Redshift's
             # spend partition) own their own panels too.
             for lead in breakdown_lead:
@@ -281,7 +280,6 @@ def render(
             if not invoice_explanations_in_trend:
                 _cost_subcategory(sc, end, sm)
                 _credits(group, end, sm)
-                _commitment(group, end, sm)
             with chrome.panel():
                 _driver_mom(sc, end, sku_mom_scoped=combine_sku_spend_and_mom)
 
@@ -1544,75 +1542,6 @@ def _cost_subcategory(scope: Scope, end: date, sm: date, *, panel_class: str = "
                     pie = px.pie(sub, names="cost_subcategory", values="net_cost", hole=0.45)
                     pie.update_traces(textposition="inside", textinfo="percent+label")
                     chrome.plot(chrome.style_fig(pie, has_legend=False, currency_axis=None))
-
-
-def _commitment(group: str, end: date, sm: date, *, panel_class: str = "") -> None:
-    """RI/Savings-Plan commitment coverage — Used vs Unused $. Renders nothing where
-    the provider has no commitment data (e.g. Databricks — no system table exposes
-    reservation/savings-plan data, see gold.commitment_summary_month's own docstring).
-
-    The visual deliberately reports only rows AWS explicitly labels Used or Unused.
-    It does not infer a commitment term or purchase timing: FOCUS utilization rows do not
-    carry a reservation start/end date.
-    """
-    if not gold_view_published(group, "commitment_summary_month"):
-        return
-    window = f"charge_month >= '{sm}' AND charge_month <= '{end}'"
-    cm = gold_df(
-        "SELECT charge_month, commitment_discount_status, sum(effective_cost) AS cost "
-        f'FROM "{group}".commitment_summary_month WHERE {window} '
-        "AND commitment_discount_status IS NOT NULL "
-        "GROUP BY charge_month, commitment_discount_status"
-    )
-    if cm.empty:
-        return
-
-    plot_rows = cm.copy()
-    plot_rows["month"] = pd.to_datetime(plot_rows["charge_month"]).dt.strftime("%Y-%m")
-    month_order = sorted(plot_rows["month"].unique())
-    fig = px.bar(
-        plot_rows,
-        x="month",
-        y="cost",
-        color="commitment_discount_status",
-        color_discrete_map={
-            "Used": chrome.ACCENT,
-            "Unused": chrome.WASTE,
-        },
-        labels={"month": "", "cost": "", "commitment_discount_status": ""},
-        category_orders={
-            "month": month_order,
-            "commitment_discount_status": ["Used", "Unused"],
-        },
-    )
-    fig.update_layout(barmode="stack")
-    totals = plot_rows.groupby("month")["cost"].sum()
-    for month, total in totals.items():
-        fig.add_annotation(
-            x=month,
-            y=total,
-            text=compact_money(float(total)),
-            showarrow=False,
-            yshift=10,
-            font=dict(size=11, color=chrome.INK_SECONDARY),
-        )
-    # A commitment is the recurring capacity level, not the changing Used/Unused split.
-    # Use the latest month's total as the current level so earlier bars visibly show
-    # when the account committed less capacity, while each bar still exposes overpay.
-    commitment = float(totals.loc[month_order[-1]])
-    fig.add_hline(
-        y=commitment,
-        line_dash="dash",
-        line_color=chrome.INK_SECONDARY,
-        annotation_text=f"Current commitment {compact_money(commitment)}",
-        annotation_position="top left",
-        annotation_font=dict(size=11, color=chrome.INK_SECONDARY),
-    )
-    with chrome.panel() as panel:
-        if panel_class:
-            panel.classes(panel_class)
-        chrome.panel_title("Commitment use vs. unused spend")
-        chrome.plot(chrome.style_fig(fig, has_legend=True, category_x=True))
 
 
 def _credits_df(group: str, end: date, sm: date) -> pd.DataFrame:
