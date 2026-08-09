@@ -1103,6 +1103,9 @@ def render() -> None:
         _flush_log()
 
         returncode, _run_id = result
+        ui.label(f"Process exit code: {returncode}").classes("text-xs").style(
+            f"color:{chrome.INK_MUTED}"
+        )
         ui.notify(
             "Sync completed" if returncode == 0 else "Sync failed — see output above",
             type="positive" if returncode == 0 else "negative",

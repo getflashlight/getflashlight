@@ -117,7 +117,7 @@ def render() -> None:
         extra_kpis=(_spectrum_kpi, _active_clusters_kpi),
         attribution_tab=_attribution_section,
         efficiency_tab=_workload_findings_section,
-        efficiency_tab_label="Efficiency & waste",
+        efficiency_tab_label="Efficiency & Waste",
         # The shared policy view already carries AWS/Redshift entity rows. It must be
         # visible even when a check is not yet measurable: that is an explicit
         # coverage gap, not a clean compliance result.
@@ -125,12 +125,12 @@ def render() -> None:
         extra_tabs=[("Client Driver Health", lambda: driver_health.render("AWS", "Redshift"))],
         show_alerts=False,
         show_daily_trend=False,
-        show_credit_kpi=False,
+        show_credit_kpi=True,
         combine_sku_spend_and_mom=True,
         # Shared categorical actuals and the shared hatched projection marker match
-        # Databricks. This operating-spend series intentionally excludes credits.
-        monthly_chart_label="Monthly operating cost",
-        invoice_explanations_in_trend=True,
+        # Databricks. Credits remain itemized separately in Breakdown.
+        monthly_chart_label="Monthly net cost",
+        invoice_explanations_in_trend=False,
     )
 
 

@@ -56,7 +56,7 @@ def test_redshift_page_enables_policy_and_driver_health_tabs(monkeypatch) -> Non
 
     assert captured["show_policy"] is True
     assert captured["efficiency_tab"] is redshift_focus._workload_findings_section
-    assert captured["efficiency_tab_label"] == "Efficiency & waste"
+    assert captured["efficiency_tab_label"] == "Efficiency & Waste"
     extra_tabs = cast(list[tuple[str, object]], captured["extra_tabs"])
     assert [title for title, _ in extra_tabs] == ["Client Driver Health"]
 

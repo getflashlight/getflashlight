@@ -1603,6 +1603,8 @@ _REDSHIFT_TABS = (
     "Breakdown",
     "Attribution",
     "Efficiency & Waste",
+    "Policy Compliance",
+    "Client Driver Health",
 )
 
 # Databricks: spend detail after Breakdown, Client Driver Health last.
@@ -1620,8 +1622,8 @@ _DATABRICKS_TABS = (
 
 
 def test_provider_page_carries_the_core_tabs(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """Generic provider pages retain their shared tab set; Redshift has its focused
-    four-tab cost/attribution/optimization workflow.
+    """Generic provider pages retain their shared tab set; Redshift adds its
+    focused cost/attribution/optimization workflow and driver-health view.
 
     Loops the *discovered* groups rather than a hard-coded pair, so a provider added later
     can't quietly get a different set. GCP is seeded deliberately: a connector that pulls
@@ -1655,7 +1657,6 @@ def test_provider_page_carries_the_core_tabs(lake_home) -> None:  # type: ignore
                     await user.should_not_see(_ALERTS_TAB)
                 elif group == "aws":
                     await user.should_not_see(_ALERTS_TAB)
-                    await user.should_not_see("Policy Compliance")
                 else:
                     await user.should_see(_ALERTS_TAB)
 

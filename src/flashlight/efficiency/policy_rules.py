@@ -125,7 +125,7 @@ POLICY_RULES: tuple[PolicyRule, ...] = (
         label="SQL warehouse tagged",
         remedy="Add cost-allocation tags (e.g. team, project, environment) to this "
         "SQL warehouse so its spend can be attributed at a granular level.",
-        applies_sql="provider_name <> 'AWS' AND entity_type = 'sql_warehouse'",
+        applies_sql="entity_type = 'sql_warehouse'",
         not_applicable_sql="tag_count IS NULL",
         compliant_sql="tag_count > 0",
         detail_sql="CASE WHEN tag_count IS NULL THEN 'tag telemetry unavailable' "
@@ -137,7 +137,7 @@ POLICY_RULES: tuple[PolicyRule, ...] = (
         remedy="Set an auto-stop timeout on this SQL warehouse, no longer than the org "
         "threshold, so idle time stops billing — the warehouse counterpart to cluster "
         "auto-termination.",
-        applies_sql="provider_name <> 'AWS' AND entity_type = 'sql_warehouse'",
+        applies_sql="entity_type = 'sql_warehouse'",
         # NULL = the warehouse_meta join found no config row (unmeasured), not a
         # confirmed-absent timeout — same honesty gate as tag_count above.
         not_applicable_sql="auto_stop_minutes IS NULL",
