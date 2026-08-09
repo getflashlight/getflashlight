@@ -9,7 +9,7 @@ terminal. Secrets never touch ``connections.yml``; see
 :mod:`flashlight.ingest.connection_credentials`.
 
 One small dedicated form-builder per connector type below rather than a
-generic schema-driven form generator — three known, finite field sets don't
+generic schema-driven form generator — four known, finite field sets don't
 need one.
 
 Cost (AWS) and Redshift-cluster connections are separate connector types (one
@@ -668,7 +668,7 @@ def render() -> None:
                 chrome.empty_state(
                     "cable",
                     "No data sources yet",
-                    "Connect an AWS, Databricks, or Redshift billing source to start "
+                    "Connect an AWS, Databricks, Redshift, or Snowflake billing source to start "
                     "seeing spend here.",
                     button_label="Add connection",
                     on_click=lambda: _open_dialog(None, None, all_connections),
@@ -689,7 +689,7 @@ def render() -> None:
         ]
 
         def _row_content(i: int, cfg: BaseModel) -> None:
-            ctype: str = getattr(cfg, "type")  # noqa: B009 - always present, 3 known config classes
+            ctype: str = getattr(cfg, "type")  # noqa: B009 - always present on connector configs
             cfg_enabled: bool = getattr(cfg, "enabled")
             cfg_name = effective_connector_name(cfg)
             with ui.row().classes("w-full items-center justify-between py-2"):

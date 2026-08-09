@@ -19,9 +19,11 @@ flashlight sample               # generate linked Redshift, Databricks, and FOCU
 flashlight dashboard serve      # dashboard → http://127.0.0.1:8501
 ```
 
-`flashlight sample [--rows 1000|10000]` loads the FinOps FOCUS sample CSV straight
-into Parquet via a vectorized DuckDB projection — the zero-config way to see the
-dashboard with real data.
+`flashlight sample` generates a deterministic, fully local mock organization: FOCUS
+cost records plus linked Redshift and Databricks telemetry. It makes no cloud calls and
+then rebuilds the same GOLD views the dashboard reads in production. For an isolated
+demo, set `FLASHLIGHT_HOME` to a dedicated directory for both commands so mock and real
+data can never be mixed.
 
 ## 3. Connect your own sources
 

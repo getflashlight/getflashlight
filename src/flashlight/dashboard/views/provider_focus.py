@@ -276,18 +276,21 @@ def render(
             for lead in breakdown_lead:
                 lead(sm, end)
             if combine_sku_spend_and_mom:
-                # Redshift's two useful billing cuts answer complementary questions:
-                # the donut shows *what* makes up the invoice, while the SKU table
-                # shows *which line items changed* in the latest closed month. Keep
-                # them in one card so that relationship is visible without making
-                # readers stitch together separate dashboard sections.
-                with chrome.panel():
-                    chrome.panel_title("Redshift breakdown")
-                    with ui.row().classes("w-full gap-6 items-start flex-wrap"):
-                        with ui.column().classes("flex-1 min-w-80 gap-0"):
-                            _cost_subcategory(sc, end, sm, embedded=True)
-                        with ui.column().classes("min-w-96 gap-0").style("flex:2 1 32rem;"):
-                            _driver_mom(sc, end, sku_mom_scoped=True)
+                # The donut shows *what* makes up the invoice, while the SKU table
+                # shows *which line items changed* in the latest closed month. They
+                # sit in distinct cards on desktop and naturally stack on small screens.
+                with ui.row().classes("w-full gap-4 items-stretch flex-wrap"):
+                    with chrome.panel() as subcategory_panel:
+                        # Inline sizing is intentional: the dashboard's utility
+                        # classes do not guarantee a `min-w-*` scale. The embedded
+                        # donut has a 300px viewport, so this card needs enough
+                        # interior width to show the whole circle.
+                        subcategory_panel.style("flex:0 0 340px;min-width:340px;")
+                        _cost_subcategory(sc, end, sm, embedded=True)
+                    with chrome.panel() as sku_panel:
+                        sku_panel.classes("min-w-96")
+                        sku_panel.style("flex:2 1 32rem;")
+                        _driver_mom(sc, end, sku_mom_scoped=True)
             else:
                 with chrome.panel():
                     _spend_pivot(sc, end, sm)
@@ -295,7 +298,10 @@ def render(
                     _cost_subcategory(sc, end, sm)
                 with chrome.panel():
                     _driver_mom(sc, end, sku_mom_scoped=False)
-            _credits(group, end, sm)
+            # Pages that lead credits in Trend & changes must not repeat the same
+            # itemized lines here. Redshift keeps them under its combined breakdown.
+            if combine_sku_spend_and_mom or not invoice_explanations_in_trend:
+                _credits(group, end, sm)
 
         def _panel_attribution() -> None:
             # Own panels — no chrome.panel() wrapper (see views/attribution.py).
@@ -1503,7 +1509,17 @@ def _cost_subcategory(
                     )
                     pie = px.pie(sub, names="cost_subcategory", values="net_cost", hole=0.45)
                     pie.update_traces(textposition="inside", textinfo="percent+label")
-                    chrome.plot(chrome.style_fig(pie, has_legend=False, currency_axis=None))
+                    if embedded:
+                        # Plotly's responsive default can retain the previous wide canvas
+                        # after this chart moves into Redshift's narrower side-by-side card.
+                        # Give that donut a compact square viewport so every slice remains
+                        # visible instead of being cropped at the card edge.
+                        pie.update_layout(width=300)
+                        chrome.plot(
+                            chrome.style_fig(pie, height=300, has_legend=False, currency_axis=None)
+                        ).style("max-width:300px;margin:0 auto;")
+                    else:
+                        chrome.plot(chrome.style_fig(pie, has_legend=False, currency_axis=None))
 
     if embedded:
         _content()
@@ -1630,13 +1646,12 @@ def _driver_mom(scope: Scope, end: date, *, sku_mom_scoped: bool = False) -> Non
             ),
         )
         chrome.heatmap_table(
-            rows[["sku_name", "sku_id", "net_cost", "cost_delta", "cost_pct_change"]],
+            rows[["sku_name", "net_cost", "cost_delta", "cost_pct_change"]],
             heat_col="cost_pct_change",
             key=f"{group}_mom",
             money_cols=["net_cost", "cost_delta"],
             rename={
                 "sku_name": "SKU",
-                "sku_id": "SKU ID",
                 "net_cost": "Net cost",
                 "cost_delta": "Δ vs prior",
                 "cost_pct_change": "MoM %",

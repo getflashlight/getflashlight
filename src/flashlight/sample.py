@@ -8,7 +8,8 @@ and telemetry so every dashboard drill-down uses the normal read path.
 from __future__ import annotations
 
 import shutil
-from datetime import UTC, date, datetime
+from calendar import monthrange
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pyarrow.parquet as pq
@@ -141,13 +142,16 @@ def scenario() -> DemoScenario:
                 project="ml-platform",
             )
         ],
-        months=[date(2026, 4, 1), date(2026, 5, 1), date(2026, 6, 1)],
+        # Three finished months plus an in-progress August.  The dashboard can therefore
+        # demonstrate both closed-month reconciliation and partial-month treatment.
+        months=[date(2026, 5, 1), date(2026, 6, 1), date(2026, 7, 1), date(2026, 8, 1)],
     )
 
 
-def _period(month: date) -> tuple[datetime, datetime]:
-    start = datetime(month.year, month.month, 15, tzinfo=UTC)
-    return start, start.replace(day=16)
+def _period(month: date, day: int = 15) -> tuple[datetime, datetime]:
+    """A one-day charge period in a deterministic calendar-shaped mock month."""
+    start = datetime(month.year, month.month, day, tzinfo=UTC)
+    return start, start + timedelta(days=1)
 
 
 def _cost(
@@ -161,8 +165,12 @@ def _cost(
     connector: str,
     compute_class: ComputeClass = ComputeClass.NOT_APPLICABLE,
     subcategory: str | None = None,
+    day: int = 15,
+    resource_id: str | None = None,
+    resource_name: str | None = None,
+    resource_type: str | None = None,
 ) -> FocusRecord:
-    start, end = _period(month)
+    start, end = _period(month, day)
     tags = {
         "project": entity.project,
         "owner": str(entity.owner_email),
@@ -193,9 +201,13 @@ def _cost(
         sku_id=f"demo-{service.lower().replace(' ', '-')}",
         region_id="us-east-1",
         pricing_category=PricingCategory.STANDARD,
-        resource_id=entity.id,
-        resource_name=entity.name,
-        resource_type="cluster" if "redshift" in entity.id else "workspace-resource",
+        resource_id=resource_id if resource_id is not None else entity.id,
+        resource_name=resource_name if resource_name is not None else entity.name,
+        resource_type=(
+            resource_type
+            if resource_type is not None
+            else ("cluster" if "redshift" in entity.id else "workspace-resource")
+        ),
         consumed_quantity=float(amount),
         consumed_unit="DBU" if provider == "Databricks" else "Hrs",
         tags=tags,
@@ -203,6 +215,126 @@ def _cost(
         x_source_connector=connector,
         x_cost_subcategory=subcategory,
     )
+
+
+def _monthly_cost(
+    entity: DemoEntity,
+    month: date,
+    amount: Decimal,
+    *,
+    provider: str,
+    service: str,
+    category: ServiceCategory,
+    connector: str,
+    compute_class: ComputeClass = ComputeClass.NOT_APPLICABLE,
+    subcategory: str | None = None,
+    resource_id: str | None = None,
+    resource_name: str | None = None,
+    resource_type: str | None = None,
+    days: int | None = None,
+) -> list[FocusRecord]:
+    """Spread a monthly total over every day in the mock billing month.
+
+    The dashboard's daily charts and date pickers should operate on the same shape as a
+    real bill.  Keep the monthly total exact by placing the remainder on the final day,
+    rather than letting decimal division introduce a rounding discrepancy.
+    """
+    charge_days = days if days is not None else monthrange(month.year, month.month)[1]
+    if not 1 <= charge_days <= monthrange(month.year, month.month)[1]:
+        raise ValueError(f"invalid mock charge-day count for {month}: {charge_days}")
+    # Billing exports are currency amounts, so mock daily rows stay at cent precision.
+    # The final remainder preserves the exact monthly amount at the resource grain.
+    daily = (amount / charge_days).quantize(Decimal("0.01"))
+    records = [
+        _cost(
+            entity,
+            month,
+            daily,
+            provider=provider,
+            service=service,
+            category=category,
+            connector=connector,
+            compute_class=compute_class,
+            subcategory=subcategory,
+            day=day,
+            resource_id=resource_id,
+            resource_name=resource_name,
+            resource_type=resource_type,
+        )
+        for day in range(1, charge_days)
+    ]
+    records.append(
+        _cost(
+            entity,
+            month,
+            amount - daily * (charge_days - 1),
+            provider=provider,
+            service=service,
+            category=category,
+            connector=connector,
+            compute_class=compute_class,
+            subcategory=subcategory,
+            day=charge_days,
+            resource_id=resource_id,
+            resource_name=resource_name,
+            resource_type=resource_type,
+        )
+    )
+    return records
+
+
+def _mock_charge_days(month: date) -> int:
+    """Number of mocked charge days: August is intentionally still accruing."""
+    return 9 if month == date(2026, 8, 1) else monthrange(month.year, month.month)[1]
+
+
+def _databricks_allocation(index: int, month: date) -> dict[str, Decimal]:
+    """One explicit, additive Databricks cost model for a mock month.
+
+    The demo must teach reconciliation, not merely contain plausible-looking line
+    items.  Every Databricks total therefore has a stable composition that the Home
+    page, the provider page, and the backing-cost tabs can all explain:
+
+    * 65% Databricks DBUs — 60% Jobs and 40% Model Serving;
+    * 30% AWS EC2 backing its classic clusters;
+    * 5% AWS S3 backing its managed storage.
+    """
+    full_month_total = (Decimal(32400), Decimal(38500), Decimal(44200), Decimal(48300))[index]
+    full_days = Decimal(monthrange(month.year, month.month)[1])
+    total = (
+        full_month_total * Decimal(_mock_charge_days(month)) / full_days
+    ).quantize(Decimal("0.01"))
+    dbus = total * Decimal("0.65")
+    jobs = dbus * Decimal("0.60")
+    return {
+        "total": total,
+        "dbus": dbus,
+        "jobs": jobs,
+        "model_serving": dbus - jobs,
+        "backing_compute": total * Decimal("0.30"),
+        "backing_storage": total * Decimal("0.05"),
+    }
+
+
+def _redshift_allocation(index: int, month: date) -> dict[str, Decimal]:
+    """One explicit, additive Redshift cost model for a mock month.
+
+    Redshift's dashboard starts from its AWS service total and drills into FOCUS cost
+    subcategories, so every mock month uses the same visible composition: 65% cluster
+    compute, 20% managed storage, 10% concurrency scaling, and 5% Spectrum scans.
+    """
+    full_month_total = (Decimal(42200), Decimal(50300), Decimal(58600), Decimal(63200))[index]
+    full_days = Decimal(monthrange(month.year, month.month)[1])
+    total = (
+        full_month_total * Decimal(_mock_charge_days(month)) / full_days
+    ).quantize(Decimal("0.01"))
+    return {
+        "total": total,
+        "compute": total * Decimal("0.65"),
+        "storage": total * Decimal("0.20"),
+        "concurrency_scaling": total * Decimal("0.10"),
+        "spectrum": total * Decimal("0.05"),
+    }
 
 
 def _records(
@@ -223,22 +355,30 @@ def _records(
     usage: list[AiUsageRecord] = []
     policies: list[RedshiftPolicyConfigRecord] = []
     for index, month in enumerate(data.months):
-        for entity in data.redshift_clusters:
-            amount = Decimal(
-                1800 + index * 120 if entity.project == "analytics" else 950 + index * 75
-            )
-            costs.append(
-                _cost(
-                    entity,
-                    month,
-                    amount,
-                    provider="AWS",
-                    service="Amazon Redshift",
-                    category=ServiceCategory.DATABASES,
-                    connector=SAMPLE_CONNECTOR,
-                    subcategory="compute",
+        charge_days = _mock_charge_days(month)
+        databricks = _databricks_allocation(index, month)
+        redshift = _redshift_allocation(index, month)
+        for cluster_index, entity in enumerate(data.redshift_clusters):
+            # Named clusters divide every Redshift subcategory 65/35, so both the
+            # service and cluster drill-downs add to the same provider total.
+            share = Decimal("0.65") if cluster_index == 0 else Decimal("0.35")
+            amount = Decimal("0")
+            for subcategory in ("compute", "storage", "concurrency_scaling", "spectrum"):
+                component = redshift[subcategory] * share
+                amount += component
+                costs.extend(
+                    _monthly_cost(
+                        entity,
+                        month,
+                        component,
+                        provider="AWS",
+                        service="Amazon Redshift",
+                        category=ServiceCategory.DATABASES,
+                        connector=SAMPLE_CONNECTOR,
+                        subcategory=subcategory,
+                        days=charge_days,
+                    )
                 )
-            )
             efficiency.append(
                 EfficiencyRecord(
                     provider_name="AWS",
@@ -251,8 +391,11 @@ def _records(
                     billed_cost=amount,
                     native_quantity=float(amount / 10),
                     native_unit="node-hours",
-                    utilization_pct=54.0 if entity.project == "analytics" else 78.0,
+                    utilization_pct=84.0 if entity.project == "analytics" else 88.0,
                     activity_count=320 + index * 25,
+                    # The demo opportunity pool is an explicit 10% of each Redshift
+                    # workload's billed cost, represented as measurable retry cost.
+                    cause_detail={"failed_cost": float(amount * Decimal("0.10"))},
                     x_source_connector=REDSHIFT_CONNECTOR,
                 )
             )
@@ -281,12 +424,14 @@ def _records(
                     x_source_connector=REDSHIFT_CONNECTOR,
                 )
             )
-        for entity in data.databricks_clusters:
-            amount = Decimal(
-                1450 + index * 130 if entity.project == "analytics" else 2100 + index * 180
-            )
-            costs.append(
-                _cost(
+        for cluster_index, entity in enumerate(data.databricks_clusters):
+            # The two Jobs clusters add to 60% of DBUs; keeping two named workloads
+            # makes the drill-down and allocation pages useful without breaking the
+            # published percentage contract.
+            cluster_share = Decimal("0.45") if cluster_index == 0 else Decimal("0.55")
+            amount = databricks["jobs"] * cluster_share
+            costs.extend(
+                _monthly_cost(
                     entity,
                     month,
                     amount,
@@ -295,6 +440,7 @@ def _records(
                     category=ServiceCategory.ANALYTICS,
                     connector=SAMPLE_CONNECTOR,
                     compute_class=ComputeClass.CLASSIC,
+                    days=charge_days,
                 )
             )
             efficiency.append(
@@ -309,8 +455,14 @@ def _records(
                     billed_cost=amount,
                     native_quantity=float(amount / 2),
                     native_unit="DBU",
-                    utilization_pct=61.0 if entity.project == "analytics" else 43.0,
+                    utilization_pct=84.0 if entity.project == "analytics" else 88.0,
                     activity_count=180 + index * 15,
+                    # DBU telemetry is 65% of Databricks' all-in cost.  Scale the
+                    # measured opportunity so the provider's action queue is exactly
+                    # 10% of its DBU + EC2 + S3 total, without inventing a second cost.
+                    cause_detail={
+                        "failed_cost": float(amount * Decimal("0.10") / Decimal("0.65"))
+                    },
                     x_source_connector=DATABRICKS_CONNECTOR,
                 )
             )
@@ -329,10 +481,42 @@ def _records(
                     )
                 ]
             )
+            health.append(
+                DriverHealthRecord(
+                    provider_name="Databricks",
+                    charge_month=month,
+                    client_driver="Databricks JDBC 2.6.38",
+                    client_application="dbt Cloud",
+                    executed_by=str(entity.owner_email),
+                    query_count=720 + index * 45 + cluster_index * 110,
+                    x_source_connector=DATABRICKS_CONNECTOR,
+                )
+            )
+            # Classic Databricks clusters are also backed by AWS instances.  These rows
+            # deliberately use the same instance ids as the metadata above so the normal
+            # backing-compute GOLD mapping, Home stack, and Databricks Compute tab all
+            # exercise the exact production accounting path.
+            instance_id = f"i-demo-{entity.id[-8:]}-{index}"
+            backing_compute = databricks["backing_compute"] * cluster_share
+            costs.extend(
+                _monthly_cost(
+                    entity,
+                    month,
+                    backing_compute,
+                    provider="AWS",
+                    service="Amazon Elastic Compute Cloud",
+                    category=ServiceCategory.COMPUTE,
+                    connector=SAMPLE_CONNECTOR,
+                    resource_id=f"arn:aws:ec2:us-east-1:123456789012:instance/{instance_id}",
+                    resource_name=instance_id,
+                    resource_type="instance",
+                    days=charge_days,
+                )
+            )
         endpoint = data.endpoints[0]
-        endpoint_cost = Decimal(720 + index * 90)
-        costs.append(
-            _cost(
+        endpoint_cost = databricks["model_serving"]
+        costs.extend(
+            _monthly_cost(
                 endpoint,
                 month,
                 endpoint_cost,
@@ -341,6 +525,26 @@ def _records(
                 category=ServiceCategory.AI_AND_MACHINE_LEARNING,
                 connector=SAMPLE_CONNECTOR,
                 compute_class=ComputeClass.SERVERLESS,
+                days=charge_days,
+            )
+        )
+        # Unity Catalog storage is AWS-billed but Databricks-managed.  The bucket root
+        # matches the storage-location metadata below, which makes this mocked cost a
+        # Databricks Storage row in GOLD rather than an opaque AWS S3 charge.
+        costs.extend(
+            _monthly_cost(
+                endpoint,
+                month,
+                databricks["backing_storage"],
+                provider="AWS",
+                service="Amazon Simple Storage Service",
+                category=ServiceCategory.STORAGE,
+                connector=SAMPLE_CONNECTOR,
+                resource_id="arn:aws:s3:::northstar-databricks-root",
+                resource_name="northstar-databricks-root",
+                resource_type="bucket",
+                subcategory="storage",
+                days=charge_days,
             )
         )
         efficiency.append(
@@ -355,9 +559,14 @@ def _records(
                 billed_cost=endpoint_cost,
                 native_quantity=float(endpoint_cost),
                 native_unit="DBU",
-                utilization_pct=37.0,
+                utilization_pct=90.0,
                 activity_count=1500 + index * 200,
-                cause_detail={"scale_to_zero_enabled": False},
+                cause_detail={
+                    "scale_to_zero_enabled": False,
+                    "failed_cost": float(
+                        endpoint_cost * Decimal("0.10") / Decimal("0.65")
+                    ),
+                },
                 x_source_connector=DATABRICKS_CONNECTOR,
             )
         )
@@ -453,6 +662,128 @@ def _audit_gold_contract() -> None:
         raise ValueError("demo GOLD contract audit failed: " + "; ".join(failures))
 
 
+def _audit_demo_accounting() -> None:
+    """Prove every visible mock drill-through has one additive parent.
+
+    This is deliberately executed by ``flashlight sample``, not just by a test. A
+    future change to a GOLD view must fail generation if it makes a Home, provider,
+    service, resource, cluster, storage, or compute figure disagree with the mock's
+    declared percentage model.
+    """
+    from flashlight.lake import duck
+
+    con = duck.connect()
+    duck.register_gold(con)
+
+    def scalar(sql: str) -> Decimal:
+        row = con.execute(sql).fetchone()
+        if row is None:
+            raise ValueError(f"demo accounting query returned no row: {sql}")
+        value = row[0]
+        return Decimal(str(value or 0))
+
+    def equal(label: str, actual: Decimal, expected: Decimal) -> None:
+        # GOLD is materialized through DuckDB's numeric interchange; retain cent-scale
+        # integrity while tolerating a binary floating-point representation artefact.
+        if abs(actual - expected) > Decimal("0.001"):
+            raise ValueError(f"demo accounting mismatch for {label}: {actual} != {expected}")
+
+    try:
+        for index, month in enumerate(scenario().months):
+            stamp = month.isoformat()
+            databricks = _databricks_allocation(index, month)
+            redshift = _redshift_allocation(index, month)
+
+            dbx_bill = scalar(
+                "SELECT gross_cost FROM databricks.monthly_bill "
+                f"WHERE charge_month = '{stamp}'"
+            )
+            dbx_service = scalar(
+                "SELECT sum(gross_cost) FROM databricks.spend_by_service_month "
+                f"WHERE charge_month = '{stamp}'"
+            )
+            dbx_resource = scalar(
+                "SELECT sum(gross_cost) FROM databricks.resource_month "
+                f"WHERE charge_month = '{stamp}'"
+            )
+            dbx_jobs = scalar(
+                "SELECT sum(gross_cost) FROM databricks.spend_by_service_month "
+                f"WHERE charge_month = '{stamp}' AND service_name = 'Databricks Jobs Compute'"
+            )
+            dbx_serving = scalar(
+                "SELECT sum(gross_cost) FROM databricks.spend_by_service_month "
+                f"WHERE charge_month = '{stamp}' AND service_name = 'Databricks Model Serving'"
+            )
+            storage = scalar(
+                "SELECT sum(gross_cost) FROM storage.backing_storage_month "
+                f"WHERE charge_month = '{stamp}' AND mapping = 'databricks'"
+            )
+            compute = scalar(
+                "SELECT sum(gross_cost) FROM compute.backing_compute_month "
+                f"WHERE charge_month = '{stamp}' AND mapping = 'databricks'"
+            )
+            equal("Databricks DBU bill → services", dbx_service, dbx_bill)
+            equal("Databricks services → resources", dbx_resource, dbx_bill)
+            equal("Databricks DBUs", dbx_bill, databricks["dbus"])
+            equal("Databricks Jobs share", dbx_jobs, databricks["jobs"])
+            equal("Databricks Model Serving share", dbx_serving, databricks["model_serving"])
+            equal("Databricks backing compute share", compute, databricks["backing_compute"])
+            equal("Databricks backing storage share", storage, databricks["backing_storage"])
+            equal("Databricks all-in Home total", dbx_bill + compute + storage, databricks["total"])
+
+            aws_bill = scalar(
+                "SELECT gross_cost FROM aws.monthly_bill " f"WHERE charge_month = '{stamp}'"
+            )
+            aws_service = scalar(
+                "SELECT sum(gross_cost) FROM aws.spend_by_service_month "
+                f"WHERE charge_month = '{stamp}'"
+            )
+            aws_resource = scalar(
+                "SELECT sum(gross_cost) FROM aws.resource_month "
+                f"WHERE charge_month = '{stamp}'"
+            )
+            aws_clusters = scalar(
+                "SELECT sum(gross_cost) FROM aws.redshift_cluster_cost_month "
+                f"WHERE charge_month = '{stamp}'"
+            )
+            equal("Redshift bill → service", aws_service, aws_bill)
+            equal("Redshift service → resources", aws_resource, aws_bill)
+            equal("Redshift resources → clusters", aws_clusters, aws_bill)
+            equal("Redshift total", aws_bill, redshift["total"])
+            for subcategory, amount in redshift.items():
+                if subcategory == "total":
+                    continue
+                component = scalar(
+                    "SELECT sum(net_cost) FROM aws.spend_by_cost_subcategory_month "
+                    f"WHERE charge_month = '{stamp}' AND cost_subcategory = '{subcategory}'"
+                )
+                equal(f"Redshift {subcategory} share", component, amount)
+
+            # Utilization/efficiency is another drill-through, not another bill. The
+            # mocked retry opportunities intentionally add to 10% of each provider's
+            # all-in cost, while the source bill itself remains unchanged.
+            dbx_opportunity = scalar(
+                "SELECT sum(recoverable_cost) FROM efficiency.waste_record "
+                f"WHERE provider_name = 'Databricks' AND charge_month = '{stamp}'"
+            )
+            aws_opportunity = scalar(
+                "SELECT sum(recoverable_cost) FROM efficiency.waste_record "
+                f"WHERE provider_name = 'AWS' AND charge_month = '{stamp}'"
+            )
+            equal(
+                "Databricks efficiency opportunity",
+                dbx_opportunity,
+                (databricks["total"] * Decimal("0.10")).quantize(Decimal("0.01")),
+            )
+            equal(
+                "Redshift efficiency opportunity",
+                aws_opportunity,
+                (redshift["total"] * Decimal("0.10")).quantize(Decimal("0.01")),
+            )
+    finally:
+        con.close()
+
+
 def cleanup() -> None:
     """Remove data produced by this generator, then rebuild GOLD."""
     for connector in (SAMPLE_CONNECTOR, REDSHIFT_CONNECTOR, DATABRICKS_CONNECTOR):
@@ -470,8 +801,8 @@ def cleanup() -> None:
         (paths.redshift_policy_config_dir(), ("AWS",), "snapshot_month"),
     ):
         for provider in providers:
-            for month in ("2026-04", "2026-05", "2026-06"):
-                target = root / f"provider_name={provider}" / f"{key}={month}"
+            for sample_month in scenario().months:
+                target = root / f"provider_name={provider}" / f"{key}={sample_month:%Y-%m}"
                 if target.exists():
                     shutil.rmtree(target)
     published = build_gold()
@@ -484,7 +815,11 @@ def load_sample(*, force: bool = False) -> None:
     data = scenario()
     costs, efficiency, health, instances, usage, storage, policies = _records(data)
     _assert_reconciled(costs, efficiency)
-    window = IngestWindow(start=data.months[0], end=date(2026, 6, 30))
+    latest_month = data.months[-1]
+    window = IngestWindow(
+        start=data.months[0],
+        end=latest_month.replace(day=_mock_charge_days(latest_month)),
+    )
     paths.ensure_layout()
     run_id = bronze.new_run_id()
     started = datetime.now(UTC)
@@ -505,6 +840,7 @@ def load_sample(*, force: bool = False) -> None:
     )
     published = build_gold()
     _audit_gold_contract()
+    _audit_demo_accounting()
     typer.echo(
         f"Generated {written} reconciled FOCUS records plus Redshift and "
         f"Databricks telemetry → {published} GOLD views."
