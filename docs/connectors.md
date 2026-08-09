@@ -206,7 +206,7 @@ cost `fetch()` to completion before any connector's `fetch_efficiency()` runs, s
 those rows are guaranteed on disk by the time this reads them, **if** `aws_focus` is
 enabled and has ingested this window. **`aws_focus` is recommended but not required**:
 without it, the cluster's $ figures are just absent/zero — every other signal (query
-patterns, per-user activity, WLM health, table inventory/usage) still runs fully,
+patterns, per-user activity, WLM health, CloudWatch CPU/disk capacity, table inventory/usage) still runs fully,
 since none of it depends on cost data.
 
 Auth: `access_key_env`/`secret_key_env` name environment variables to read static
@@ -214,8 +214,11 @@ AWS keys from (same pattern as every AWS connector); leave both unset to fall th
 to boto3's own default chain (IAM role, `~/.aws/credentials` default profile). Set
 `aws_profile` to authenticate as a specific named profile (including AWS SSO
 profiles) instead — takes priority over the env-var fields when set. This governs
-the AWS API calls (Data API, `describe_clusters`, `describe_reserved_nodes`) — it's
-separate from the SQL-query auth below.
+the AWS API calls (Data API, `describe_clusters`, `describe_reserved_nodes`, and
+CloudWatch) — it's separate from the SQL-query auth below. Grant
+`cloudwatch:GetMetricStatistics` to collect hourly CPU and disk-space summaries. A
+missing CloudWatch permission is logged and does not block the rest of the telemetry
+pull; it must appear as unavailable, never be inferred from WLM.
 
 **SQL-query auth is two independent choices**: which connection path reaches the
 cluster, and how that connection authenticates.
@@ -259,7 +262,7 @@ calls `describe_clusters` regardless — that's a separate, unrelated signal.
 
 | Signal | Grain | Source |
 |---|---|---|
-| Cluster $ breakdown (compute/concurrency-scaling/storage/Spectrum), reserved-node coverage, WLM queue wait (p95/p99, wait-to-exec ratio), overall disk-spill rate | one row per provisioned cluster × month | `aws_focus` BRONZE rows + `describe_reserved_nodes` + `redshift_efficiency.sql` (STL_WLM_QUERY, SVCS_CONCURRENCY_SCALING_USAGE) |
+| Cluster $ breakdown (compute/concurrency-scaling/storage/Spectrum), reserved-node coverage, WLM queue wait (p95/p99, wait-to-exec ratio), overall disk-spill rate, rolling-14-day CPU and disk-space average/peak | one row per provisioned cluster × month | `aws_focus` BRONZE rows + `describe_reserved_nodes` + `redshift_efficiency.sql` (STL_WLM_QUERY, SVCS_CONCURRENCY_SCALING_USAGE) + CloudWatch `AWS/Redshift` |
 | Query-pattern runtime/spill/skew — which repeated query shape (hashed, not stored verbatim) is slow, spilling, or skewed | `query_pattern` × month, top-200 by runtime | `redshift_query_pattern_metrics.sql` (STL_QUERY, STL_WLM_QUERY, SVL_QUERY_REPORT) |
 | Per-user CPU/scan/spill pressure and cost-concentration share | `sql_warehouse_user` × month, top-50 by exec time | `redshift_user_activity.sql` (SVL_QUERY_METRICS_SUMMARY, SVL_QUERY_REPORT) |
 | Table inventory (size/encoding/maintenance-staleness) + usage (query count, last access, days since last access) | `table` × month, generous cap (5000 — a pathological-catalog safety valve, not a curation cut, since the waste rules and dashboard pagination do the real narrowing) | SVV_TABLE_INFO + STL_SCAN |

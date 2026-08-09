@@ -213,6 +213,8 @@ def run_ingest(
     # account-prices probe — pay their network round-trip once per run, not
     # once per phase.
     connectors = [build_connector(config) for config in configs]
+    if on_progress:
+        on_progress("ingest_started", f"{len(connectors)} selected", len(connectors))
 
     # Each connector's fetch()/write targets its own x_source_connector BRONZE
     # partition dir (see lake/bronze.py) and its own runlog file, so concurrent
@@ -240,21 +242,51 @@ def run_ingest(
             failed.append(outcome.name)
             logger.error("connector_failed", connector=outcome.name, detail=outcome.detail)
 
+    # Cost completion is visible independently, but it is not the publication
+    # gate: a connector is only fully complete once its telemetry has finished
+    # too. This line lets callers distinguish "all bills landed" from "the whole
+    # ingest is ready to transform".
+    if on_progress:
+        on_progress(
+            "cost_phase_complete",
+            f"{len(connectors)}/{len(connectors)} ({len(succeeded_connectors)} succeeded, "
+            f"{len(failed)} failed)",
+            len(connectors),
+        )
     _run_supplemental(
         window,
         succeeded_connectors,
         on_progress,
     )
 
-    # The layer boundary is deliberate: all selected connectors finish their
-    # BRONZE writes before SILVER is evaluated and GOLD is published. A failed
-    # connector's window is left as it was before this run (bronze.write_window
-    # re-purges on error, never leaving a partial write), while a successful
-    # connector contributes its fresh partitions. One full, idempotent transform
-    # therefore publishes one coherent view of everything available in BRONZE.
+    # Every telemetry plane has returned. Only now is the complete, coherent
+    # Bronze + telemetry snapshot ready for the single SILVER/GOLD publication.
+    if on_progress:
+        on_progress(
+            "telemetry_phase_complete",
+            f"{len(succeeded_connectors)}/{len(succeeded_connectors)} eligible "
+            f"({len(failed)} cost pull failed)",
+            len(succeeded_connectors),
+        )
+        on_progress(
+            "runner_complete",
+            f"{len(connectors)}/{len(connectors)} settled "
+            f"({len(succeeded_connectors)} complete, {len(failed)} failed)",
+            len(connectors),
+        )
+    logger.info(
+        "ingest_runner_complete",
+        connectors=len(connectors),
+        completed=len(succeeded_connectors),
+        failed=len(failed),
+    )
     if not no_transform and succeeded_connectors:
+        if on_progress:
+            on_progress("transform_start", "complete data", 0)
         published = build_gold()
-        logger.info("transform_done", gold_views=published, phase="bronze_complete")
+        logger.info("transform_done", gold_views=published, phase="all_complete")
+        if on_progress:
+            on_progress("transform_done", "complete data", published)
     logger.info(
         "ingest_complete",
         connectors=len(connectors),

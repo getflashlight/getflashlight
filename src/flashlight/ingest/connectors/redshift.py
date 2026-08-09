@@ -58,7 +58,7 @@ import warnings
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -305,6 +305,13 @@ class RedshiftConnector(Connector):
         )
         self._redshift = aws_client(
             "redshift",
+            region=config.region,
+            profile=config.aws_profile,
+            access_key_env=config.access_key_env,
+            secret_key_env=config.secret_key_env,
+        )
+        self._cloudwatch = aws_client(
+            "cloudwatch",
             region=config.region,
             profile=config.aws_profile,
             access_key_env=config.access_key_env,
@@ -571,6 +578,7 @@ class RedshiftConnector(Connector):
 
         cost = self._cost_breakdown(window, entity_id)
         reserved = self._reserved_node_coverage()
+        capacity = self._capacity_metrics(window, entity_id)
         # The activity chain (probe -> cluster_activity -> gated query_patterns/
         # user_activity/spectrum_table_usage) and the table-inventory chain
         # (table_inventory/table_usage/table_owner, unconditional and independent of
@@ -613,6 +621,17 @@ class RedshiftConnector(Connector):
             "concurrency_scaling_active_seconds": activity.get(
                 "concurrency_scaling_active_seconds"
             ),
+            "cluster_cpu_utilization_avg_pct": capacity.get("cpu_avg_pct"),
+            "cluster_cpu_utilization_max_pct": capacity.get("cpu_max_pct"),
+            "cluster_disk_space_used_avg_pct": capacity.get("disk_avg_pct"),
+            "cluster_disk_space_used_max_pct": capacity.get("disk_max_pct"),
+            "capacity_metrics_measured_since": capacity.get("measured_since"),
+            "capacity_metrics_measured_until": capacity.get("measured_until"),
+            # CloudWatch measures physical cluster capacity. These are intentionally
+            # kept distinct from WLM signals: WLM queue time says whether work is
+            # contended, while CPU/disk readings say how much of the cluster was used.
+            # The ClusterIdentifier CPU aggregate includes leader and compute nodes,
+            # so it is evidence for cluster health, not an automatic resize verdict.
             "on_demand_node_hours": reserved.get("on_demand_node_hours"),
             "reserved_node_hours": reserved.get("reserved_node_hours"),
             # Only carried when True — a clean cause_detail should call out the
@@ -1056,6 +1075,74 @@ class RedshiftConnector(Connector):
             ),
             "activity_measured_since": str(earliest_retained) if partial else None,
             "activity_window_unmeasurable": unmeasurable,
+        }
+
+    def _capacity_metrics(self, window: IngestWindow, cluster_id: str) -> dict[str, Any]:
+        """Read hourly CloudWatch CPU and disk summaries for a provisioned cluster.
+
+        ``CPUUtilization`` at the ``ClusterIdentifier`` grain is AWS's aggregate of
+        leader and compute nodes. It is useful corroborating capacity evidence, but
+        must never be presented as a compute-node-only right-sizing percentage. Disk
+        space is likewise retained alongside its peak because transient COPY/VACUUM
+        pressure matters even when the period average is low.
+
+        CloudWatch is deliberately best-effort, like all non-billing telemetry. An
+        installation without ``cloudwatch:GetMetricStatistics`` still gets its WLM
+        findings and cost data rather than failing the entire Redshift efficiency pull.
+        """
+        start_day = max(window.start, window.end - timedelta(days=13))
+        start = datetime.combine(start_day, datetime.min.time(), tzinfo=UTC)
+        end = datetime.combine(window.end + timedelta(days=1), datetime.min.time(), tzinfo=UTC)
+        dimensions = [{"Name": "ClusterIdentifier", "Value": cluster_id}]
+
+        def read(metric_name: str) -> list[dict[str, Any]]:
+            try:
+                response = self._cloudwatch.get_metric_statistics(
+                    Namespace="AWS/Redshift",
+                    MetricName=metric_name,
+                    Dimensions=dimensions,
+                    StartTime=start,
+                    EndTime=end,
+                    # One aggregate point for the rolling 14-day assessment — no
+                    # hourly series is downloaded or persisted.
+                    Period=int((end - start).total_seconds()),
+                    Statistics=["Average", "Maximum"],
+                    Unit="Percent",
+                )
+            except Exception as exc:  # noqa: BLE001 - supplemental telemetry
+                logger.warning(
+                    "redshift_capacity_metrics_pull_failed",
+                    cluster_id=cluster_id,
+                    metric=metric_name,
+                    error=str(exc),
+                )
+                return []
+            return [point for point in response.get("Datapoints", []) if point.get("Timestamp")]
+
+        cpu = read("CPUUtilization")
+        disk = read("PercentageDiskSpaceUsed")
+        points = cpu + disk
+        timestamps = [point["Timestamp"] for point in points]
+
+        def average(points: list[dict[str, Any]]) -> float | None:
+            values = [_opt_float(point.get("Average")) for point in points]
+            real = [value for value in values if value is not None]
+            return sum(real) / len(real) if real else None
+
+        def maximum(points: list[dict[str, Any]]) -> float | None:
+            values = [_opt_float(point.get("Maximum")) for point in points]
+            real = [value for value in values if value is not None]
+            return max(real) if real else None
+
+        return {
+            "cpu_avg_pct": average(cpu),
+            "cpu_max_pct": maximum(cpu),
+            "disk_avg_pct": average(disk),
+            "disk_max_pct": maximum(disk),
+            # A 14-day CloudWatch period returns one aggregate point whose timestamp
+            # is a bucket boundary, not evidence that only that one day was sampled.
+            "measured_since": str(start.date()) if timestamps else None,
+            "measured_until": str((end - timedelta(days=1)).date()) if timestamps else None,
         }
 
     def _fetch_query_patterns(

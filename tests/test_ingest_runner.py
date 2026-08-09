@@ -64,7 +64,7 @@ def test_all_connectors_run_even_after_a_failure(monkeypatch) -> None:  # type: 
     # ...but every connector ran, including the one after the failure. Order isn't
     # guaranteed once connectors run concurrently (see _stub's docstring).
     assert set(ran) == {"databricks", "aws_focus", "aws_infra"}
-    # SILVER/GOLD are built once, after all successful connectors finish BRONZE.
+    # SILVER/GOLD waits until every successful connector has completed telemetry.
     assert built == [True]
 
 
@@ -106,7 +106,7 @@ def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatc
     rows = run_ingest(connector="redshift")
     assert ran == ["redshift"]
     assert rows == 0
-    assert built == [True]  # one transform after all BRONZE writes finish
+    assert built == [True]  # one publication after cost and telemetry finish
 
 
 def test_all_fail_skips_gold_rebuild(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -141,8 +141,35 @@ def test_all_success_returns_rows_and_builds_gold(monkeypatch) -> None:  # type:
         ran,
     )
     assert run_ingest() == 15
-    assert built == [True]  # one transform after all BRONZE writes finish
+    assert built == [True]  # one publication after cost and telemetry finish
     assert set(ran) == {"databricks", "aws_focus"}
+
+
+def test_cost_and_telemetry_phases_report_before_the_publish(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    built: list[bool] = []
+    ran: list[str] = []
+    _stub(
+        monkeypatch,
+        [
+            ConnectorOutcome(name="databricks", rows=10, ok=True),
+            ConnectorOutcome(name="aws_focus", rows=0, ok=False, detail="expired token"),
+        ],
+        built,
+        ran,
+    )
+    events: list[tuple[str, str, int]] = []
+
+    with pytest.raises(IngestError):
+        run_ingest(on_progress=lambda event, name, rows: events.append((event, name, rows)))
+
+    assert events == [
+        ("ingest_started", "2 selected", 2),
+        ("cost_phase_complete", "2/2 (1 succeeded, 1 failed)", 2),
+        ("telemetry_phase_complete", "1/1 eligible (1 cost pull failed)", 1),
+        ("runner_complete", "2/2 settled (1 complete, 1 failed)", 2),
+        ("transform_start", "complete data", 0),
+        ("transform_done", "complete data", 11),
+    ]
 
 
 def test_supplemental_phases_share_a_bounded_parallel_pool(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -170,6 +197,7 @@ def test_supplemental_phases_share_a_bounded_parallel_pool(monkeypatch) -> None:
         return 0
 
     monkeypatch.setattr(runner, "_run_efficiency", _phase)
+    monkeypatch.setattr(runner, "_run_redshift_table_observability", _phase)
     monkeypatch.setattr(runner, "_run_driver_health", _phase)
     monkeypatch.setattr(runner, "_run_policy_config", _phase)
     monkeypatch.setattr(runner, "_run_ai_usage", _phase)
@@ -178,7 +206,7 @@ def test_supplemental_phases_share_a_bounded_parallel_pool(monkeypatch) -> None:
 
     runner._run_supplemental(object(), [object()])  # type: ignore[arg-type, list-item]
 
-    assert completed == 6
+    assert completed == 7
     assert 2 <= peak <= 3
 
 
@@ -207,8 +235,8 @@ def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  
     assert len(supplemental_configs[0]) == 1  # only the one connector that succeeded
 
 
-def test_transform_waits_for_all_bronze_phases(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """A failed supplemental phase must not publish a partial Gold snapshot."""
+def test_transform_waits_for_all_telemetry_phases(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """An interrupted telemetry phase must not publish a falsely complete snapshot."""
     built: list[bool] = []
     ran: list[str] = []
     _stub(

@@ -24,26 +24,6 @@ connector only supplies efficiency/waste telemetry. So this page:
   page's own :func:`_spend_partition`.
 - **Attribution**: :func:`_attribution_section`, a Redshift-scoped cost hierarchy
   (service → cluster → user allocation) narrowed by ``service_name``.
-- **Workload Findings**: faceted per cluster (:func:`_workload_findings_section`) — one
-  section per billed Redshift cluster. Clusters with telemetry show only Redshift-native
-  findings; clusters without it show an explicit, cluster-specific instrumentation gap. ``entity_id`` for
-  ``entity_type='sql_warehouse'`` under ``provider_name='AWS'`` is the cluster
-  identifier itself, and every other Redshift entity_type is ``<cluster_id>:...``
-  prefixed, see ``ingest/connectors/redshift.py``). Clusters that bill on this
-  account (visible in the cost section's "Spend by cluster") but have no
-  ``redshift`` connector entry get their own explicit setup state, never a
-  silently omitted or account-level answer. Each cluster's findings come from
-  ``efficiency.waste_record`` filtered to ``provider_name = 'AWS'`` and a
-  ``redshift_``-prefixed category. Generic shared-compute rules are deliberately
-  excluded: their Databricks-oriented remedies do not apply to Redshift. Each cluster
-  shows only its actionable findings; generic billed-spend and utilization/detection-
-  coverage summaries are omitted because Redshift telemetry is diagnostic rather than
-  a per-entity utilization reading.
-
-  This tab is why the page does NOT also carry ``efficiency_waste.render()`` the way every
-  other provider page does: ``_workload_findings_section`` is scoped per *cluster*, which is finer than
-  per provider, so a provider-scoped tab beside it would render the union of these sections
-  — the same ``waste_record`` rows twice.
 """
 
 from __future__ import annotations
@@ -75,7 +55,6 @@ _SKU_SCOPE = (
 _REDSHIFT_RULE_BY_CATEGORY = {
     rule.category: rule for rule in WASTE_RULES if rule.category.startswith("redshift_")
 }
-
 # Views this page reads WIDER than its own service scope, on purpose. Declared rather
 # than inferred because the first three *do* carry service_name — `credits_month`
 # especially — so a "the column exists, so filter by it" rule would silently narrow
@@ -138,7 +117,7 @@ def render() -> None:
         extra_kpis=(_spectrum_kpi, _active_clusters_kpi),
         attribution_tab=_attribution_section,
         efficiency_tab=_workload_findings_section,
-        efficiency_tab_label="Workload Findings",
+        efficiency_tab_label="Efficiency & waste",
         # The shared policy view already carries AWS/Redshift entity rows. It must be
         # visible even when a check is not yet measurable: that is an explicit
         # coverage gap, not a clean compliance result.
@@ -224,6 +203,7 @@ def _spend_partition(sm: date, end: date) -> None:
     )
     if not cluster.empty:
         with chrome.panel():
+
             @ui.refreshable
             def _drill(selected_cluster: str | None = None) -> None:
                 if selected_cluster is None:
@@ -315,8 +295,11 @@ def _spectrum_table_allocation(sm: date, end: date) -> None:
         search_col="external_table",
         money_cols=["allocated_cost", "estimated_recovery"],
         rename={
-            "external_table": "External table", "scans": "Scans", "scanned_gb": "Scanned GB",
-            "return_pct": "Returned %", "allocated_cost": "Allocated Spectrum charge",
+            "external_table": "External table",
+            "scans": "Scans",
+            "scanned_gb": "Scanned GB",
+            "return_pct": "Returned %",
+            "allocated_cost": "Allocated Spectrum charge",
             "estimated_recovery": "Estimated recovery",
         },
     )
@@ -369,8 +352,10 @@ def _cluster_breadcrumb(
 def _cluster_attribution(sm: date, end: date) -> None:
     """Render one Redshift-only drill: cluster → component → database user."""
     with chrome.panel():
-        title = ui.label("Cost attribution — clusters").classes("text-sm font-medium mb-2").style(
-            f"color:{chrome.INK_SECONDARY}"
+        title = (
+            ui.label("Cost attribution — clusters")
+            .classes("text-sm font-medium mb-2")
+            .style(f"color:{chrome.INK_SECONDARY}")
         )
         body = ui.column().classes("w-full gap-2")
 
@@ -392,17 +377,13 @@ def _cluster_attribution(sm: date, end: date) -> None:
                     _render_component_level(state.cluster_id, sm, end, refresh=_body.refresh)
                 elif state.level == "user":
                     assert state.cluster_id is not None and state.cost_subcategory is not None
-                    title.text = (
-                        f"Cost attribution — {state.cluster_id} — {state.cost_subcategory}"
-                    )
+                    title.text = f"Cost attribution — {state.cluster_id} — {state.cost_subcategory}"
                     _render_component_users(
                         state.cluster_id, state.cost_subcategory, sm, end, refresh=_body.refresh
                     )
                 else:
                     assert state.cluster_id is not None and state.cost_subcategory is not None
-                    title.text = (
-                        f"Cost attribution — {state.cluster_id} — {state.cost_subcategory}"
-                    )
+                    title.text = f"Cost attribution — {state.cluster_id} — {state.cost_subcategory}"
                     _render_component_charges(
                         state.cluster_id, state.cost_subcategory, sm, end, refresh=_body.refresh
                     )
@@ -460,16 +441,10 @@ def _render_component_level(
     def _on_click(row: dict[str, object]) -> None:
         component = str(row["cost_subcategory"])
         if component in _COMPUTE_LIKE_COMPONENTS:
-            refresh(
-                _ClusterDrill(
-                    level="user", cluster_id=cluster_id, cost_subcategory=component
-                )
-            )
+            refresh(_ClusterDrill(level="user", cluster_id=cluster_id, cost_subcategory=component))
         else:
             refresh(
-                _ClusterDrill(
-                    level="charge", cluster_id=cluster_id, cost_subcategory=component
-                )
+                _ClusterDrill(level="charge", cluster_id=cluster_id, cost_subcategory=component)
             )
 
     chrome.searchable_table(
@@ -726,15 +701,12 @@ def _render_compute_heavy_tables(cluster_id: str, sm: date, end: date) -> None:
         # The new view includes owner_user, but a running dashboard can still have a
         # pre-upgrade Parquet file registered. Keep the drill usable during that one
         # refresh cycle instead of turning a new optional column into a page failure.
-        legacy_sql = (
-            sql.replace(
-                "entity_name AS table_name, owner_user, ",
-                "entity_name AS table_name, NULL::VARCHAR AS owner_user, ",
-            )
-            .replace(
-                "activity_count AS query_count, ",
-                "NULL::BIGINT AS query_count, ",
-            )
+        legacy_sql = sql.replace(
+            "entity_name AS table_name, owner_user, ",
+            "entity_name AS table_name, NULL::VARCHAR AS owner_user, ",
+        ).replace(
+            "activity_count AS query_count, ",
+            "NULL::BIGINT AS query_count, ",
         )
         rows = gold_df(legacy_sql)
     if rows.empty:
@@ -842,10 +814,7 @@ def _tags_section(sm: date, end: date) -> None:
 
 
 def _cost_cluster_ids() -> set[str]:
-    """Real cluster identities visible in the AWS bill (not the snapshot/
-    other buckets `_breakdown_section`'s own table lumps separately) — the universe of
-    clusters that *could* have optimization telemetry, whether or not they do.
-    """
+    """Cluster identities visible in the AWS bill."""
     df = gold_df(
         "SELECT DISTINCT regexp_extract(resource_id, ':cluster:(.+)$', 1) AS cluster "
         f"FROM {_GROUP}.resource_month WHERE service_name IN ({_SERVICE_IN}) "
@@ -855,16 +824,7 @@ def _cost_cluster_ids() -> set[str]:
 
 
 def _telemetry_cluster_ids() -> list[str]:
-    """Clusters an actual `redshift` connector entry has pulled telemetry for —
-    entity_id for entity_type='sql_warehouse' under provider AWS is the cluster
-    identifier itself (see ingest/connectors/redshift.py). Not filtered by
-    x_source_connector: a Redshift connector entry's ``name`` (and so its
-    x_source_connector stamp) is whatever connections.yml names it (e.g.
-    "Prod"/"BI" for multiple clusters, see effective_connector_name) — never
-    literally "redshift" once more than one cluster is configured. provider_name
-    ='AWS' + entity_type='sql_warehouse' is already Redshift-only (see module
-    docstring), so no further connector-name filter is needed.
-    """
+    """Clusters with Redshift telemetry."""
     df = gold_df(
         "SELECT DISTINCT entity_id FROM efficiency.efficiency_entity_month "
         f"WHERE provider_name = '{_PROVIDER}' "
@@ -874,57 +834,36 @@ def _telemetry_cluster_ids() -> list[str]:
 
 
 def _workload_findings_section(sm: date, end: date) -> None:
-    """Redshift-native findings only; generic shared-compute savings are excluded."""
-    chrome.section_title("Redshift performance findings")
-    chrome.section_caption(
-        "Find query, table, WLM, and Spectrum conditions that may be wasting capacity or "
-        "slowing workloads. Open a finding for resource-level evidence; query-pattern rows "
-        "show a sample Redshift query ID that can be opened in the query console."
-    )
-    # The bill is the primary cluster universe: a reader needs an answer for all four
-    # billed clusters, not only the subset that already has a telemetry connector. A
-    # telemetry-only cluster is retained too, so a newly configured connector never
-    # vanishes simply because its cost ARN was not present in this billing slice.
+    """Render Redshift-native efficiency and waste evidence by cluster."""
+    chrome.section_title("Efficiency & waste")
     telemetry_clusters = set(_telemetry_cluster_ids())
-    cost_clusters = _cost_cluster_ids()
-    clusters = sorted(cost_clusters | telemetry_clusters)
+    clusters = sorted(_cost_cluster_ids() | telemetry_clusters)
     if not clusters:
-        (
-            ui.label("No billed Redshift clusters or efficiency telemetry yet.")
-            .classes("text-sm")
-            .style(f"color:{chrome.INK_MUTED}")
-        )
+        ui.label("No billed Redshift clusters or efficiency telemetry yet.").classes(
+            "text-sm"
+        ).style(f"color:{chrome.INK_MUTED}")
         return
-
     if len(clusters) == 1:
         _cluster_efficiency_section(clusters[0], clusters[0] in telemetry_clusters)
-    else:
-        with ui.tabs().classes("w-full") as tabs:
-            tab_refs = [ui.tab(cluster_id) for cluster_id in clusters]
-        with (
-            ui.tab_panels(tabs, value=tab_refs[0])
-            .classes("w-full")
-            .style("background:transparent;")
-        ):
-            for cluster_id, tab_ref in zip(clusters, tab_refs, strict=True):
-                with ui.tab_panel(tab_ref):
-                    _cluster_efficiency_section(
-                        cluster_id, cluster_id in telemetry_clusters
-                    )
+        return
+    with ui.tabs().classes("w-full") as tabs:
+        tab_refs = [ui.tab(cluster_id) for cluster_id in clusters]
+    with ui.tab_panels(tabs, value=tab_refs[0]).classes("w-full").style("background:transparent;"):
+        for cluster_id, tab_ref in zip(clusters, tab_refs, strict=True):
+            with ui.tab_panel(tab_ref):
+                _cluster_efficiency_section(cluster_id, cluster_id in telemetry_clusters)
 
 
 def _cluster_efficiency_section(cluster_id: str, instrumented: bool) -> None:
-    """Render one billed cluster's complete efficiency answer or its precise gap."""
     if not instrumented:
         with chrome.panel():
             chrome.panel_title("Not yet instrumented")
             chrome.section_caption(
                 "This cluster has billed Redshift spend, but no `redshift` connector entry. "
                 "Add one connection for this cluster in connections.yml to enable its "
-                "Redshift workload findings."
+                "Redshift efficiency and waste findings."
             )
         return
-
     current_month = _d(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
     scope = (
         f"(entity_id = '{_sql_str(cluster_id)}' "
@@ -943,7 +882,61 @@ def _cluster_efficiency_section(cluster_id: str, instrumented: bool) -> None:
             "appear after the month closes so partial-month signals are not misleading.",
         )
         return
+    _cluster_capacity_health(cluster_id, completed_months[-1])
     _cluster_waste_section(cluster_id, completed_months[-1])
+
+
+def _cluster_capacity_health(cluster_id: str, month: str) -> None:
+    """Show the latest CloudWatch capacity evidence beside its WLM corroboration."""
+    escaped = _sql_str(cluster_id)
+    row = gold_df(
+        "SELECT activity_count, cause_detail, "
+        "try_cast(json_extract_string(cause_detail, '$.cluster_cpu_utilization_avg_pct') AS DOUBLE) "
+        "AS cpu_avg, try_cast(json_extract_string(cause_detail, '$.cluster_cpu_utilization_max_pct') AS DOUBLE) AS cpu_max, "
+        "try_cast(json_extract_string(cause_detail, '$.cluster_disk_space_used_avg_pct') AS DOUBLE) AS disk_avg, "
+        "try_cast(json_extract_string(cause_detail, '$.cluster_disk_space_used_max_pct') AS DOUBLE) AS disk_max, "
+        "try_cast(json_extract_string(cause_detail, '$.wlm_queue_wait_ms_p95') AS DOUBLE) AS queue_p95, "
+        "try_cast(json_extract_string(cause_detail, '$.disk_spill_query_count') AS DOUBLE) AS spills, "
+        "try_cast(json_extract_string(cause_detail, '$.concurrency_scaling_active_seconds') AS DOUBLE) AS scaling "
+        "FROM efficiency.efficiency_entity_month "
+        f"WHERE provider_name = '{_PROVIDER}' AND entity_type = 'sql_warehouse' "
+        f"AND entity_id = '{escaped}' AND charge_month = '{month}' LIMIT 1"
+    )
+    if row.empty:
+        return
+    r = row.iloc[0]
+    cpu_avg, cpu_max, queue = (r["cpu_avg"], r["cpu_max"], r["queue_p95"])
+    queries, spills = float(r["activity_count"] or 0), float(r["spills"] or 0)
+    spill_rate = spills / queries if queries else None
+    if pd.isna(cpu_avg):
+        state = "Insufficient capacity telemetry"
+        detail = "CloudWatch CPU/disk readings were unavailable for this assessment."
+    elif cpu_avg < 25 and cpu_max < 50 and (pd.isna(queue) or queue < 1000) and (spill_rate or 0) < 0.01:
+        state, detail = "Likely underused", "Low capacity use without workload contention."
+    elif cpu_max >= 90 and ((not pd.isna(queue) and queue >= 5000) or (spill_rate or 0) >= 0.02 or float(r["scaling"] or 0) > 0):
+        state, detail = "Likely constrained", "Peak capacity is corroborated by workload pressure."
+    else:
+        state, detail = "Balanced / mixed", "Capacity peaks are not enough alone to establish contention."
+    def pct(v: object) -> str:
+        return "—" if pd.isna(v) else f"{float(v):.1f}%"
+    def secs(v: object) -> str:
+        return "—" if pd.isna(v) else f"{float(v) / 1000:.1f}s"
+    with chrome.panel():
+        chrome.panel_title("Cluster capacity & workload health")
+        ui.label(state).classes("text-base font-semibold").style(f"color:{chrome.ACCENT}")
+        chrome.section_caption(detail)
+        with ui.row().classes("w-full gap-5 flex-wrap"):
+            for label, value in (
+                ("CPU avg / peak", f"{pct(cpu_avg)} / {pct(cpu_max)}"),
+                ("Disk avg / peak", f"{pct(r['disk_avg'])} / {pct(r['disk_max'])}"),
+                ("WLM queue p95", secs(queue)),
+                ("Spill rate", "—" if spill_rate is None else f"{spill_rate:.1%}"),
+            ):
+                with ui.column().classes("gap-0"):
+                    ui.label(label).classes("text-xs").style(f"color:{chrome.INK_MUTED}")
+                    ui.label(value).classes("text-sm font-medium")
+        if '"activity_window_capped": true' in str(r["cause_detail"]):
+            chrome.section_caption("WLM evidence covers its retained recent-log window, not a complete 14-day history.")
 
 
 def _cluster_waste_section(cluster_id: str, month: str) -> None:
@@ -963,7 +956,9 @@ def _cluster_waste_section(cluster_id: str, month: str) -> None:
     with chrome.panel():
         chrome.panel_title("Findings")
         if records.empty:
-            chrome.section_caption("No Redshift workload findings in the latest completed month.")
+            chrome.section_caption(
+                "No Redshift efficiency or waste findings in the latest completed month."
+            )
             return
         body = ui.column().classes("w-full gap-2")
 
@@ -1005,11 +1000,7 @@ def _cluster_waste_section(cluster_id: str, month: str) -> None:
                         on_row_click=_open_finding,
                     )
                     return
-
                 with ui.row().classes("items-center gap-1"):
-                    # NiceGUI keeps a refreshable target's prior positional arguments when
-                    # refresh() receives none. Pass None explicitly to return to the root
-                    # rather than re-rendering this same finding detail.
                     ui.button(
                         "All findings", icon="arrow_back", on_click=lambda: _body.refresh(None)
                     ).props("flat dense no-caps").style(f"color:{chrome.ACCENT};")
@@ -1025,16 +1016,11 @@ def _cluster_waste_section(cluster_id: str, month: str) -> None:
                 )
                 resources = findings["entity_name"].fillna(findings["entity_id"])
                 if resource_column == "Sample query ID":
-                    # Older metric files predate sample_query_id and stored only the
-                    # MD5 fingerprint. It cannot be reversed to SQL, so name the
-                    # required refresh instead of displaying an opaque hash.
                     resources = resources.mask(
                         resources.astype(str).str.fullmatch(r"[0-9a-f]{32}"),
                         "Unavailable — refresh this cluster to capture a query ID",
                     )
-                display_columns: dict[str, pd.Series] = {
-                    resource_column: resources,
-                }
+                display_columns: dict[str, pd.Series] = {resource_column: resources}
                 if resource_column == "Sample query ID":
                     display_columns |= {
                         "Owner": findings["query_owner"].fillna("Unknown"),
@@ -1049,14 +1035,15 @@ def _cluster_waste_section(cluster_id: str, month: str) -> None:
                 display = pd.DataFrame(display_columns)
                 download = display.copy()
                 if resource_column == "Sample query ID":
-                    # Keep the full captured SQL in CSV, but make the interactive
-                    # table scannable even for multi-line, 4,000-character queries.
                     display["Query text"] = display["Query text"].map(
-                        lambda text: " ".join(str(text).split())[:240]
-                        + ("…" if len(" ".join(str(text).split())) > 240 else "")
+                        lambda text: (
+                            " ".join(str(text).split())[:240]
+                            + ("…" if len(" ".join(str(text).split())) > 240 else "")
+                        )
                     )
                     chrome.section_caption(
-                        "Query text is shortened here; Download CSV includes the full captured text."
+                        "Query text is shortened here; Download CSV includes the full captured "
+                        "text."
                     )
                 chrome.searchable_table(
                     display,

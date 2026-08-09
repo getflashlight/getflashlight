@@ -122,7 +122,9 @@ def _progress_printer() -> Callable[[str, str, int], None]:
 
     def _on_progress(event: str, name: str, rows: int) -> None:
         with lock:
-            if event == "start":
+            if event == "ingest_started":
+                typer.echo(f"  Ingest started: {name} connector(s)")
+            elif event == "start":
                 typer.echo(f"  {name} ...")
             elif event == "done":
                 typer.echo(f"  {name} ... cost pull complete: {rows:,} rows")
@@ -132,6 +134,16 @@ def _progress_printer() -> Callable[[str, str, int], None]:
                 typer.echo(f"  {name} ... efficiency: {rows:,} records")
             elif event == "efficiency_failed":
                 typer.secho(f"  {name} ... efficiency failed", fg=typer.colors.RED)
+            elif event == "cost_phase_complete":
+                typer.echo(f"  Cost phase complete: {name} connector(s) finished")
+            elif event == "telemetry_phase_complete":
+                typer.echo(f"  Telemetry phase complete: {name} connector(s) finished")
+            elif event == "runner_complete":
+                typer.echo(f"  Runner complete: {name} connector(s)")
+            elif event == "transform_start":
+                typer.echo(f"  Rebuilding SILVER/GOLD from {name} ...")
+            elif event == "transform_done":
+                typer.echo(f"  SILVER/GOLD published from {name}: {rows:,} views")
 
     return _on_progress
 
