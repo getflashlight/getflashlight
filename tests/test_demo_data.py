@@ -36,9 +36,9 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
     dbx = run_select(
         "SELECT gross_cost FROM databricks.monthly_bill WHERE charge_month = '2026-07-01'"
     )[0]["gross_cost"]
-    aws = run_select(
-        "SELECT gross_cost FROM aws.monthly_bill WHERE charge_month = '2026-07-01'"
-    )[0]["gross_cost"]
+    aws = run_select("SELECT gross_cost FROM aws.monthly_bill WHERE charge_month = '2026-07-01'")[
+        0
+    ]["gross_cost"]
     storage = run_select(
         "SELECT sum(gross_cost) AS total FROM storage.backing_storage_month "
         "WHERE charge_month = '2026-07-01' AND mapping = 'databricks'"
@@ -49,15 +49,15 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
     )[0]["total"]
     home_total = float(dbx + aws + storage + compute)
     databricks_total = float(dbx + storage + compute)
-    # Databricks is a fully additive 65% DBU / 30% EC2 / 5% S3 model, and the
-    # Home page's provider row is its total rather than an unrelated second number.
+    # Databricks uses the observed production-shaped mix: vendor DBUs 76.1%, AWS
+    # backing compute 16.8%, and AWS backing storage 7.1%.
     assert databricks_total == pytest.approx(44200.0)
-    assert float(dbx) == pytest.approx(databricks_total * 0.65)
-    assert float(compute) == pytest.approx(databricks_total * 0.30)
-    assert float(storage) == pytest.approx(databricks_total * 0.05)
+    assert float(dbx) == pytest.approx(databricks_total * 0.761)
+    assert float(compute) == pytest.approx(databricks_total * 0.168)
+    assert float(storage) == pytest.approx(databricks_total * 0.071)
 
-    # AWS Redshift is likewise one additive provider total: 65% cluster compute,
-    # 20% managed storage, 10% concurrency scaling, and 5% Spectrum.
+    # AWS Redshift follows the production subcategory mix: compute 62.1%, managed
+    # storage 23.6%, Spectrum 10.6%, concurrency scaling 3.68%, plus its rounding tail.
     redshift_components = {
         row["cost_subcategory"]: float(row["net_cost"])
         for row in run_select(
@@ -69,10 +69,11 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
     assert float(aws) == pytest.approx(58600.0)
     assert redshift_components == pytest.approx(
         {
-            "compute": 38090.0,
-            "storage": 11720.0,
-            "concurrency_scaling": 5860.0,
-            "spectrum": 2930.0,
+            "compute": 36390.6,
+            "storage": 13829.6,
+            "spectrum": 6211.6,
+            "concurrency_scaling": 2156.48,
+            "other": 11.72,
         }
     )
     assert home_total == pytest.approx(102800.0)
@@ -118,6 +119,38 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
         "redshift-finance",
         "redshift-prod-analytics",
     ]
+    # Production-shaped detail is present below the headline: a SKU long tail, a
+    # broader owner/resource population, five managed storage locations, and the
+    # requested two Redshift clusters all have real rows to drill into.
+    assert (
+        run_select(
+            "SELECT count(*) AS count FROM databricks.spend_by_sku_month "
+            "WHERE charge_month = '2026-07-01'"
+        )[0]["count"]
+        >= 15
+    )
+    assert (
+        run_select(
+            "SELECT count(DISTINCT resource_id) AS count FROM databricks.resource_month "
+            "WHERE charge_month = '2026-07-01'"
+        )[0]["count"]
+        == 10
+    )
+    assert (
+        run_select(
+            "SELECT count(DISTINCT tag_value) AS count FROM databricks.spend_by_tag_month "
+            "WHERE charge_month = '2026-07-01' AND tag_key = 'owner'"
+        )[0]["count"]
+        >= 6
+    )
+    assert run_select("SELECT count(*) AS count FROM storage.storage_location")[0]["count"] == 5
+    assert (
+        run_select(
+            "SELECT count(*) AS count FROM compute.compute_instance "
+            "WHERE charge_month = '2026-07-01'"
+        )[0]["count"]
+        == 5
+    )
     for view in (
         "efficiency.efficiency_entity_month",
         "efficiency.utilization_entity_month",
