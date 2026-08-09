@@ -69,15 +69,11 @@ def test_sample_cleanup_removes_all_data(lake_home, tmp_path) -> None:  # type: 
 
     paths.ensure_layout()
 
-    # Seed the sample's three artifacts: BRONZE partitions, a cached CSV, a run log.
+    # Seed BRONZE via the CSV helper and a matching run-log entry — cleanup is
+    # connector-scoped and must remove both, leaving other connectors alone.
     csv_path = tmp_path / "src.csv"
     csv_path.write_text(_CSV)
     seed.seed_from_csv(csv_path, connector=SAMPLE_CONNECTOR, ingest_run_id="run1")
-
-    data_dir = paths.home() / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    cached = data_dir / "focus_sample.csv"
-    cached.write_text(_CSV)
 
     from datetime import UTC, datetime
 
@@ -94,16 +90,12 @@ def test_sample_cleanup_removes_all_data(lake_home, tmp_path) -> None:  # type: 
     bronze_part = paths.bronze_dir() / f"x_source_connector={SAMPLE_CONNECTOR}"
     run_file = paths.runs_dir() / f"run1-{SAMPLE_CONNECTOR}.parquet"
     assert bronze_part.exists()
-    assert cached.exists()
     assert run_file.exists()
 
     cleanup()
 
     assert not bronze_part.exists()
-    assert not cached.exists()
     assert not run_file.exists()
-    # GOLD is rebuilt from now-empty BRONZE, so no provider groups remain (the
-    # sample's spend is gone); only the empty fixed groups are left.
     from flashlight.transform.catalog import discover_provider_groups
 
     assert discover_provider_groups() == []

@@ -1551,12 +1551,26 @@ def _commitment(group: str, end: date, sm: date, *, panel_class: str = "") -> No
     the provider has no commitment data (e.g. Databricks — no system table exposes
     reservation/savings-plan data, see gold.commitment_summary_month's own docstring).
 
+    Three things this has to get right, all learned from real AWS data:
+
+    * **The headline % excludes the current month.** A month two days in shows almost all
+      of its commitment as Unused simply because nothing has drawn it down yet, which
+      reads as a catastrophic waste rate. The percentage uses complete months only while
+      the chart still shows every month in range.
+    * **NULL-status commitment spend is disclosed, not silently dropped.** The chart is
+      rightly Used-vs-Unused only, but those rows still carry real dollars (including
+      negative corrective lines), and excluding them from the denominator without saying
+      so overstates the split's coverage.
+    * **A negative total can't produce a percentage.** ``if total`` passes for a negative
+      sum and yields a nonsense figure, so the guard is ``> 0``.
+
     The visual deliberately reports only rows AWS explicitly labels Used or Unused.
     It does not infer a commitment term or purchase timing: FOCUS utilization rows do not
     carry a reservation start/end date.
     """
     if not gold_view_published(group, "commitment_summary_month"):
         return
+    current = _d(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
     window = f"charge_month >= '{sm}' AND charge_month <= '{end}'"
     cm = gold_df(
         "SELECT charge_month, commitment_discount_status, sum(effective_cost) AS cost "
@@ -1566,6 +1580,39 @@ def _commitment(group: str, end: date, sm: date, *, panel_class: str = "") -> No
     )
     if cm.empty:
         return
+
+    complete = cm[pd.to_datetime(cm["charge_month"]).dt.date < current]
+    basis = complete if not complete.empty else cm
+    unused = float(basis.loc[basis["commitment_discount_status"] == "Unused", "cost"].sum())
+    total = float(basis["cost"].sum())
+    pct = f"{100 * unused / total:.1f}%" if total > 0 else "—"
+    scope = (
+        "complete months only"
+        if not complete.empty
+        else "this window — no complete month in range yet, so treat it as provisional"
+    )
+    caption = (
+        "Reserved Instance / Savings Plan spend, split by whether it was drawn down. "
+        f"{pct} of commitment spend was Unused ({scope}) — that's recoverable."
+    )
+
+    # The rows the Used/Unused split leaves out. Queried separately rather than folded in,
+    # because they belong in the caption as a caveat, not on the chart as a third bar.
+    other = gold_df(
+        "SELECT coalesce(sum(effective_cost), 0) AS cost, "
+        "coalesce(sum(effective_cost) FILTER (WHERE effective_cost < 0), 0) AS negative "
+        f'FROM "{group}".commitment_summary_month WHERE {window} '
+        "AND commitment_discount_status IS NULL"
+    ).iloc[0]
+    other_cost, negative = float(other["cost"]), float(other["negative"])
+    if other_cost or negative:
+        caption += (
+            f" A further {compact_money(other_cost)} carries no CommitmentDiscountStatus "
+            "and is excluded from this split"
+        )
+        caption += (
+            f" (net of {compact_money(negative)} in negative corrections)." if negative else "."
+        )
 
     plot_rows = cm.copy()
     plot_rows["month"] = pd.to_datetime(plot_rows["charge_month"]).dt.strftime("%Y-%m")
@@ -1587,11 +1634,11 @@ def _commitment(group: str, end: date, sm: date, *, panel_class: str = "") -> No
     )
     fig.update_layout(barmode="stack")
     totals = plot_rows.groupby("month")["cost"].sum()
-    for month, total in totals.items():
+    for month, total_cost in totals.items():
         fig.add_annotation(
             x=month,
-            y=total,
-            text=compact_money(float(total)),
+            y=total_cost,
+            text=compact_money(float(total_cost)),
             showarrow=False,
             yshift=10,
             font=dict(size=11, color=chrome.INK_SECONDARY),
@@ -1612,6 +1659,12 @@ def _commitment(group: str, end: date, sm: date, *, panel_class: str = "") -> No
         if panel_class:
             panel.classes(panel_class)
         chrome.panel_title("Commitment use vs. unused spend")
+        chrome.section_caption(caption)
+        if not complete.empty and len(complete) != len(cm):
+            chrome.section_caption(
+                f"Chart includes the in-progress month ({current:%b %Y}), which will look "
+                "under-drawn until it completes."
+            )
         chrome.plot(chrome.style_fig(fig, has_legend=True, category_x=True))
 
 

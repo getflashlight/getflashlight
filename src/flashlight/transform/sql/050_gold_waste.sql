@@ -36,6 +36,8 @@ SELECT DISTINCT
     entity_type,
     entity_id,
     entity_name,
+    owner_user,
+    activity_count,
     cause_detail,
     -- Cast to DATE, same as gold.waste_record's own charge_month — metrics.efficiency_
     -- record stores it as a '%Y-%m' string, and the two views need to compare cleanly.

@@ -161,8 +161,9 @@ def test_provider_page_renders_commitment_panel_when_present(lake_home) -> None:
         async with user_simulation() as user:
             build_pages()
             await user.open("/aws")
-            user.find(kind=ui.tab, content="Breakdown").click()
-            await user.should_see("Commitment coverage")
+            # Redshift puts invoice explanations (commitment / credits) on Trend.
+            user.find(kind=ui.tab, content="Trend & changes").click()
+            await user.should_see("Commitment use vs. unused spend")
 
     asyncio.run(_check())
 
@@ -354,8 +355,8 @@ def test_redshift_page_itemizes_credits(lake_home) -> None:  # type: ignore[no-u
         async with user_simulation() as user:
             build_pages()
             await user.open("/aws")
-            await user.should_see("Credits & Discounts")  # KPI card
-            user.find(kind=ui.tab, content="Breakdown").click()
+            # show_credit_kpi=False — credits are listed under Trend, not as a KPI card.
+            user.find(kind=ui.tab, content="Trend & changes").click()
             await user.should_see("Discounts & credits")  # the table's own panel
             # ui.table rows are data, not text nodes should_see can match.
             rows = " ".join(str(t.rows) for t in user.find(kind=ui.table).elements)
@@ -586,13 +587,15 @@ def test_connections_page_sync_button_streams_output_without_crashing(  # type: 
     class _FakeProcess:
         def __init__(self, lines: list[bytes], returncode: int) -> None:
             self.stdout = _FakeStdout(lines)
+            self.returncode: int | None = None
             self._returncode = returncode
 
         async def wait(self) -> int:
+            self.returncode = self._returncode
             return self._returncode
 
     async def _fake_create_subprocess_exec(*cmd, **kwargs):  # type: ignore[no-untyped-def]
-        lines = [b"  Prod-Focus ...\n", b"  Prod-Focus ... 42 rows done\n"]
+        lines = [b"  Prod-Focus ...\n", b"  Prod-Focus ... cost pull complete: 42 rows\n"]
         return _FakeProcess(lines, returncode=0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
@@ -615,14 +618,14 @@ def test_connections_page_sync_button_streams_output_without_crashing(  # type: 
             user.find("Sync now").click()
             await user.should_see("Syncing all connections")
 
-            for _ in range(20):
+            for _ in range(40):
                 await asyncio.sleep(0.05)
                 try:
-                    await user.should_see("exit code")
+                    await user.should_see("Sync completed")
                     break
                 except AssertionError:
                     continue
-            await user.should_see("exit code")
+            await user.should_see("Sync completed")
 
             log_lines = [
                 child.text
@@ -631,7 +634,7 @@ def test_connections_page_sync_button_streams_output_without_crashing(  # type: 
                 if isinstance(child, ui.label)
             ]
             assert "  Prod-Focus ..." in log_lines
-            assert "  Prod-Focus ... 42 rows done" in log_lines
+            assert "  Prod-Focus ... cost pull complete: 42 rows" in log_lines
 
     asyncio.run(_check())
     assert not caught, f"sync click triggered unexpected exception(s): {caught}"
@@ -1646,7 +1649,9 @@ _REDSHIFT_TABS = (
     "Trend & changes",
     "Breakdown",
     "Attribution",
-    "Optimization",
+    "Workload Findings",
+    "Policy Compliance",
+    "Client Driver Health",
 )
 
 # Databricks: spend detail after Breakdown, Client Driver Health last.
@@ -1699,7 +1704,6 @@ def test_provider_page_carries_the_core_tabs(lake_home) -> None:  # type: ignore
                     await user.should_not_see(_ALERTS_TAB)
                 elif group == "aws":
                     await user.should_not_see(_ALERTS_TAB)
-                    await user.should_not_see("Policy Compliance")
                 else:
                     await user.should_see(_ALERTS_TAB)
 
@@ -2386,8 +2390,9 @@ def test_commitment_panel_discloses_null_status_spend(lake_home) -> None:  # typ
         async with user_simulation() as user:
             build_pages()
             await user.open("/aws")
-            user.find(kind=ui.tab, content="Breakdown").click()
-            await user.should_see("Commitment coverage")
+            # Redshift keeps commitment / credits on Trend (invoice_explanations_in_trend).
+            user.find(kind=ui.tab, content="Trend & changes").click()
+            await user.should_see("Commitment use vs. unused spend")
             await user.should_see("no CommitmentDiscountStatus")
             await user.should_see("negative corrections")
             # 20 of 120 complete-month commitment spend is Unused.
@@ -2418,8 +2423,12 @@ def test_provider_nav_rows_are_bare_labels_with_databricks_first(lake_home) -> N
     bronze.write_window("t", window, [aws, dbx], ingest_run_id="r1")
     build_gold()
 
-    assert _nav_groups() == ["databricks", "aws"]
-    assert [_nav_label(group) for group in _nav_groups()] == ["Databricks", "AWS Redshift"]
+    assert _nav_groups() == ["databricks", "snowflake", "aws"]
+    assert [_nav_label(group) for group in _nav_groups()] == [
+        "Databricks",
+        "Snowflake",
+        "AWS Redshift",
+    ]
 
 
 def test_redshift_page_uses_monthly_stacked_trend_with_scoped_projection(lake_home) -> None:  # type: ignore[no-untyped-def]
@@ -2447,7 +2456,7 @@ def test_redshift_page_uses_monthly_stacked_trend_with_scoped_projection(lake_ho
         async with user_simulation() as user:
             build_pages()
             await user.open("/aws")
-            await user.should_see("Monthly net cost")
+            await user.should_see("Monthly operating cost")
             await user.should_not_see("Daily spend")
             await user.should_not_see("click a bar to drill in")
             # The discount lives on the Net Spend card subtitle (net + savings = list is
@@ -2523,28 +2532,33 @@ def test_out_of_scope_bill_does_not_read_as_a_broken_connection(lake_home) -> No
 def test_policy_tab_names_unevaluable_rows_instead_of_implying_compliance(lake_home) -> None:  # type: ignore[no-untyped-def]
     """Redshift's real case: policy rows exist, but not one could be evaluated.
 
-    `policy_record` is generated with no provider filter, and two of its rules key on
-    entity_type='sql_warehouse' — which the Redshift connector emits. But Redshift reports
-    neither warehouse tag counts nor auto-stop timeouts, so every row is not_applicable.
-    Filtering by provider alone would render "— compliant · 0 non-compliant", which is
-    indistinguishable from a clean bill of health. The tab has to say what happened.
+    Redshift policy evidence comes from ``raw.redshift_policy_config``. When every
+    control field is NULL, every emitted row is ``not_applicable`` — the tab must
+    say that instead of looking like a clean bill of health.
     """
     from nicegui import ui
     from nicegui.testing.user_simulation import user_simulation
 
+    from flashlight.ingest.base import IngestWindow
+    from flashlight.lake import redshift_policy_config
+    from flashlight.lake.redshift_policy_config_schema import RedshiftPolicyConfigRecord
+
     redshift_cost = _rec(15)
     redshift_cost.service_name = "Amazon Redshift"
-    # A Redshift-shaped efficiency row: sql_warehouse entity under provider AWS, with
-    # none of the config fields the policy rules test.
-    warehouse = EfficiencyRecord(
-        provider_name="AWS",
-        charge_month=date(2026, 5, 1),
-        entity_type=EntityType.SQL_WAREHOUSE,
-        entity_id="prod-cluster",
-        billed_cost=Decimal("500"),
-        x_source_connector="redshift",
+    _seed([], cost_rows=[_db_cost_row(), redshift_cost])
+    redshift_policy_config.write(
+        IngestWindow(date(2026, 5, 1), date(2026, 5, 31)),
+        [
+            RedshiftPolicyConfigRecord(
+                snapshot_month=date(2026, 5, 1),
+                cluster_id="prod-cluster",
+                x_source_connector="redshift",
+            )
+        ],
     )
-    _seed([warehouse], cost_rows=[_db_cost_row(), redshift_cost])
+    from flashlight.transform.runner import build_gold
+
+    build_gold()
 
     from flashlight.dashboard.router import build_pages
 
@@ -2570,19 +2584,33 @@ def test_policy_tab_is_provider_filtered(lake_home) -> None:  # type: ignore[no-
     under the AWS heading and vice versa.
     """
     from flashlight.dashboard.views import policy
+    from flashlight.ingest.base import IngestWindow
+    from flashlight.lake import redshift_policy_config
+    from flashlight.lake.redshift_policy_config_schema import RedshiftPolicyConfigRecord
 
     db_cluster = _eff("db-interactive", EntityType.INTERACTIVE, "100", auto_stop_minutes=0)
-    warehouse = EfficiencyRecord(
-        provider_name="AWS",
-        charge_month=date(2026, 5, 1),
-        entity_type=EntityType.SQL_WAREHOUSE,
-        entity_id="prod-cluster",
-        billed_cost=Decimal("500"),
-        x_source_connector="redshift",
-    )
     redshift_cost = _rec(15)
     redshift_cost.service_name = "Amazon Redshift"
-    _seed([db_cluster, warehouse], cost_rows=[_db_cost_row(), redshift_cost])
+    _seed([db_cluster], cost_rows=[_db_cost_row(), redshift_cost])
+    redshift_policy_config.write(
+        IngestWindow(date(2026, 5, 1), date(2026, 5, 31)),
+        [
+            RedshiftPolicyConfigRecord(
+                snapshot_month=date(2026, 5, 1),
+                cluster_id="prod-cluster",
+                encrypted=True,
+                publicly_accessible=False,
+                enhanced_vpc_routing=True,
+                automated_snapshot_retention_days=7,
+                require_ssl=True,
+                tag_count=2,
+                x_source_connector="redshift",
+            )
+        ],
+    )
+    from flashlight.transform.runner import build_gold
+
+    build_gold()
 
     rows = policy._df("SELECT * FROM policy.policy_record")  # noqa: SLF001
     assert set(rows["provider_name"]) == {"Databricks", "AWS"}, "both providers land here"

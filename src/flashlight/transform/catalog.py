@@ -329,6 +329,25 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
         measures=("net_cost", "gross_cost", "consumed_quantity"),
     ),
     ViewSpec(
+        view="redshift_cluster_cost_month",
+        title="Redshift cluster cost / month",
+        description="Redshift charge-side cost per billed cluster and invoice component. "
+        "The cluster is parsed only from a Redshift cluster ARN; resource-less lines stay "
+        "in `(not assigned to a cluster)`. cost_subcategory is AWS UsageType-derived "
+        "(compute, concurrency_scaling, storage, spectrum_scan, or unclassified).",
+        cost_metric=CostMetric.EFFECTIVE_COST,
+        dimensions=(
+            "provider_name",
+            "service_name",
+            "cluster_id",
+            "cost_subcategory",
+            "sku_id",
+            "sku_description",
+            "charge_month",
+        ),
+        measures=("net_cost", "gross_cost"),
+    ),
+    ViewSpec(
         view="spend_by_sku_tag_month",
         title="Spend by SKU × tag / month",
         description="Net spend per (SKU, cost-allocation tag key/value), by month — attributes a "
