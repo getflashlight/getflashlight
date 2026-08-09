@@ -2319,8 +2319,12 @@ def test_provider_nav_rows_are_bare_labels_with_databricks_first(lake_home) -> N
     bronze.write_window("t", window, [aws, dbx], ingest_run_id="r1")
     build_gold()
 
-    assert _nav_groups() == ["databricks", "aws"]
-    assert [_nav_label(group) for group in _nav_groups()] == ["Databricks", "AWS Redshift"]
+    assert _nav_groups() == ["databricks", "snowflake", "aws"]
+    assert [_nav_label(group) for group in _nav_groups()] == [
+        "Databricks",
+        "Snowflake",
+        "AWS Redshift",
+    ]
 
 
 def test_redshift_page_uses_monthly_stacked_trend_with_scoped_projection(lake_home) -> None:  # type: ignore[no-untyped-def]

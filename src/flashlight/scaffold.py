@@ -49,6 +49,17 @@ connectors: []
   #   host: https://my-workspace.cloud.databricks.com
   #   token_env: DATABRICKS_TOKEN
   #   sql_warehouse_id: abc123
+
+  # - type: snowflake
+  #   enabled: true
+  #   name: Prod org
+  #   account: xy12345.us-east-1
+  #   user_env: SNOWFLAKE_USER
+  #   password_env: SNOWFLAKE_PASSWORD
+  #   role: ACCOUNTADMIN
+  #   # warehouse: COMPUTE_WH          # optional query warehouse
+  #   # authenticator: externalbrowser # optional SSO; leave unset for password
+  #   # private_key_path: /path/key.pem  # optional key-pair; takes priority over password
 """
 
 

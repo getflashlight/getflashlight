@@ -37,6 +37,7 @@ def test_driver_health_schema_round_trip() -> None:
     assert row["executed_by"] == "alice@example.com"
     assert row["cluster_id"] == "analytics-prod"
     assert row["query_count"] == 33
+    assert row["support_status"] is None
     assert row["provider_name"] == "Databricks"
     assert row["charge_month"] == "2026-07"  # first-of-month normalization
 
