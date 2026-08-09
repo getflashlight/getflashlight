@@ -4,8 +4,7 @@
 -- redshift_efficiency.sql can't give: that query answers "is the cluster spilling
 -- overall", this one answers "which query pattern".
 --
--- Provisioned-cluster system tables only (STL_*/SVL_*) — see redshift_efficiency.sql's
--- header for the Serverless caveat, same here.
+-- Provisioned-cluster system tables only (STL_*/SVL_*).
 --
 -- NOT YET VALIDATED against a live cluster — column names follow AWS's published
 -- system-table docs (docs.aws.amazon.com/redshift/latest/dg/c_intro_STL_tables.html).
@@ -16,12 +15,19 @@
 -- min_duration_secs floors out trivial sub-second queries; top_n bounds cardinality — a
 -- cluster can have thousands of distinct query shapes, this is a triage signal, not an
 -- exhaustive audit (same bounded-pool reasoning as the table inventory query).
-WITH q AS (
+--
+-- Performance design: SVL_QUERY_REPORT is the expensive step-level view.  Determine
+-- the top patterns from STL_QUERY first, then join that view only for the queries in
+-- those patterns.  Do not move the LIMIT below the spill CTE: that would recreate a
+-- full retained-history SVL_QUERY_REPORT scan for every telemetry pull.
+WITH base_queries AS (
     SELECT
         query,
         userid,
         starttime,
         endtime,
+        querytxt,
+        datediff(seconds, starttime, endtime) AS duration_secs,
         CASE
             WHEN userid = 102 AND querytxt LIKE '-- Looker Query Context%'
                 THEN MD5(TRIM(SUBSTRING(querytxt, 144, 160)))
@@ -32,13 +38,43 @@ WITH q AS (
       AND userid > 1
       AND datediff(seconds, starttime, endtime) >= :min_duration_secs
 ),
+top_patterns AS (
+    SELECT
+        qry_md5,
+        count(*) AS run_count,
+        sum(duration_secs) / 60.0 AS total_run_min
+    FROM base_queries
+    GROUP BY qry_md5
+    ORDER BY sum(duration_secs) DESC
+    LIMIT :top_n
+),
+candidate_queries AS (
+    SELECT q.*
+    FROM base_queries q
+    JOIN top_patterns p ON p.qry_md5 = q.qry_md5
+),
+sample_queries AS (
+    -- Keep the newest execution's ID, owner, and SQL text together.  querytxt is
+    -- Redshift's logged text (up to 4,000 characters); the MD5 remains only the
+    -- stable grouping key and is never presented as the useful query identifier.
+    SELECT qry_md5, query AS sample_query_id, userid, starttime AS last_seen_at,
+           trim(querytxt) AS sample_query_text
+    FROM (
+        SELECT q.*,
+               row_number() OVER (PARTITION BY qry_md5 ORDER BY starttime DESC, query DESC) AS rn
+        FROM candidate_queries q
+    ) ranked
+    WHERE rn = 1
+),
 wlm AS (
-    SELECT query, total_queue_time, total_exec_time
-    FROM stl_wlm_query
+    -- The same candidate set prevents a retained-history WLM scan.
+    SELECT w.query, w.total_queue_time, w.total_exec_time
+    FROM stl_wlm_query w
+    JOIN candidate_queries q ON q.query = w.query
 ),
 spill AS (
     SELECT
-        query,
+        r.query AS query,
         max(CASE WHEN is_diskbased = 't' THEN 1 ELSE 0 END)::double precision AS spilled,
         sum(CASE WHEN is_diskbased = 't' THEN bytes ELSE 0 END) / 1024.0 / 1024 / 1024
                                                                               AS spill_gb,
@@ -47,22 +83,27 @@ spill AS (
         min(rows) AS min_rows,
         sum(rows) AS total_rows,
         count(rows) AS slices
-    FROM svl_query_report
-    GROUP BY query
+    FROM svl_query_report r
+    JOIN candidate_queries q ON q.query = r.query
+    GROUP BY r.query
 ),
 user_counts AS (
     SELECT
         q.qry_md5,
         u.usename,
         row_number() OVER (PARTITION BY q.qry_md5 ORDER BY count(*) DESC) AS rnk
-    FROM q
+    FROM candidate_queries q
     JOIN pg_user u ON u.usesysid = q.userid
     GROUP BY q.qry_md5, u.usename
 )
 SELECT
     q.qry_md5,
-    count(*)                                                       AS run_count,
-    sum(datediff(seconds, q.starttime, q.endtime)) / 60.0           AS total_run_min,
+    max(sample.sample_query_id)                                    AS sample_query_id,
+    max(sample.last_seen_at)                                       AS last_seen_at,
+    max(sample.sample_query_text)                                  AS sample_query_text,
+    max(sample_owner.usename)                                      AS sample_query_owner,
+    max(pattern.run_count)                                         AS run_count,
+    max(pattern.total_run_min)                                     AS total_run_min,
     avg(coalesce(wlm.total_exec_time, 0)) / 1000000.0 / 60          AS avg_exec_min,
     avg(coalesce(wlm.total_queue_time, 0)) / 1000000.0 / 60         AS avg_queue_min,
     avg(coalesce(spill.spilled, 0))                                 AS pct_runs_spilling,
@@ -82,10 +123,12 @@ SELECT
     )                                                                AS max_skew_ratio,
     avg(coalesce(spill.slices, 0))                                  AS avg_slices_in_use,
     max(uc.usename)                                                 AS top_user
-FROM q
+FROM candidate_queries q
+JOIN top_patterns pattern ON pattern.qry_md5 = q.qry_md5
+LEFT JOIN sample_queries sample ON sample.qry_md5 = q.qry_md5
+LEFT JOIN pg_user sample_owner ON sample_owner.usesysid = sample.userid
 LEFT JOIN wlm ON wlm.query = q.query
 LEFT JOIN spill ON spill.query = q.query
 LEFT JOIN user_counts uc ON uc.qry_md5 = q.qry_md5 AND uc.rnk = 1
 GROUP BY q.qry_md5
 ORDER BY total_run_min DESC
-LIMIT :top_n;

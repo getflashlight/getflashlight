@@ -1,11 +1,8 @@
-"""Driver-health writes: partition-replace per (provider, charge-month window).
+"""Typed Bronze driver-health writes, partition-replaced by provider and month.
 
-Copies :mod:`flashlight.lake.metrics`'s purge+COPY kernel for the sibling
-``DriverHealthRecord`` dataset — same shape, different Parquet root
-(:func:`~flashlight.lake.paths.driver_health_dir`) so it doesn't collide with the
-efficiency plane's recursive glob (see that function's docstring). Source-aggregated
-rows are unique per (driver, application, user, month), so there is no within-batch
-dedupe step.
+``DriverHealthRecord`` does not fit the FOCUS-cost schema, so it is persisted in its
+own relation under ``bronze/driver_health``. Source rows are already unique per
+(driver, application, user, month), so no within-batch dedupe is needed.
 """
 
 from __future__ import annotations
@@ -51,7 +48,7 @@ def _purge_window(providers: set[str], window: IngestWindow) -> None:
     """Remove each provider's partition dirs across the window — the delete-window step."""
     months = _window_months(window.start, window.end)
     for provider in providers:
-        provider_dir = paths.driver_health_dir() / f"provider_name={provider}"
+        provider_dir = paths.bronze_driver_health_dir() / f"provider_name={provider}"
         for month in months:
             partition = provider_dir / f"charge_month={month}"
             if partition.exists():
@@ -68,11 +65,13 @@ def write_driver_health(window: IngestWindow, records: list[DriverHealthRecord])
         return 0
 
     table = build_table(records)
-    paths.driver_health_dir().mkdir(parents=True, exist_ok=True)
+    paths.bronze_driver_health_dir().mkdir(parents=True, exist_ok=True)
     con = duck.connect()
     try:
         con.register("_rows", table)
-        con.execute(f"COPY _rows TO '{paths.driver_health_dir()}' ({_copy_options()})")  # noqa: S608
+        con.execute(
+            f"COPY _rows TO '{paths.bronze_driver_health_dir()}' ({_copy_options()})"
+        )  # noqa: S608
     finally:
         con.close()
     logger.info("driver_health_window_written", rows=len(records))

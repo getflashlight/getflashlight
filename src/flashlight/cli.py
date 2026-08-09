@@ -1,8 +1,8 @@
 """Unified ``flashlight`` command — the one operator interface.
 
     flashlight init               scaffold the lake home (config skeleton + connections.yml)
-    flashlight sample             download the FinOps FOCUS sample dataset and seed it
-    flashlight sample --clean     remove all seeded sample data, then rebuild GOLD
+    flashlight sample             generate the linked Redshift, Databricks, and FOCUS demo
+    flashlight sample --clean     remove generated demo data, then rebuild GOLD
     flashlight ingest             pull billing → BRONZE Parquet, then rebuild GOLD
     flashlight transform          rebuild GOLD Parquet from BRONZE
     flashlight cleanup            remove ALL lake data (BRONZE/GOLD Parquet + run log)
@@ -64,24 +64,21 @@ def init(
 
 @app.command()
 def sample(
-    rows: int = typer.Option(1000, help="Sample size: 1000 or 10000"),
-    url: str | None = typer.Option(None, help="Override the FOCUS sample CSV URL"),
-    force: bool = typer.Option(False, "--force", help="Re-download even if cached"),
     clean: bool = typer.Option(
-        False, "--clean", help="Remove all seeded sample data instead of seeding"
+        False, "--clean", help="Remove generated demo data instead of generating it"
     ),
 ) -> None:
-    """Download the FinOps FOCUS sample dataset and seed it for the dashboard.
+    """Generate a reconciled Redshift, Databricks, and FOCUS demo for the dashboard.
 
-    With ``--clean``, removes everything the sample seeded (BRONZE partitions, cached
-    CSVs, run-log entries) and rebuilds GOLD — other connectors are left untouched.
+    The scenario is deterministic and schema-validated: cluster names, owners,
+    emails, tags, cost records, and telemetry all refer to the same entities.
     """
     from flashlight.sample import cleanup, load_sample
 
     if clean:
         cleanup()
         return
-    load_sample(rows=rows, url=url, force=force)
+    load_sample()
 
 
 @mcp_app.command("serve")
@@ -125,16 +122,28 @@ def _progress_printer() -> Callable[[str, str, int], None]:
 
     def _on_progress(event: str, name: str, rows: int) -> None:
         with lock:
-            if event == "start":
+            if event == "ingest_started":
+                typer.echo(f"  Ingest started: {name} connector(s)")
+            elif event == "start":
                 typer.echo(f"  {name} ...")
             elif event == "done":
-                typer.echo(f"  {name} ... {rows:,} rows done")
+                typer.echo(f"  {name} ... cost pull complete: {rows:,} rows")
             elif event == "failed":
                 typer.secho(f"  {name} ... failed", fg=typer.colors.RED)
             elif event == "efficiency_done":
                 typer.echo(f"  {name} ... efficiency: {rows:,} records")
             elif event == "efficiency_failed":
                 typer.secho(f"  {name} ... efficiency failed", fg=typer.colors.RED)
+            elif event == "cost_phase_complete":
+                typer.echo(f"  Cost phase complete: {name} connector(s) finished")
+            elif event == "telemetry_phase_complete":
+                typer.echo(f"  Telemetry phase complete: {name} connector(s) finished")
+            elif event == "runner_complete":
+                typer.echo(f"  Runner complete: {name} connector(s)")
+            elif event == "transform_start":
+                typer.echo(f"  Rebuilding SILVER/GOLD from {name} ...")
+            elif event == "transform_done":
+                typer.echo(f"  SILVER/GOLD published from {name}: {rows:,} views")
 
     return _on_progress
 

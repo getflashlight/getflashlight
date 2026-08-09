@@ -54,6 +54,12 @@ class PolicyThresholds(BaseModel):
         description="A SQL warehouse's auto-stop timeout must be set and no longer than "
         "this to count as compliant.",
     )
+    min_redshift_snapshot_retention_days: int = Field(
+        default=7,
+        ge=1,
+        description="A Redshift cluster must retain automated snapshots for at least this many "
+        "days.",
+    )
     low_traffic_endpoint_requests: int = Field(
         default=100,
         gt=0,

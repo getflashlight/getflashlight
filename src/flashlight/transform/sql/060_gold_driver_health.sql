@@ -1,7 +1,8 @@
 -- GOLD: client-driver fleet-health passthrough. ONE consumer view; the dashboard reads it.
 --
--- Already aggregated at source (databricks_driver_health.sql GROUPs by driver ×
--- application × user × month) — no further classification needed, unlike waste_record.
+-- Already aggregated at source (the Databricks/Redshift driver-health queries GROUP by
+-- cluster × driver × application × user × month) — no further classification needed, unlike
+-- waste_record. Reads local typed Bronze only; GOLD never queries either provider.
 -- No dollar figure, no automated "stale version" verdict: humans read the leaderboard.
 CREATE OR REPLACE VIEW gold.driver_health AS
 SELECT
@@ -10,5 +11,6 @@ SELECT
     client_driver,
     client_application,
     executed_by,
+    cluster_id,
     query_count
-FROM metrics.driver_health;
+FROM raw.driver_health;

@@ -5,8 +5,7 @@
 -- other columns carry CPU/scan/spill pressure detail for the "which user" drill-down
 -- the cluster-level snapshot in redshift_efficiency.sql can't give.
 --
--- Provisioned-cluster system tables only (STL_*/SVL_*) — see redshift_efficiency.sql's
--- header for the Serverless caveat, same here.
+-- Provisioned-cluster system tables only (STL_*/SVL_*).
 --
 -- NOT YET VALIDATED against a live cluster — column names follow AWS's published
 -- SVL_QUERY_METRICS_SUMMARY docs. Re-run `flashlight ingest` against a real cluster and
@@ -26,12 +25,15 @@ WITH q AS (
 ),
 spill AS (
     SELECT
-        query,
-        userid,
+        r.query AS query,
+        r.userid AS userid,
         sum(CASE WHEN is_diskbased = 't' THEN bytes ELSE 0 END) / 1024.0 / 1024 / 1024
                                                                         AS spill_gb
-    FROM svl_query_report
-    GROUP BY query, userid
+    -- Scope the expensive step-level view to the requested query IDs before
+    -- aggregating it.  This avoids grouping all retained query-report history.
+    FROM svl_query_report r
+    JOIN q ON q.query = r.query AND q.userid = r.userid
+    GROUP BY r.query, r.userid
 )
 SELECT
     u.usename                          AS username,

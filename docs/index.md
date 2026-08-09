@@ -74,7 +74,7 @@ plus how much of it is recoverable waste.
 
 ```bash
 pip install getflashlight
-flashlight sample               # download the FinOps FOCUS sample + seed it
+flashlight sample               # generate linked Redshift, Databricks, and FOCUS demo data
 flashlight dashboard serve      # dashboard → http://127.0.0.1:8501
 ```
 

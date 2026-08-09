@@ -174,10 +174,10 @@ class RedshiftConfig(BaseModel):
     # the common case, unlike the other connector types.
     name: str | None = None
     region: str = "us-east-1"
-    # Exactly one of these identifies the compute to query — a provisioned cluster
-    # or a Serverless workgroup.
-    cluster_identifier: str | None = None
-    workgroup_name: str | None = None
+    # Provisioned Redshift cluster to query. Amazon Redshift Serverless is not
+    # supported: see the before-validator below for the explicit legacy migration
+    # error instead of Pydantic's normal unknown-field discard.
+    cluster_identifier: str
     database: str = "dev"
     # Data API auth: a temporary-credentials DB user (provisioned clusters, IAM-based)
     # or a Secrets Manager secret ARN — never a static password in config. Also the
@@ -223,16 +223,18 @@ class RedshiftConfig(BaseModel):
     bastion_private_key_path: str | None = None
     bastion_private_key_passphrase_env: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_serverless_workgroup(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "workgroup_name" in value:
+            raise ValueError(
+                "Redshift Serverless is no longer supported. Remove `workgroup_name` "
+                "and configure a provisioned `cluster_identifier`."
+            )
+        return value
+
     @model_validator(mode="after")
-    def _one_target(self) -> RedshiftConfig:
-        if bool(self.cluster_identifier) == bool(self.workgroup_name):
-            raise ValueError(
-                "exactly one of cluster_identifier or workgroup_name must be set"
-            )
-        if self.bastion_host is not None and not self.cluster_identifier:
-            raise ValueError(
-                "bastion_host requires cluster_identifier (provisioned clusters only)"
-            )
+    def _validate_cluster_access(self) -> RedshiftConfig:
         if self.bastion_host is not None and not self.bastion_user:
             raise ValueError("bastion_host requires bastion_user")
         if self.bastion_host is not None and not self.bastion_private_key_path:
@@ -241,10 +243,6 @@ class RedshiftConfig(BaseModel):
             raise ValueError("bastion_host requires db_user (for the IAM credential fetch)")
         if self.db_password_env and not self.db_user:
             raise ValueError("db_password_env requires db_user")
-        if self.db_password_env and not self.cluster_identifier:
-            raise ValueError(
-                "db_password_env requires cluster_identifier (provisioned clusters only)"
-            )
         return self
 
     @model_validator(mode="after")
@@ -373,7 +371,10 @@ def _parse_entries(raw: dict[str, Any]) -> list[BaseModel]:
         model = _CONFIG_TYPES.get(ctype)
         if model is None:
             raise ConfigError(f"Unknown connector type: {ctype!r}")
-        configs.append(model.model_validate(entry))
+        try:
+            configs.append(model.model_validate(entry))
+        except Exception as exc:  # pydantic's structured detail is user-actionable here
+            raise ConfigError(f"Invalid {ctype} connection: {exc}") from exc
 
     _validate_connectors(configs)
     return configs

@@ -73,7 +73,7 @@ _subscribers: list[Callable[[str], None]] = []
 
 def is_running() -> bool:
     """True if a sync started from this dashboard process is still going."""
-    return _proc is not None and _proc.returncode is None
+    return _current is not None and _current.exit_code is None
 
 
 def current_run() -> _Run | None:

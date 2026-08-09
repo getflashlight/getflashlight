@@ -86,6 +86,34 @@ def test_partition_replace_is_idempotent(lake_home) -> None:  # type: ignore[no-
     assert row[0] == 2
 
 
+def test_efficiency_partition_replace_keeps_sibling_redshift_connectors(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Refreshing BI must not replace Prod's AWS efficiency rows for the same month."""
+    from flashlight.efficiency.model import EfficiencyRecord, EntityType
+    from flashlight.lake import duck, metrics
+
+    def record(cluster_id: str, connector: str) -> EfficiencyRecord:
+        return EfficiencyRecord(
+            provider_name="AWS",
+            charge_month=date(2026, 5, 1),
+            entity_type=EntityType.SQL_WAREHOUSE,
+            entity_id=cluster_id,
+            entity_name=cluster_id,
+            x_source_connector=connector,
+        )
+
+    assert metrics.write_efficiency(_WINDOW, [record("prod-cluster", "Prod")]) == 1
+    assert metrics.write_efficiency(_WINDOW, [record("bi-cluster", "BI")]) == 1
+
+    # A second BI refresh replaces only BI's partition, never Prod's sibling partition.
+    assert metrics.write_efficiency(_WINDOW, [record("bi-cluster-new", "BI")]) == 1
+    con = duck.connect()
+    duck.register_metrics(con)
+    rows = con.execute(
+        "SELECT entity_id, x_source_connector FROM metrics.efficiency_record ORDER BY entity_id"
+    ).fetchall()
+    assert rows == [("bi-cluster-new", "BI"), ("prod-cluster", "Prod")]
+
+
 def test_transform_builds_gold_split_per_provider(lake_home) -> None:  # type: ignore[no-untyped-def]
     from flashlight.gold.reader import query_view
     from flashlight.lake import bronze

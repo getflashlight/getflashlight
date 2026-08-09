@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from flashlight.core.settings import get_settings
-from flashlight.dashboard.ingest_runner import stream_sync
+from flashlight.dashboard.ingest_runner import is_running, start_sync, stream_sync, wait_for_current
 from flashlight.lake import paths
 
 
@@ -111,3 +112,24 @@ def test_stream_sync_passes_start_and_end_through_to_the_cli(monkeypatch, tmp_pa
     assert captured["cmd"][captured["cmd"].index("--start") + 1] == "2026-05-01"
     assert "--end" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--end") + 1] == "2026-07-31"
+
+
+def test_start_sync_tracks_the_run_without_reading_process_returncode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The live dashboard state comes from its _Run, not a subprocess implementation detail."""
+    connections_path = tmp_path / "connections.yml"
+    connections_path.write_text("connectors: []\n")
+
+    async def _fake_create_subprocess_exec(*_cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        return _FakeProcess([], returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    async def _run() -> None:
+        await start_sync(connections_path)
+        assert is_running()
+        assert await wait_for_current() is not None
+        assert not is_running()
+
+    asyncio.run(_run())

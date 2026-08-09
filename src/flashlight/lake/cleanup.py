@@ -1,7 +1,7 @@
 """``flashlight cleanup`` — wipe all lake data (Parquet) under ``FLASHLIGHT_HOME``.
 
-The nuclear counterpart to ``sample --clean`` (which is scoped to the isolated
-``focus_sample`` connector): this removes *everything* the writers produce —
+The nuclear counterpart to ``sample --clean`` (which is scoped to the generated
+demo's partitions): this removes *everything* the writers produce —
 every BRONZE partition, every published GOLD view, any half-built staging dir,
 and the ingest run log — leaving only ``config/`` so the install stays usable.
 Idempotent: a no-op on a never-seeded home. Config (``connections.yml``) and any
@@ -23,6 +23,8 @@ logger = get_logger(__name__)
 def _data_dirs() -> Iterator[tuple[str, Path]]:
     """The (label, path) of every dir that holds generated lake data — not config."""
     yield "bronze", paths.bronze_dir()
+    # Pre-Bronze driver health is read during the migration but no longer written.
+    yield "legacy_driver_health", paths.legacy_driver_health_dir()
     yield "gold", paths.gold_dir()
     yield "gold.staging", paths.gold_staging_dir()
     yield "runs", paths.runs_dir()

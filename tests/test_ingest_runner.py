@@ -41,7 +41,7 @@ def _stub(monkeypatch, outcomes: list[ConnectorOutcome], built: list[bool], ran:
         return 11
 
     monkeypatch.setattr(runner, "build_gold", _build_gold)
-    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None: None)
+    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None, **_kw: None)
 
 
 def test_all_connectors_run_even_after_a_failure(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -64,10 +64,8 @@ def test_all_connectors_run_even_after_a_failure(monkeypatch) -> None:  # type: 
     # ...but every connector ran, including the one after the failure. Order isn't
     # guaranteed once connectors run concurrently (see _stub's docstring).
     assert set(ran) == {"databricks", "aws_focus", "aws_infra"}
-    # GOLD is still rebuilt from the connectors that succeeded — twice: once
-    # right after the cost pull, once more as the final holistic rebuild after
-    # the efficiency/driver-health phases (see run_ingest).
-    assert built == [True, True]
+    # SILVER/GOLD waits until every successful connector has completed telemetry.
+    assert built == [True]
 
 
 def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -103,12 +101,12 @@ def test_run_ingest_connector_filter_runs_only_the_matching_connector(monkeypatc
         return 1
 
     monkeypatch.setattr(runner, "build_gold", _build_gold)
-    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None: None)
+    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None, **_kw: None)
 
     rows = run_ingest(connector="redshift")
     assert ran == ["redshift"]
     assert rows == 0
-    assert built == [True, True]  # cost-pull publish + final holistic rebuild
+    assert built == [True]  # one publication after cost and telemetry finish
 
 
 def test_all_fail_skips_gold_rebuild(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -143,8 +141,35 @@ def test_all_success_returns_rows_and_builds_gold(monkeypatch) -> None:  # type:
         ran,
     )
     assert run_ingest() == 15
-    assert built == [True, True]  # cost-pull publish + final holistic rebuild
+    assert built == [True]  # one publication after cost and telemetry finish
     assert set(ran) == {"databricks", "aws_focus"}
+
+
+def test_cost_and_telemetry_phases_report_before_the_publish(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    built: list[bool] = []
+    ran: list[str] = []
+    _stub(
+        monkeypatch,
+        [
+            ConnectorOutcome(name="databricks", rows=10, ok=True),
+            ConnectorOutcome(name="aws_focus", rows=0, ok=False, detail="expired token"),
+        ],
+        built,
+        ran,
+    )
+    events: list[tuple[str, str, int]] = []
+
+    with pytest.raises(IngestError):
+        run_ingest(on_progress=lambda event, name, rows: events.append((event, name, rows)))
+
+    assert events == [
+        ("ingest_started", "2 selected", 2),
+        ("cost_phase_complete", "2/2 (1 succeeded, 1 failed)", 2),
+        ("telemetry_phase_complete", "1/1 eligible (1 cost pull failed)", 1),
+        ("runner_complete", "2/2 settled (1 complete, 1 failed)", 2),
+        ("transform_start", "complete data", 0),
+        ("transform_done", "complete data", 11),
+    ]
 
 
 def test_supplemental_phases_share_a_bounded_parallel_pool(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -172,14 +197,16 @@ def test_supplemental_phases_share_a_bounded_parallel_pool(monkeypatch) -> None:
         return 0
 
     monkeypatch.setattr(runner, "_run_efficiency", _phase)
+    monkeypatch.setattr(runner, "_run_redshift_table_observability", _phase)
     monkeypatch.setattr(runner, "_run_driver_health", _phase)
+    monkeypatch.setattr(runner, "_run_policy_config", _phase)
     monkeypatch.setattr(runner, "_run_ai_usage", _phase)
     monkeypatch.setattr(runner, "_run_storage_locations", _phase)
     monkeypatch.setattr(runner, "_run_compute_instances", _phase)
 
     runner._run_supplemental(object(), [object()])  # type: ignore[arg-type, list-item]
 
-    assert completed == 5
+    assert completed == 7
     assert 2 <= peak <= 3
 
 
@@ -197,7 +224,9 @@ def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  
     )
     supplemental_configs: list[list[object]] = []
 
-    def _record_supplemental(_w: object, configs: list[object], _p: object = None) -> None:
+    def _record_supplemental(
+        _w: object, configs: list[object], _p: object = None, **_kwargs: object
+    ) -> None:
         supplemental_configs.append(configs)
 
     monkeypatch.setattr(runner, "_run_supplemental", _record_supplemental)
@@ -206,15 +235,8 @@ def test_efficiency_and_driver_health_get_survivors_only(monkeypatch) -> None:  
     assert len(supplemental_configs[0]) == 1  # only the one connector that succeeded
 
 
-def test_cost_pull_gold_publish_survives_a_later_phase_dying(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Regression test for a real incident: a process killed partway through
-    the best-effort efficiency/driver-health phases left successfully-pulled
-    cost data sitting in BRONZE with GOLD never published at all, because the
-    old code called build_gold() exactly once, at the very end. build_gold()
-    must instead run right after the cost pull too — simulated here by making
-    _run_efficiency blow up outright (standing in for the process dying
-    mid-phase) and confirming the cost-pull publish already happened by then.
-    """
+def test_transform_waits_for_all_telemetry_phases(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """An interrupted telemetry phase must not publish a falsely complete snapshot."""
     built: list[bool] = []
     ran: list[str] = []
     _stub(
@@ -224,7 +246,7 @@ def test_cost_pull_gold_publish_survives_a_later_phase_dying(monkeypatch) -> Non
         ran,
     )
 
-    def _boom(_w: object, _c: object, _p: object = None) -> None:
+    def _boom(_w: object, _c: object, _p: object = None, **_kwargs: object) -> None:
         raise RuntimeError("simulated mid-run kill")
 
     monkeypatch.setattr(runner, "_run_supplemental", _boom)
@@ -232,7 +254,7 @@ def test_cost_pull_gold_publish_survives_a_later_phase_dying(monkeypatch) -> Non
     with pytest.raises(RuntimeError, match="simulated mid-run kill"):
         run_ingest()
 
-    assert built == [True]
+    assert built == []
 
 
 def test_run_ingest_threads_progress_callback_to_every_connector(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -242,7 +264,7 @@ def test_run_ingest_threads_progress_callback_to_every_connector(monkeypatch) ->
     monkeypatch.setattr(runner, "load_connections", lambda _c: [object(), object()])
     monkeypatch.setattr(runner, "build_connector", lambda c: c)
     monkeypatch.setattr(runner, "build_gold", lambda: 0)
-    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None: None)
+    monkeypatch.setattr(runner, "_run_supplemental", lambda _w, _c, _p=None, **_kw: None)
 
     received: list[object] = []
 

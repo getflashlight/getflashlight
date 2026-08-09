@@ -4,8 +4,8 @@ Silent and idempotent: creates the directory skeleton and writes a documented
 ``connections.yml`` (all connectors commented as examples), then prints next
 steps. Re-running leaves existing files alone unless ``--force``.
 
-It does **not** bundle sample data — `flashlight sample` downloads the FinOps FOCUS
-sample on demand, so the wheel stays lean and there's one seeding path.
+It does **not** bundle sample data — `flashlight sample` generates a deterministic
+schema-driven demo on demand, so the wheel stays lean and there's one seeding path.
 """
 
 from __future__ import annotations
@@ -129,7 +129,7 @@ def scaffold(force: bool = False) -> None:
 
     typer.echo(f"\nFlashlight initialized at {paths.home()}")
     typer.echo("\nNext steps:")
-    typer.echo("  flashlight sample            # download the FOCUS sample + seed it (no config)")
+    typer.echo("  flashlight sample            # generate the linked demo data (no config)")
     typer.echo(f"  # or edit {conn} to add your sources, then: flashlight ingest")
     typer.echo(f"  # cost-policy thresholds (optional): {policies}")
     typer.echo(f"  # assistant model (optional, or use the dashboard's gear icon): {assistant}")

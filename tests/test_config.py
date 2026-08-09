@@ -74,6 +74,18 @@ def test_load_connections_registers_redshift(tmp_path) -> None:  # type: ignore[
     assert configs[1].cluster_identifier == "prod-cluster"
 
 
+def test_legacy_redshift_workgroup_is_a_clear_migration_error(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "connections.yml"
+    path.write_text(
+        "connectors:\n"
+        "  - type: redshift\n"
+        "    enabled: false\n"
+        "    workgroup_name: legacy-serverless\n"
+    )
+    with pytest.raises(ConfigError, match="Redshift Serverless is no longer supported"):
+        load_all_connections(str(path))
+
+
 def test_enabled_redshift_requires_enabled_aws_focus(tmp_path) -> None:  # type: ignore[no-untyped-def]
     path = tmp_path / "connections.yml"
     path.write_text(

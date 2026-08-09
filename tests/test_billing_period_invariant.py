@@ -7,8 +7,8 @@ stop being true when a connector is added or an upstream export changes shape â€
 test rather than a comment. If this fails, the honest fix is usually to carry the columns
 into SILVER and give the new billing cycle a real dimension, not to loosen the assertion.
 
-Runs against the committed ``demo/lake/`` (deterministic and available in CI) the same
-way :mod:`tests.test_demo_lake` does.
+Runs against the schema-driven local demo generator, so it does not depend on a
+committed public-demo lake.
 
 Two details this test exists to get right:
 
@@ -31,8 +31,6 @@ import pytest
 
 from flashlight.core.settings import get_settings
 
-_DEMO_LAKE = Path(__file__).parents[1] / "demo" / "lake"
-
 # Both halves of the claim, as one scan. Casting to DATE on the left keeps the comparison
 # against the date32 billing_period_* columns type-clean.
 _SQL = """
@@ -50,13 +48,16 @@ WHERE provider_name <> 'Oracle'
 """
 
 
-@pytest.mark.skipif(not _DEMO_LAKE.exists(), reason="demo/lake/ not present in this checkout")
 def test_billing_period_is_a_redundant_derivation_of_charge_month(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("FLASHLIGHT_HOME", str(_DEMO_LAKE))
+    monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
     get_settings.cache_clear()
     try:
+        from flashlight.sample import load_sample
+
+        load_sample()
         from flashlight.lake import duck
 
         con = duck.connect()
@@ -81,16 +82,20 @@ def test_billing_period_is_a_redundant_derivation_of_charge_month(
     )
 
 
-@pytest.mark.skipif(not _DEMO_LAKE.exists(), reason="demo/lake/ not present in this checkout")
-def test_silver_does_not_expose_the_billing_period(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_silver_does_not_expose_the_billing_period(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """The other half of the invariant: nothing downstream can group by it.
 
     Asserted on the view's own columns rather than on the SQL text, so it keeps holding
     however ``010_silver_focus.sql`` is rewritten.
     """
-    monkeypatch.setenv("FLASHLIGHT_HOME", str(_DEMO_LAKE))
+    monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
     get_settings.cache_clear()
     try:
+        from flashlight.sample import load_sample
+
+        load_sample()
         from flashlight.lake import duck
         from flashlight.transform.runner import SQL_DIR, _statements
 

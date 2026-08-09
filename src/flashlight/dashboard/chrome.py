@@ -618,6 +618,8 @@ def searchable_table(
     df: pd.DataFrame,
     *,
     key: str,
+    row_data: pd.DataFrame | None = None,
+    download_df: pd.DataFrame | None = None,
     search_col: str | None = None,
     money_cols: Sequence[str] = (),
     pct_cols: Sequence[str] = (),
@@ -631,14 +633,21 @@ def searchable_table(
     """A paginated, optionally search-filterable ``ui.table`` with CSV export.
 
     ``max_rows`` caps the *displayed* rows; the CSV export always carries the
-    full set. ``on_row_click`` gets the raw (pre-format) row dict.
+    full set. Pass ``download_df`` when a compact display (such as a SQL preview)
+    needs a richer CSV export. ``on_row_click`` gets the raw (pre-format) row dict.
+    Pass ``row_data`` when the rendered columns are a subset of the fields needed by a
+    click-through; it must be row-aligned with *df*.
     """
+    if row_data is not None and len(row_data) != len(df):
+        raise ValueError("row_data must have one row for every displayed table row")
+    if download_df is not None and len(download_df) != len(df):
+        raise ValueError("download_df must have one row for every displayed table row")
     shown = df if max_rows is None else df.head(max_rows)
     columns, rows = _fmt_columns(
         shown, money_cols=money_cols, pct_cols=pct_cols, int_cols=int_cols,
         num_cols=num_cols, rename=rename,
     )
-    raw_rows = df.to_dict("records")
+    raw_rows = (row_data if row_data is not None else df).to_dict("records")
 
     with ui.row().classes("items-center justify-between w-full mb-2"):
         search: ui.input | None = None
@@ -650,14 +659,13 @@ def searchable_table(
                 .classes("w-64")
                 .style(f"color:{INK_PRIMARY}")
             )
-        if max_rows is not None and len(df) > max_rows:
-            section_caption(
-                f"Showing top {max_rows} of {len(df):,} — download the CSV for the full list."
-            )
         ui.button(
             "Download CSV",
             icon="download",
-            on_click=lambda: ui.download(df.to_csv(index=False).encode(), filename=f"{key}.csv"),
+            on_click=lambda: ui.download(
+                (download_df if download_df is not None else df).to_csv(index=False).encode(),
+                filename=f"{key}.csv",
+            ),
         ).props("flat dense no-caps").style(f"color:{ACCENT};")
 
     classes = "fl-table w-full" + (" fl-table-clickable" if on_row_click else "")
@@ -686,16 +694,19 @@ def flat_table(
     int_cols: Sequence[str] = (),
     num_cols: Sequence[str] = (),
     rename: dict[str, str] | None = None,
+    pagination: int | None = None,
 ) -> ui.table:
-    """An unpaginated ``ui.table`` for a fully-visible pivot/summary table."""
+    """A compact table, unpaginated by default and optionally page-sized."""
     columns, rows = _fmt_columns(
         df, money_cols=money_cols, pct_cols=pct_cols, int_cols=int_cols,
         num_cols=num_cols, rename=rename,
     )
-    return (
-        ui.table(columns=columns, rows=rows)
-        .props("flat dense hide-pagination")
-        .classes(f"fl-table w-full {key}")
+    props = "flat dense" if pagination is not None else "flat dense hide-pagination"
+    table_kwargs: dict[str, Any] = {"columns": columns, "rows": rows}
+    if pagination is not None:
+        table_kwargs["pagination"] = pagination
+    return ui.table(**table_kwargs).props(props).classes(
+        f"fl-table w-full {key}"
     )
 
 
@@ -731,9 +742,12 @@ def heatmap_table(
     """
     disp = df.rename(columns=rename) if rename else df.copy()
     heat_name = (rename or {}).get(heat_col, heat_col)
+    money_names = [(rename or {}).get(column, column) for column in money_cols]
 
     columns, rows = _fmt_columns(
-        disp, money_cols=money_cols, pct_cols=[heat_name] if heat_name in disp.columns else [],
+        disp,
+        money_cols=money_names,
+        pct_cols=[heat_name] if heat_name in disp.columns else [],
     )
     if heat_name in disp.columns:
         for row, val in zip(rows, disp[heat_name], strict=True):
