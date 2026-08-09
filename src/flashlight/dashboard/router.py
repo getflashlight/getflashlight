@@ -486,13 +486,24 @@ def build_pages() -> None:
         )
 
     def _render_snowflake_visibility_only() -> None:
-        """Snowflake visibility UX without GOLD spend yet — synthetic Parquet fallback.
-
-        No live Snowflake connection is made from the dashboard. Leaderboard + Visibility
-        read ``snowflake/synthetic_data/*.parquet`` until ``flashlight ingest`` publishes
-        ``gold/snowflake/``.
-        """
+        """Render Snowflake visibility from a live connection or the bundled demo data."""
+        from flashlight.dashboard.snowflake import live_data, visibility_data
         from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
+
+        # Prefer the customer's configured account.  The synthetic source is solely a
+        # demo fallback; selecting it when its Parquet files are absent caused DuckDB to
+        # interpret ACCOUNT_USAGE table names as local tables and return a 500.
+        if live_data.is_configured():
+            data = live_data
+        elif visibility_data.has_synthetic_data():
+            data = visibility_data
+        else:
+            no_data_page("Snowflake visibility")
+            ui.label(
+                "Add an enabled Snowflake connection on the Connections page, or "
+                "generate the bundled demo data."
+            ).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+            return
 
         with ui.tabs().classes("w-full").props("dense") as tabs:
             tab_exec = ui.tab("LeaderBoard")
@@ -505,7 +516,7 @@ def build_pages() -> None:
             panels["LeaderBoard"] = ui.tab_panel(tab_exec)
             panels["Visibility"] = ui.tab_panel(tab_vis)
         with panels["LeaderBoard"]:
-            snowflake_visibility.render_leaderboard()
+            snowflake_visibility.render_leaderboard(data)
         loaded["LeaderBoard"] = True
 
         def _on_tab_change(e: object) -> None:
@@ -513,7 +524,7 @@ def build_pages() -> None:
             if name == "Visibility" and name not in loaded:
                 loaded[name] = True
                 with panels["Visibility"]:
-                    snowflake_visibility.render()
+                    snowflake_visibility.render(data)
 
         tabs.on_value_change(_on_tab_change)
 

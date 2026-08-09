@@ -33,6 +33,11 @@ class CostBreakdownItem(TypedDict):
     cost: float
 
 
+def has_synthetic_data() -> bool:
+    """Return whether the bundled Snowflake demo dataset is available."""
+    return any(_DATA_DIR.glob("*.parquet"))
+
+
 def _con() -> duckdb.DuckDBPyConnection:
     """Connect and register all synthetic Parquet files as views."""
     con = duckdb.connect()
@@ -48,7 +53,7 @@ def _as_of() -> date:
 
     Falls back to today only if the Parquet set is missing/empty.
     """
-    if not any(_DATA_DIR.glob("warehouse_metering_history.parquet")):
+    if not _DATA_DIR.joinpath("warehouse_metering_history.parquet").exists():
         return date.today()
     con = _con()
     try:
@@ -1267,4 +1272,3 @@ def cost_breakdown_monthly(months: int = 12) -> pd.DataFrame:
         return df
     finally:
         con.close()
-

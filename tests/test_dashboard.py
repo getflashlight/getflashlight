@@ -90,6 +90,22 @@ def test_provider_page_renders_when_data_starts_midmonth(lake_home) -> None:  # 
     asyncio.run(_check())
 
 
+def test_snowflake_page_without_connection_or_demo_shows_empty_state(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """An optional demo dataset must not turn the always-reachable route into a 500."""
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/snowflake")
+            await user.should_see("Snowflake visibility")
+            await user.should_see("Add an enabled Snowflake connection")
+
+    asyncio.run(_check())
+
+
 def test_provider_page_reachable_after_first_sync_post_boot(lake_home) -> None:  # type: ignore[no-untyped-def]
     """Regression: a provider's GOLD group can appear *after* the dashboard has
     already booted (its first successful sync, run from the Connections page in

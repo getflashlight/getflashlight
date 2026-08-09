@@ -48,6 +48,20 @@ def test_load_connections_registers_snowflake(tmp_path: Path) -> None:
     assert configs[0].account == "xy12345.us-east-1"
 
 
+def test_live_dashboard_detects_enabled_snowflake_connection(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The dashboard must select live data instead of its optional demo files."""
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "connections.yml").write_text(
+        "connectors:\n  - type: snowflake\n    enabled: true\n    account: xy12345.us-east-1\n"
+    )
+    monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
+
+    from flashlight.dashboard.snowflake import live_data
+
+    assert live_data.is_configured() is True
+
+
 def test_build_connector_returns_real_snowflake_connector() -> None:
     cfg = SnowflakeConfig(account="xy12345", name="Org")
     connector = build_connector(cfg)

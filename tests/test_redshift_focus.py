@@ -145,6 +145,29 @@ def test_fetch_driver_health_uses_bastion_route_when_configured(monkeypatch) -> 
     assert driver_call.args[1] == "bastion-connection"
 
 
+def test_fetch_driver_health_caps_an_oversized_window_to_retained_logs(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A historical cost backfill still collects the recent connection-log suffix."""
+    from datetime import date
+    from unittest.mock import MagicMock
+
+    from flashlight.ingest.base import IngestWindow
+
+    connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
+    execute = MagicMock(return_value=[])
+    monkeypatch.setattr(connector, "_execute", execute)
+
+    records = list(
+        connector.fetch_driver_health(IngestWindow(date(2026, 1, 1), date(2026, 8, 8)))
+    )
+
+    assert records == []
+    driver_call = next(
+        call for call in execute.call_args_list if call.kwargs["name"] == "driver_health"
+    )
+    assert "recordtime >= '2026-08-02'" in driver_call.args[0].lower()
+    assert "dateadd(day, 1, '2026-08-08')" in driver_call.args[0].lower()
+
+
 def test_fetch_policy_config_maps_control_plane_evidence() -> None:
     from datetime import date
     from unittest.mock import MagicMock

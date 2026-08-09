@@ -765,7 +765,10 @@ def render() -> None:
             else:
                 with ui.row().classes("items-center gap-3 pt-3 pb-1"):
                     ui.icon("error_outline", size="1.25rem").style(f"color:{chrome.WASTE}")
-                    ui.label("Cost data: AWS FOCUS required").classes("text-sm").style(
+                    ui.label(
+                        "AWS FOCUS is not enabled — Redshift telemetry will sync, "
+                        "but cost data won't be available"
+                    ).classes("text-sm").style(
                         f"color:{chrome.INK_SECONDARY}"
                     )
 

@@ -66,6 +66,16 @@ def _sf_config() -> SnowflakeConfig | None:
     return None
 
 
+def is_configured() -> bool:
+    """Whether an enabled Snowflake connection is available to the dashboard.
+
+    This deliberately only checks configuration.  Authentication and query failures
+    are handled by the individual data functions so a temporarily unavailable
+    account cannot take down the dashboard page.
+    """
+    return _sf_config() is not None
+
+
 def _connect(cfg: SnowflakeConfig) -> snowflake.connector.SnowflakeConnection:
     user = env(cfg.user_env)
     params: dict[str, object] = {
@@ -1198,4 +1208,3 @@ def cost_breakdown_monthly(months: int = 12) -> pd.DataFrame:
             conn.close()
     except Exception:  # noqa: BLE001
         return pd.DataFrame()
-

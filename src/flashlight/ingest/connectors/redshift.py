@@ -341,15 +341,18 @@ class RedshiftConnector(Connector):
             mode = "data_api"
         system_window = _system_log_window(window)
         if system_window.start != window.start:
+            # Connection logs have finite retention.  A normal cost backfill can
+            # therefore be much wider than this source can answer, but that must
+            # not prevent the recent, available driver-health data from landing.
+            # Query the retained suffix just as fetch_efficiency does for its
+            # system-log-backed measurements.
             logger.info(
-                "redshift_driver_health_skipped",
-                reason="requested_window_exceeds_system_log_cap",
+                "redshift_driver_health_window_capped",
                 requested_start=str(window.start),
                 effective_start=str(system_window.start),
                 window_end=str(system_window.end),
                 max_lookback_days=_SYSTEM_LOG_MAX_LOOKBACK_DAYS,
             )
-            return
         logger.info(
             "redshift_driver_health_query_window",
             requested_start=str(window.start),
