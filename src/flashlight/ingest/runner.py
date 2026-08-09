@@ -29,6 +29,7 @@ from flashlight.ingest.config import (
     AwsFocusConfig,
     DatabricksConfig,
     RedshiftConfig,
+    SnowflakeConfig,
     effective_connector_name,
     load_connections,
 )
@@ -36,6 +37,7 @@ from flashlight.ingest.connectors import (
     AwsFocusConnector,
     DatabricksConnector,
     RedshiftConnector,
+    SnowflakeConnector,
 )
 from flashlight.lake import (
     ai_usage,
@@ -62,6 +64,7 @@ _REGISTRY: dict[type[BaseModel], type[Connector]] = {
     AwsFocusConfig: AwsFocusConnector,
     DatabricksConfig: DatabricksConnector,
     RedshiftConfig: RedshiftConnector,
+    SnowflakeConfig: SnowflakeConnector,
 }
 
 #: Fallback when ``FLASHLIGHT_INGEST_LOOKBACK_DAYS`` is unset — see

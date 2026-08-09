@@ -95,8 +95,16 @@ nav:
       - AWS: connectors/aws.md
       - Databricks: connectors/databricks.md
       - Amazon Redshift: connectors/redshift.md
+      - Snowflake: connectors/snowflake.md
       - Mapping details: connectors.md
       - Build a connector: connectors/custom.md
+  - Snowflake:
+      - User guide: snowflake/user-guide.md
+      - FOCUS mapping: snowflake/focus-mapping.md
+      - Service types: snowflake/service-types.md
+      - Synthetic data: snowflake/synthetic-data-guide.md
+      - Synthetic data reference: snowflake/synthetic-data-reference.md
+      - Dashboard developer guide: snowflake/dashboard-developer-guide.md
   - Reference:
       - CLI: reference/cli.md
       - Configuration: reference/configuration.md

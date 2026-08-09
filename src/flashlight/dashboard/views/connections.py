@@ -39,6 +39,7 @@ from flashlight.ingest.config import (
     AwsFocusConfig,
     DatabricksConfig,
     RedshiftConfig,
+    SnowflakeConfig,
     effective_connector_name,
     load_all_connections,
     save_connections,
@@ -57,12 +58,14 @@ _TYPE_LABELS: dict[str, str] = {
     "aws_focus": "AWS FOCUS cost source",
     "databricks": "Databricks",
     "redshift": "Redshift usage",
+    "snowflake": "Snowflake",
 }
 
 _TYPE_ICONS: dict[str, str] = {
     "aws_focus": "cloud",
     "databricks": "hub",
     "redshift": "storage",
+    "snowflake": "ac_unit",
 }
 
 # Keep card and sidebar provider marks in sync via the shared dashboard assets.
@@ -503,10 +506,71 @@ def _redshift_form(existing: BaseModel | None) -> Collector:
     return collect
 
 
+def _snowflake_form(existing: BaseModel | None) -> Collector:
+    existing = existing if isinstance(existing, SnowflakeConfig) else None
+    name = _text(
+        "Display name", existing.name or "" if existing else "", placeholder="Prod org"
+    )
+    account = _text(
+        "Account",
+        existing.account if existing else "",
+        placeholder="xy12345.us-east-1",
+    )
+    role = _text("Role", existing.role if existing else "ACCOUNTADMIN")
+    warehouse = _text(
+        "Warehouse",
+        (existing.warehouse or "") if existing else "",
+        hint="Optional — query warehouse for ORGANIZATION_USAGE reads.",
+    )
+    database = _text("Database", existing.database if existing else "SNOWFLAKE")
+    authenticator = _text(
+        "Authenticator",
+        (existing.authenticator or "") if existing else "",
+        hint="Optional — e.g. externalbrowser. Leave blank to use password.",
+    )
+    private_key = _text(
+        "Private key path",
+        (existing.private_key_path or "") if existing else "",
+        hint="Optional — PEM key-pair auth. Takes priority over password.",
+    )
+    user = _secret(
+        "Snowflake user",
+        configured=bool(existing and load_secret(existing.user_env)),
+    )
+    password = _secret(
+        "Snowflake password",
+        configured=bool(existing and load_secret(existing.password_env)),
+    )
+
+    def collect() -> tuple[BaseModel, dict[str, str]] | None:
+        try:
+            cfg = SnowflakeConfig(
+                name=name.value or None,
+                account=account.value,
+                role=role.value or "ACCOUNTADMIN",
+                warehouse=warehouse.value or None,
+                database=database.value or "SNOWFLAKE",
+                authenticator=authenticator.value or None,
+                private_key_path=private_key.value or None,
+            )
+        except ValidationError as exc:
+            ui.notify(str(exc), type="negative")
+            return None
+        secrets: dict[str, str] = {}
+        if user.value:
+            secrets[cfg.user_env] = user.value
+        if password.value:
+            secrets[cfg.password_env] = password.value
+        return cfg, secrets
+
+    return collect
+
+
 _FORM_BUILDERS: dict[str, Callable[[BaseModel | None], Collector]] = {
     "aws_focus": _aws_focus_form,
     "databricks": _databricks_form,
     "redshift": _redshift_form,
+    "snowflake": _snowflake_form,
 }
 
 
@@ -519,6 +583,8 @@ def _summary(cfg: BaseModel) -> str:
         return cfg.host
     if isinstance(cfg, RedshiftConfig):
         return cfg.cluster_identifier
+    if isinstance(cfg, SnowflakeConfig):
+        return cfg.account
     return ""
 
 
@@ -617,6 +683,9 @@ def render() -> None:
         ]
         databricks_entries = [
             (i, c) for i, c in enumerate(all_connections) if isinstance(c, DatabricksConfig)
+        ]
+        snowflake_entries = [
+            (i, c) for i, c in enumerate(all_connections) if isinstance(c, SnowflakeConfig)
         ]
 
         def _row_content(i: int, cfg: BaseModel) -> None:
@@ -734,6 +803,11 @@ def render() -> None:
                     _row_content(i, db_cfg)
                     _tco_readiness()
 
+        if snowflake_entries:
+            _section("Snowflake")
+            for i, sf_cfg in snowflake_entries:
+                with chrome.panel():
+                    _row_content(i, sf_cfg)
     def _delete(index: int, all_connections: list[BaseModel]) -> None:
         updated = [c for j, c in enumerate(all_connections) if j != index]
         save_connections(updated)

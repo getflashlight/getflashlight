@@ -88,3 +88,16 @@ connectors:
     # bastion_user: ec2-user
     # bastion_private_key_path: /path/to/bastion-key.pem
     # db_password_env: REDSHIFT_DB_PASSWORD   # optional, see above
+
+  # Snowflake ORGANIZATION_USAGE cost + ACCOUNT_USAGE driver health. Credentials
+  # come from the *_env vars (or OS keychain), never this file.
+  # - type: snowflake
+  #   enabled: true
+  #   name: Prod org
+  #   account: xy12345.us-east-1
+  #   user_env: SNOWFLAKE_USER
+  #   password_env: SNOWFLAKE_PASSWORD
+  #   role: ACCOUNTADMIN
+  #   # warehouse: COMPUTE_WH
+  #   # authenticator: externalbrowser
+  #   # private_key_path: /path/key.pem
