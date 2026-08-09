@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Forbid operator config in git
+        run: bash .github/forbid-operator-config.sh
+
       - name: Set up uv + Python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@v7
         with:

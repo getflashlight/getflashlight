@@ -11,6 +11,13 @@ repos:
 
   - repo: local
     hooks:
+      - id: forbid-operator-config
+        name: forbid operator config in git
+        entry: bash .github/forbid-operator-config.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+
       - id: ruff
         name: ruff check
         entry: uv run ruff check --fix
