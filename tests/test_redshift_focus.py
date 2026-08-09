@@ -1,3 +1,7 @@
+from contextlib import AbstractContextManager
+from pathlib import Path
+from typing import Any, cast
+
 import pytest
 from pydantic import ValidationError
 
@@ -38,12 +42,12 @@ def test_redshift_config_disabled_by_default() -> None:
 
 
 def test_redshift_page_enables_policy_and_driver_health_tabs(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    from flashlight.dashboard.views import redshift_focus
+    from flashlight.dashboard.views import provider_focus, redshift_focus
 
     captured: dict[str, object] = {}
     monkeypatch.setattr(redshift_focus, "provider_label", lambda _: "Redshift")
     monkeypatch.setattr(
-        redshift_focus.provider_focus,
+        provider_focus,
         "render",
         lambda _group, _label, **kwargs: captured.update(kwargs),
     )
@@ -53,7 +57,8 @@ def test_redshift_page_enables_policy_and_driver_health_tabs(monkeypatch) -> Non
     assert captured["show_policy"] is True
     assert captured["efficiency_tab"] is redshift_focus._workload_findings_section
     assert captured["efficiency_tab_label"] == "Efficiency & waste"
-    assert [title for title, _ in captured["extra_tabs"]] == ["Client Driver Health"]
+    extra_tabs = cast(list[tuple[str, object]], captured["extra_tabs"])
+    assert [title for title, _ in extra_tabs] == ["Client Driver Health"]
 
 
 def test_sync_history_marks_redshift_as_telemetry_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1273,7 +1278,7 @@ def test_capacity_metrics_capture_cluster_cpu_and_disk_without_claiming_node_pre
     from flashlight.ingest.base import IngestWindow
 
     connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
-    connector._cloudwatch = MagicMock()  # type: ignore[assignment]
+    connector._cloudwatch = MagicMock()
     connector._cloudwatch.get_metric_statistics.side_effect = [
         {
             "Datapoints": [
@@ -1330,7 +1335,7 @@ def test_capacity_metrics_permission_failure_is_non_blocking() -> None:
     from flashlight.ingest.base import IngestWindow
 
     connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
-    connector._cloudwatch = MagicMock()  # type: ignore[assignment]
+    connector._cloudwatch = MagicMock()
     connector._cloudwatch.get_metric_statistics.side_effect = RuntimeError("AccessDenied")
 
     window = IngestWindow(date(2026, 7, 1), date(2026, 7, 1))
@@ -1390,7 +1395,7 @@ def test_table_inventory_cache_reuses_catalog_but_keeps_usage_live(monkeypatch, 
     get_settings.cache_clear()
     connector = RedshiftConnector(RedshiftConfig.model_validate({"cluster_identifier": "prod"}))
     calls: list[str] = []
-    results = {
+    results: dict[str, list[dict[str, object]]] = {
         "table_inventory": [
             {
                 "table_id": 7,
@@ -1411,7 +1416,7 @@ def test_table_inventory_cache_reuses_catalog_but_keeps_usage_live(monkeypatch, 
     monkeypatch.setattr(connector, "_execute", _execute)
     window = IngestWindow(date(2026, 1, 1), date(2026, 1, 31))
 
-    def lane():  # type: ignore[no-untyped-def]
+    def lane() -> AbstractContextManager[Any]:
         return nullcontext(None)
 
     first = connector._run_table_inventory_lane(window, "prod", date(2026, 1, 1), lane)
@@ -1768,8 +1773,8 @@ def test_cluster_facets_split_instrumented_from_cost_only(monkeypatch, tmp_path)
 
 
 def test_redshift_cluster_cost_view_keeps_components_and_unassigned_visible(
-    monkeypatch, tmp_path
-) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """The Attribution landing grain is the billed cluster, not its redundant service.
 
     Invoice components remain below that cluster: this is what prevents a

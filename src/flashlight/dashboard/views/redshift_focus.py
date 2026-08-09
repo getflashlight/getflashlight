@@ -930,7 +930,7 @@ def _cluster_capacity_health(cluster_id: str, month: str) -> None:
     elif cpu_max >= 90 and (
         (not pd.isna(queue) and queue >= 5000)
         or (spill_rate or 0) >= 0.02
-        or float(r["scaling"] or 0) > 0
+        or float(str(r["scaling"] or 0)) > 0
     ):
         state, detail = "Likely constrained", "Peak capacity is corroborated by workload pressure."
         state_color, state_icon = chrome.WASTE, "warning_amber"
@@ -941,9 +941,9 @@ def _cluster_capacity_health(cluster_id: str, month: str) -> None:
         )
         state_color, state_icon = chrome.ACCENT, "balance"
     def pct(v: object) -> str:
-        return "—" if pd.isna(v) else f"{float(v):.1f}%"
+        return "—" if pd.isna(v) else f"{float(str(v)):.1f}%"
     def secs(v: object) -> str:
-        return "—" if pd.isna(v) else f"{float(v) / 1000:.1f}s"
+        return "—" if pd.isna(v) else f"{float(str(v)) / 1000:.1f}s"
     with chrome.panel():
         chrome.panel_title("Cluster capacity & workload health")
         with ui.row().classes("w-full items-start justify-between gap-4 flex-wrap"):

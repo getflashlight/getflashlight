@@ -414,14 +414,18 @@ def _assert_reconciled(costs: list[FocusRecord], efficiency: list[EfficiencyReco
             record.charge_period_start.date().replace(day=1),
         )
         focus_totals[key] = focus_totals.get(key, Decimal("0")) + record.effective_cost
-    for record in efficiency:
-        key = (record.provider_name, record.entity_id, record.charge_month)
+    for efficiency_record in efficiency:
+        key = (
+            efficiency_record.provider_name,
+            efficiency_record.entity_id,
+            efficiency_record.charge_month,
+        )
         if key not in focus_totals:
             raise ValueError(f"telemetry entity has no FOCUS cost: {key}")
-        if focus_totals[key] != record.billed_cost:
+        if focus_totals[key] != efficiency_record.billed_cost:
             raise ValueError(
                 f"telemetry cost does not reconcile for {key}: "
-                f"{record.billed_cost} != {focus_totals[key]}"
+                f"{efficiency_record.billed_cost} != {focus_totals[key]}"
             )
 
 
