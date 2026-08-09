@@ -346,9 +346,9 @@ def test_fetch_storage_locations_captures_every_metastore_not_just_this_workspac
     """``metastores.list()`` is preferred over ``summary()`` because summary() returns ONLY
     the metastore assigned to the workspace this connector points at.
 
-    The real bug: an account with production and development metastores attached to different workspaces
-    reported one of them, and the other's bucket sat in `unmapped` looking like it wasn't
-    Databricks storage at all.
+    The real bug: an account with production and development metastores attached to
+    different workspaces reported one of them, and the other's bucket sat in `unmapped`
+    looking like it wasn't Databricks storage at all.
     """
     client = _client(
         metastores_list_raises=False,

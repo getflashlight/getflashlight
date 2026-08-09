@@ -891,13 +891,20 @@ def _cluster_capacity_health(cluster_id: str, month: str) -> None:
     escaped = _sql_str(cluster_id)
     row = gold_df(
         "SELECT activity_count, cause_detail, "
-        "try_cast(json_extract_string(cause_detail, '$.cluster_cpu_utilization_avg_pct') AS DOUBLE) "
-        "AS cpu_avg, try_cast(json_extract_string(cause_detail, '$.cluster_cpu_utilization_max_pct') AS DOUBLE) AS cpu_max, "
-        "try_cast(json_extract_string(cause_detail, '$.cluster_disk_space_used_avg_pct') AS DOUBLE) AS disk_avg, "
-        "try_cast(json_extract_string(cause_detail, '$.cluster_disk_space_used_max_pct') AS DOUBLE) AS disk_max, "
-        "try_cast(json_extract_string(cause_detail, '$.wlm_queue_wait_ms_p95') AS DOUBLE) AS queue_p95, "
-        "try_cast(json_extract_string(cause_detail, '$.disk_spill_query_count') AS DOUBLE) AS spills, "
-        "try_cast(json_extract_string(cause_detail, '$.concurrency_scaling_active_seconds') AS DOUBLE) AS scaling "
+        "try_cast(json_extract_string(cause_detail, "
+        "'$.cluster_cpu_utilization_avg_pct') AS DOUBLE) AS cpu_avg, "
+        "try_cast(json_extract_string(cause_detail, "
+        "'$.cluster_cpu_utilization_max_pct') AS DOUBLE) AS cpu_max, "
+        "try_cast(json_extract_string(cause_detail, "
+        "'$.cluster_disk_space_used_avg_pct') AS DOUBLE) AS disk_avg, "
+        "try_cast(json_extract_string(cause_detail, "
+        "'$.cluster_disk_space_used_max_pct') AS DOUBLE) AS disk_max, "
+        "try_cast(json_extract_string(cause_detail, "
+        "'$.wlm_queue_wait_ms_p95') AS DOUBLE) AS queue_p95, "
+        "try_cast(json_extract_string(cause_detail, "
+        "'$.disk_spill_query_count') AS DOUBLE) AS spills, "
+        "try_cast(json_extract_string(cause_detail, "
+        "'$.concurrency_scaling_active_seconds') AS DOUBLE) AS scaling "
         "FROM efficiency.efficiency_entity_month "
         f"WHERE provider_name = '{_PROVIDER}' AND entity_type = 'sql_warehouse' "
         f"AND entity_id = '{escaped}' AND charge_month = '{month}' LIMIT 1"
@@ -912,14 +919,26 @@ def _cluster_capacity_health(cluster_id: str, month: str) -> None:
         state = "Insufficient capacity telemetry"
         detail = "CloudWatch CPU/disk readings were unavailable for this assessment."
         state_color, state_icon = chrome.INK_MUTED, "help_outline"
-    elif cpu_avg < 25 and cpu_max < 50 and (pd.isna(queue) or queue < 1000) and (spill_rate or 0) < 0.01:
+    elif (
+        cpu_avg < 25
+        and cpu_max < 50
+        and (pd.isna(queue) or queue < 1000)
+        and (spill_rate or 0) < 0.01
+    ):
         state, detail = "Likely underused", "Low capacity use without workload contention."
         state_color, state_icon = chrome.OPPORTUNITY, "south_east"
-    elif cpu_max >= 90 and ((not pd.isna(queue) and queue >= 5000) or (spill_rate or 0) >= 0.02 or float(r["scaling"] or 0) > 0):
+    elif cpu_max >= 90 and (
+        (not pd.isna(queue) and queue >= 5000)
+        or (spill_rate or 0) >= 0.02
+        or float(r["scaling"] or 0) > 0
+    ):
         state, detail = "Likely constrained", "Peak capacity is corroborated by workload pressure."
         state_color, state_icon = chrome.WASTE, "warning_amber"
     else:
-        state, detail = "Balanced / mixed", "Capacity peaks are not enough alone to establish contention."
+        state, detail = (
+            "Balanced / mixed",
+            "Capacity peaks are not enough alone to establish contention.",
+        )
         state_color, state_icon = chrome.ACCENT, "balance"
     def pct(v: object) -> str:
         return "—" if pd.isna(v) else f"{float(v):.1f}%"
@@ -941,10 +960,15 @@ def _cluster_capacity_health(cluster_id: str, month: str) -> None:
                 ("CPU", f"{pct(cpu_avg)} avg · {pct(cpu_max)} peak", "memory"),
                 ("Disk", f"{pct(r['disk_avg'])} avg · {pct(r['disk_max'])} peak", "storage"),
                 ("Queue p95", secs(queue), "schedule"),
-                ("Spill rate", "—" if spill_rate is None else f"{spill_rate:.1%}", "waterfall_chart"),
+                (
+                    "Spill rate",
+                    "—" if spill_rate is None else f"{spill_rate:.1%}",
+                    "waterfall_chart",
+                ),
             ):
                 with ui.row().classes("items-center gap-2 px-3 py-2 rounded-lg").style(
-                    f"min-width:10.5rem;flex:1;background:{chrome.SURFACE};border:1px solid {chrome.BORDER};"
+                    f"min-width:10.5rem;flex:1;background:{chrome.SURFACE};"
+                    f"border:1px solid {chrome.BORDER};"
                 ):
                     ui.icon(icon).classes("text-base").style(f"color:{chrome.INK_MUTED}")
                     with ui.column().classes("gap-0"):
@@ -953,7 +977,10 @@ def _cluster_capacity_health(cluster_id: str, month: str) -> None:
         if '"activity_window_capped": true' in str(r["cause_detail"]):
             with ui.row().classes("items-center gap-1.5 mt-3"):
                 ui.icon("info_outline").classes("text-sm").style(f"color:{chrome.INK_MUTED}")
-                chrome.section_caption("WLM evidence covers its retained recent-log window, not a complete 14-day history.")
+                chrome.section_caption(
+                    "WLM evidence covers its retained recent-log window, "
+                    "not a complete 14-day history."
+                )
 
 
 def _cluster_waste_section(cluster_id: str, month: str) -> None:
