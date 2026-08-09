@@ -26,7 +26,8 @@ connector only supplies efficiency/waste telemetry. So this page:
   (service → cluster → user allocation) narrowed by ``service_name``.
 - **Workload Findings**: faceted per cluster (:func:`_workload_findings_section`) — one
   section per billed Redshift cluster. Clusters with telemetry show only Redshift-native
-  findings; clusters without it show an explicit, cluster-specific instrumentation gap. ``entity_id`` for
+  findings; clusters without it show an explicit, cluster-specific instrumentation gap.
+  ``entity_id`` for
   ``entity_type='sql_warehouse'`` under ``provider_name='AWS'`` is the cluster
   identifier itself, and every other Redshift entity_type is ``<cluster_id>:...``
   prefixed, see ``ingest/connectors/redshift.py``). Clusters that bill on this
@@ -40,10 +41,10 @@ connector only supplies efficiency/waste telemetry. So this page:
   coverage summaries are omitted because Redshift telemetry is diagnostic rather than
   a per-entity utilization reading.
 
-  This tab is why the page does NOT also carry ``efficiency_waste.render()`` the way every
-  other provider page does: ``_workload_findings_section`` is scoped per *cluster*, which is finer than
-  per provider, so a provider-scoped tab beside it would render the union of these sections
-  — the same ``waste_record`` rows twice.
+  This tab is why the page does NOT also carry ``efficiency_waste.render()`` the way
+  every other provider page does: ``_workload_findings_section`` is scoped per
+  *cluster*, which is finer than per provider, so a provider-scoped tab beside it
+  would render the union of these sections — the same ``waste_record`` rows twice.
 """
 
 from __future__ import annotations
@@ -1056,7 +1057,8 @@ def _cluster_waste_section(cluster_id: str, month: str) -> None:
                         + ("…" if len(" ".join(str(text).split())) > 240 else "")
                     )
                     chrome.section_caption(
-                        "Query text is shortened here; Download CSV includes the full captured text."
+                        "Query text is shortened here; Download CSV includes the full "
+                        "captured text."
                     )
                 chrome.searchable_table(
                     display,

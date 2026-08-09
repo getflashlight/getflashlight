@@ -25,6 +25,10 @@ Two details this test exists to get right:
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from flashlight.core.settings import get_settings
 
 # Both halves of the claim, as one scan. Casting to DATE on the left keeps the comparison
@@ -45,8 +49,8 @@ WHERE provider_name <> 'Oracle'
 
 
 def test_billing_period_is_a_redundant_derivation_of_charge_month(
-    monkeypatch,
-    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
     get_settings.cache_clear()
@@ -78,7 +82,9 @@ def test_billing_period_is_a_redundant_derivation_of_charge_month(
     )
 
 
-def test_silver_does_not_expose_the_billing_period(monkeypatch, tmp_path) -> None:
+def test_silver_does_not_expose_the_billing_period(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """The other half of the invariant: nothing downstream can group by it.
 
     Asserted on the view's own columns rather than on the SQL text, so it keeps holding
