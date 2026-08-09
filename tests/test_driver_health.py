@@ -1,6 +1,13 @@
 from datetime import date
 
-from flashlight.dashboard.views.driver_health import _COLS, _OUTDATED_COLS, _parse_driver
+import pandas as pd
+
+from flashlight.dashboard.views.driver_health import (
+    _COLS,
+    _OUTDATED_COLS,
+    _parse_driver,
+    _with_staleness,
+)
 from flashlight.ingest.connectors.databricks import DatabricksConnector
 from flashlight.lake.driver_health_schema import (
     DriverHealthRecord,
@@ -17,6 +24,7 @@ def test_driver_health_schema_round_trip() -> None:
             client_driver="DatabricksJDBCDriver, 2.7.1",
             client_application="Retool",
             executed_by="alice@example.com",
+            cluster_id="analytics-prod",
             query_count=33,
             x_source_connector="databricks",
         ),
@@ -27,6 +35,7 @@ def test_driver_health_schema_round_trip() -> None:
     assert row["client_driver"] == "DatabricksJDBCDriver, 2.7.1"
     assert row["client_application"] == "Retool"
     assert row["executed_by"] == "alice@example.com"
+    assert row["cluster_id"] == "analytics-prod"
     assert row["query_count"] == 33
     assert row["support_status"] is None
     assert row["provider_name"] == "Databricks"
@@ -74,6 +83,27 @@ def test_driver_health_tables_omit_empty_application_column() -> None:
     assert "client_application" not in _OUTDATED_COLS
 
 
+def test_staleness_comparison_does_not_cross_clusters() -> None:
+    records = pd.DataFrame(
+        [
+            {
+                "provider_name": "AWS",
+                "cluster_id": "analytics",
+                "client_driver": "Redshift JDBC Driver 2.0.0.0",
+            },
+            {
+                "provider_name": "AWS",
+                "cluster_id": "reporting",
+                "client_driver": "Redshift JDBC Driver 2.2.7",
+            },
+        ]
+    )
+
+    enriched = _with_staleness(records)
+
+    assert enriched["status"].tolist() == ["up_to_date", "up_to_date"]
+
+
 def test_driver_health_flows_from_typed_bronze_to_gold(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from flashlight.core.settings import get_settings
     from flashlight.gold.reader import query_view
@@ -89,7 +119,8 @@ def test_driver_health_flows_from_typed_bronze_to_gold(tmp_path, monkeypatch) ->
         [
             DriverHealthRecord(
                 provider_name="AWS", charge_month=date(2026, 7, 1),
-                client_driver="Redshift JDBC Driver 2.0.0.0", query_count=44,
+                client_driver="Redshift JDBC Driver 2.0.0.0", cluster_id="analytics-prod",
+                query_count=44,
                 x_source_connector="Prod",
             )
         ],

@@ -99,6 +99,7 @@ def test_fetch_driver_health_maps_connection_log_rows(monkeypatch) -> None:  # t
 
     assert len(records) == 1
     assert records[0].provider_name == "AWS"
+    assert records[0].cluster_id == "prod"
     assert records[0].client_driver == "Redshift JDBC Driver 2.0.0.0"
     assert records[0].query_count == 44
     driver_call = next(
@@ -999,6 +1000,10 @@ def test_fetch_efficiency_yields_all_entity_types(monkeypatch, tmp_path) -> None
             "qry_md5": (
                 [
                     "qry_md5",
+                    "sample_query_id",
+                    "last_seen_at",
+                    "sample_query_text",
+                    "sample_query_owner",
                     "run_count",
                     "total_run_min",
                     "avg_exec_min",
@@ -1011,7 +1016,8 @@ def test_fetch_efficiency_yields_all_entity_types(monkeypatch, tmp_path) -> None
                     "avg_slices_in_use",
                     "top_user",
                 ],
-                [["abc123", 5, 42.0, 2.0, 0.5, 0.6, 3.5, 1.2, 4.0, 6.0, 8.0, "alice"]],
+                [["abc123", 7654321, "2026-01-31 23:59:00", "SELECT * FROM orders", "alice",
+                  5, 42.0, 2.0, 0.5, 0.6, 3.5, 1.2, 4.0, 6.0, 8.0, "alice"]],
             ),
             "exec_microseconds": (
                 [
@@ -1114,7 +1120,11 @@ def test_fetch_efficiency_yields_all_entity_types(monkeypatch, tmp_path) -> None
     pattern_rows = by_type[EntityType.QUERY_PATTERN]
     assert len(pattern_rows) == 1
     assert pattern_rows[0].entity_id == "prod:abc123"
+    assert pattern_rows[0].entity_name == "Query 7654321"
     assert pattern_rows[0].owner_user == "alice"
+    assert pattern_rows[0].cause_detail["sample_query_id"] == 7654321
+    assert pattern_rows[0].cause_detail["sample_query_text"] == "SELECT * FROM orders"
+    assert pattern_rows[0].cause_detail["query_owner"] == "alice"
     assert pattern_rows[0].cause_detail["pct_runs_spilling"] == pytest.approx(0.6)
 
     user_rows = {r.entity_name: r for r in by_type[EntityType.SQL_WAREHOUSE_USER]}
@@ -1860,7 +1870,6 @@ def test_redshift_tab_renders_per_cluster_with_action_queue(monkeypatch, tmp_pat
             await user.open("/aws")
             await user.should_see("Redshift spend")
             user.find(kind=ui.tab, content="Workload Findings").click()
-            await user.should_see("Redshift workload findings")
             await user.should_see("Findings")
             await user.should_see("Not yet instrumented")
 

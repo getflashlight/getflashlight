@@ -73,6 +73,38 @@ def _purge_window(partitions: set[tuple[str, str]], window: IngestWindow) -> Non
                 )
 
 
+def _migrate_legacy_provider_month_partitions() -> None:
+    """Upgrade old provider/month-only files before writing the new connector grain.
+
+    Without this one-time split, old files would be read beside new connector-scoped
+    files and a later refresh would duplicate their rows.  The old files already carry
+    ``x_source_connector`` as a normal Parquet column, so the migration can safely
+    repartition them without guessing a cluster identity.
+    """
+    root = paths.metrics_dir()
+    legacy_dirs = [
+        month_dir
+        for provider_dir in root.glob("provider_name=*")
+        if provider_dir.is_dir()
+        for month_dir in provider_dir.glob("charge_month=*")
+        if month_dir.is_dir() and list(month_dir.glob("*.parquet"))
+    ]
+    if not legacy_dirs:
+        return
+
+    files = [file for partition in legacy_dirs for file in partition.glob("*.parquet")]
+    literal_files = ", ".join(f"'{str(file).replace("'", "''")}'" for file in files)
+    source = f"read_parquet([{literal_files}], hive_partitioning=true, union_by_name=true)"
+    con = duck.connect()
+    try:
+        con.execute(f"COPY (SELECT * FROM {source}) TO '{root}' ({_copy_options()})")  # noqa: S608
+    finally:
+        con.close()
+    for partition in legacy_dirs:
+        shutil.rmtree(partition)
+    logger.info("metrics_legacy_partitions_migrated", partitions=len(legacy_dirs), files=len(files))
+
+
 def write_efficiency(window: IngestWindow, records: list[EfficiencyRecord]) -> int:
     """Partition-replace ``[window]`` with ``records``. Returns rows written.
 
@@ -80,6 +112,7 @@ def write_efficiency(window: IngestWindow, records: list[EfficiencyRecord]) -> i
     writes the fresh, source-aggregated pull as zstd Parquet partitioned by provider,
     connector, and month.
     """
+    _migrate_legacy_provider_month_partitions()
     partitions = {(str(r.provider_name), r.x_source_connector) for r in records}
     _purge_window(partitions, window)
     if not records:

@@ -137,7 +137,7 @@ def render() -> None:
         provider_label(_GROUP),
         scope=scope(),
         breakdown_lead=(_spend_partition,),
-        extra_kpis=(_commitment_utilization_kpi, _spectrum_kpi, _active_clusters_kpi),
+        extra_kpis=(_spectrum_kpi, _active_clusters_kpi),
         attribution_tab=_attribution_section,
         efficiency_tab=_workload_findings_section,
         efficiency_tab_label="Workload Findings",
@@ -168,37 +168,6 @@ def _spectrum_kpi(sm: date, end: date) -> chrome.KpiCard | None:
     if not cost:
         return None
     return ("Spectrum scans", compact_money(cost), "Included in Net Spend", "volume")
-
-
-def _commitment_utilization_kpi(sm: date, end: date) -> chrome.KpiCard | None:
-    """Latest complete month's used share; an in-progress month is not comparable."""
-    if not gold_view_published(_GROUP, "commitment_summary_month"):
-        return None
-    current = _d(gold_df("SELECT date_trunc('month', CURRENT_DATE) AS m").iloc[0]["m"])
-    rows = gold_df(
-        "SELECT charge_month, commitment_discount_status, sum(effective_cost) AS cost "
-        f"FROM {_GROUP}.commitment_summary_month "
-        f"WHERE charge_month >= '{sm}' AND charge_month <= '{end}' "
-        f"AND charge_month < '{current}' AND commitment_discount_status IN ('Used', 'Unused') "
-        "GROUP BY charge_month, commitment_discount_status"
-    )
-    if rows.empty:
-        return None
-    latest = pd.Timestamp(rows["charge_month"].max()).date()
-    latest_rows = rows[pd.to_datetime(rows["charge_month"]).dt.date == latest]
-    used = float(latest_rows.loc[latest_rows["commitment_discount_status"] == "Used", "cost"].sum())
-    unused = float(
-        latest_rows.loc[latest_rows["commitment_discount_status"] == "Unused", "cost"].sum()
-    )
-    total = used + unused
-    if total <= 0:
-        return None
-    return (
-        "Commitment utilization",
-        f"{100 * used / total:.1f}%",
-        f"{latest:%b %Y} · {compact_money(used)} used · {compact_money(unused)} unused",
-        "volume",
-    )
 
 
 def _active_clusters_kpi(sm: date, end: date) -> chrome.KpiCard | None:
@@ -908,8 +877,12 @@ def _telemetry_cluster_ids() -> list[str]:
 
 def _workload_findings_section(sm: date, end: date) -> None:
     """Redshift-native findings only; generic shared-compute savings are excluded."""
-    chrome.section_title("Redshift workload findings")
-
+    chrome.section_title("Redshift performance findings")
+    chrome.section_caption(
+        "Find query, table, WLM, and Spectrum conditions that may be wasting capacity or "
+        "slowing workloads. Open a finding for resource-level evidence; query-pattern rows "
+        "show a sample Redshift query ID that can be opened in the query console."
+    )
     # The bill is the primary cluster universe: a reader needs an answer for all four
     # billed clusters, not only the subset that already has a telemetry connector. A
     # telemetry-only cluster is retained too, so a newly configured connector never
@@ -977,13 +950,17 @@ def _cluster_efficiency_section(cluster_id: str, instrumented: bool) -> None:
 
 def _cluster_waste_section(cluster_id: str, month: str) -> None:
     scope = (
-        f"(entity_id = '{_sql_str(cluster_id)}' "
-        f"OR starts_with(entity_id, '{_sql_str(cluster_id)}:'))"
+        f"(w.entity_id = '{_sql_str(cluster_id)}' "
+        f"OR starts_with(w.entity_id, '{_sql_str(cluster_id)}:'))"
     )
     records = gold_df(
-        f"SELECT * FROM efficiency.waste_record WHERE provider_name = '{_PROVIDER}' "
-        f"AND {scope} AND charge_month = '{month}' "
-        "AND waste_category LIKE 'redshift_%' ORDER BY confidence DESC, waste_category"
+        "SELECT w.*, json_extract_string(e.cause_detail, '$.sample_query_text') "
+        "AS sample_query_text, coalesce(e.owner_user, w.owner_user) AS query_owner "
+        "FROM efficiency.waste_record w LEFT JOIN efficiency.efficiency_entity_month e "
+        "ON e.provider_name = w.provider_name AND e.charge_month = w.charge_month "
+        "AND e.entity_type = w.entity_type AND e.entity_id = w.entity_id "
+        f"WHERE w.provider_name = '{_PROVIDER}' AND {scope} AND w.charge_month = '{month}' "
+        "AND w.waste_category LIKE 'redshift_%' ORDER BY w.confidence DESC, w.waste_category"
     )
     with chrome.panel():
         chrome.panel_title("Findings")
@@ -1014,7 +991,7 @@ def _cluster_waste_section(cluster_id: str, month: str) -> None:
                                 lambda high: "High" if high else "Candidate"
                             ),
                         )
-                        .sort_values(["has_high_confidence", "Finding"], ascending=[False, True])
+                        .sort_values(["resource_count", "Finding"], ascending=[False, True])
                     )
 
                     def _open_finding(row: dict[str, object]) -> None:
@@ -1031,21 +1008,64 @@ def _cluster_waste_section(cluster_id: str, month: str) -> None:
                     )
                     return
 
-                ui.button("← All findings", on_click=lambda: _body.refresh()).props(
-                    "flat dense no-caps"
-                ).style(f"color:{chrome.ACCENT};")
+                with ui.row().classes("items-center gap-1"):
+                    # NiceGUI keeps a refreshable target's prior positional arguments when
+                    # refresh() receives none. Pass None explicitly to return to the root
+                    # rather than re-rendering this same finding detail.
+                    ui.button(
+                        "All findings", icon="arrow_back", on_click=lambda: _body.refresh(None)
+                    ).props("flat dense no-caps").style(f"color:{chrome.ACCENT};")
+                    ui.label("/").style(f"color:{chrome.INK_MUTED}")
+                    ui.label(_REDSHIFT_RULE_BY_CATEGORY[category].label).style(
+                        f"color:{chrome.INK_SECONDARY}"
+                    )
                 findings = records.loc[records["waste_category"] == category]
-                display = pd.DataFrame(
-                    {
-                        "Resource": findings["entity_name"].fillna(findings["entity_id"]),
-                        "Evidence": findings["detail"],
-                        "Confidence": findings["confidence"].str.capitalize(),
-                    }
+                resource_column = (
+                    "Sample query ID"
+                    if findings["entity_type"].eq("query_pattern").all()
+                    else "Resource"
                 )
+                resources = findings["entity_name"].fillna(findings["entity_id"])
+                if resource_column == "Sample query ID":
+                    # Older metric files predate sample_query_id and stored only the
+                    # MD5 fingerprint. It cannot be reversed to SQL, so name the
+                    # required refresh instead of displaying an opaque hash.
+                    resources = resources.mask(
+                        resources.astype(str).str.fullmatch(r"[0-9a-f]{32}"),
+                        "Unavailable — refresh this cluster to capture a query ID",
+                    )
+                display_columns: dict[str, pd.Series] = {
+                    resource_column: resources,
+                }
+                if resource_column == "Sample query ID":
+                    display_columns |= {
+                        "Owner": findings["query_owner"].fillna("Unknown"),
+                        "Query text": findings["sample_query_text"].fillna(
+                            "Unavailable — refresh this cluster to capture query text"
+                        ),
+                    }
+                display_columns |= {
+                    "Evidence": findings["detail"],
+                    "Confidence": findings["confidence"].str.capitalize(),
+                }
+                display = pd.DataFrame(display_columns)
+                download = display.copy()
+                if resource_column == "Sample query ID":
+                    # Keep the full captured SQL in CSV, but make the interactive
+                    # table scannable even for multi-line, 4,000-character queries.
+                    display["Query text"] = display["Query text"].map(
+                        lambda text: " ".join(str(text).split())[:240]
+                        + ("…" if len(" ".join(str(text).split())) > 240 else "")
+                    )
+                    chrome.section_caption(
+                        "Query text is shortened here; Download CSV includes the full "
+                        "captured text."
+                    )
                 chrome.searchable_table(
                     display,
+                    download_df=download,
                     key=f"redshift_findings_{_slug(cluster_id)}_{_slug(category)}",
-                    search_col="Resource",
+                    search_col=resource_column,
                 )
 
         _body()

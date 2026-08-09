@@ -709,7 +709,7 @@ DRIVER_HEALTH_BASE_VIEWS: tuple[ViewSpec, ...] = (
         "dashboard judges fleet-relative staleness instead.",
         cost_metric=None,
         dimensions=("provider_name", "charge_month", "client_driver", "client_application",
-                    "executed_by", "support_status"),
+                    "executed_by", "cluster_id", "support_status"),
         measures=("query_count",),
     ),
 )
