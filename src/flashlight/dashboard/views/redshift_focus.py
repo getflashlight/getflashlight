@@ -911,32 +911,49 @@ def _cluster_capacity_health(cluster_id: str, month: str) -> None:
     if pd.isna(cpu_avg):
         state = "Insufficient capacity telemetry"
         detail = "CloudWatch CPU/disk readings were unavailable for this assessment."
+        state_color, state_icon = chrome.INK_MUTED, "help_outline"
     elif cpu_avg < 25 and cpu_max < 50 and (pd.isna(queue) or queue < 1000) and (spill_rate or 0) < 0.01:
         state, detail = "Likely underused", "Low capacity use without workload contention."
+        state_color, state_icon = chrome.OPPORTUNITY, "south_east"
     elif cpu_max >= 90 and ((not pd.isna(queue) and queue >= 5000) or (spill_rate or 0) >= 0.02 or float(r["scaling"] or 0) > 0):
         state, detail = "Likely constrained", "Peak capacity is corroborated by workload pressure."
+        state_color, state_icon = chrome.WASTE, "warning_amber"
     else:
         state, detail = "Balanced / mixed", "Capacity peaks are not enough alone to establish contention."
+        state_color, state_icon = chrome.ACCENT, "balance"
     def pct(v: object) -> str:
         return "—" if pd.isna(v) else f"{float(v):.1f}%"
     def secs(v: object) -> str:
         return "—" if pd.isna(v) else f"{float(v) / 1000:.1f}s"
     with chrome.panel():
         chrome.panel_title("Cluster capacity & workload health")
-        ui.label(state).classes("text-base font-semibold").style(f"color:{chrome.ACCENT}")
-        chrome.section_caption(detail)
-        with ui.row().classes("w-full gap-5 flex-wrap"):
-            for label, value in (
-                ("CPU avg / peak", f"{pct(cpu_avg)} / {pct(cpu_max)}"),
-                ("Disk avg / peak", f"{pct(r['disk_avg'])} / {pct(r['disk_max'])}"),
-                ("WLM queue p95", secs(queue)),
-                ("Spill rate", "—" if spill_rate is None else f"{spill_rate:.1%}"),
-            ):
+        with ui.row().classes("w-full items-start justify-between gap-4 flex-wrap"):
+            with ui.row().classes("items-center gap-3"):
+                ui.icon(state_icon).classes("text-xl").style(f"color:{state_color}")
                 with ui.column().classes("gap-0"):
-                    ui.label(label).classes("text-xs").style(f"color:{chrome.INK_MUTED}")
-                    ui.label(value).classes("text-sm font-medium")
+                    ui.label(state).classes("text-lg font-semibold").style(f"color:{state_color}")
+                    chrome.section_caption(detail)
+            ui.label("Last 14 days").classes("text-xs font-medium px-2 py-1 rounded-full").style(
+                f"color:{chrome.INK_SECONDARY};background:{chrome.SURFACE};"
+            )
+        with ui.row().classes("w-full gap-3 flex-wrap mt-3"):
+            for label, value, icon in (
+                ("CPU", f"{pct(cpu_avg)} avg · {pct(cpu_max)} peak", "memory"),
+                ("Disk", f"{pct(r['disk_avg'])} avg · {pct(r['disk_max'])} peak", "storage"),
+                ("Queue p95", secs(queue), "schedule"),
+                ("Spill rate", "—" if spill_rate is None else f"{spill_rate:.1%}", "waterfall_chart"),
+            ):
+                with ui.row().classes("items-center gap-2 px-3 py-2 rounded-lg").style(
+                    f"min-width:10.5rem;flex:1;background:{chrome.SURFACE};border:1px solid {chrome.BORDER};"
+                ):
+                    ui.icon(icon).classes("text-base").style(f"color:{chrome.INK_MUTED}")
+                    with ui.column().classes("gap-0"):
+                        ui.label(label).classes("text-xs").style(f"color:{chrome.INK_MUTED}")
+                        ui.label(value).classes("text-sm font-medium")
         if '"activity_window_capped": true' in str(r["cause_detail"]):
-            chrome.section_caption("WLM evidence covers its retained recent-log window, not a complete 14-day history.")
+            with ui.row().classes("items-center gap-1.5 mt-3"):
+                ui.icon("info_outline").classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+                chrome.section_caption("WLM evidence covers its retained recent-log window, not a complete 14-day history.")
 
 
 def _cluster_waste_section(cluster_id: str, month: str) -> None:
