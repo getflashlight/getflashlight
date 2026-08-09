@@ -339,9 +339,9 @@ def sync_in_progress_banner(group: str) -> None:
         f"background:rgba(57,135,229,0.12);border:1px solid {chrome.BORDER};border-radius:8px;"
     ):
         ui.spinner(size="1rem").style(f"color:{chrome.ACCENT}")
-        ui.label("Sync in progress — this dashboard will refresh with the latest data when it completes.").classes(
-            "text-sm"
-        ).style(f"color:{chrome.INK_SECONDARY}")
+        ui.label(
+            "Sync in progress — this dashboard will refresh with the latest data when it completes."
+        ).classes("text-sm").style(f"color:{chrome.INK_SECONDARY}")
 
 
 def sync_in_progress_page(label: str) -> None:
@@ -352,9 +352,10 @@ def sync_in_progress_page(label: str) -> None:
             ui.label(f"Syncing {label}").classes("text-lg font-semibold").style(
                 f"color:{chrome.INK_PRIMARY}"
             )
-            ui.label("Sync in progress. Your dashboard will be available when the first data publish finishes.").classes(
-                "text-sm"
-            ).style(f"color:{chrome.INK_MUTED}")
+            ui.label(
+                "Sync in progress. Your dashboard will be available when the first data publish "
+                "finishes."
+            ).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
 
 
 def build_pages() -> None:

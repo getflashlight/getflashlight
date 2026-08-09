@@ -75,6 +75,44 @@ def test_provider_groups_cover_selected_enabled_connections() -> None:
     assert provider_groups_for_configs(configs, connector="Warehouse") == frozenset({"aws"})
 
 
+def test_active_provider_groups_last_for_the_complete_sync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sidebar stays in progress until the subprocess, including publish, exits."""
+    from flashlight.dashboard.ingest_runner import active_provider_groups
+
+    connections_path = tmp_path / "connections.yml"
+    connections_path.write_text(
+        "connectors:\n"
+        "  - type: databricks\n"
+        "    name: Analytics\n"
+        "    host: https://acme.cloud.databricks.com\n"
+        "  - type: snowflake\n"
+        "    name: Finance\n"
+        "    account: xy12345\n"
+    )
+    complete = asyncio.Event()
+
+    class _BlockingProcess(_FakeProcess):
+        async def wait(self) -> int:
+            await complete.wait()
+            return 0
+
+    async def _fake_create_subprocess_exec(*_cmd, **_kwargs):  # type: ignore[no-untyped-def]
+        return _BlockingProcess([], returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    async def _run() -> None:
+        await start_sync(connections_path)
+        assert active_provider_groups() == frozenset({"databricks", "snowflake"})
+        complete.set()
+        assert await wait_for_current() is not None
+        assert active_provider_groups() == frozenset()
+
+    asyncio.run(_run())
+
+
 def test_stream_sync_streams_lines_and_returns_exit_code(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
     connections_path = tmp_path / "connections.yml"
     connections_path.write_text("connectors: []\n")
