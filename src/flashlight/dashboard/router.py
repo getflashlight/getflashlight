@@ -22,7 +22,7 @@ from fastapi.responses import RedirectResponse, Response
 from nicegui import ui
 
 from flashlight.core.settings import get_settings
-from flashlight.dashboard import chrome
+from flashlight.dashboard import chrome, ingest_runner
 from flashlight.dashboard.data import (
     NO_DATA_MSG,
     gold_df,
@@ -79,11 +79,11 @@ def _nav_groups() -> list[str]:
     Snowflake is always included so ``/snowflake`` stays reachable before the first
     ingest publishes ``gold/snowflake/`` (visibility falls back to synthetic Parquet).
     """
-    groups = discover_provider_groups()
-    if "snowflake" not in groups:
-        groups = [*groups, "snowflake"]
+    groups = set(discover_provider_groups())
+    groups.add("snowflake")
+    groups.update(ingest_runner.active_provider_groups())
     lead = [g for g in _NAV_GROUP_ORDER if g in groups]
-    return lead + [g for g in groups if g not in lead]
+    return lead + sorted(g for g in groups if g not in lead)
 
 
 def _nav_label(group: str) -> str:
@@ -103,7 +103,13 @@ def _logo() -> None:
 
 
 def _nav_row(
-    *, label: str, icon: str, href: str, active: bool, logo_source: str | None = None
+    *,
+    label: str,
+    icon: str,
+    href: str,
+    active: bool,
+    logo_source: str | None = None,
+    syncing: bool = False,
 ) -> None:
     row = ui.row().classes(
         "fl-sidebar-row items-center gap-2 w-full px-2 py-2 cursor-pointer"
@@ -121,6 +127,11 @@ def _nav_row(
         ui.link(label, href).classes("fl-sidebar-label text-sm no-underline").style(
             f"color:{chrome.INK_PRIMARY}"
         )
+        if syncing:
+            ui.spinner(size="14px").classes("flex-none").style(f"color:{chrome.ACCENT}")
+            ui.label("Syncing").classes("fl-sidebar-label text-xs").style(
+                f"color:{chrome.INK_MUTED}"
+            )
     row.on("click", lambda: ui.navigate.to(href))
 
 
@@ -193,6 +204,7 @@ def shell(active_path: str, *, full_height: bool = False) -> ui.column:
                             href=href,
                             active=active_path == href,
                             logo_source=_SIDEBAR_PROVIDER_LOGOS.get(group),
+                            syncing=group in ingest_runner.active_provider_groups(),
                         )
 
     with ui.header().classes("items-center justify-between px-6 py-3").style(
@@ -317,6 +329,32 @@ def register_retired_route_redirects() -> None:
 def no_data_page(title: str) -> None:
     ui.label(title).classes("text-lg font-semibold").style(f"color:{chrome.INK_PRIMARY}")
     ui.label(NO_DATA_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+
+
+def sync_in_progress_banner(group: str) -> None:
+    """A non-blocking notice above a provider report during a dashboard sync."""
+    if group not in ingest_runner.active_provider_groups():
+        return
+    with ui.row().classes("w-full items-center gap-2 px-3 py-2").style(
+        f"background:rgba(57,135,229,0.12);border:1px solid {chrome.BORDER};border-radius:8px;"
+    ):
+        ui.spinner(size="1rem").style(f"color:{chrome.ACCENT}")
+        ui.label("Sync in progress — this dashboard will refresh with the latest data when it completes.").classes(
+            "text-sm"
+        ).style(f"color:{chrome.INK_SECONDARY}")
+
+
+def sync_in_progress_page(label: str) -> None:
+    """First-sync destination for a provider whose GOLD report does not exist yet."""
+    with chrome.panel():
+        with ui.column().classes("w-full items-center gap-3").style("padding:32px 0;"):
+            ui.spinner(size="2rem").style(f"color:{chrome.ACCENT}")
+            ui.label(f"Syncing {label}").classes("text-lg font-semibold").style(
+                f"color:{chrome.INK_PRIMARY}"
+            )
+            ui.label("Sync in progress. Your dashboard will be available when the first data publish finishes.").classes(
+                "text-sm"
+            ).style(f"color:{chrome.INK_MUTED}")
 
 
 def build_pages() -> None:
@@ -528,6 +566,7 @@ def build_pages() -> None:
     def _snowflake_page() -> None:
         label = provider_label("snowflake")
         with gold_session(), shell("/snowflake"):
+            sync_in_progress_banner("snowflake")
             if "snowflake" in discover_provider_groups() and has_data():
                 _render_snowflake_page(label)
             else:
@@ -554,18 +593,24 @@ def build_pages() -> None:
                 else:
                     _render_snowflake_visibility_only()
             return
-        if group not in discover_provider_groups():
+        published_groups = set(discover_provider_groups())
+        syncing = group in ingest_runner.active_provider_groups()
+        if group not in published_groups and not syncing:
             raise HTTPException(status_code=404)
         label = provider_label(group)
         # One registered connection for the whole render, reused by every gold_df()
         # call inside it (the Databricks page alone issues ~50 today) — see
         # data.gold_session's docstring.
         with gold_session(), shell(f"/{group}"):
-            if not has_data():
+            if group not in published_groups and syncing:
+                sync_in_progress_page(label)
+            elif not has_data():
                 no_data_page(f"{label} spend")
-            elif group == "aws":
-                redshift_focus.render()
-            elif group == "databricks":
-                _render_databricks_page(label)
             else:
-                provider_focus.render(group, label)
+                sync_in_progress_banner(group)
+                if group == "aws":
+                    redshift_focus.render()
+                elif group == "databricks":
+                    _render_databricks_page(label)
+                else:
+                    provider_focus.render(group, label)

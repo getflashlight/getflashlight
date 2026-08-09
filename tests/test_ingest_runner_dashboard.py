@@ -53,6 +53,28 @@ class _FakeProcess:
         return self._returncode
 
 
+def test_provider_groups_cover_selected_enabled_connections() -> None:
+    """Sidebar status is provider-level even when configs have distinct names."""
+    from flashlight.dashboard.ingest_runner import provider_groups_for_configs
+    from flashlight.ingest.config import (
+        AwsFocusConfig,
+        DatabricksConfig,
+        RedshiftConfig,
+        SnowflakeConfig,
+    )
+
+    configs = [
+        AwsFocusConfig(name="AWS", cost_source="cost_explorer"),
+        DatabricksConfig(name="Analytics", host="https://acme.cloud.databricks.com"),
+        RedshiftConfig(name="Warehouse", enabled=True, cluster_identifier="warehouse"),
+        SnowflakeConfig(name="Finance", account="xy12345"),
+    ]
+
+    assert provider_groups_for_configs(configs) == frozenset({"aws", "databricks", "snowflake"})
+    assert provider_groups_for_configs(configs, connector="Analytics") == frozenset({"databricks"})
+    assert provider_groups_for_configs(configs, connector="Warehouse") == frozenset({"aws"})
+
+
 def test_stream_sync_streams_lines_and_returns_exit_code(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
     connections_path = tmp_path / "connections.yml"
     connections_path.write_text("connectors: []\n")

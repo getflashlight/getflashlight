@@ -247,7 +247,7 @@ if not data.empty:
 
 If existing Parquet files don't have the columns you need:
 1. Add to `generate.py` or modify an existing generator
-2. Regenerate: `.venv/bin/python snowflake/synthetic_data/generate.py`
+2. Regenerate: `uv run fl sample`
 3. The data layer auto-discovers new Parquet files (no registration needed)
 
 ---
@@ -359,7 +359,7 @@ print(result)
 
 ```bash
 # Regenerate
-.venv/bin/python snowflake/synthetic_data/generate.py
+uv run fl sample
 
 # Restart dashboard (it caches the DuckDB connection)
 ```

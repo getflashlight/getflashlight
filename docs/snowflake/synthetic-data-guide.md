@@ -22,7 +22,7 @@ cd auralake-main
 ### Generate the full dataset
 
 ```bash
-.venv/bin/python snowflake/synthetic_data/generate.py
+uv run fl sample
 ```
 
 Expected output:
@@ -129,7 +129,7 @@ DAYS = (date.today() - START_DATE).days  # Auto-calculates to today
 "NEW_USER": {"warehouses": ["NEW_WAREHOUSE", "ANALYTICS"], "pattern": "medium", "type": "compute"},
 ```
 
-3. Regenerate: `.venv/bin/python snowflake/synthetic_data/generate.py`
+3. Regenerate: `uv run fl sample`
 
 ### Add a new user
 
@@ -270,15 +270,14 @@ snowflake/synthetic_data/*.parquet
 
 Use the project virtual environment:
 ```bash
-.venv/bin/python snowflake/synthetic_data/generate.py
-# NOT: python3 snowflake/synthetic_data/generate.py
+uv run fl sample
 ```
 
 ### Dashboard shows stale data
 
 Regenerate and restart:
 ```bash
-.venv/bin/python snowflake/synthetic_data/generate.py
+uv run fl sample
 # Then restart the dashboard (it caches the DuckDB connection)
 ```
 
@@ -353,7 +352,7 @@ When adding a new dashboard view that needs data:
    def new_feature_data():
        return _query("SELECT * FROM new_feature WHERE ...")
    ```
-6. **Regenerate**: `.venv/bin/python snowflake/synthetic_data/generate.py`
+6. **Regenerate**: `uv run fl sample`
 
 ---
 

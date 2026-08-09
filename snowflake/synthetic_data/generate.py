@@ -6,7 +6,7 @@ Produces one Parquet file per source view, modeling a mixed-workload account:
   - 30 days of data
   - AI workloads (Cortex functions, ML training)
 
-Run: python snowflake-visbility/synthetic_data/generate.py
+Run with ``uv run fl sample`` from the repository root.
 """
 
 from __future__ import annotations
@@ -991,7 +991,3 @@ def main() -> None:
     generate_shadow_waste_data()
 
     print(f"\nDone! Files written to: {OUTPUT_DIR}")
-
-
-if __name__ == "__main__":
-    main()

@@ -7,11 +7,13 @@ and telemetry so every dashboard drill-down uses the normal read path.
 
 from __future__ import annotations
 
+import runpy
 import shutil
 from calendar import monthrange
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pyarrow.parquet as pq
 import typer
@@ -42,6 +44,25 @@ from flashlight.transform.runner import build_gold
 SAMPLE_CONNECTOR = "flashlight_demo_focus"
 REDSHIFT_CONNECTOR = "flashlight_demo_redshift"
 DATABRICKS_CONNECTOR = "flashlight_demo_databricks"
+_SNOWFLAKE_SYNTHETIC_DIR = Path(__file__).resolve().parents[2] / "snowflake" / "synthetic_data"
+
+
+def generate_snowflake_dashboard_demo() -> None:
+    """Generate the synthetic ACCOUNT_USAGE files used by the Snowflake demo UI.
+
+    The generator remains beside its source data specification in the repository, but
+    this is the single supported entry point so ``fl sample`` seeds every dashboard
+    demo in one command.
+    """
+    generator = _SNOWFLAKE_SYNTHETIC_DIR / "generate.py"
+    namespace = runpy.run_path(str(generator))
+    namespace["main"]()
+
+
+def cleanup_snowflake_dashboard_demo() -> None:
+    """Remove only generated Snowflake demo Parquet files, never the generator."""
+    for parquet in _SNOWFLAKE_SYNTHETIC_DIR.glob("*.parquet"):
+        parquet.unlink()
 
 
 @dataclass(frozen=True)

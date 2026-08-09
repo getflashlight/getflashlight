@@ -13,17 +13,21 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 
 from flashlight.core.exceptions import ConnectorError
 from flashlight.core.logging import get_logger
+from flashlight.core.settings import get_settings
+from flashlight.focus import sql_mapping
 from flashlight.focus.enums import ChargeCategory, ProviderName, ServiceCategory
 from flashlight.focus.model import FocusRecord
-from flashlight.ingest.base import Connector, IngestWindow
+from flashlight.ingest.base import Connector, IngestWindow, ProgressCallback
 from flashlight.ingest.config import SnowflakeConfig, effective_connector_name, env
 from flashlight.ingest.connectors._snowflake_supported_drivers import check_support_status
+from flashlight.lake import bronze
 from flashlight.lake.driver_health_schema import DriverHealthRecord
 
 logger = get_logger(__name__)
@@ -48,6 +52,48 @@ SELECT
     IS_ADJUSTMENT
 FROM {database}.ORGANIZATION_USAGE.USAGE_IN_CURRENCY_DAILY
 WHERE USAGE_DATE BETWEEN %(start)s AND %(end)s
+"""
+
+# The cost source is already at a sensible financial grain: one daily
+# (organization/account/service/usage-type) fact.  Filter and shape it in Snowflake,
+# then let the shared DuckDB mapping only enforce the canonical FOCUS schema and write
+# Parquet in bulk.  Quoted aliases retain the FOCUS casing through pandas and DuckDB.
+_BULK_QUERY = """\
+SELECT
+    'Snowflake' AS "ProviderName",
+    ORGANIZATION_NAME AS "BillingAccountId",
+    ACCOUNT_NAME AS "SubAccountId",
+    ACCOUNT_LOCATOR AS "SubAccountName",
+    DATE_TRUNC('MONTH', USAGE_DATE)::DATE AS "BillingPeriodStart",
+    DATEADD(MONTH, 1, DATE_TRUNC('MONTH', USAGE_DATE))::DATE AS "BillingPeriodEnd",
+    USAGE_DATE::TIMESTAMP_NTZ AS "ChargePeriodStart",
+    DATEADD(DAY, 1, USAGE_DATE)::TIMESTAMP_NTZ AS "ChargePeriodEnd",
+    CURRENCY AS "BillingCurrency",
+    USAGE_IN_CURRENCY AS "BilledCost",
+    USAGE_IN_CURRENCY AS "EffectiveCost",
+    USAGE_IN_CURRENCY AS "ListCost",
+    USAGE_IN_CURRENCY AS "ContractedCost",
+    IFF(IS_ADJUSTMENT, 'Adjustment', 'Usage') AS "ChargeCategory",
+    USAGE_TYPE AS "ChargeDescription",
+    CASE UPPER(SERVICE_TYPE)
+        WHEN 'WAREHOUSE_METERING' THEN 'Compute'
+        WHEN 'CLOUD_SERVICES' THEN 'Compute'
+        WHEN 'QUERY_ACCELERATION' THEN 'Compute'
+        WHEN 'SERVERLESS_COMPUTE' THEN 'Compute'
+        WHEN 'STORAGE' THEN 'Storage'
+        WHEN 'DATA_TRANSFER' THEN 'Networking'
+        WHEN 'REPLICATION' THEN 'Networking'
+        WHEN 'AI_SERVICES' THEN 'AI and Machine Learning'
+        ELSE 'Other'
+    END AS "ServiceCategory",
+    SERVICE_TYPE AS "ServiceName",
+    USAGE_TYPE AS "SkuId",
+    REGION AS "RegionId",
+    USAGE AS "ConsumedQuantity",
+    'Credits' AS "ConsumedUnit"
+FROM {database}.ORGANIZATION_USAGE.USAGE_IN_CURRENCY_DAILY
+WHERE USAGE_DATE BETWEEN %(start)s AND %(end)s
+  AND USAGE_IN_CURRENCY IS NOT NULL
 """
 
 _DRIVER_HEALTH_SQL = (Path(__file__).parent / "sql" / "snowflake_driver_health.sql").read_text()
@@ -123,6 +169,56 @@ class SnowflakeConnector(Connector):
         if self._config.warehouse:
             params["warehouse"] = self._config.warehouse
         return snowflake.connector.connect(**params)
+
+    def ingest(
+        self,
+        window: IngestWindow,
+        *,
+        run_id: str,
+        on_progress: ProgressCallback | None = None,
+    ) -> int:
+        """Bulk-ingest Snowflake cost rows without creating a Python model per row.
+
+        Snowflake applies the date/null filters and projects rows into FOCUS-shaped
+        columns.  The connector fetches one tabular batch, after which DuckDB runs the
+        shared canonical mapping and writes the complete BRONZE window in one COPY.
+        """
+        query = _BULK_QUERY.format(database=self._config.database)
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(query, {"start": window.start, "end": window.end})
+                frame = cur.fetch_pandas_all()
+            finally:
+                cur.close()
+        finally:
+            conn.close()
+
+        con = duckdb.connect()
+        try:
+            sql_mapping.ensure_helpers(con)
+            con.register("_snowflake_source", frame)
+            source_sql = "_snowflake_source"
+            mapped = sql_mapping.mapping_sql(
+                source_sql,
+                connector=self.name,
+                run_id=run_id,
+                present=sql_mapping.present_columns(con, source_sql),
+            )
+            return bronze.write_window_sql(
+                self.name,
+                window,
+                con,
+                mapped,
+                base_currency=get_settings().base_currency,
+            )
+        except Exception as exc:
+            if isinstance(exc, ConnectorError):
+                raise
+            raise ConnectorError(self.name, f"Bulk cost ingest failed: {exc}") from exc
+        finally:
+            con.close()
 
     def fetch(self, window: IngestWindow) -> Iterator[FocusRecord]:
         query = _QUERY.format(database=self._config.database)
