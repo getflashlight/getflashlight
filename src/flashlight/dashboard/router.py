@@ -74,19 +74,27 @@ def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
 # Provider groups that lead the "BY PROVIDER" nav, in this order, ahead of every
 # remaining group in alphabetical order. Databricks is the platform users come here
 # for; the cloud underneath it reads as supporting detail, so it sorts first even
-# though "aws" would win alphabetically.
-_NAV_GROUP_ORDER: tuple[str, ...] = ("databricks",)
+# though "aws" would win alphabetically. Snowflake is always listed (even before its
+# first GOLD publish) so the visibility UX is reachable with synthetic fallback.
+_NAV_GROUP_ORDER: tuple[str, ...] = ("databricks", "snowflake")
 
 _SIDEBAR_PROVIDER_LOGOS: dict[str, str] = {
     "databricks": chrome.CONNECTOR_LOGOS["databricks"],
     "aws": chrome.CONNECTOR_LOGOS["redshift"],
+    "snowflake": chrome.CONNECTOR_LOGOS["snowflake"],
 }
 
 
 def _nav_groups() -> list[str]:
     """Provider groups in nav order: :data:`_NAV_GROUP_ORDER` first, then the rest
-    in the alphabetical order ``discover_provider_groups`` already returns."""
+    in the alphabetical order ``discover_provider_groups`` already returns.
+
+    Snowflake is always included so ``/snowflake`` stays reachable before the first
+    ingest publishes ``gold/snowflake/`` (visibility falls back to synthetic Parquet).
+    """
     groups = discover_provider_groups()
+    if "snowflake" not in groups:
+        groups = [*groups, "snowflake"]
     lead = [g for g in _NAV_GROUP_ORDER if g in groups]
     return lead + [g for g in groups if g not in lead]
 
@@ -477,6 +485,67 @@ def build_pages() -> None:
             show_alerts=False,
         )
 
+    def _render_snowflake_visibility_only() -> None:
+        """Snowflake visibility UX without GOLD spend yet — synthetic Parquet fallback.
+
+        No live Snowflake connection is made from the dashboard. Leaderboard + Visibility
+        read ``snowflake/synthetic_data/*.parquet`` until ``flashlight ingest`` publishes
+        ``gold/snowflake/``.
+        """
+        from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
+
+        with ui.tabs().classes("w-full").props("dense") as tabs:
+            tab_exec = ui.tab("LeaderBoard")
+            tab_vis = ui.tab("Visibility")
+        loaded: dict[str, bool] = {"LeaderBoard": False}
+        panels: dict[str, ui.tab_panel] = {}
+        with ui.tab_panels(tabs, value=tab_exec).classes("w-full").style(
+            "background:transparent;"
+        ):
+            panels["LeaderBoard"] = ui.tab_panel(tab_exec)
+            panels["Visibility"] = ui.tab_panel(tab_vis)
+        with panels["LeaderBoard"]:
+            snowflake_visibility.render_leaderboard()
+        loaded["LeaderBoard"] = True
+
+        def _on_tab_change(e: object) -> None:
+            name = getattr(e, "value", None)
+            if name == "Visibility" and name not in loaded:
+                loaded[name] = True
+                with panels["Visibility"]:
+                    snowflake_visibility.render()
+
+        tabs.on_value_change(_on_tab_change)
+
+    def _render_snowflake_page(label: str) -> None:
+        """FOCUS spend via provider_focus, plus Snowflake visibility + driver health."""
+        from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
+
+        provider_focus.render(
+            "snowflake",
+            label,
+            extra_tabs=[
+                ("LeaderBoard", snowflake_visibility.render_leaderboard),
+                ("Visibility", snowflake_visibility.render),
+                (
+                    "Client Driver Health",
+                    lambda: driver_health.render("Snowflake", "Snowflake"),
+                ),
+            ],
+            show_alerts=False,
+        )
+
+    # Explicit /snowflake before the catch-all: always reachable for the visibility UX
+    # even when gold/snowflake/ has not been published yet.
+    @ui.page("/snowflake")
+    def _snowflake_page() -> None:
+        label = provider_label("snowflake")
+        with gold_session(), shell("/snowflake"):
+            if "snowflake" in discover_provider_groups() and has_data():
+                _render_snowflake_page(label)
+            else:
+                _render_snowflake_visibility_only()
+
     # One parameterized route, not one @ui.page per group discovered right now —
     # discover_provider_groups() reads gold/ live, so it can (and does) return a
     # different answer *after* the dashboard has booted: a provider's first sync
@@ -487,6 +556,17 @@ def build_pages() -> None:
     # instead means a group's page and its nav link agree at all times.
     @ui.page("/{group}")
     def _provider_page(group: str) -> None:
+        # /snowflake is registered explicitly above (visibility fallback before GOLD).
+        # Starlette matches in registration order, so this catch-all should not see it;
+        # if it does, mirror the dedicated page rather than 404.
+        if group == "snowflake":
+            label = provider_label("snowflake")
+            with gold_session(), shell("/snowflake"):
+                if "snowflake" in discover_provider_groups() and has_data():
+                    _render_snowflake_page(label)
+                else:
+                    _render_snowflake_visibility_only()
+            return
         if group not in discover_provider_groups():
             raise HTTPException(status_code=404)
         label = provider_label(group)
