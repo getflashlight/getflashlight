@@ -71,7 +71,7 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
         {
             "compute": 36390.6,
             "storage": 13829.6,
-            "spectrum": 6211.6,
+            "spectrum_scan": 6211.6,
             "concurrency_scaling": 2156.48,
             "other": 11.72,
         }
@@ -107,6 +107,43 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
         "WHERE charge_day >= '2026-08-01' AND charge_day < '2026-09-01'"
     )[0]
     assert partial_dates == {"first_day": "2026-08-01", "last_day": "2026-08-09"}
+    assert (
+        run_select(
+            "SELECT count(DISTINCT net_cost) AS count FROM databricks.spend_trend_daily "
+            "WHERE charge_day >= '2026-07-01' AND charge_day < '2026-08-01'"
+        )[0]["count"]
+        > 20
+    )
+
+    # The detailed screens receive truthful, reconcilable source facts rather than a
+    # uniform total copied into every row: S3 has its four visible charge families,
+    # token allocation equals model-serving spend, and Databricks policy telemetry
+    # produces both compliant and non-compliant findings.
+    storage_types = {
+        row["cost_subcategory"]
+        for row in run_select(
+            "SELECT DISTINCT cost_subcategory FROM storage.backing_storage_month "
+            "WHERE charge_month = '2026-07-01' AND mapping = 'databricks'"
+        )
+    }
+    assert storage_types == {"data_transfer", "other", "requests", "storage"}
+    allocated_ai = run_select(
+        "SELECT sum(allocated_cost) AS total FROM ai_usage.requester_month "
+        "WHERE charge_month = '2026-07-01'"
+    )[0]["total"]
+    model_serving = run_select(
+        "SELECT sum(net_cost) AS total FROM databricks.ai_spend_month "
+        "WHERE charge_month = '2026-07-01' AND ai_product_family = 'model_serving'"
+    )[0]["total"]
+    assert float(allocated_ai) == pytest.approx(float(model_serving))
+    policy_statuses = {
+        row["status"]
+        for row in run_select(
+            "SELECT DISTINCT status FROM policy.policy_record "
+            "WHERE provider_name = 'Databricks' AND charge_month = '2026-07-01'"
+        )
+    }
+    assert policy_statuses == {"compliant", "non_compliant"}
 
     # Every visible demo surface gets source-shaped mock data. In particular, the
     # Redshift drill-down has two real clusters, and utilization, owners, policy,
@@ -116,8 +153,8 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
         "WHERE charge_month = '2026-07-01' ORDER BY resource_id"
     )
     assert [row["resource_id"] for row in redshift_clusters] == [
-        "redshift-finance",
-        "redshift-prod-analytics",
+        "arn:aws:redshift:us-east-1:123456789012:cluster:finance",
+        "arn:aws:redshift:us-east-1:123456789012:cluster:prod-analytics",
     ]
     # Production-shaped detail is present below the headline: a SKU long tail, a
     # broader owner/resource population, five managed storage locations, and the

@@ -430,14 +430,24 @@ def _monthly_cost(
     charge_days = days if days is not None else monthrange(month.year, month.month)[1]
     if not 1 <= charge_days <= monthrange(month.year, month.month)[1]:
         raise ValueError(f"invalid mock charge-day count for {month}: {charge_days}")
-    # Billing exports are currency amounts, so mock daily rows stay at cent precision.
-    # The final remainder preserves the exact monthly amount at the resource grain.
-    daily = (amount / charge_days).quantize(Decimal("0.01"))
+    # Use a deterministic workload-shaped daily profile instead of an even division.
+    # This creates weekday/weekend variation and occasional batch spikes while keeping
+    # the resource × SKU monthly total exact to the cent.
+    seed = sum(ord(char) for char in f"{entity.id}:{service}:{sku_id or ''}") % 17
+    weights = [
+        Decimal(70 + ((day * 11 + seed * 7) % 53) + (42 if (day + seed) % 13 == 0 else 0))
+        for day in range(1, charge_days + 1)
+    ]
+    weight_total = sum(weights, Decimal("0"))
+    daily_amounts = [
+        (amount * weight / weight_total).quantize(Decimal("0.01")) for weight in weights[:-1]
+    ]
+    daily_amounts.append(amount - sum(daily_amounts, Decimal("0")))
     records = [
         _cost(
             entity,
             month,
-            daily,
+            daily_amounts[day - 1],
             provider=provider,
             service=service,
             category=category,
@@ -459,7 +469,7 @@ def _monthly_cost(
         _cost(
             entity,
             month,
-            amount - daily * (charge_days - 1),
+            daily_amounts[-1],
             provider=provider,
             service=service,
             category=category,
@@ -537,7 +547,7 @@ def _redshift_allocation(index: int, month: date) -> dict[str, Decimal]:
     weights = {
         "compute": Decimal("0.621"),
         "storage": Decimal("0.236"),
-        "spectrum": Decimal("0.106"),
+        "spectrum_scan": Decimal("0.106"),
         "concurrency_scaling": Decimal("0.0368"),
         "other": Decimal("0.0002"),
     }
@@ -573,6 +583,13 @@ def _records(
         rows = [(amount / count).quantize(Decimal("0.01")) for _ in range(count - 1)]
         return [*rows, amount - sum(rows, Decimal("0"))]
 
+    def weighted_split(amount: Decimal, weights: tuple[Decimal, ...]) -> list[Decimal]:
+        total_weight = sum(weights, Decimal("0"))
+        rows = [
+            (amount * weight / total_weight).quantize(Decimal("0.01")) for weight in weights[:-1]
+        ]
+        return [*rows, amount - sum(rows, Decimal("0"))]
+
     for index, month in enumerate(data.months):
         days = _mock_charge_days(month)
         databricks, redshift = (
@@ -581,7 +598,13 @@ def _records(
         )
         for cluster_index, entity in enumerate(data.redshift_clusters):
             amount = Decimal("0")
-            for subcategory in ("compute", "storage", "spectrum", "concurrency_scaling", "other"):
+            for subcategory in (
+                "compute",
+                "storage",
+                "spectrum_scan",
+                "concurrency_scaling",
+                "other",
+            ):
                 component = split(redshift[subcategory], len(data.redshift_clusters))[cluster_index]
                 amount += component
                 costs.extend(
@@ -595,6 +618,11 @@ def _records(
                         connector=SAMPLE_CONNECTOR,
                         subcategory=subcategory,
                         sku_id=f"REDSHIFT_{subcategory.upper()}",
+                        resource_id=(
+                            "arn:aws:redshift:us-east-1:123456789012:cluster:"
+                            f"{entity.id.removeprefix('redshift-')}"
+                        ),
+                        resource_type="cluster",
                         days=days,
                     )
                 )
@@ -647,7 +675,24 @@ def _records(
         dbx_totals: dict[str, Decimal] = {entity.id: Decimal("0") for entity in dbx_entities}
         for sku, sku_amount in _databricks_sku_allocation(databricks["dbus"]):
             targets = data.endpoints if sku.service == "MODEL_SERVING" else data.databricks_clusters
-            for entity, amount in zip(targets, split(sku_amount, len(targets)), strict=True):
+            weights = (
+                (
+                    Decimal("0.31"),
+                    Decimal("0.22"),
+                    Decimal("0.18"),
+                    Decimal("0.17"),
+                    Decimal("0.12"),
+                )
+                if sku.service != "MODEL_SERVING"
+                else (
+                    Decimal("0.34"),
+                    Decimal("0.23"),
+                    Decimal("0.18"),
+                    Decimal("0.15"),
+                    Decimal("0.10"),
+                )
+            )
+            for entity, amount in zip(targets, weighted_split(sku_amount, weights), strict=True):
                 costs.extend(
                     _monthly_cost(
                         entity,
@@ -698,7 +743,16 @@ def _records(
             )
         for entity, amount, pricing in zip(
             data.databricks_clusters,
-            split(databricks["backing_compute"], len(data.databricks_clusters)),
+            weighted_split(
+                databricks["backing_compute"],
+                (
+                    Decimal("0.34"),
+                    Decimal("0.24"),
+                    Decimal("0.19"),
+                    Decimal("0.14"),
+                    Decimal("0.09"),
+                ),
+            ),
             (
                 PricingCategory.COMMITTED,
                 PricingCategory.DYNAMIC,
@@ -743,42 +797,84 @@ def _records(
         )
         remaining = databricks["backing_storage"]
         for entity, bucket, weight in zip(dbx_entities[:5], buckets, bucket_weights, strict=True):
-            amount = (
+            bucket_amount = (
                 (databricks["backing_storage"] * weight).quantize(Decimal("0.01"))
                 if bucket != buckets[-1]
                 else remaining
             )
-            remaining -= amount
-            costs.extend(
-                _monthly_cost(
-                    entity,
-                    month,
-                    amount,
-                    provider="AWS",
-                    service="Amazon Simple Storage Service",
-                    category=ServiceCategory.STORAGE,
-                    connector=SAMPLE_CONNECTOR,
-                    resource_id=f"arn:aws:s3:::{bucket}",
-                    resource_name=bucket,
-                    resource_type="bucket",
-                    subcategory="storage",
-                    sku_id="S3_STANDARD_STORAGE",
-                    extra_tags={"storage_location": bucket},
-                    days=days,
+            remaining -= bucket_amount
+            # Every managed bucket contains the same real S3 charge families, with a
+            # storage-heavy mix and distinct SKU/charge records for the Storage tab.
+            for subcategory, sku_id, amount in zip(
+                ("storage", "requests", "data_transfer", "other"),
+                (
+                    "S3_STANDARD_STORAGE",
+                    "S3_REQUESTS_AND_RETRIEVALS",
+                    "S3_DATA_TRANSFER_OUT",
+                    "S3_INVENTORY_AND_ANALYTICS",
+                ),
+                weighted_split(
+                    bucket_amount,
+                    (Decimal("0.82"), Decimal("0.10"), Decimal("0.05"), Decimal("0.03")),
+                ),
+                strict=True,
+            ):
+                costs.extend(
+                    _monthly_cost(
+                        entity,
+                        month,
+                        amount,
+                        provider="AWS",
+                        service="Amazon Simple Storage Service",
+                        category=ServiceCategory.STORAGE,
+                        connector=SAMPLE_CONNECTOR,
+                        resource_id=f"arn:aws:s3:::{bucket}",
+                        resource_name=bucket,
+                        resource_type="bucket",
+                        subcategory=subcategory,
+                        sku_id=sku_id,
+                        extra_tags={"storage_location": bucket, "charge_type": subcategory},
+                        days=days,
+                    )
                 )
-            )
 
         opportunities = split(
             (databricks["total"] * Decimal("0.10")).quantize(Decimal("0.01")),
             len(dbx_entities),
         )
-        for entity, opportunity in zip(dbx_entities, opportunities, strict=True):
+        entity_types = (
+            EntityType.JOB,
+            EntityType.JOB,
+            EntityType.INTERACTIVE,
+            EntityType.SQL_WAREHOUSE,
+            EntityType.INTERACTIVE,
+        )
+        for entity_index, (entity, opportunity) in enumerate(
+            zip(dbx_entities, opportunities, strict=True)
+        ):
             amount = dbx_totals[entity.id]
+            entity_type = (
+                EntityType.ENDPOINT if entity in data.endpoints else entity_types[entity_index]
+            )
+            policy_facts: dict[str, int | str] = {}
+            if entity_type == EntityType.INTERACTIVE:
+                policy_facts = {
+                    "auto_termination_minutes": 45 if entity_index == 2 else 120,
+                    "min_autoscale_workers": 2,
+                    "max_autoscale_workers": 8 if entity_index == 2 else 2,
+                    "tag_count": 5 if entity_index == 2 else 0,
+                }
+                if entity_index == 2:
+                    policy_facts["policy_id"] = "shared-analytics-guardrails"
+            elif entity_type == EntityType.SQL_WAREHOUSE:
+                policy_facts = {"tag_count": 4, "auto_stop_minutes": 20}
+            elif entity_type == EntityType.ENDPOINT:
+                policy_facts = {"tag_count": 4 if entity_index % 2 else 0}
             efficiency.append(
                 EfficiencyRecord(
                     provider_name="Databricks",
                     charge_month=month,
-                    entity_type=EntityType.ENDPOINT if entity in data.endpoints else EntityType.JOB,
+                    entity_type=entity_type,
                     entity_id=entity.id,
                     entity_name=entity.name,
                     owner_user=str(entity.owner_email),
@@ -793,12 +889,16 @@ def _records(
                     cause_detail={
                         "failed_cost": float(opportunity),
                         "scale_to_zero_enabled": entity not in data.endpoints[:2],
+                        **policy_facts,
                     },
                     x_source_connector=DATABRICKS_CONNECTOR,
                 )
             )
-        for endpoint in data.endpoints:
-            for person in data.people[:2]:
+        requester_weights = (Decimal("0.46"), Decimal("0.31"), Decimal("0.23"))
+        for endpoint_index, endpoint in enumerate(data.endpoints):
+            for requester_index, requester_weight in enumerate(requester_weights):
+                person = data.people[(endpoint_index + requester_index) % len(data.people)]
+                token_scale = 1 + endpoint_index * 3 + requester_index * 2 + index
                 usage.append(
                     AiUsageRecord(
                         provider_name="Databricks",
@@ -815,9 +915,13 @@ def _records(
                         scale_to_zero_enabled=endpoint not in data.endpoints[:2],
                         workload_size="Small",
                         workload_type="CPU",
-                        request_count=700 + index * 40,
-                        input_tokens=160000 + index * 10000,
-                        output_tokens=32000 + index * 2000,
+                        request_count=420 * token_scale,
+                        error_request_count=7 * (requester_index + 1),
+                        input_tokens=int(120_000 * token_scale * float(requester_weight)),
+                        output_tokens=int(26_000 * token_scale * float(requester_weight)),
+                        error_input_tokens=900 * (requester_index + 1),
+                        error_output_tokens=180 * (requester_index + 1),
+                        total_duration_ms=3_000_000 * token_scale,
                         x_source_connector=DATABRICKS_CONNECTOR,
                     )
                 )
@@ -859,6 +963,16 @@ def _assert_reconciled(costs: list[FocusRecord], efficiency: list[EfficiencyReco
             record.charge_period_start.date().replace(day=1),
         )
         focus_totals[key] = focus_totals.get(key, Decimal("0")) + record.effective_cost
+        if record.provider_name == "AWS" and ":cluster:" in (record.resource_id or ""):
+            cluster_id = (record.resource_id or "").rsplit(":cluster:", 1)[1]
+            legacy_key = (
+                record.provider_name,
+                f"redshift-{cluster_id}",
+                record.charge_period_start.date().replace(day=1),
+            )
+            focus_totals[legacy_key] = (
+                focus_totals.get(legacy_key, Decimal("0")) + record.effective_cost
+            )
     for efficiency_record in efficiency:
         key = (
             efficiency_record.provider_name,
