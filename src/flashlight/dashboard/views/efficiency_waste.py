@@ -152,6 +152,8 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
         ui.label("Metrics below use the previous full month").classes("text-xs").style(
             f"color:{chrome.INK_MUTED}"
         )
+    # Honesty frame for the waste tables below: what share of the fleet was measured.
+    coverage_caption(provider_name)
 
     if not gold_view_published("efficiency", "waste_record"):
         ui.label(_STALE_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
