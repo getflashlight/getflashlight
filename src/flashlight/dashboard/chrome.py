@@ -619,6 +619,7 @@ def searchable_table(
     *,
     key: str,
     row_data: pd.DataFrame | None = None,
+    download_df: pd.DataFrame | None = None,
     search_col: str | None = None,
     money_cols: Sequence[str] = (),
     pct_cols: Sequence[str] = (),
@@ -632,12 +633,15 @@ def searchable_table(
     """A paginated, optionally search-filterable ``ui.table`` with CSV export.
 
     ``max_rows`` caps the *displayed* rows; the CSV export always carries the
-    full set. ``on_row_click`` gets the raw (pre-format) row dict. Pass
-    ``row_data`` when the rendered columns are a subset of the fields needed by a
+    full set. Pass ``download_df`` when a compact display (such as a SQL preview)
+    needs a richer CSV export. ``on_row_click`` gets the raw (pre-format) row dict.
+    Pass ``row_data`` when the rendered columns are a subset of the fields needed by a
     click-through; it must be row-aligned with *df*.
     """
     if row_data is not None and len(row_data) != len(df):
         raise ValueError("row_data must have one row for every displayed table row")
+    if download_df is not None and len(download_df) != len(df):
+        raise ValueError("download_df must have one row for every displayed table row")
     shown = df if max_rows is None else df.head(max_rows)
     columns, rows = _fmt_columns(
         shown, money_cols=money_cols, pct_cols=pct_cols, int_cols=int_cols,
@@ -658,7 +662,10 @@ def searchable_table(
         ui.button(
             "Download CSV",
             icon="download",
-            on_click=lambda: ui.download(df.to_csv(index=False).encode(), filename=f"{key}.csv"),
+            on_click=lambda: ui.download(
+                (download_df if download_df is not None else df).to_csv(index=False).encode(),
+                filename=f"{key}.csv",
+            ),
         ).props("flat dense no-caps").style(f"color:{ACCENT};")
 
     classes = "fl-table w-full" + (" fl-table-clickable" if on_row_click else "")

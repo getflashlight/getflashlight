@@ -26,6 +26,7 @@ WITH base_queries AS (
         userid,
         starttime,
         endtime,
+        querytxt,
         datediff(seconds, starttime, endtime) AS duration_secs,
         CASE
             WHEN userid = 102 AND querytxt LIKE '-- Looker Query Context%'
@@ -51,6 +52,19 @@ candidate_queries AS (
     SELECT q.*
     FROM base_queries q
     JOIN top_patterns p ON p.qry_md5 = q.qry_md5
+),
+sample_queries AS (
+    -- Keep the newest execution's ID, owner, and SQL text together.  querytxt is
+    -- Redshift's logged text (up to 4,000 characters); the MD5 remains only the
+    -- stable grouping key and is never presented as the useful query identifier.
+    SELECT qry_md5, query AS sample_query_id, userid, starttime AS last_seen_at,
+           trim(querytxt) AS sample_query_text
+    FROM (
+        SELECT q.*,
+               row_number() OVER (PARTITION BY qry_md5 ORDER BY starttime DESC, query DESC) AS rn
+        FROM candidate_queries q
+    ) ranked
+    WHERE rn = 1
 ),
 wlm AS (
     -- The same candidate set prevents a retained-history WLM scan.
@@ -84,6 +98,10 @@ user_counts AS (
 )
 SELECT
     q.qry_md5,
+    max(sample.sample_query_id)                                    AS sample_query_id,
+    max(sample.last_seen_at)                                       AS last_seen_at,
+    max(sample.sample_query_text)                                  AS sample_query_text,
+    max(sample_owner.usename)                                      AS sample_query_owner,
     max(pattern.run_count)                                         AS run_count,
     max(pattern.total_run_min)                                     AS total_run_min,
     avg(coalesce(wlm.total_exec_time, 0)) / 1000000.0 / 60          AS avg_exec_min,
@@ -107,6 +125,8 @@ SELECT
     max(uc.usename)                                                 AS top_user
 FROM candidate_queries q
 JOIN top_patterns pattern ON pattern.qry_md5 = q.qry_md5
+LEFT JOIN sample_queries sample ON sample.qry_md5 = q.qry_md5
+LEFT JOIN pg_user sample_owner ON sample_owner.usesysid = sample.userid
 LEFT JOIN wlm ON wlm.query = q.query
 LEFT JOIN spill ON spill.query = q.query
 LEFT JOIN user_counts uc ON uc.qry_md5 = q.qry_md5 AND uc.rnk = 1

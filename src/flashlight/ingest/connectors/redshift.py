@@ -1081,7 +1081,12 @@ class RedshiftConnector(Connector):
             qry_md5 = row.get("qry_md5")
             if not qry_md5:
                 continue
+            sample_query_id = _opt_int(row.get("sample_query_id"))
             cause = {
+                "sample_query_id": sample_query_id,
+                "last_seen_at": row.get("last_seen_at"),
+                "sample_query_text": row.get("sample_query_text"),
+                "query_owner": row.get("sample_query_owner") or row.get("top_user"),
                 "run_count": _opt_int(row.get("run_count")),
                 "total_run_min": _opt_float(row.get("total_run_min")),
                 "avg_exec_min": _opt_float(row.get("avg_exec_min")),
@@ -1098,8 +1103,12 @@ class RedshiftConnector(Connector):
                 charge_month=month,
                 entity_type=EntityType.QUERY_PATTERN,
                 entity_id=f"{cluster_id}:{qry_md5}",
-                entity_name=qry_md5,
-                owner_user=row.get("top_user"),
+                entity_name=(
+                    f"Query {sample_query_id}"
+                    if sample_query_id is not None
+                    else f"Query pattern {str(qry_md5)[:12]}"
+                ),
+                owner_user=row.get("sample_query_owner") or row.get("top_user"),
                 activity_count=_opt_int(row.get("run_count")),
                 cause_detail={k: v for k, v in cause.items() if v is not None},
                 x_source_connector=self.name,
