@@ -19,8 +19,8 @@ classifiers = [
 dependencies = [
     # Connector SDKs are imported eagerly by ingest, so they're required for now.
     # Making them optional extras needs lazy connector imports (follow-up).
-    "boto3>=1.43.61",
-    "databricks-sdk>=0.123.0",
+    "boto3>=1.43.66",
+    "databricks-sdk>=0.125.0",
     "duckdb>=1.5.5",
     "httpx>=0.28.1",
     "keyring>=25.7.0",
@@ -31,14 +31,14 @@ dependencies = [
     "plotly>=6.9.0",
     "pyarrow>=25.0.0",
     "pydantic>=2.13.4",
-    "pydantic-ai-slim[anthropic,google,openai]>=2.22.0",
+    "pydantic-ai-slim[anthropic,google,openai]>=2.26.0",
     "pydantic-graph>=2.22.0",
-    "pydantic-settings>=2.14.2",
+    "pydantic-settings>=2.15.0",
     "python-dotenv>=1.0.1",
     "pyyaml>=6.0.3",
     "snowflake-connector-python>=3.12.0",
     "structlog>=26.1.0",
-    "typer>=0.27.0",
+    "typer>=0.27.1",
 ]
 
 [project.optional-dependencies]
@@ -48,7 +48,7 @@ dependencies = [
 # in for everyone.
 redshift-bastion = [
     "sshtunnel>=0.4.0",
-    "redshift-connector>=2.1.15",
+    "redshift-connector>=2.1.16",
 ]
 
 [project.scripts]
@@ -72,7 +72,7 @@ dev = [
     "mypy>=2.3.0",
     "pre-commit>=4.6.1",
     "pytest>=9.1.1",
-    "ruff>=0.16.1",
+    "ruff>=0.16.2",
 ]
 docs = [
     "mkdocs-material>=9.7.7",
