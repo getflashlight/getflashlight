@@ -34,6 +34,7 @@ asterisks.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -44,7 +45,7 @@ from pydantic_ai.messages import ModelMessage
 
 from flashlight.dashboard import assistant_config, assistant_credentials, chrome
 from flashlight.dashboard.answer_caption import is_money_column, is_temporal_column
-from flashlight.dashboard.assistant_engine import ChartSpec, ToolStep, run_turn
+from flashlight.dashboard.assistant_engine import AssistantTurnResult, ChartSpec, ToolStep, run_turn
 
 
 def _informative_dims(df: pd.DataFrame, varying_cols: list[str]) -> list[str]:
@@ -58,6 +59,7 @@ def _informative_dims(df: pd.DataFrame, varying_cols: list[str]) -> list[str]:
     (category + service + month) past the two-dimension limit into a table.
     Keeping only informative columns leaves service x month — a stacked bar.
     """
+
     def preference(col: str) -> tuple[bool, int, int]:
         """Which of two interchangeable columns to keep, highest first.
 
@@ -203,7 +205,12 @@ def _plot(df: pd.DataFrame, spec: tuple[str, str | None, str], y_col: str) -> No
     labels = {x_col: "", y_col: ""}
     if kind == "line":
         fig = px.line(
-            df, x=x_col, y=y_col, color=series, labels=labels, markers=True,
+            df,
+            x=x_col,
+            y=y_col,
+            color=series,
+            labels=labels,
+            markers=True,
             color_discrete_sequence=list(chrome.CATEGORICAL_SLOTS),
         )
     else:
@@ -215,7 +222,11 @@ def _plot(df: pd.DataFrame, spec: tuple[str, str | None, str], y_col: str) -> No
         # question was actually about — and ChartSpec has no "grouped" kind to
         # override this with, deliberately.
         fig = px.bar(
-            df, x=x_col, y=y_col, color=series, labels=labels,
+            df,
+            x=x_col,
+            y=y_col,
+            color=series,
+            labels=labels,
             color_discrete_sequence=list(chrome.CATEGORICAL_SLOTS),
             barmode="stack",
         )
@@ -331,6 +342,7 @@ def _preset_label(cfg: assistant_config.AssistantConfig) -> str:
         if preset["provider"] == cfg.provider:
             return label
     return _DEFAULT_PROVIDER
+
 
 # (headline, detail) — the two are concatenated into the question actually sent,
 # so the detail carries real specificity into the prompt instead of being
@@ -460,15 +472,17 @@ async def render() -> None:
             settings_dialog.close()
 
         with ui.row().classes("w-full justify-end"):
-            ui.button("Done", on_click=_save_settings).props(
-                "flat no-caps color=primary"
-            ).mark("assistant-settings-done")
+            ui.button("Done", on_click=_save_settings).props("flat no-caps color=primary").mark(
+                "assistant-settings-done"
+            )
 
     # A compact top bar (model name + actions) instead of a page title/caption
     # block: this page is a conversational surface, so the vertical space goes to
     # the transcript, the way every chat app spends it.
-    with ui.row().classes("w-full items-center justify-between px-5 py-2 shrink-0").style(
-        f"border-bottom:1px solid {chrome.BORDER};"
+    with (
+        ui.row()
+        .classes("w-full items-center justify-between px-5 py-2 shrink-0")
+        .style(f"border-bottom:1px solid {chrome.BORDER};")
     ):
         status_label = ui.label().classes("text-sm").style(f"color:{chrome.INK_MUTED}")
         with ui.row().classes("items-center gap-1"):
@@ -496,6 +510,7 @@ async def render() -> None:
     messages: list[ModelMessage] = []
     session_id = ui.context.client.tab_id or ui.context.client.id
     turn_counter = 0
+    active_task: asyncio.Task[AssistantTurnResult] | None = None
 
     # Two layout modes, one composer. Empty state: everything (heading,
     # composer, suggestions) sits vertically centered in the page. First
@@ -504,8 +519,10 @@ async def render() -> None:
     # duplicated so there's only ever one input to keep in sync (NiceGUI's
     # Element.move, verified present in this version).
     with ui.column().classes("w-full items-stretch gap-0").style("flex:1;min-height:0;"):
-        hero = ui.column().classes("w-full items-center justify-center gap-0 px-4").style(
-            "flex:1;min-height:0;"
+        hero = (
+            ui.column()
+            .classes("w-full items-center justify-center gap-0 px-4")
+            .style("flex:1;min-height:0;")
         )
         with hero:
             with ui.row().classes("items-center gap-3 pb-6"):
@@ -527,9 +544,7 @@ async def render() -> None:
                         .mark(f"assistant-suggestion-{i}")
                     )
                     with row:
-                        ui.label(headline).classes("text-base").style(
-                            f"color:{chrome.INK_PRIMARY}"
-                        )
+                        ui.label(headline).classes("text-base").style(f"color:{chrome.INK_PRIMARY}")
                         ui.label(detail).classes("text-xs").style(f"color:{chrome.INK_MUTED}")
                     row.on(
                         "click",
@@ -550,7 +565,7 @@ async def render() -> None:
             scroll_area.scroll_to(percent=1.0)
 
         async def send(*, answering_clarification: bool = False) -> None:
-            nonlocal turn_counter
+            nonlocal turn_counter, active_task
             question = input_box.value.strip()
             if not question:
                 return
@@ -570,40 +585,60 @@ async def render() -> None:
                 ui.chat_message(question, sent=True)
                 with ui.row().classes("items-center gap-2") as thinking:
                     ui.spinner(size="1.2rem").style(f"color:{chrome.INK_MUTED}")
-                    ui.label("Thinking...").classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+                    progress = (
+                        ui.label("Understanding question...")
+                        .classes("text-sm")
+                        .style(f"color:{chrome.INK_MUTED}")
+                    )
             _scroll_down()
             send_button.props("loading")
             input_box.props("disable")
+            cancel_button.set_visibility(True)
             provider = _PRESETS.get(provider_select.value or "", _PRESETS[_DEFAULT_PROVIDER])[
                 "provider"
             ]
             try:
-                result = await run_turn(
-                    messages,
-                    question,
-                    provider=provider,
-                    api_key=api_key_input.value,
-                    model=model_input.value,
-                    base_url=base_url_input.value or None,
-                    session_id=session_id,
-                    answering_clarification=answering_clarification,
+                active_task = asyncio.create_task(
+                    run_turn(
+                        messages,
+                        question,
+                        provider=provider,
+                        api_key=api_key_input.value,
+                        model=model_input.value,
+                        base_url=base_url_input.value or None,
+                        session_id=session_id,
+                        answering_clarification=answering_clarification,
+                        on_stage=lambda stage: setattr(progress, "text", f"{stage}..."),
+                    )
                 )
+                result = await active_task
+            except asyncio.CancelledError:
+                with message_area:
+                    ui.label("Request cancelled.").classes("text-sm").style(
+                        f"color:{chrome.INK_MUTED}"
+                    )
+                return
             finally:
+                active_task = None
                 thinking.delete()
                 send_button.props(remove="loading")
                 input_box.props(remove="disable")
+                cancel_button.set_visibility(False)
             turn_counter += 1
             with message_area, ui.column().classes("w-full gap-2"):
                 if result.reasoning:
                     # Collapsed by default — it's debugging detail, not the
                     # answer. Open it and it's the only record of what the model
                     # was trying to do on a turn that produced no answer at all.
-                    with ui.expansion(
-                        f"Model reasoning ({len(result.reasoning)} step"
-                        f"{'s' if len(result.reasoning) > 1 else ''})",
-                        icon="psychology",
-                    ).classes("w-full").style(f"color:{chrome.INK_MUTED}").mark(
-                        f"assistant-reasoning-{turn_counter}"
+                    with (
+                        ui.expansion(
+                            f"Model reasoning ({len(result.reasoning)} step"
+                            f"{'s' if len(result.reasoning) > 1 else ''})",
+                            icon="psychology",
+                        )
+                        .classes("w-full")
+                        .style(f"color:{chrome.INK_MUTED}")
+                        .mark(f"assistant-reasoning-{turn_counter}")
                     ):
                         for trace in result.reasoning:
                             ui.label(trace).classes("text-xs whitespace-pre-wrap").style(
@@ -619,8 +654,11 @@ async def render() -> None:
                     # pill, which doesn't leave room for an option to actually
                     # describe itself (e.g. "All services across all providers
                     # (default)") — a full-width row wraps naturally instead.
-                    with ui.list().props("bordered separator dense").classes("w-full").style(
-                        f"border-radius:8px;border-color:{chrome.BORDER};"
+                    with (
+                        ui.list()
+                        .props("bordered separator dense")
+                        .classes("w-full")
+                        .style(f"border-radius:8px;border-color:{chrome.BORDER};")
                     ):
                         for i, option in enumerate(result.options):
                             ui.item(option, on_click=lambda o=option: _send_option(o)).style(
@@ -650,9 +688,13 @@ async def render() -> None:
         # One soft rounded surface holding the field and send button, built
         # inside the empty state's slot and later moved to bottom_bar.
         with composer_slot_hero:
-            composer = ui.row().classes("w-full max-w-3xl gap-2 items-center px-3 py-1").style(
-                f"background:{chrome.SURFACE};border:1px solid {chrome.BORDER};"
-                "border-radius:26px;"
+            composer = (
+                ui.row()
+                .classes("w-full max-w-3xl gap-2 items-center px-3 py-1")
+                .style(
+                    f"background:{chrome.SURFACE};border:1px solid {chrome.BORDER};"
+                    "border-radius:26px;"
+                )
             )
             with composer:
                 input_box = (
@@ -668,3 +710,12 @@ async def render() -> None:
                     .props("round dense color=primary")
                     .mark("assistant-send")
                 )
+                cancel_button = (
+                    ui.button(
+                        icon="close", on_click=lambda: active_task.cancel() if active_task else None
+                    )
+                    .props("round dense flat")
+                    .tooltip("Cancel request")
+                    .mark("assistant-cancel")
+                )
+                cancel_button.set_visibility(False)

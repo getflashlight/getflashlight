@@ -53,11 +53,23 @@ ASSISTANT_TURN_SCHEMA: pa.Schema = pa.schema(
         # answer | clarify | no_answer | error — so the share of turns that
         # ended with nothing useful is a tracked number, not an anecdote.
         ("outcome", pa.string()),
-        # summary_spec | caption | model — where the answer's wording came from.
+        # deterministic | summary_spec | caption | model — where the answer's wording came from.
         # summary_spec and caption both skip the synthesis call (the model declared
         # the sentence at plan time, or a fixed assembly was used); model means a
         # real second round trip. Makes the saving measurable rather than asserted.
         ("answer_source", pa.string()),
+        # Whether this was answered from a bounded, local fast path or through
+        # the BYOK model graph. `intent` is deliberately a small machine label,
+        # never the user's question text.
+        ("route", pa.string()),
+        ("intent", pa.string()),
+        # The first point at which the UI could show a useful result. For the
+        # deterministic path this is when its local reads complete; for the LLM
+        # path it is the completed answer until streaming is introduced.
+        ("time_to_first_result_ms", pa.float64()),
+        # Structured-output retries are distinct from provider empty rounds so
+        # model compatibility problems are diagnosable from Usage.
+        ("output_retries", pa.int64()),
     ]
 )
 

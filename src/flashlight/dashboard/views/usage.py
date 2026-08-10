@@ -21,7 +21,8 @@ def render() -> None:
         "SELECT turn_id, session_id, model, prompt_tokens, completion_tokens, "
         "total_tokens, tool_call_count, duration_ms, plan_ms, explore_ms, execute_ms, "
         "synthesize_ms, llm_request_count, plan_pass_count, empty_round_retries, outcome, "
-        "answer_source, occurred_at FROM telemetry.assistant_turn ORDER BY occurred_at DESC"
+        "answer_source, route, intent, time_to_first_result_ms, output_retries, occurred_at "
+        "FROM telemetry.assistant_turn ORDER BY occurred_at DESC"
     )
     if df.empty:
         chrome.section_caption("No assistant activity yet — ask something on the Assistant page.")
@@ -73,6 +74,20 @@ def render() -> None:
         ]
     )
 
+    routed = df[df["route"].notna()]
+    if not routed.empty:
+        fast = routed[routed["route"] == "deterministic"]
+        fast_detail = "no deterministic turns yet"
+        if not fast.empty and fast["duration_ms"].notna().any():
+            timed_fast = fast[fast["duration_ms"].notna()]["duration_ms"]
+            fast_detail = (
+                f"p50 {timed_fast.median() / 1000:,.1f}s · "
+                f"p90 {timed_fast.quantile(0.9) / 1000:,.1f}s"
+            )
+        chrome.section_caption(
+            f"Fast path: {len(fast) / len(routed):.0%} of routed turns · {fast_detail}."
+        )
+
     if not timed.empty:
         with chrome.panel():
             chrome.panel_title("Where a turn's time goes")
@@ -107,6 +122,9 @@ def render() -> None:
     display["synthesize_ms"] = display["synthesize_ms"].map(
         lambda ms: "—" if pd.isna(ms) else f"{ms / 1000:,.1f}s"
     )
+    display["time_to_first_result_ms"] = display["time_to_first_result_ms"].map(
+        lambda ms: "—" if pd.isna(ms) else f"{ms / 1000:,.1f}s"
+    )
     display["occurred_at"] = pd.to_datetime(display["occurred_at"]).dt.strftime(
         "%Y-%m-%d %H:%M UTC"
     )
@@ -125,6 +143,7 @@ def render() -> None:
                 "llm_request_count",
                 "plan_pass_count",
                 "empty_round_retries",
+                "output_retries",
             ],
             rename={
                 "session_id": "Session",
@@ -140,6 +159,10 @@ def render() -> None:
                 "empty_round_retries": "Empty rounds",
                 "outcome": "Outcome",
                 "answer_source": "Answered by",
+                "route": "Route",
+                "intent": "Intent",
+                "time_to_first_result_ms": "First result",
+                "output_retries": "Output retries",
                 "occurred_at": "When",
             },
         )
