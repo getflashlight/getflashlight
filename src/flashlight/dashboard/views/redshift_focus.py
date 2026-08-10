@@ -224,7 +224,7 @@ def _spend_partition(sm: date, end: date) -> None:
                     return
 
                 ui.button(
-                    "All clusters", icon="arrow_back", on_click=lambda: _drill.refresh()
+                    "All clusters", icon="arrow_back", on_click=lambda: _drill.refresh(None)
                 ).props("flat dense no-caps").style(f"color:{chrome.ACCENT};")
                 chrome.panel_title(f"Spend by SKU — {selected_cluster}")
                 sku = gold_df(
