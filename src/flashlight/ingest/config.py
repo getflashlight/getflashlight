@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -361,7 +362,7 @@ def effective_connector_name(cfg: BaseModel) -> str:
     return name or ctype
 
 
-def _validate_connectors(configs: list[BaseModel]) -> None:
+def _validate_connectors(configs: Sequence[BaseModel]) -> None:
     """Cross-connector checks that a single config can't make on its own — run on
     both load (:func:`_parse_entries`) and save (:func:`save_connections`), so a
     dashboard edit is rejected at write time, not just on the next ingest run.
@@ -422,7 +423,7 @@ def load_connections(path: str | None = None) -> list[BaseModel]:
     return [cfg for cfg in load_all_connections(path) if getattr(cfg, "enabled", True)]
 
 
-def save_connections(entries: list[BaseModel], path: str | None = None) -> None:
+def save_connections(entries: Sequence[BaseModel], path: str | None = None) -> None:
     """Write connector configs back to the connections YAML (full overwrite).
 
     Round-trips through the same Pydantic models :func:`load_all_connections` reads

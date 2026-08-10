@@ -8,6 +8,7 @@ from pathlib import Path
 
 import duckdb
 import pandas as pd
+import pytest
 
 from flashlight.core.settings import get_settings
 from flashlight.focus.enums import ChargeCategory, ProviderName, ServiceCategory
@@ -61,8 +62,8 @@ def test_build_connector_returns_real_snowflake_connector() -> None:
 
 
 def test_bulk_ingest_shapes_source_in_snowflake_and_writes_bronze(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Cost rows use the Snowflake SQL/DuckDB bulk path, not FocusRecord iteration."""
     monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
     get_settings.cache_clear()

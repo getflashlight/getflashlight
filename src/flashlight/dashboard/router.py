@@ -329,6 +329,18 @@ def no_data_page(title: str) -> None:
     ui.label(NO_DATA_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
 
 
+def snowflake_empty_state() -> None:
+    """Guide users from Snowflake's always-reachable page to its setup path."""
+    with chrome.panel():
+        chrome.empty_state(
+            "ac_unit",
+            "Snowflake visibility",
+            "Add an enabled Snowflake connection and run a sync to see your organization's spend.",
+            button_label="Add an enabled Snowflake connection",
+            on_click=lambda: ui.navigate.to("/connections"),
+        )
+
+
 def home_empty_state() -> None:
     """First-run Home guidance, with Connections as the single setup surface."""
     with chrome.panel():
@@ -535,7 +547,7 @@ def build_pages() -> None:
             if "snowflake" in discover_provider_groups() and has_data():
                 _render_snowflake_page(label)
             else:
-                no_data_page("Snowflake spend")
+                snowflake_empty_state()
 
     # One parameterized route, not one @ui.page per group discovered right now —
     # discover_provider_groups() reads gold/ live, so it can (and does) return a
@@ -556,7 +568,7 @@ def build_pages() -> None:
                 if "snowflake" in discover_provider_groups() and has_data():
                     _render_snowflake_page(label)
                 else:
-                    no_data_page("Snowflake spend")
+                    snowflake_empty_state()
             return
         published_groups = set(discover_provider_groups())
         syncing = group in ingest_runner.active_provider_groups()

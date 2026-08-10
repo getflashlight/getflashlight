@@ -134,6 +134,7 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
             ("Entities flagged", f"{n_entities:,}", month_label),
         ],
     )
+    measurement_coverage(provider_name, month)
 
     # One action queue, drilled in place just like Attribution. Each entity contributes
     # only its best-priced recommendation to the displayed savings total.
@@ -161,6 +162,48 @@ def completed_record_months(records: pd.DataFrame, current_month: date) -> list[
     cutoff = pd.Timestamp(current_month).replace(day=1)
     record_months = pd.to_datetime(records["charge_month"], errors="coerce").dropna()
     return sorted(record_months[record_months < cutoff].dt.strftime("%Y-%m-%d").unique())
+
+
+def measurement_coverage(provider_name: str, month: str) -> None:
+    """Name the limits of the utilization readings behind the action queue.
+
+    A missing utilization percentage has two materially different meanings: shared
+    compute has none obtainable in principle at this grain, while a workload that
+    normally reports utilization may simply have had no telemetry arrive. Keeping
+    those separate prevents an unmeasured workload, or one with no fired rule, from
+    reading as proof of efficiency.
+    """
+    rows = _df(
+        "SELECT entity_type, utilization_pct FROM efficiency.efficiency_entity_month "
+        f"WHERE provider_name = '{_q(provider_name)}' AND charge_month = '{_q(month)}'"
+    )
+    if rows.empty:
+        return
+
+    total = len(rows)
+    measured = int(rows["utilization_pct"].notna().sum())
+    # Shared compute and query-pattern rows are attributable, but no per-entity CPU
+    # utilization exists for them. A NULL on every other entity kind is a collection
+    # gap, not evidence that the workload was idle or healthy.
+    not_applicable_types = {"sql_warehouse", "sql_warehouse_user", "query_pattern"}
+    no_utilization = rows[rows["utilization_pct"].isna()]
+    not_applicable = int(no_utilization["entity_type"].isin(not_applicable_types).sum())
+    unmeasured = len(no_utilization) - not_applicable
+    pegged = bool((rows["utilization_pct"] >= 100).any())
+
+    parts = [f"{measured} of {total} entity-months carry a utilization reading"]
+    if not_applicable:
+        parts.append(f"{not_applicable} have none obtainable in principle")
+    if unmeasured:
+        parts.append(f"{unmeasured} have no telemetry arrived")
+    caption = "; ".join(parts) + ". "
+    if pegged:
+        caption += "A 100% reading is a sensor ceiling, not proof that capacity was ideal. "
+    caption += (
+        "An entity that is unflagged, not proven efficient, may still need different telemetry."
+    )
+
+    chrome.section_caption(caption)
 
 
 # ── Month-over-month delta (KPI row) ────────────────────────────────────────────────
