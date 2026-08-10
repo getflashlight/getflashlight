@@ -442,6 +442,48 @@ def test_connected_providers_and_catalog_lines_ground_in_live_data() -> None:
     assert "aws.monthly_bill: dimensions=" in catalog_line
 
 
+def test_plan_guidance_expands_redshift_cost_drivers_by_subcategory() -> None:
+    """A service-level AWS answer must not hide Redshift's useful cost split."""
+    instructions = assistant_engine._PLAN_INSTRUCTIONS  # noqa: SLF001
+
+    assert "aws.spend_by_cost_subcategory_month" in instructions
+    assert "Amazon Redshift" in instructions
+    assert "concurrency-scaling" in instructions
+    assert "Spectrum-scan" in instructions
+
+
+def test_plan_guidance_uses_all_in_databricks_and_no_duplicate_aws_column() -> None:
+    """A Redshift/Databricks comparison uses all-in Databricks, without duplicate AWS."""
+    instructions = assistant_engine._PLAN_INSTRUCTIONS  # noqa: SLF001
+
+    assert "Databricks total cost of ownership" in instructions
+    assert "storage.backing_storage_month filtered to mapping='databricks'" in instructions
+    assert "compute.backing_compute_month filtered to mapping='databricks'" in instructions
+    assert "do not show an AWS net-cost column" in instructions
+
+
+def test_plan_guidance_leads_unallocated_questions_with_coverage() -> None:
+    """Missing tags are an allocation gap, not evidence of a resource owner."""
+    instructions = assistant_engine._PLAN_INSTRUCTIONS  # noqa: SLF001
+
+    assert "spend_tag_coverage_month" in instructions
+    assert "spend_untagged_by_service_month" in instructions
+    assert "spend_untagged_by_resource_month only when the user explicitly asks" in instructions
+    assert "cost-allocation rule based on the benefiting workloads" in instructions
+
+
+def test_plan_guidance_makes_waste_answers_actionable_and_compact() -> None:
+    """Waste answers should prioritize evidence and recovery, not generic row spam."""
+    instructions = assistant_engine._PLAN_INSTRUCTIONS  # noqa: SLF001
+
+    assert "efficiency.waste_summary_month" in instructions
+    assert "efficiency.waste_record" in instructions
+    assert "recoverable share of billed cost" in instructions
+    assert "show no more than the top five entities" in instructions
+    assert "list_optimization_rules" in instructions
+    assert "month-to-date" in instructions
+
+
 def test_run_turn_never_persists_instructions_into_message_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
