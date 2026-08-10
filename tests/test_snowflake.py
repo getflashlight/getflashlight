@@ -6,7 +6,13 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import duckdb
+import pandas as pd
+import pytest
+
+from flashlight.core.settings import get_settings
 from flashlight.focus.enums import ChargeCategory, ProviderName, ServiceCategory
+from flashlight.ingest.base import IngestWindow
 from flashlight.ingest.config import SnowflakeConfig, load_connections, scoped_env_name
 from flashlight.ingest.connectors._snowflake_supported_drivers import check_support_status
 from flashlight.ingest.connectors.snowflake import SnowflakeConnector
@@ -53,6 +59,76 @@ def test_build_connector_returns_real_snowflake_connector() -> None:
     connector = build_connector(cfg)
     assert isinstance(connector, SnowflakeConnector)
     assert connector.name == "Org"
+
+
+def test_bulk_ingest_shapes_source_in_snowflake_and_writes_bronze(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cost rows use the Snowflake SQL/DuckDB bulk path, not FocusRecord iteration."""
+    monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
+    get_settings.cache_clear()
+
+    class Cursor:
+        query = ""
+        params: dict[str, object] = {}
+
+        def execute(self, query: str, params: dict[str, object]) -> None:
+            self.query = query
+            self.params = params
+
+        def fetch_pandas_all(self) -> pd.DataFrame:
+            return pd.DataFrame([
+                {
+                    "ProviderName": "Snowflake", "BillingAccountId": "ACME",
+                    "SubAccountId": "PROD", "SubAccountName": "XY12345",
+                    "BillingPeriodStart": "2026-03-01", "BillingPeriodEnd": "2026-04-01",
+                    "ChargePeriodStart": "2026-03-15 00:00:00",
+                    "ChargePeriodEnd": "2026-03-16 00:00:00",
+                    "BillingCurrency": "USD", "BilledCost": "12.50",
+                    "EffectiveCost": "12.50", "ListCost": "12.50",
+                    "ContractedCost": "12.50", "ChargeCategory": "Usage",
+                    "ChargeDescription": "compute", "ServiceCategory": "Compute",
+                    "ServiceName": "WAREHOUSE_METERING", "SkuId": "compute",
+                    "RegionId": "us-east-1", "ConsumedQuantity": 4.0,
+                    "ConsumedUnit": "Credits",
+                }
+            ])
+
+        def close(self) -> None:
+            pass
+
+    class Connection:
+        cursor_instance = Cursor()
+
+        def cursor(self) -> Cursor:
+            return self.cursor_instance
+
+        def close(self) -> None:
+            pass
+
+    connector = SnowflakeConnector(SnowflakeConfig(account="xy12345", name="Org"))
+    connection = Connection()
+    monkeypatch.setattr(connector, "_connect", lambda: connection)
+    window = IngestWindow(date(2026, 3, 1), date(2026, 3, 31))
+
+    try:
+        assert connector.ingest(window, run_id="run-1") == 1
+        assert "USAGE_IN_CURRENCY IS NOT NULL" in connection.cursor_instance.query
+        assert connection.cursor_instance.params == {"start": window.start, "end": window.end}
+
+        from flashlight.lake import paths
+
+        con = duckdb.connect()
+        try:
+            row = con.execute(
+                f"SELECT provider_name, effective_cost, x_source_connector "
+                f"FROM read_parquet('{paths.bronze_dir()}/**/*.parquet', hive_partitioning = true)"
+            ).fetchone()
+        finally:
+            con.close()
+        assert row == ("Snowflake", Decimal("12.500000"), "Org")
+    finally:
+        get_settings.cache_clear()
 
 
 def test_map_row_builds_focus_record() -> None:
@@ -105,6 +181,25 @@ def test_map_row_marks_adjustment() -> None:
     assert record is not None
     assert record.charge_category == ChargeCategory.ADJUSTMENT
     assert record.service_category == ServiceCategory.STORAGE
+
+
+def test_map_row_marks_negative_adjustment_as_credit() -> None:
+    connector = SnowflakeConnector(SnowflakeConfig(account="xy12345"))
+    record = connector._map_row(
+        {
+            "USAGE_DATE": "2026-03-01",
+            "USAGE_IN_CURRENCY": "-1.25",
+            "IS_ADJUSTMENT": True,
+            "SERVICE_TYPE": "CLOUD_SERVICES",
+            "USAGE_TYPE": "support adjustment",
+            "ORGANIZATION_NAME": "ACME",
+            "CURRENCY": "USD",
+            "USAGE": 0,
+        }
+    )
+    assert record is not None
+    assert record.charge_category == ChargeCategory.CREDIT
+    assert record.effective_cost == Decimal("-1.25")
 
 
 def test_map_row_skips_null_usage_date() -> None:

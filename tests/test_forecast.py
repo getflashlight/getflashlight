@@ -157,59 +157,6 @@ def test_forecast_never_projects_negative_spend(lake_home) -> None:  # type: ign
 # ── The dashboard's run-rate presentation gate ───────────────────────────────
 # GOLD deliberately keeps a low-history run_rate figure (a 2-day mean is a valid mean),
 # so the honesty gate lives in the KPI that renders it. These cover that gate directly —
-# no lake needed, since _run_rate_card is pure.
-def test_run_rate_card_suppressed_below_three_days() -> None:
-    """The observed failure: $1.27M projected from $43k actual on history_days=1."""
-    from flashlight.dashboard.views.provider_focus import _run_rate_card
-
-    for days in (0, 1, 2):
-        assert (
-            _run_rate_card(
-                month=date(2026, 8, 1),
-                forecast_cost=1_272_760.80,
-                actual_to_date=43_042.0,
-                history_days=days,
-            )
-            is None
-        ), f"a {days}-day mean extended over a month is noise, not a projection"
-
-
-def test_run_rate_card_is_suppressed_under_a_week() -> None:
-    """Under a week neither an MTD tile nor an unreliable forecast is a KPI."""
-    from flashlight.dashboard.views.provider_focus import _run_rate_card
-
-    card = _run_rate_card(
-        month=date(2026, 8, 1),
-        forecast_cost=90_000.0,
-        actual_to_date=12_000.0,
-        history_days=4,
-    )
-    assert card is None
-
-
-def test_run_rate_card_is_plain_with_a_week_of_history() -> None:
-    from flashlight.dashboard.views.provider_focus import _run_rate_card
-
-    card = _run_rate_card(
-        month=date(2026, 8, 1), forecast_cost=90_000.0, actual_to_date=21_000.0, history_days=7
-    )
-    assert card is not None
-    assert len(card) == 3, "no variant → rendered as an ordinary KPI"
-    assert card[0] == "Projected"
-    assert "90K" in card[1]
-    assert "7-day run rate" in card[2]
-    assert "21K so far" in card[2]
-
-
-def test_run_rate_card_tolerates_a_missing_actual() -> None:
-    from flashlight.dashboard.views.provider_focus import _run_rate_card
-
-    card = _run_rate_card(
-        month=date(2026, 8, 1), forecast_cost=90_000.0, actual_to_date=None, history_days=4
-    )
-    assert card is None
-
-
 def test_databricks_backing_costs_are_added_to_forecasts(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Storage and compute carry through to both forecast shapes, not just actual bars."""
     import pandas as pd

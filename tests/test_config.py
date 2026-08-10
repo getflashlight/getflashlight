@@ -86,7 +86,7 @@ def test_legacy_redshift_workgroup_is_a_clear_migration_error(tmp_path) -> None:
         load_all_connections(str(path))
 
 
-def test_enabled_redshift_requires_enabled_aws_focus(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_enabled_redshift_runs_without_aws_focus_for_telemetry(tmp_path) -> None:  # type: ignore[no-untyped-def]
     path = tmp_path / "connections.yml"
     path.write_text(
         "connectors:\n"
@@ -94,10 +94,11 @@ def test_enabled_redshift_requires_enabled_aws_focus(tmp_path) -> None:  # type:
         "    enabled: true\n"
         "    cluster_identifier: prod-cluster\n"
     )
-    with pytest.raises(ConfigError, match="aws_focus"):
-        load_connections(str(path))
+    configs = load_connections(str(path))
+    assert len(configs) == 1
+    assert isinstance(configs[0], RedshiftConfig)
 
-    # Disabled aws_focus doesn't count — ingest wouldn't actually pull cost.
+    # A disabled AWS FOCUS source still permits Redshift telemetry ingestion.
     path.write_text(
         "connectors:\n"
         "  - type: aws_focus\n"
@@ -107,8 +108,9 @@ def test_enabled_redshift_requires_enabled_aws_focus(tmp_path) -> None:  # type:
         "    enabled: true\n"
         "    cluster_identifier: prod-cluster\n"
     )
-    with pytest.raises(ConfigError, match="aws_focus"):
-        load_connections(str(path))
+    configs = load_connections(str(path))
+    assert len(configs) == 1
+    assert isinstance(configs[0], RedshiftConfig)
 
     # A disabled redshift entry is fine on its own — nothing to actually run.
     path.write_text(
@@ -120,13 +122,11 @@ def test_enabled_redshift_requires_enabled_aws_focus(tmp_path) -> None:  # type:
     assert load_all_connections(str(path))
 
 
-def test_save_connections_rejects_redshift_without_aws_focus(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_save_connections_allows_redshift_without_aws_focus(tmp_path) -> None:  # type: ignore[no-untyped-def]
     path = tmp_path / "connections.yml"
-    with pytest.raises(ConfigError, match="aws_focus"):
-        save_connections(
-            [RedshiftConfig(enabled=True, cluster_identifier="prod-cluster")], str(path)
-        )
-    assert not path.exists()
+    entries = [RedshiftConfig(enabled=True, cluster_identifier="prod-cluster")]
+    save_connections(entries, str(path))
+    assert load_connections(str(path)) == entries
 
 
 def test_env_treats_empty_as_unset(monkeypatch) -> None:  # type: ignore[no-untyped-def]

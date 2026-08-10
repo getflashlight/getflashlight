@@ -120,9 +120,9 @@ async def _tail(proc: asyncio.subprocess.Process) -> None:
 async def start() -> bool:
     """Launch ``flashlight mcp serve``. False if one is already up (ours or not).
 
-    Never raises for the ordinary failures — a refusal (``FLASHLIGHT_DEMO=1``), a busy
-    port, a bad setting — those arrive as output lines and an exit code, which is what
-    the page shows. Only a genuine spawn failure propagates.
+    Never raises for ordinary failures — a busy port or bad setting arrives as output
+    lines and an exit code, which is what the page shows. Only a genuine spawn failure
+    propagates.
     """
     global _proc, _tail_task
     if is_running() or is_listening():

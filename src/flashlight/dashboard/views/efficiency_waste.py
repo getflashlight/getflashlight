@@ -1,18 +1,8 @@
-"""Efficiency & waste — one provider's recoverable spend, and what was measured to find it.
+"""Efficiency & waste — one provider's recoverable savings opportunities.
 
 The "Efficiency & Waste" tab on every provider page. It reads the one standardized GOLD view
 (``efficiency.waste_record``) and presents one action queue, drilled in place like
 Attribution: workload/remedy → entity → evidence and recommended action.
-
-``waste_record`` only carries entities a rule *fired* on, so on its own it can answer "what
-is wasteful?" but never "what didn't we look at?". :func:`coverage_caption` answers the
-second question from the measurement stage of the same telemetry plane
-(``efficiency.utilization_entity_month`` — same ``metrics.efficiency_record`` rows, before
-they were judged). It leads the tab because on real data only ~10% of Databricks
-entity-months carry a utilization reading and **0%** of AWS's do: absence of a finding is
-mostly absence of measurement, and a tab that didn't say so would read as a clean bill of
-health. The rest of the measurement stage (per-signal readings, $/native-unit rates) stays in
-GOLD for the assistant and MCP rather than being a second set of panels here.
 
 The optional resolution view contributes an entity's all-time first-seen date to the same
 drill-down. Both views are gated behind
@@ -27,7 +17,6 @@ from dataclasses import dataclass
 from datetime import date
 
 import pandas as pd
-import plotly.express as px
 from nicegui import ui
 
 from flashlight.dashboard import chrome
@@ -50,14 +39,6 @@ _STALE_MSG = (
     "This lake's published GOLD predates the efficiency views — run `flashlight transform` "
     "to rebuild it."
 )
-
-# Only entity types where a per-entity reading is obtainable in principle can be
-# "unmeasured"; the rest are "not_applicable". Kept here purely for the caption wording —
-# the classification itself is baked into the GOLD view (055_gold_utilization.sql).
-_NOT_APPLICABLE_REASON = (
-    "shared compute, per-user shares, query shapes, tables and serving endpoints"
-)
-
 
 def _q(value: str) -> str:
     """Escape a string for inlining as a single-quoted SQL literal."""
@@ -90,70 +71,19 @@ def _empty_state(label: str) -> None:
     )
 
 
-def coverage_caption(provider_name: str, *, scope_sql: str = "") -> None:
-    """One line: how much of this provider's fleet carries a utilization reading at all.
-
-    The surviving panel from the old cross-provider ``/utilization`` page, reduced to its
-    load-bearing fact. *scope_sql* is an extra predicate ANDed on (no leading ``AND``) so
-    ``redshift_focus`` can state coverage per cluster.
-    """
-    if not gold_view_published("efficiency", "utilization_entity_month"):
-        return
-    where = f"WHERE provider_name = '{_q(provider_name)}'" + (
-        f" AND {scope_sql}" if scope_sql else ""
-    )
-    rows = _df(
-        "SELECT measurement_status, count(*) AS n, "
-        "count(*) FILTER (WHERE is_saturated_reading) AS saturated, "
-        f"max(charge_month) AS charge_month FROM efficiency.utilization_entity_month {where} "
-        "AND charge_month = (SELECT max(charge_month) FROM "
-        f"efficiency.utilization_entity_month {where}) GROUP BY measurement_status"
-    )
-    if rows.empty:
-        chrome.section_caption(
-            "No utilization telemetry for this scope, so nothing below is backed by a "
-            "measurement of how hard the resource was actually working."
-        )
-        return
-
-    by_status = rows.set_index("measurement_status")["n"]
-    total = int(by_status.sum())
-    measured = int(by_status.get("measured", 0))
-    not_applicable = int(by_status.get("not_applicable", 0))
-    unmeasured = int(by_status.get("unmeasured", 0))
-    saturated = int(rows["saturated"].sum())
-    month_label = pd.Timestamp(rows["charge_month"].iloc[0]).strftime("%b %Y")
-
-    chrome.section_caption(
-        f"Coverage · {month_label}: {measured:,} of {total:,} entity-months carry a "
-        f"utilization reading ({100 * measured / total:.0f}%). {not_applicable:,} have "
-        f"none obtainable in principle — {_NOT_APPLICABLE_REASON} have no per-entity "
-        f"utilization. {unmeasured:,} could be measured but no telemetry arrived. "
-        f"{saturated:,} reading(s) are pegged at the sensor ceiling (≥99.5%) — a ceiling, "
-        "not a verdict. An entity absent from the tables below is unflagged, not proven "
-        "efficient."
-    )
-
-
 def render(provider_name: str, label: str, sm: date, end: date) -> None:
     """One provider's efficiency tab. *provider_name* is the raw FOCUS ``provider_name``
     (``data.provider_name_for_group``) — never the display label, which matches no row.
 
-    *sm*/*end* are the page's own date-range control (same as every other core tab —
-    Attribution, Policy Compliance). Only :func:`recoverable_trend_chart` reads them: the
-    entity leaderboard below deliberately keeps showing "the latest month with telemetry"
-    regardless of the picker (documented where ``month`` is computed) because coverage is
-    sparse enough that a narrow window can easily contain zero measured months. The
-    all-time first-seen date displayed beside an entity is intentionally not clipped by
-    the picker, so it retains the "has this been open a long time" signal.
+    The tab deliberately keeps showing the latest completed month regardless of the page's
+    date picker. The all-time first-seen date displayed beside an entity is likewise not
+    clipped, so it retains the "has this been open a long time" signal.
     """
     with ui.row().classes("items-center gap-2"):
         chrome.section_title("Efficiency & waste")
         ui.label("Metrics below use the previous full month").classes("text-xs").style(
             f"color:{chrome.INK_MUTED}"
         )
-    coverage_caption(provider_name)
-
     if not gold_view_published("efficiency", "waste_record"):
         ui.label(_STALE_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
         return
@@ -187,40 +117,27 @@ def render(provider_name: str, label: str, sm: date, end: date) -> None:
     month_label = pd.Timestamp(month).strftime("%b %Y")
 
     action_groups = _display_action_groups(month_rows)
-    waste_total = action_groups.loc[action_groups["lens"] == "WASTE", "potential_savings"].sum()
-    opp_total = action_groups.loc[action_groups["lens"] == "OPPORTUNITY", "potential_savings"].sum()
-    high_total = action_groups.loc[action_groups["lens"] == "WASTE", "high_confidence"].sum()
+    savings_total = action_groups["potential_savings"].sum()
+    high_total = action_groups["high_confidence"].sum()
     n_entities = month_rows["entity_id"].nunique()
-    waste_delta = mom_recoverable_delta(records, months, "WASTE")
-    opp_delta = mom_recoverable_delta(records, months, "OPPORTUNITY")
+    savings_delta = mom_recoverable_delta(records, months, "ALL")
 
-    # WASTE and OPPORTUNITY are separate lenses (a cluster can be both — different
-    # remedies), so they are shown separately, never summed into one headline.
     chrome.kpi_row(
         [
             (
-                "Waste (tune it)",
-                compact_money(waste_total),
-                _delta_sub(waste_delta, "idle · underused"),
-                delta_variant(waste_delta) if waste_delta is not None else "unattributed",
+                "Savings opportunities",
+                compact_money(savings_total),
+                _delta_sub(savings_delta, "best action per entity"),
+                delta_variant(savings_delta) if savings_delta is not None else "unattributed",
             ),
-            (
-                "Opportunity (move)",
-                compact_money(opp_total),
-                _delta_sub(opp_delta, "→ jobs compute"),
-                delta_variant(opp_delta) if opp_delta is not None else "decrease",
-            ),
-            ("High confidence", compact_money(high_total), "of tune/right-size actions"),
+            ("High confidence", compact_money(high_total), "of savings opportunities"),
             ("Entities flagged", f"{n_entities:,}", month_label),
         ],
     )
+    measurement_coverage(provider_name, month)
 
-    last_complete_day = (pd.Timestamp(current_month) - pd.Timedelta(days=1)).date()
-    recoverable_trend_chart(records, sm, min(end, last_complete_day))
-
-    # One action queue, drilled in place just like Attribution.  The two lenses remain
-    # distinct rows at its root: a cluster can be both underused and movable, and those
-    # are alternative remedies rather than an additive savings total.
+    # One action queue, drilled in place just like Attribution. Each entity contributes
+    # only its best-priced recommendation to the displayed savings total.
     tracking = (
         _resolution_rows(provider_name)
         if gold_view_published("efficiency", "waste_resolution_month")
@@ -245,6 +162,48 @@ def completed_record_months(records: pd.DataFrame, current_month: date) -> list[
     cutoff = pd.Timestamp(current_month).replace(day=1)
     record_months = pd.to_datetime(records["charge_month"], errors="coerce").dropna()
     return sorted(record_months[record_months < cutoff].dt.strftime("%Y-%m-%d").unique())
+
+
+def measurement_coverage(provider_name: str, month: str) -> None:
+    """Name the limits of the utilization readings behind the action queue.
+
+    A missing utilization percentage has two materially different meanings: shared
+    compute has none obtainable in principle at this grain, while a workload that
+    normally reports utilization may simply have had no telemetry arrive. Keeping
+    those separate prevents an unmeasured workload, or one with no fired rule, from
+    reading as proof of efficiency.
+    """
+    rows = _df(
+        "SELECT entity_type, utilization_pct FROM efficiency.efficiency_entity_month "
+        f"WHERE provider_name = '{_q(provider_name)}' AND charge_month = '{_q(month)}'"
+    )
+    if rows.empty:
+        return
+
+    total = len(rows)
+    measured = int(rows["utilization_pct"].notna().sum())
+    # Shared compute and query-pattern rows are attributable, but no per-entity CPU
+    # utilization exists for them. A NULL on every other entity kind is a collection
+    # gap, not evidence that the workload was idle or healthy.
+    not_applicable_types = {"sql_warehouse", "sql_warehouse_user", "query_pattern"}
+    no_utilization = rows[rows["utilization_pct"].isna()]
+    not_applicable = int(no_utilization["entity_type"].isin(not_applicable_types).sum())
+    unmeasured = len(no_utilization) - not_applicable
+    pegged = bool((rows["utilization_pct"] >= 100).any())
+
+    parts = [f"{measured} of {total} entity-months carry a utilization reading"]
+    if not_applicable:
+        parts.append(f"{not_applicable} have none obtainable in principle")
+    if unmeasured:
+        parts.append(f"{unmeasured} have no telemetry arrived")
+    caption = "; ".join(parts) + ". "
+    if pegged:
+        caption += "A 100% reading is a sensor ceiling, not proof that capacity was ideal. "
+    caption += (
+        "An entity that is unflagged, not proven efficient, may still need different telemetry."
+    )
+
+    chrome.section_caption(caption)
 
 
 # ── Month-over-month delta (KPI row) ────────────────────────────────────────────────
@@ -274,8 +233,19 @@ def mom_recoverable_delta(records: pd.DataFrame, months: list[str], lens: str) -
     if len(months) < 2:
         return None
     potential = action_potential_by_month(
-        records, pd.Timestamp(months[-2]).date(), pd.Timestamp(months[-1]).date()
+        records,
+        pd.Timestamp(months[-2]).date(),
+        pd.Timestamp(months[-1]).date(),
+        by_lens=lens != "ALL",
     )
+    if lens == "ALL":
+        cur = potential.loc[
+            potential["charge_month"].astype(str) == months[-1], "potential_savings"
+        ].sum()
+        prior = potential.loc[
+            potential["charge_month"].astype(str) == months[-2], "potential_savings"
+        ].sum()
+        return round(float(cur) - float(prior), 2)
     cur = potential.loc[
         (potential["charge_month"].astype(str) == months[-1]) & (potential["lens"] == lens),
         "potential_savings",
@@ -289,48 +259,10 @@ def mom_recoverable_delta(records: pd.DataFrame, months: list[str], lens: str) -
 
 # ── Trend chart ──────────────────────────────────────────────────────────────────────
 def _trend_by_month(records: pd.DataFrame, sm: date, end: date) -> pd.DataFrame:
-    """*records* (the caller's full-history rows) narrowed to the page's selected date
-    range and rolled up to ``(charge_month, lens)`` — pure aggregation, split out from
-    :func:`recoverable_trend_chart` for testing without a NiceGUI context."""
+    """Legacy pure aggregation for callers that still need a lens-level monthly rollup."""
     return action_potential_by_month(records, sm, end).rename(
         columns={"potential_savings": "recoverable_cost"}
     )
-
-
-def recoverable_trend_chart(records: pd.DataFrame, sm: date, end: date) -> None:
-    """Recoverable $ by month, split by lens — the trend the KPI row's single-month
-    snapshot can't show on its own, over the page's own date-range control (unlike the
-    leaderboard/coverage panels above, which deliberately freeze on the latest measured
-    month regardless of the picker).
-
-    Bars are grouped, never stacked: stacking WASTE on top of OPPORTUNITY would draw one
-    bar height that sums two different remedies into a number neither lens owns — the
-    same "never sum across lens" rule the KPI row and action queue already keep.
-
-    Renders nothing with fewer than two measured months in range — a single bar draws no
-    trend, and this chart is supplementary context under an already-informative KPI row,
-    not load-bearing enough to need its own "why nothing" caption the way
-    ``provider_focus._forecast_series`` does.
-    """
-    trend = _trend_by_month(records, sm, end)
-    if trend.empty or trend["charge_month"].nunique() < 2:
-        return
-    trend = trend.assign(month=pd.to_datetime(trend["charge_month"]).dt.strftime("%Y-%m"))
-    with chrome.panel():
-        chrome.panel_title("Recoverable $ by month")
-        chrome.section_caption(
-            "WASTE and OPPORTUNITY plotted separately — never summed into one bar."
-        )
-        fig = px.bar(
-            trend.sort_values("month"),
-            x="month",
-            y="recoverable_cost",
-            color="lens",
-            barmode="group",
-            color_discrete_map={"WASTE": chrome.WASTE, "OPPORTUNITY": chrome.OPPORTUNITY},
-            labels={"month": "", "recoverable_cost": "", "lens": ""},
-        )
-        chrome.plot(chrome.style_fig(fig, has_legend=True, category_x=True))
 
 
 # ── Savings opportunities ────────────────────────────────────────────────────────────
@@ -348,10 +280,6 @@ _ENTITY_LABELS = {
     "storage": "Storage",
     "query_pattern": "Query patterns",
     "endpoint": "Serving endpoints",
-}
-_LENS_LABELS = {
-    "WASTE": "Tune or right-size",
-    "OPPORTUNITY": "Move to cheaper compute",
 }
 _ACTION_GROUP_COLS = ["workload", "potential_savings", "entities", "high_confidence"]
 _ACTION_GROUP_RENAME = {
@@ -407,18 +335,17 @@ class _ActionDrill:
     entity_name: str | None = None
 
 
-def _workload_label(entity_type: str, lens: str) -> str:
-    entity_label = _ENTITY_LABELS.get(entity_type, entity_type.replace("_", " ").title())
-    return f"{entity_label} — {_LENS_LABELS.get(lens, lens.title())}"
+def _workload_label(entity_type: str) -> str:
+    return _ENTITY_LABELS.get(entity_type, entity_type.replace("_", " ").title())
 
 
 def _display_action_groups(month_rows: pd.DataFrame) -> pd.DataFrame:
     """Shared action potential with the presentation-only workload label added."""
-    rows = action_group_rows(month_rows).copy()
+    rows = action_group_rows(month_rows, by_lens=False).copy()
     if rows.empty:
         return pd.DataFrame(columns=_ACTION_GROUP_COLS)
     rows["workload"] = rows.apply(
-        lambda row: _workload_label(str(row["entity_type"]), str(row["lens"])), axis=1
+        lambda row: _workload_label(str(row["entity_type"])), axis=1
     )
     return rows
 
@@ -452,7 +379,7 @@ def _add_tracking_context(entities: pd.DataFrame, tracking: pd.DataFrame) -> pd.
 
 
 def entity_finding_rows(
-    month_rows: pd.DataFrame, entity_type: str, lens: str, entity_id: str
+    month_rows: pd.DataFrame, entity_type: str, lens: str | None, entity_id: str
 ) -> pd.DataFrame:
     """Evidence rows whose displayed potential exactly sums to their parent entity.
 
@@ -462,9 +389,10 @@ def entity_finding_rows(
     """
     findings = month_rows[
         (month_rows["entity_type"] == entity_type)
-        & (month_rows["lens"] == lens)
         & (month_rows["entity_id"].astype(str) == entity_id)
     ].copy()
+    if lens is not None:
+        findings = findings[findings["lens"] == lens]
     if findings.empty:
         return findings.assign(
             rule_estimate=pd.Series(dtype=float), potential_savings=pd.Series(dtype=float)
@@ -500,8 +428,7 @@ def action_queue(month_rows: pd.DataFrame, tracking: pd.DataFrame, *, key: str) 
                     title.text = "Savings opportunities"
                     chrome.section_caption(
                         "Click through to reconcile the exact potential savings at every level. "
-                        "Potential savings uses one best priced action per entity; different "
-                        "remedy lanes are not added together."
+                        "Potential savings uses one best-priced action per entity."
                     )
                     rows = _display_action_groups(month_rows)
                     if rows.empty:
@@ -515,7 +442,6 @@ def action_queue(month_rows: pd.DataFrame, tracking: pd.DataFrame, *, key: str) 
                             _ActionDrill(
                                 level="entity",
                                 entity_type=str(row["entity_type"]),
-                                lens=str(row["lens"]),
                             )
                         )
 
@@ -532,13 +458,13 @@ def action_queue(month_rows: pd.DataFrame, tracking: pd.DataFrame, *, key: str) 
                     )
                     return
 
-                assert state.entity_type is not None and state.lens is not None
-                workload = _workload_label(state.entity_type, state.lens)
+                assert state.entity_type is not None
+                workload = _workload_label(state.entity_type)
                 _action_breadcrumb(
                     ("← All opportunities", _ActionDrill()), (workload, None), refresh=_body.refresh
                 )
                 entities = _add_tracking_context(
-                    entity_action_rows(month_rows, state.entity_type, state.lens), tracking
+                    entity_action_rows(month_rows, state.entity_type), tracking
                 )
                 if state.level == "entity":
                     title.text = f"Savings opportunities — {workload}"
@@ -548,7 +474,6 @@ def action_queue(month_rows: pd.DataFrame, tracking: pd.DataFrame, *, key: str) 
                             _ActionDrill(
                                 level="finding",
                                 entity_type=state.entity_type,
-                                lens=state.lens,
                                 entity_id=str(row["entity_id"]),
                                 entity_name=str(row["entity_name"]),
                             )
@@ -574,14 +499,14 @@ def action_queue(month_rows: pd.DataFrame, tracking: pd.DataFrame, *, key: str) 
                     (
                         workload,
                         _ActionDrill(
-                            level="entity", entity_type=state.entity_type, lens=state.lens
+                            level="entity", entity_type=state.entity_type
                         ),
                     ),
                     (state.entity_name, None),
                     refresh=_body.refresh,
                 )
                 findings = entity_finding_rows(
-                    month_rows, state.entity_type, state.lens, state.entity_id
+                    month_rows, state.entity_type, None, state.entity_id
                 )
                 chrome.section_caption(
                     "Potential savings reconciles to the entity total: it is assigned to the "

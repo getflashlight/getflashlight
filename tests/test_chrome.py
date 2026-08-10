@@ -3,6 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date
+
+
+def test_format_range_uses_portable_date_formatting() -> None:
+    """Date labels render on Windows, whose strftime lacks the ``%-d`` directive."""
+    from flashlight.dashboard import chrome
+
+    assert chrome._format_range({"start": date(2026, 8, 1), "end": date(2026, 8, 9)}) == (
+        "Aug 1 – Aug 9, 2026"
+    )
+    assert chrome._format_range({"start": date(2025, 12, 31), "end": date(2026, 1, 1)}) == (
+        "Dec 31, 2025 – Jan 1, 2026"
+    )
 
 
 def test_lazy_tab_panels_builds_only_the_active_tab_until_clicked() -> None:
