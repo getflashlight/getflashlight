@@ -61,8 +61,7 @@ def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
 # Provider groups that lead the "BY PROVIDER" nav, in this order, ahead of every
 # remaining group in alphabetical order. Databricks is the platform users come here
 # for; the cloud underneath it reads as supporting detail, so it sorts first even
-# though "aws" would win alphabetically. Snowflake is always listed (even before its
-# first GOLD publish) so the visibility UX is reachable with synthetic fallback.
+# though "aws" would win alphabetically.
 _NAV_GROUP_ORDER: tuple[str, ...] = ("databricks", "snowflake")
 
 _SIDEBAR_PROVIDER_LOGOS: dict[str, str] = {
@@ -76,11 +75,10 @@ def _nav_groups() -> list[str]:
     """Provider groups in nav order: :data:`_NAV_GROUP_ORDER` first, then the rest
     in the alphabetical order ``discover_provider_groups`` already returns.
 
-    Snowflake is always included so ``/snowflake`` stays reachable before the first
-    ingest publishes ``gold/snowflake/`` (visibility falls back to synthetic Parquet).
+    Active dashboard syncs are included before their first GOLD publish, so a newly
+    connected provider is visible while its initial ingestion is still running.
     """
     groups = set(discover_provider_groups())
-    groups.add("snowflake")
     groups.update(ingest_runner.active_provider_groups())
     lead = [g for g in _NAV_GROUP_ORDER if g in groups]
     return lead + sorted(g for g in groups if g not in lead)
@@ -331,6 +329,18 @@ def no_data_page(title: str) -> None:
     ui.label(NO_DATA_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
 
 
+def home_empty_state() -> None:
+    """First-run Home guidance, with Connections as the single setup surface."""
+    with chrome.panel():
+        chrome.empty_state(
+            "cable",
+            "Connect your first data source",
+            "Add a billing source, then run a sync to populate your spend dashboard.",
+            button_label="Connect a data source",
+            on_click=lambda: ui.navigate.to("/connections"),
+        )
+
+
 def sync_in_progress_banner(group: str) -> None:
     """A non-blocking notice above a provider report during a dashboard sync."""
     if group not in ingest_runner.active_provider_groups():
@@ -392,7 +402,7 @@ def build_pages() -> None:
         # call inside it — see data.gold_session's docstring.
         with gold_session(), shell("/"):
             if not has_data():
-                no_data_page("Flashlight")
+                home_empty_state()
             else:
                 home_overview.render()
 

@@ -106,6 +106,25 @@ def test_snowflake_page_without_connection_or_demo_shows_empty_state(lake_home) 
     asyncio.run(_check())
 
 
+def test_home_without_data_guides_the_user_to_connections(lake_home) -> None:  # type: ignore[no-untyped-def]
+    """Home's first-run state is an actionable setup path, not a dead-end message."""
+    from nicegui.testing.user_simulation import user_simulation
+
+    from flashlight.dashboard.router import build_pages
+
+    async def _check() -> None:
+        async with user_simulation() as user:
+            build_pages()
+            await user.open("/")
+            await user.should_see("Connect your first data source")
+            await user.should_see("Add a billing source, then run a sync")
+            await user.should_see("Connect a data source")
+            user.find("Connect a data source").click()
+            await user.should_see("Data sources")
+
+    asyncio.run(_check())
+
+
 def test_provider_page_reachable_after_first_sync_post_boot(lake_home) -> None:  # type: ignore[no-untyped-def]
     """Regression: a provider's GOLD group can appear *after* the dashboard has
     already booted (its first successful sync, run from the Connections page in
@@ -2336,10 +2355,9 @@ def test_provider_nav_rows_are_bare_labels_with_databricks_first(lake_home) -> N
     bronze.write_window("t", window, [aws, dbx], ingest_run_id="r1")
     build_gold()
 
-    assert _nav_groups() == ["databricks", "snowflake", "aws"]
+    assert _nav_groups() == ["databricks", "aws"]
     assert [_nav_label(group) for group in _nav_groups()] == [
         "Databricks",
-        "Snowflake",
         "AWS Redshift",
     ]
 
@@ -2352,7 +2370,7 @@ def test_syncing_provider_is_in_nav_before_its_first_publish(lake_home, monkeypa
     from flashlight.dashboard.router import _nav_groups, build_pages
 
     monkeypatch.setattr(ingest_runner, "active_provider_groups", lambda: frozenset({"databricks"}))
-    assert _nav_groups() == ["databricks", "snowflake"]
+    assert _nav_groups() == ["databricks"]
 
     async def _check() -> None:
         async with user_simulation() as user:
