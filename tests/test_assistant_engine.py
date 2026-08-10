@@ -6,7 +6,7 @@ import gzip
 import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -153,12 +153,85 @@ def _ingest_two_months_aws() -> None:
     build_gold()
 
 
+def test_fast_path_last_month_service_spend_skips_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ingest_two_months_aws()
+    stages: list[str] = []
+
+    def no_model(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a deterministic fast-path turn must not build an LLM model")
+
+    monkeypatch.setattr(assistant_engine, "_build_model", no_model)
+    messages: list[Any] = []
+    result = _run_turn(
+        messages,
+        "Break down last month's spend — by service, across every connected provider",
+        on_stage=stages.append,
+    )
+
+    assert result.route == "deterministic"
+    assert result.intent == "last_month_service_spend"
+    assert result.steps and result.steps[0].arguments["measures"] == ["gross_cost"]
+    assert "2026-05" in result.text
+    assert stages == ["Understanding question", "Querying published data"]
+    assert len(messages) == 2
+    row = _assistant_turn_rows()[0]
+    assert row["route"] == "deterministic"
+    assert row["intent"] == "last_month_service_spend"
+    assert _num(row, "time_to_first_result_ms") < 3_000
+
+
+def test_fast_path_close_variant_and_unknown_wording_have_safe_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ingest_two_months_aws()
+    assert assistant_engine._fast_intent("show the monthly spend trend") == "monthly_spend_trend"  # noqa: SLF001
+    assert assistant_engine._fast_intent("show AWS monthly spend trend") is None  # noqa: SLF001
+
+    # A provider-specific request is intentionally handed to the LLM graph;
+    # patching that seam proves the router did not guess an all-provider scope.
+    async def graph_fallback(
+        *args: object, **kwargs: object
+    ) -> assistant_engine.AssistantTurnResult:
+        return assistant_engine.AssistantTurnResult(text="fallback")
+
+    monkeypatch.setattr(assistant_engine, "_run_graph", graph_fallback)
+    result = _run_turn([], "show AWS monthly spend trend")
+    assert result.route == "llm"
+
+
+def test_fast_path_month_over_month_answer_uses_local_arithmetic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ingest_two_months_aws()
+    monkeypatch.setattr(
+        assistant_engine, "_build_model", lambda *args, **kwargs: pytest.fail("model was called")
+    )
+    result = _run_turn(
+        [], "Compare month over month — which service grew the most, and by how much"
+    )
+    assert result.route == "deterministic"
+    assert result.intent == "month_over_month_growth"
+    assert "AmazonEC2" in result.text
+
+
+def test_fast_path_no_data_is_a_deterministic_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        assistant_engine, "_build_model", lambda *args, **kwargs: pytest.fail("model was called")
+    )
+    result = _run_turn([], "Find recoverable spend — idle and underutilized resources right now")
+    assert result.route == "deterministic"
+    assert "No published billing data" in result.text
+
+
 def _assistant_turn_rows() -> list[dict[str, object]]:
     con = duck.connect()
     try:
         duck.register_assistant_turns(con)
-        return con.execute("SELECT * FROM telemetry.assistant_turn").fetchdf().to_dict(  # type: ignore[no-any-return]
-            "records"
+        return cast(
+            list[dict[str, object]],
+            con.execute("SELECT * FROM telemetry.assistant_turn").fetchdf().to_dict("records"),
         )
     finally:
         con.close()
@@ -434,12 +507,53 @@ def test_connected_providers_and_catalog_lines_ground_in_live_data() -> None:
     # seeded row is AmazonEC2), while the metric names the model has to call stay
     # group-prefixed ("aws.monthly_bill") whatever the label says.
     assert assistant_engine._connected_providers_line() == (  # noqa: SLF001
-        'Connected providers: AWS (metric group "aws"). '
-        "Never mention or offer any other provider."
+        'Connected providers: AWS (metric group "aws"). Never mention or offer any other provider.'
     )
     catalog_line = assistant_engine._catalog_line()  # noqa: SLF001
     assert "Available metric views" in catalog_line
     assert "aws.monthly_bill: dimensions=" in catalog_line
+
+
+def test_plan_guidance_expands_redshift_cost_drivers_by_subcategory() -> None:
+    """A service-level AWS answer must not hide Redshift's useful cost split."""
+    instructions = assistant_engine._PLAN_INSTRUCTIONS  # noqa: SLF001
+
+    assert "aws.spend_by_cost_subcategory_month" in instructions
+    assert "Amazon Redshift" in instructions
+    assert "concurrency-scaling" in instructions
+    assert "Spectrum-scan" in instructions
+
+
+def test_plan_guidance_uses_all_in_databricks_and_no_duplicate_aws_column() -> None:
+    """A Redshift/Databricks comparison uses all-in Databricks, without duplicate AWS."""
+    instructions = assistant_engine._PLAN_INSTRUCTIONS  # noqa: SLF001
+
+    assert "Databricks total cost of ownership" in instructions
+    assert "storage.backing_storage_month filtered to mapping='databricks'" in instructions
+    assert "compute.backing_compute_month filtered to mapping='databricks'" in instructions
+    assert "do not show an AWS net-cost column" in instructions
+
+
+def test_plan_guidance_leads_unallocated_questions_with_coverage() -> None:
+    """Missing tags are an allocation gap, not evidence of a resource owner."""
+    instructions = assistant_engine._PLAN_INSTRUCTIONS  # noqa: SLF001
+
+    assert "spend_tag_coverage_month" in instructions
+    assert "spend_untagged_by_service_month" in instructions
+    assert "spend_untagged_by_resource_month only when the user explicitly asks" in instructions
+    assert "cost-allocation rule based on the benefiting workloads" in instructions
+
+
+def test_plan_guidance_makes_waste_answers_actionable_and_compact() -> None:
+    """Waste answers should prioritize evidence and recovery, not generic row spam."""
+    instructions = assistant_engine._PLAN_INSTRUCTIONS  # noqa: SLF001
+
+    assert "efficiency.waste_summary_month" in instructions
+    assert "efficiency.waste_record" in instructions
+    assert "recoverable share of billed cost" in instructions
+    assert "show no more than the top five entities" in instructions
+    assert "list_optimization_rules" in instructions
+    assert "month-to-date" in instructions
 
 
 def test_run_turn_never_persists_instructions_into_message_history(
@@ -505,9 +619,7 @@ def test_run_turn_without_tool_call_logs_one_row(monkeypatch: pytest.MonkeyPatch
     assert _num(rows[0], "duration_ms") > 0
     assert _num(rows[0], "plan_ms") > 0
     assert _num(rows[0], "synthesize_ms") > 0
-    assert _num(rows[0], "plan_ms") + _num(rows[0], "synthesize_ms") <= _num(
-        rows[0], "duration_ms"
-    )
+    assert _num(rows[0], "plan_ms") + _num(rows[0], "synthesize_ms") <= _num(rows[0], "duration_ms")
 
 
 def test_run_turn_executes_real_tool_call_in_process(monkeypatch: pytest.MonkeyPatch) -> None:

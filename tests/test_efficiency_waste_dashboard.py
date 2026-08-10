@@ -211,6 +211,34 @@ def test_action_groups_use_one_best_recommendation_per_entity_and_lens() -> None
     assert groups.loc[("job", "OPPORTUNITY"), "potential_savings"] == pytest.approx(25.0)
 
 
+def test_unified_action_groups_use_one_best_recommendation_per_entity() -> None:
+    """The simplified dashboard must not add overlapping remedy classifications."""
+    rows = _month_rows(
+        [
+            {
+                "entity_id": "job-1",
+                "entity_type": "job",
+                "lens": "WASTE",
+                "recoverable_cost": 100.0,
+                "billed_cost": 200.0,
+                "confidence": "high",
+            },
+            {
+                "entity_id": "job-1",
+                "entity_type": "job",
+                "lens": "OPPORTUNITY",
+                "recoverable_cost": 25.0,
+                "billed_cost": 200.0,
+                "confidence": "candidate",
+            },
+        ]
+    )
+
+    groups = action_group_rows(rows, by_lens=False)
+    assert list(groups["potential_savings"]) == [pytest.approx(100.0)]
+    assert list(groups["entities"]) == [1]
+
+
 def test_evidence_rows_reconcile_to_their_entity_action_potential() -> None:
     rows = _month_rows(
         [

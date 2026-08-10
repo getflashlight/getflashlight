@@ -68,12 +68,15 @@ def sample(
         False, "--clean", help="Remove generated demo data instead of generating it"
     ),
 ) -> None:
-    """Generate a reconciled Redshift, Databricks, and FOCUS demo for the dashboard.
+    """Generate the reconciled cross-cloud FOCUS demo.
 
     The scenario is deterministic and schema-validated: cluster names, owners,
     emails, tags, cost records, and telemetry all refer to the same entities.
     """
-    from flashlight.sample import cleanup, load_sample
+    from flashlight.sample import (
+        cleanup,
+        load_sample,
+    )
 
     if clean:
         cleanup()

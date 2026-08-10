@@ -275,13 +275,33 @@ def render(
             # spend partition) own their own panels too.
             for lead in breakdown_lead:
                 lead(sm, end)
-            with chrome.panel():
-                _spend_pivot(sc, end, sm, include_mom=combine_sku_spend_and_mom)
-            if not invoice_explanations_in_trend:
-                _cost_subcategory(sc, end, sm)
+            if combine_sku_spend_and_mom:
+                # The donut shows *what* makes up the invoice, while the SKU table
+                # shows *which line items changed* in the latest closed month. They
+                # sit in distinct cards on desktop and naturally stack on small screens.
+                with ui.row().classes("w-full gap-4 items-stretch flex-wrap"):
+                    with chrome.panel() as subcategory_panel:
+                        # Inline sizing is intentional: the dashboard's utility
+                        # classes do not guarantee a `min-w-*` scale. The embedded
+                        # donut has a 300px viewport, so this card needs enough
+                        # interior width to show the whole circle.
+                        subcategory_panel.style("flex:0 0 340px;min-width:340px;")
+                        _cost_subcategory(sc, end, sm, embedded=True)
+                    with chrome.panel() as sku_panel:
+                        sku_panel.classes("min-w-96")
+                        sku_panel.style("flex:2 1 32rem;")
+                        _driver_mom(sc, end, sku_mom_scoped=True)
+            else:
+                with chrome.panel():
+                    _spend_pivot(sc, end, sm)
+                if not invoice_explanations_in_trend:
+                    _cost_subcategory(sc, end, sm)
+                with chrome.panel():
+                    _driver_mom(sc, end, sku_mom_scoped=False)
+            # Pages that lead credits in Trend & changes must not repeat the same
+            # itemized lines here. Redshift keeps them under its combined breakdown.
+            if combine_sku_spend_and_mom or not invoice_explanations_in_trend:
                 _credits(group, end, sm)
-            with chrome.panel():
-                _driver_mom(sc, end, sku_mom_scoped=combine_sku_spend_and_mom)
 
         def _panel_attribution() -> None:
             # Own panels — no chrome.panel() wrapper (see views/attribution.py).
@@ -412,62 +432,22 @@ def _kpis(
                 "decrease",
             )
         )
-    # Provider-shaped cards sit after this provider's own bill and before the forward-
-    # looking projection, so the row reads: what it cost → what else is attached to it →
-    # where it's heading.
+    # Provider-shaped cards sit after this provider's own bill.
     cards.extend(card for hook in extra_kpis if (card := hook(sm, end)) is not None)
-    projected = _projected_this_month(scope)
-    if projected is not None:
-        cards.append(projected)
     chrome.kpi_row(cards)
 
 
 # A run-rate projection is a completed-day mean extended across the month, so its error
 # multiplier is roughly (days in month / history_days). At 1 day that's ~30x — one late
-# billing export and the tile reads a million dollars off (observed: $1.27M projected from
-# $43k actual on a lake with history_days=1). 3 is the smallest window where a single
-# anomalous day can't much more than triple the estimate, and it's reached by the 4th of
-# every month, so the tile is dark for at most a few days. 7 covers the weekday/weekend
-# cycle, the dominant periodicity in cloud spend.
+# billing export can make a projected chart segment wildly misleading. Three days is the
+# smallest window where a single anomalous day cannot much more than triple the estimate.
 _RUN_RATE_MIN_DAYS = 3
-_RUN_RATE_LOW_CONFIDENCE_DAYS = 7
-
-
-def _run_rate_card(
-    *, month: date, forecast_cost: float, actual_to_date: float | None, history_days: int
-) -> chrome.KpiCard | None:
-    """The Projected KPI, suppressed when too little history backs it.
-
-    Gated here rather than in ``040_gold_forecast.sql`` on purpose: a two-day mean *is* a
-    valid mean, so NULLing it in GOLD would destroy a number an agent may legitimately
-    want (unlike the `trend` rows, where a hold over fewer than 3 complete months is
-    genuinely meaningless and so is NULL at source). It's the presentation that misleads, and
-    ``spend_forecast_month``'s catalog description carries the same warning so agents get
-    it too.
-
-    Under a week of history the run-rate is too noisy to present as a standalone KPI.
-    The chart still shows its clearly hatched projected remainder; at a week+, the
-    projection is the card.
-    """
-    if history_days < _RUN_RATE_MIN_DAYS:
-        return None
-    if history_days < _RUN_RATE_LOW_CONFIDENCE_DAYS:
-        return None
-    actual = f" · {compact_money(actual_to_date)} so far" if actual_to_date is not None else ""
-    return (
-        "Projected",
-        compact_money(forecast_cost),
-        f"{month:%b %Y} · {history_days}-day run rate{actual}",
-    )
-
-
 def _run_rate_row(scope: Scope) -> tuple[date, float, float | None, int] | None:
     """The latest month's run-rate forecast row — ``(month, forecast_cost,
     actual_to_date, history_days)`` — or None if unknowable.
 
-    Shared by the KPI card (:func:`_projected_this_month`) and the monthly chart's
-    partial-month bar segment (:func:`_partial_month_remainder`) so both read the same
-    number instead of two independently-fitted ones.
+    Used by the monthly chart's partial-month bar segment
+    (:func:`_partial_month_remainder`) so it is based on one fitted number.
 
     Absent from a lake published before the forecast view existed, so the file is
     checked rather than the query being wrapped in a bare except — a real SQL error
@@ -528,24 +508,6 @@ def _scoped_run_rate_row(scope: Scope) -> tuple[date, float, float | None, int] 
     days_in_month = int((anchor + pd.offsets.MonthEnd(1)).day)
     forecast_cost = round(float(completed["net_cost"].sum()) / history_days * days_in_month, 2)
     return anchor.date(), forecast_cost, actual_to_date, history_days
-
-
-def _projected_this_month(scope: Scope) -> chrome.KpiCard | None:
-    """Where the latest month lands at its current run rate, or None if unknowable.
-
-    Only the run_rate row is shown here — it's the number that's actionable mid-month.
-    The 3-month trend rows get their own panel (see :func:`_forecast`).
-    """
-    row = _run_rate_row(scope)
-    if row is None:
-        return None
-    month, forecast_cost, actual_to_date, history_days = row
-    return _run_rate_card(
-        month=month,
-        forecast_cost=forecast_cost,
-        actual_to_date=actual_to_date,
-        history_days=history_days,
-    )
 
 
 def _trend(scope: Scope, label: str, start: date, end: date, *, accent: str) -> None:
@@ -1376,11 +1338,12 @@ def _short_redshift_sku_name(description: object, net_cost: float) -> str:
 
 
 def _spend_pivot(scope: Scope, end: date, sm: date, *, include_mom: bool = False) -> None:
-    """SKU × month spend matrix, with the latest complete-month movement in-line.
+    """SKU × month spend matrix, optionally with latest complete-month movement in-line.
 
     A table can carry the SKU detail a stacked trend chart cannot. When requested by a
     provider-specific page, its delta columns compare the two latest complete months
-    *within the selected range* and replace that page's separate month-over-month table.
+    *within the selected range*. Redshift now presents that comparison beside its
+    cost-subcategory donut instead, while the other providers retain this matrix.
     """
     group = scope.group
     if include_mom or group == "databricks":
@@ -1505,7 +1468,14 @@ def _spend_pivot(scope: Scope, end: date, sm: date, *, include_mom: bool = False
     )
 
 
-def _cost_subcategory(scope: Scope, end: date, sm: date, *, panel_class: str = "") -> None:
+def _cost_subcategory(
+    scope: Scope,
+    end: date,
+    sm: date,
+    *,
+    panel_class: str = "",
+    embedded: bool = False,
+) -> None:
     """Below-SKU cost breakdown, only where a connector stamps ``x_cost_subcategory``
     (Redshift compute/concurrency-scaling/storage/spectrum-scan, and S3
     storage/requests/data-transfer/monitoring/early-delete). Renders nothing for
@@ -1529,9 +1499,7 @@ def _cost_subcategory(scope: Scope, end: date, sm: date, *, panel_class: str = "
     )
     if df.empty:
         return
-    with chrome.panel() as panel:
-        if panel_class:
-            panel.classes(panel_class)
+    def _content() -> None:
         chrome.panel_title("Cost subcategory breakdown")
         with ui.row().classes("w-full gap-4 flex-wrap"):
             for service_name, sub in df.groupby("service_name"):
@@ -1541,7 +1509,25 @@ def _cost_subcategory(scope: Scope, end: date, sm: date, *, panel_class: str = "
                     )
                     pie = px.pie(sub, names="cost_subcategory", values="net_cost", hole=0.45)
                     pie.update_traces(textposition="inside", textinfo="percent+label")
-                    chrome.plot(chrome.style_fig(pie, has_legend=False, currency_axis=None))
+                    if embedded:
+                        # Plotly's responsive default can retain the previous wide canvas
+                        # after this chart moves into Redshift's narrower side-by-side card.
+                        # Give that donut a compact square viewport so every slice remains
+                        # visible instead of being cropped at the card edge.
+                        pie.update_layout(width=300)
+                        chrome.plot(
+                            chrome.style_fig(pie, height=300, has_legend=False, currency_axis=None)
+                        ).style("max-width:300px;margin:0 auto;")
+                    else:
+                        chrome.plot(chrome.style_fig(pie, has_legend=False, currency_axis=None))
+
+    if embedded:
+        _content()
+        return
+    with chrome.panel() as panel:
+        if panel_class:
+            panel.classes(panel_class)
+        _content()
 
 
 def _credits_df(group: str, end: date, sm: date) -> pd.DataFrame:
@@ -1660,13 +1646,12 @@ def _driver_mom(scope: Scope, end: date, *, sku_mom_scoped: bool = False) -> Non
             ),
         )
         chrome.heatmap_table(
-            rows[["sku_name", "sku_id", "net_cost", "cost_delta", "cost_pct_change"]],
+            rows[["sku_name", "net_cost", "cost_delta", "cost_pct_change"]],
             heat_col="cost_pct_change",
             key=f"{group}_mom",
             money_cols=["net_cost", "cost_delta"],
             rename={
                 "sku_name": "SKU",
-                "sku_id": "SKU ID",
                 "net_cost": "Net cost",
                 "cost_delta": "Δ vs prior",
                 "cost_pct_change": "MoM %",

@@ -26,14 +26,18 @@ def driver_dim(group: str) -> tuple[str, str, str]:
     return "service_name", "Service", "spend_by_service_month"
 
 
-def entity_action_rows(rows: pd.DataFrame, entity_type: str, lens: str) -> pd.DataFrame:
-    """One best priced action per entity for a workload/remedy lane.
+def entity_action_rows(
+    rows: pd.DataFrame, entity_type: str, lens: str | None = None
+) -> pd.DataFrame:
+    """One best priced action per entity for a workload, optionally within one remedy lane.
 
     A single entity can fire several rules. They remain individually auditable in the
     dashboard, but their dollar figures must not be added into a purported next-action
     saving. This is the shared contract for the home page and Efficiency & Waste tab.
     """
-    scoped = rows[(rows["entity_type"] == entity_type) & (rows["lens"] == lens)].copy()
+    scoped = rows[rows["entity_type"] == entity_type].copy()
+    if lens is not None:
+        scoped = scoped[scoped["lens"] == lens]
     if scoped.empty:
         return scoped.assign(
             potential_savings=pd.Series(dtype=float), findings=pd.Series(dtype=int)
@@ -50,26 +54,23 @@ def entity_action_rows(rows: pd.DataFrame, entity_type: str, lens: str) -> pd.Da
     )
 
 
-def action_group_rows(rows: pd.DataFrame) -> pd.DataFrame:
-    """Conservative action potential grouped by workload type and remedy lane."""
-    columns = [
-        "entity_type",
-        "lens",
-        "potential_savings",
-        "entities",
-        "high_confidence",
-    ]
+def action_group_rows(rows: pd.DataFrame, *, by_lens: bool = True) -> pd.DataFrame:
+    """Conservative action potential grouped by workload, optionally by remedy lane."""
+    columns = ["entity_type", "potential_savings", "entities", "high_confidence"]
+    if by_lens:
+        columns.insert(1, "lens")
     if rows.empty:
         return pd.DataFrame(columns=columns)
     parts: list[dict[str, object]] = []
-    for (entity_type, lens), _ in rows.groupby(["entity_type", "lens"], dropna=False):
-        entities = entity_action_rows(rows, str(entity_type), str(lens))
+    group_cols = ["entity_type", "lens"] if by_lens else ["entity_type"]
+    for key, _ in rows.groupby(group_cols, dropna=False):
+        entity_type, lens = (key if by_lens else (key[0] if isinstance(key, tuple) else key, None))
+        entities = entity_action_rows(rows, str(entity_type), None if lens is None else str(lens))
         if entities.empty:
             continue
         parts.append(
             {
                 "entity_type": str(entity_type),
-                "lens": str(lens),
                 "potential_savings": float(entities["potential_savings"].sum()),
                 "entities": int(len(entities)),
                 "high_confidence": float(
@@ -77,24 +78,30 @@ def action_group_rows(rows: pd.DataFrame) -> pd.DataFrame:
                 ),
             }
         )
+        if by_lens:
+            parts[-1]["lens"] = str(lens)
     return pd.DataFrame(parts, columns=columns).sort_values("potential_savings", ascending=False)
 
 
-def action_potential_by_month(rows: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+def action_potential_by_month(
+    rows: pd.DataFrame, start: date, end: date, *, by_lens: bool = True
+) -> pd.DataFrame:
     """Conservative potential by month and remedy lane for the Efficiency trend."""
-    columns = ["charge_month", "lens", "potential_savings"]
+    columns = ["charge_month", "potential_savings"]
+    if by_lens:
+        columns.insert(1, "lens")
     if rows.empty:
         return pd.DataFrame(columns=columns)
     month = pd.to_datetime(rows["charge_month"])
     scoped = rows.loc[(month >= pd.Timestamp(start)) & (month <= pd.Timestamp(end))]
     parts: list[pd.DataFrame] = []
     for charge_month, month_rows in scoped.groupby("charge_month"):
-        groups = action_group_rows(month_rows)
+        groups = action_group_rows(month_rows, by_lens=by_lens)
         if groups.empty:
             continue
+        group_by = "lens" if by_lens else "entity_type"
         parts.append(
-            groups.groupby("lens", as_index=False)["potential_savings"]
-            .sum()
+            groups.groupby(group_by, as_index=False)["potential_savings"].sum()
             .assign(charge_month=charge_month)
         )
     return pd.concat(parts, ignore_index=True)[columns] if parts else pd.DataFrame(columns=columns)

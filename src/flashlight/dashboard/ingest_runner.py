@@ -38,13 +38,25 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from flashlight.ingest.config import load_connections
+from pydantic import BaseModel
+
+from flashlight.ingest.config import effective_connector_name, load_connections
 from flashlight.lake import paths
 
 # Recent output for the current/last run, kept so a page opened (or reopened, after
 # navigating away and back) mid-sync still shows context instead of an empty log
 # until the next line happens to arrive.
 _TAIL_LINES = 2000
+
+# Dashboard pages are organised by provider, while connections.yml permits several
+# independently named connections for a provider. Keep this mapping here beside the
+# dashboard-owned run state so the sidebar can report one provider-level sync state.
+_CONNECTOR_PROVIDER_GROUPS: dict[str, str] = {
+    "aws_focus": "aws",
+    "redshift": "aws",
+    "databricks": "databricks",
+    "snowflake": "snowflake",
+}
 
 
 @dataclass
@@ -54,6 +66,7 @@ class _Run:
     total: int
     full_refresh: bool
     started_at: datetime
+    provider_groups: frozenset[str]
     # Its own Event/exit_code, not a shared module-level pair: a bare module-level
     # ``asyncio.Event()`` binds to whichever event loop first calls ``.wait()``/
     # ``.set()`` on it and raises on any other — fatal for tests, each of which runs
@@ -84,6 +97,38 @@ def current_run() -> _Run | None:
     progress dialog instead of looking like nothing is happening.
     """
     return _current if is_running() else None
+
+
+def active_provider_groups() -> frozenset[str]:
+    """Provider groups covered by the dashboard sync currently in progress.
+
+    This is intentionally process-local: a terminal-started ingest has no shared
+    status channel to report through the dashboard.
+    """
+    run = current_run()
+    return run.provider_groups if run else frozenset()
+
+
+def provider_groups_for_configs(
+    configs: list[BaseModel], *, connector: str | None = None
+) -> frozenset[str]:
+    """Return dashboard provider groups for the enabled configs selected by a sync.
+
+    ``connector`` is an effective connection name, so filtering with the same
+    resolver as the CLI keeps a row-level Sync button and the launched subprocess
+    precisely aligned. Unknown future connector types are deliberately omitted
+    until they acquire a dashboard provider route.
+    """
+    selected = (
+        [config for config in configs if effective_connector_name(config) == connector]
+        if connector is not None
+        else configs
+    )
+    return frozenset(
+        group
+        for config in selected
+        if (group := _CONNECTOR_PROVIDER_GROUPS.get(str(getattr(config, "type", ""))))
+    )
 
 
 def recent_lines() -> list[str]:
@@ -189,10 +234,18 @@ async def start_sync(
         cmd.append("--full-refresh")
     if connector is not None:
         cmd.extend(["--connector", connector])
+    # Resolve before launching so dashboard state reflects the exact selected
+    # connections and a malformed config cannot leave an untracked subprocess.
+    configs = load_connections(str(connections_path))
+    selected = (
+        [config for config in configs if effective_connector_name(config) == connector]
+        if connector is not None
+        else configs
+    )
     proc = await asyncio.create_subprocess_exec(
         *cmd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
-    total = 1 if connector is not None else len(load_connections(str(connections_path)))
+    total = len(selected)
     _proc = proc
     _recent.clear()
     run = _Run(
@@ -201,6 +254,7 @@ async def start_sync(
         total=total,
         full_refresh=full_refresh,
         started_at=datetime.now(UTC),
+        provider_groups=provider_groups_for_configs(configs, connector=connector),
     )
     _current = run
     _tail_task = asyncio.create_task(_tail(proc, run, paths.sync_log_path(run_id)))

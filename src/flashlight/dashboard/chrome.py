@@ -493,8 +493,8 @@ def year_start(end: date) -> date:
 def _format_range(state: DateState) -> str:
     s, e = state["start"], state["end"]
     if s.year == e.year:
-        return f"{s:%b %-d} – {e:%b %-d, %Y}"
-    return f"{s:%b %-d, %Y} – {e:%b %-d, %Y}"
+        return f"{s:%b} {s.day} – {e:%b} {e.day}, {e:%Y}"
+    return f"{s:%b} {s.day}, {s:%Y} – {e:%b} {e.day}, {e:%Y}"
 
 
 _QUICK_RANGES = (("1mo", 1), ("3mo", 3), ("6mo", 6), ("12mo", 12), ("YTD", "ytd"), ("All", None))

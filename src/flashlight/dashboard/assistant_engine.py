@@ -60,7 +60,7 @@ from pydantic_graph import BaseNode, End, Graph, GraphBuilder, GraphRunContext
 from flashlight.core.logging import get_logger
 from flashlight.dashboard.answer_caption import caption_for
 from flashlight.dashboard.data import provider_label
-from flashlight.gold.reader import distinct_values
+from flashlight.gold.reader import distinct_values, query_view
 from flashlight.lake.assistant_turns import record_assistant_turn
 from flashlight.mcp.server import mcp
 from flashlight.transform.catalog import current_catalog, discover_provider_groups
@@ -90,6 +90,8 @@ _OUTPUT_RETRIES = 3
 # workflow needs a bigger single-turn plan or more filter-value lookups.
 MAX_PLAN_STEPS = 12
 MAX_EXPLORE_LOOKUPS = 6
+MAX_HISTORY_MESSAGES = 12
+FAST_PATH_LIMIT = 100
 
 
 def _connected_providers_line() -> str:
@@ -195,6 +197,9 @@ class AssistantTurnResult:
     # (see _split_content_parts). Surfaced collapsed in the UI — mainly so a
     # turn that produced no answer still shows what the model was trying to do.
     reasoning: list[str] = field(default_factory=list)
+    route: Literal["deterministic", "llm"] = "llm"
+    intent: str | None = None
+    time_to_first_result_ms: float | None = None
 
 
 class ClarifyingQuestion(BaseModel):
@@ -251,6 +256,290 @@ class ChartSpec(BaseModel):
         description="A second dimension to split each x value by (the stack or "
         "line colour). Leave null when the result has only one dimension.",
     )
+
+
+def _normalised_question(question: str) -> str:
+    """A deliberately conservative normal form for the no-model fast path."""
+    return re.sub(r"\s+", " ", question.lower().strip().rstrip("?.!"))
+
+
+def _fast_intent(question: str) -> str | None:
+    """Recognise only complete, all-provider questions with a fixed meaning.
+
+    This is not an NLP classifier.  A false negative merely uses the existing LLM
+    flow; a false positive could silently answer the wrong question, so every
+    accepted form is an explicit product-supported phrase or a near-equivalent.
+    """
+    q = _normalised_question(question)
+    exact = {
+        (
+            "break down last month's spend — by service, across every connected provider"
+        ): "last_month_service_spend",
+        "find recoverable spend — idle and underutilized resources right now": "recoverable_spend",
+        (
+            "compare month over month — which service grew the most, and by how much"
+        ): "month_over_month_growth",
+    }
+    if q in exact:
+        return exact[q]
+    if q in {
+        "break down last month's spend by service across every connected provider",
+        "break down last month's spend by service across all providers",
+        "show last month's spend by service across all providers",
+    }:
+        return "last_month_service_spend"
+    if q in {"show monthly spend trend", "show the monthly spend trend", "monthly spend trend"}:
+        return "monthly_spend_trend"
+    if q in {"find recoverable spend", "show recoverable spend", "recoverable spend"}:
+        return "recoverable_spend"
+    if q in {
+        "compare month over month which service grew the most and by how much",
+        "which service grew the most month over month",
+        "which service grew the most mom",
+    }:
+        return "month_over_month_growth"
+    return None
+
+
+def _as_month(value: object) -> str | None:
+    """Canonical month text for the ISO date values emitted by GOLD."""
+    try:
+        return datetime.fromisoformat(str(value)).date().replace(day=1).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_complete_month(months: list[str]) -> str | None:
+    """Return the latest month before the current (possibly partial) month."""
+    current = datetime.now(UTC).date().replace(day=1).isoformat()
+    return max((month for month in months if month < current), default=None)
+
+
+async def _fast_query(name: str, **kwargs: Any) -> list[dict[str, Any]]:
+    """Run a bounded, catalogued local read without blocking the event loop."""
+    return await asyncio.to_thread(query_view, name, limit=FAST_PATH_LIMIT, **kwargs)
+
+
+async def _fast_months(groups: list[str]) -> dict[str, list[str]]:
+    """Read each provider's available months concurrently from published GOLD."""
+    results = await asyncio.gather(
+        *(_fast_query(f"{group}.monthly_bill", measures=["gross_cost"]) for group in groups),
+        return_exceptions=True,
+    )
+    months: dict[str, list[str]] = {}
+    for group, result in zip(groups, results, strict=True):
+        if isinstance(result, BaseException):
+            continue
+        values = sorted({month for row in result if (month := _as_month(row.get("charge_month")))})
+        if values:
+            months[group] = values
+    return months
+
+
+def _fast_no_data(intent: str) -> AssistantTurnResult:
+    return AssistantTurnResult(
+        text="No published billing data is available yet. Run an ingest, then try again.",
+        route="deterministic",
+        intent=intent,
+    )
+
+
+async def _run_fast_path(intent: str) -> AssistantTurnResult | None:
+    """Answer the small, audited set of common questions with local arithmetic.
+
+    `None` means the request cannot be answered safely from the available GOLD
+    shape and must use the normal LLM planner.  A valid empty-data answer is a
+    result, not a fallback: it is both faster and more truthful than asking a
+    model to discover that no files have been published.
+    """
+    groups = discover_provider_groups()
+    if intent == "recoverable_spend":
+        try:
+            rows = await _fast_query(
+                "efficiency.waste_summary_month", measures=["recoverable_cost"]
+            )
+        except Exception:  # noqa: BLE001 - an unpublished fixed view is normal on a new lake
+            return _fast_no_data(intent)
+        if not rows:
+            return _fast_no_data(intent)
+        latest = max((m for row in rows if (m := _as_month(row.get("charge_month")))), default=None)
+        if latest is None:
+            return None
+        latest_rows = [row for row in rows if _as_month(row.get("charge_month")) == latest]
+        total = sum(float(row.get("recoverable_cost") or 0) for row in latest_rows)
+        step = ToolStep(
+            name="query_metric",
+            arguments={
+                "name": "efficiency.waste_summary_month",
+                "filters": {"charge_month": latest},
+                "measures": ["recoverable_cost"],
+            },
+            rows=latest_rows,
+            chart=ChartSpec(kind="bar", x="waste_category"),
+        )
+        return AssistantTurnResult(
+            text=(
+                f"Estimated recoverable spend is **${total:,.0f}** for {latest[:7]}. "
+                "This is a measured or rule-based estimate, not an automatic "
+                "remediation recommendation."
+            ),
+            steps=[step],
+            route="deterministic",
+            intent=intent,
+        )
+
+    if not groups:
+        return _fast_no_data(intent)
+    months_by_group = await _fast_months(groups)
+    if not months_by_group:
+        return _fast_no_data(intent)
+
+    if intent == "last_month_service_spend":
+        complete_by_group = {
+            group: month
+            for group, months in months_by_group.items()
+            if (month := _last_complete_month(months)) is not None
+        }
+        if not complete_by_group:
+            return _fast_no_data(intent)
+        latest = max(complete_by_group.values())
+        selected_groups = [group for group, month in complete_by_group.items() if month == latest]
+        results = await asyncio.gather(
+            *(
+                _fast_query(
+                    f"{group}.spend_by_service_month",
+                    filters={"charge_month": latest},
+                    measures=["gross_cost"],
+                    order_by="gross_cost",
+                    descending=True,
+                )
+                for group in selected_groups
+            )
+        )
+        steps = [
+            ToolStep(
+                name="query_metric",
+                arguments={
+                    "name": f"{group}.spend_by_service_month",
+                    "filters": {"charge_month": latest},
+                    "measures": ["gross_cost"],
+                    "order_by": "gross_cost",
+                    "descending": True,
+                },
+                rows=rows,
+                chart=ChartSpec(kind="bar", x="service_name"),
+            )
+            for group, rows in zip(selected_groups, results, strict=True)
+        ]
+        total = sum(float(row.get("gross_cost") or 0) for rows in results for row in rows)
+        labels = ", ".join(provider_label(group) for group in selected_groups)
+        return AssistantTurnResult(
+            text=(
+                f"Gross charges were **${total:,.0f}** in {latest[:7]} across {labels}, "
+                "broken down by service below."
+            ),
+            steps=steps,
+            route="deterministic",
+            intent=intent,
+        )
+
+    if intent == "monthly_spend_trend":
+        results = await asyncio.gather(
+            *(
+                _fast_query(f"{group}.monthly_bill", measures=["gross_cost"])
+                for group in months_by_group
+            )
+        )
+        rows = [
+            {**row, "provider_name": provider_label(group)}
+            for group, group_rows in zip(months_by_group, results, strict=True)
+            for row in group_rows
+        ]
+        if not rows:
+            return _fast_no_data(intent)
+        trend_months = [
+            month for row in rows if (month := _as_month(row["charge_month"])) is not None
+        ]
+        if not trend_months:
+            return None
+        first, last = min(trend_months), max(trend_months)
+        return AssistantTurnResult(
+            text=f"Monthly gross charges from {first[:7]} through {last[:7]} are shown below.",
+            steps=[
+                ToolStep(
+                    name="query_metric",
+                    arguments={"name": "fast_path.monthly_spend_trend", "measures": ["gross_cost"]},
+                    rows=rows,
+                    chart=ChartSpec(kind="line", x="charge_month", series="provider_name"),
+                )
+            ],
+            route="deterministic",
+            intent=intent,
+        )
+
+    if intent == "month_over_month_growth":
+        common_months = sorted(
+            month
+            for month in set.intersection(*(set(months) for months in months_by_group.values()))
+            if month < datetime.now(UTC).date().replace(day=1).isoformat()
+        )
+        if len(common_months) < 2:
+            return None
+        previous, latest = common_months[-2:]
+        results = await asyncio.gather(
+            *(
+                _fast_query(
+                    f"{group}.spend_by_service_month",
+                    filters={"charge_month": [previous, latest]},
+                    measures=["gross_cost"],
+                )
+                for group in months_by_group
+            )
+        )
+        totals: dict[tuple[str, str], dict[str, float]] = {}
+        for group, group_rows in zip(months_by_group, results, strict=True):
+            for row in group_rows:
+                key = (provider_label(group), str(row.get("service_name") or "(not set)"))
+                month = _as_month(row.get("charge_month"))
+                if month in (previous, latest):
+                    totals.setdefault(key, {}).setdefault(month, 0.0)
+                    totals[key][month] += float(row.get("gross_cost") or 0)
+        if not totals:
+            return _fast_no_data(intent)
+        winner, values = max(
+            totals.items(), key=lambda item: item[1].get(latest, 0) - item[1].get(previous, 0)
+        )
+        delta = values.get(latest, 0) - values.get(previous, 0)
+        rows = [
+            {
+                "provider_name": provider,
+                "service_name": service,
+                "charge_month": month,
+                "gross_cost": value,
+            }
+            for (provider, service), by_month in totals.items()
+            for month, value in by_month.items()
+        ]
+        return AssistantTurnResult(
+            text=(
+                f"**{winner[1]}** on {winner[0]} grew the most: **${delta:,.0f}** "
+                f"from {previous[:7]} to {latest[:7]} in gross charges."
+            ),
+            steps=[
+                ToolStep(
+                    name="query_metric",
+                    arguments={
+                        "name": "fast_path.month_over_month_growth",
+                        "measures": ["gross_cost"],
+                    },
+                    rows=rows,
+                    chart=ChartSpec(kind="stacked_bar", x="service_name", series="charge_month"),
+                )
+            ],
+            route="deterministic",
+            intent=intent,
+        )
+    return None
 
 
 # The placeholders a SummarySpec may reference. Every one is computed from the rows
@@ -390,7 +679,8 @@ PLAN_STEP_MODELS: tuple[type[BaseModel], ...] = (
 
 
 _PLAN_TOOL_NAMES = frozenset(
-    str(m.model_fields["tool"].default) for m in PLAN_STEP_MODELS  # noqa: SLF001 - our own models
+    str(m.model_fields["tool"].default)
+    for m in PLAN_STEP_MODELS  # noqa: SLF001 - our own models
 )
 # Keys a model plausibly nests a step's arguments under instead of inlining them.
 _ARG_WRAPPER_KEYS = ("args", "arguments", "parameters", "params", "input")
@@ -516,6 +806,12 @@ class TurnTiming:
     # call was skipped entirely, "model" when it wasn't. The column that makes the
     # saving measurable on /usage rather than asserted.
     answer_source: str | None = None
+    route: Literal["deterministic", "llm"] = "llm"
+    intent: str | None = None
+    time_to_first_result_ms: float | None = None
+    # Sum of output-validation re-asks; provider empty rounds are counted
+    # separately by _QuirkTransport.
+    output_retries: int = 0
 
     def add(self, node: str, ms: float) -> None:
         self.node_ms[node] = self.node_ms.get(node, 0.0) + ms
@@ -535,6 +831,10 @@ class TurnTiming:
             "empty_round_retries": self.empty_round_retries,
             "outcome": self.outcome,
             "answer_source": self.answer_source,
+            "route": self.route,
+            "intent": self.intent,
+            "time_to_first_result_ms": self.time_to_first_result_ms,
+            "output_retries": self.output_retries,
         }
 
 
@@ -554,6 +854,7 @@ def _timed(timing: TurnTiming, node: str) -> Iterator[None]:
         yield
     finally:
         timing.add(node, (time.perf_counter() - start) * 1000)
+
 
 # The model's own reasoning for the current turn, collected off the wire by
 # _QuirkTransport (see _split_content_parts) and drained by run_turn.
@@ -875,22 +1176,20 @@ _PLAN_INSTRUCTIONS = (
     "the request is already clear, return a Plan directly — with an empty "
     "steps list if no new data is needed (a greeting, thanks, or a question "
     "already answered earlier in this conversation).\n\n"
-    "Metric names are provider-scoped (e.g. \"aws.monthly_bill\", "
-    "\"databricks.monthly_bill\") — there is no single metric with every "
+    'Metric names are provider-scoped (e.g. "aws.monthly_bill", '
+    '"databricks.monthly_bill") — there is no single metric with every '
     "provider's spend already combined. Because each view is already scoped to "
     "one provider, never filter it by provider_name: every row is that provider "
     "already, and a guessed value simply matches nothing — filters are exact and "
-    "case-sensitive, so \"databricks\" finds none of the \"Databricks\" rows. "
-    "The fixed \"efficiency\", \"driver_health\", \"policy\", \"ai_usage\", "
-    "\"storage\" and \"compute\" groups are the exception — they span providers and "
+    'case-sensitive, so "databricks" finds none of the "Databricks" rows. '
+    'The fixed "efficiency", "driver_health", "policy", "ai_usage", '
+    '"storage" and "compute" groups are the exception — they span providers and '
     "carry provider_name as a real column, so filtering those by provider_name is "
     "correct. None of them is a cross-provider spend total. "
-    "\"storage.backing_storage_month\" in particular is AWS-billed S3 cost that is "
+    '"storage.backing_storage_month" in particular is AWS-billed S3 cost that is '
     "NOT in aws.monthly_bill (provider GOLD excludes Amazon S3); it is the storage "
-    "behind Databricks, named Databricks Storage when mapping='databricks', not "
-    "Databricks spend. Never add it to a Databricks figure or present a combined "
-    "\"total Databricks cost\" — Databricks' own bill covers DBU compute only, and "
-    "those are two separate bills. It carries two provider columns for that reason: "
+    "behind Databricks, named Databricks Storage when mapping='databricks'. It carries "
+    "two provider columns for that reason: "
     "billing_provider_name (who invoices it) and platform_provider_name (whose "
     "metadata claims the bucket). Only mapping='databricks' counts as Databricks "
     "storage (the Unity Catalog metastore root); 'unmapped' includes external-location "
@@ -900,15 +1199,26 @@ _PLAN_INSTRUCTIONS = (
     "but not counted — so describe it as at-least, never as the full figure. Where "
     "mapping_confidence = 'prefix_scoped', the cost is an upper bound for that bucket, so "
     "say so rather than quoting it as exact. "
-    "\"compute.backing_compute_month\" is the identical shape, for EC2 instead of S3: "
+    '"compute.backing_compute_month" is the identical shape, for EC2 instead of S3: '
     "AWS-billed EC2 cost that is NOT in aws.monthly_bill (provider GOLD excludes Amazon "
     "Elastic Compute Cloud too), named Databricks Compute when mapping='databricks' "
-    "(matched to a Databricks cluster via system.compute.node_timeline), never Databricks "
-    "spend, never summed with it. It is also a FLOOR: it only ever covers CLASSIC "
+    "(matched to a Databricks cluster via system.compute.node_timeline). It is also a FLOOR: "
+    "it only ever covers CLASSIC "
     "(non-serverless) compute — serverless SQL warehouses/jobs/DLT pipelines have no "
     "customer-visible instance at all, so they can never show up as mapped here even "
-    "though they may carry real DBU cost. "
-    "For \"across all providers\"/\"total\" spend, or a computed comparison "
+    "though they may carry real DBU cost. When the user asks for Databricks' total, "
+    "all-in, footprint, or total cost of ownership, query all three monthly metrics "
+    "for the same months: databricks.monthly_bill, "
+    "storage.backing_storage_month filtered to mapping='databricks', and "
+    "compute.backing_compute_month filtered to mapping='databricks'. Sum their "
+    'net_cost values in the final answer and label it "Databricks total cost of '
+    'ownership (DBU usage + mapped AWS infrastructure)", not a Databricks invoice. '
+    "State that it is a conservative floor because the mapped AWS storage and compute "
+    "coverage is incomplete. When a request names both AWS and Redshift, do not show "
+    "an AWS net-cost column: Redshift is the AWS-billed cost in this comparison, so "
+    "show Redshift cost and Databricks total cost of ownership only. Mention AWS only "
+    "as the biller of Redshift and mapped Databricks infrastructure. "
+    'For "across all providers"/"total" spend, or a computed comparison '
     "(month-over-month growth, which grew the most), plan one query_metric "
     "step per provider/period — the arithmetic happens in the final answer, "
     "never plan a run_sql step with a JOIN, UNION, or window function to "
@@ -919,7 +1229,7 @@ _PLAN_INSTRUCTIONS = (
     "the dimension you need), and keep it as simple as possible.\n\n"
     "Choosing between net_cost and gross_cost, on any view that offers both: "
     "gross_cost is charges only; net_cost also applies credits and adjustments. "
-    "A \"where is the money going\" question — spend, a breakdown, a trend, a "
+    'A "where is the money going" question — spend, a breakdown, a trend, a '
     "mover, what grew — asks about charges, so use gross_cost. Use net_cost only "
     "when the question is what was actually owed or paid (the bill, the invoice). "
     "This matters because a single one-off credit lands entirely in one month and "
@@ -929,20 +1239,58 @@ _PLAN_INSTRUCTIONS = (
     "of the spend answer: they are itemized per credit line in the provider's own "
     "credits_month view, so plan a second step against it when the user asks about "
     "credits, discounts or the difference between the two figures.\n\n"
+    "For a cost-driver or service breakdown that includes AWS Redshift, do not "
+    "stop at the single `Amazon Redshift` row in aws.spend_by_service_month. "
+    "Also query aws.spend_by_cost_subcategory_month for that same period, using "
+    "net_cost, and present its Redshift compute, managed-storage, "
+    "concurrency-scaling, and Spectrum-scan rows alongside the service-level "
+    "results. This is the AWS equivalent of Databricks' separate product rows. "
+    "That subcategory view is intentionally a partial reconciliation: rows with "
+    "no classified subcategory are absent, so label any gap from the Amazon "
+    "Redshift service total rather than inventing a category.\n\n"
+    "For questions about unallocated, untagged, team, owner, project, or cost-center "
+    "spend, treat this as an allocation-coverage question first, not a resource "
+    "leaderboard. For each relevant provider and month, query "
+    "spend_tag_coverage_month (gross_cost, tagged_cost, untagged_cost, tagged_pct) "
+    "and spend_untagged_by_service_month (filter untagged_cost > 0). Lead with the "
+    "total untagged charges, their share of charges, and the largest provider/service "
+    "gaps. Do not claim that a team or owner is known when the required allocation "
+    "tags are absent. Query spend_untagged_by_resource_month only when the user "
+    "explicitly asks for the affected resources or a remediation work queue; it is a "
+    "drill-down, not the primary answer to an owner/team question. If the leading "
+    "untagged charge is a reservation or commitment, recommend documenting a named "
+    "cost-center owner and a cost-allocation rule based on the benefiting workloads "
+    "or clusters. Do not imply that tagging the individual commitment identifier will "
+    "necessarily allocate its amortized cost. For ordinary resources, recommend the "
+    "missing required allocation tags (for example team, owner, project, and cost_center).\n\n"
+    "For highest-confidence waste or optimization opportunities, begin with "
+    "efficiency.waste_summary_month filtered to confidence='high', then query "
+    "efficiency.waste_record with the same filter ordered by recoverable_cost DESC. "
+    "Lead with the total high-confidence finding count and recoverable cost, and "
+    "keep billed_cost explicitly distinct from recoverable_cost. When both are "
+    "positive, state the recoverable share of billed cost. Group the narrative by "
+    "waste_category before naming entities, show no more than the top five entities "
+    "unless the user asks for the full work queue, and include each row's detail as "
+    "the evidence for its classification. Include owner_user or owner_project when "
+    "available; otherwise label it Unassigned rather than omitting ownership. Use "
+    "list_optimization_rules to obtain the rule's canonical remedy when proposing an "
+    "action — do not fill a table with near-duplicate generic advice. If the latest "
+    "month is the current calendar month, call the figures month-to-date rather than "
+    "presenting them as a full-month savings forecast.\n\n"
     "When the user asks to see, chart, graph, plot or visualise something, or "
     "asks for a trend or a breakdown, set two things on the query_metric step: "
-    "measures=[the one relevant measure] (e.g. [\"gross_cost\"] — leaving it unset "
+    'measures=[the one relevant measure] (e.g. ["gross_cost"] — leaving it unset '
     "returns every measure on the view, which is too wide to chart), and "
     "chart={...} saying how to draw it. You choose the axis, because only you "
-    "know which breakdown was asked for: \"spend by service\" means "
-    "x=service_name, while \"the monthly trend\" means x=charge_month, even "
+    'know which breakdown was asked for: "spend by service" means '
+    'x=service_name, while "the monthly trend" means x=charge_month, even '
     "though both queries return the same columns. If a second dimension varies "
     "in the rows (e.g. you asked for several months of per-service spend), name "
     "it as series so each bar is split by it, rather than leaving the two "
     "dimensions to collide on one axis. Only the dimensions of the view you "
     "query are available as x/series.\n\n"
     "Whenever a single query_metric step answers the question on its own, also "
-    "set summary={\"sentence\": ...} on it: one sentence answering the question, "
+    'set summary={"sentence": ...} on it: one sentence answering the question, '
     "written with placeholders instead of numbers. The figures are computed from "
     "the rows and substituted in, so you never write a figure yourself and the "
     "answer needs no second round trip. Leave summary unset when the answer needs "
@@ -1013,11 +1361,15 @@ def _plan_instructions(
     empty_plan_retry: bool = False,
     data_failures: list[str] | None = None,
 ) -> str:
+    # Direct callers/tests pass an empty tool catalog; keep this helper fully
+    # grounded in that case. PlanNode supplies a cached combined block so a
+    # re-plan within one turn does not reopen GOLD just to rebuild the same text.
+    if not tool_catalog:
+        tool_catalog = "\n\n".join(
+            (_connected_providers_line(), _data_window_line(), _catalog_line())
+        )
     sections = [
         _PLAN_INSTRUCTIONS,
-        _connected_providers_line(),
-        _data_window_line(),
-        _catalog_line(),
         tool_catalog,
     ]
     if allow_explore:
@@ -1073,9 +1425,7 @@ def _step_failure(step: ToolStep) -> str | None:
         if values:
             hints.append(f"{column} actually contains {[str(v) for v in values]}")
     if hints:
-        detail += (
-            f" — filter values are matched exactly and are case-sensitive; {'; '.join(hints)}"
-        )
+        detail += f" — filter values are matched exactly and are case-sensitive; {'; '.join(hints)}"
     return detail
 
 
@@ -1107,8 +1457,7 @@ def _describe_step(step: ToolStep) -> str:
     shown = rows[:_SYNTH_ROW_SAMPLE]
     lines = ["\t".join(columns)]
     lines += [
-        "\t".join("" if row.get(c) is None else str(row.get(c)) for c in columns)
-        for row in shown
+        "\t".join("" if row.get(c) is None else str(row.get(c)) for c in columns) for row in shown
     ]
     omitted = len(rows) - len(shown)
     tail = (
@@ -1119,6 +1468,16 @@ def _describe_step(step: ToolStep) -> str:
     )
     body = "\n  ".join(lines)
     return f"- {step.name}({step.arguments}): {len(rows)} rows\n  {body}{tail}"
+
+
+def _history_for_model(history: list[ModelMessage]) -> list[ModelMessage]:
+    """Bound model input growth without changing the browser-tab transcript.
+
+    Assistant history is stored as one request/response pair per completed turn.
+    Keeping the most recent six pairs preserves short follow-ups while preventing a
+    long investigation from making every later planner call progressively slower.
+    """
+    return history[-MAX_HISTORY_MESSAGES:]
 
 
 # --- Graph --------------------------------------------------------------
@@ -1146,6 +1505,12 @@ class AssistantState:
     steps: list[ToolStep] = field(default_factory=list)
     usage: RunUsage = field(default_factory=RunUsage)
     timing: TurnTiming = field(default_factory=TurnTiming)
+    stage_callback: Callable[[str], None] | None = None
+    grounding: str | None = None
+
+    def stage(self, label: str) -> None:
+        if self.stage_callback is not None:
+            self.stage_callback(label)
 
 
 @dataclass
@@ -1170,13 +1535,23 @@ class PlanNode(BaseNode[AssistantState, None, AssistantTurnResult]):
         # the output below is free, and this keeps plan_ms comparable across the
         # branches it can take.
         with _timed(ctx.state.timing, "PlanNode"):
+            ctx.state.stage("Understanding question")
             ctx.state.timing.plan_passes += 1
             tool_catalog = await _plan_tool_catalog()
+            if ctx.state.grounding is None:
+                ctx.state.grounding = "\n\n".join(
+                    (
+                        _connected_providers_line(),
+                        _data_window_line(),
+                        _catalog_line(),
+                        tool_catalog,
+                    )
+                )
             instructions = _plan_instructions(
                 allow_explore=self.allow_explore,
                 allow_clarify=ctx.state.allow_clarify,
                 explored=ctx.state.explored,
-                tool_catalog=tool_catalog,
+                tool_catalog=ctx.state.grounding,
                 empty_plan_retry=ctx.state.empty_plan_retried,
                 data_failures=ctx.state.data_failures,
             )
@@ -1193,10 +1568,11 @@ class PlanNode(BaseNode[AssistantState, None, AssistantTurnResult]):
             )
             result = await agent.run(
                 ctx.state.question,
-                message_history=ctx.state.history,
+                message_history=_history_for_model(ctx.state.history),
                 usage_limits=UsageLimits(request_limit=_OUTPUT_REQUEST_LIMIT),
             )
         ctx.state.usage.incr(result.usage)
+        ctx.state.timing.output_retries += max(0, result.usage.requests - 1)
         match result.output:
             case ClarifyingQuestion() as cq:
                 ctx.state.timing.outcome = "clarify"
@@ -1234,6 +1610,7 @@ class ExploreNode(BaseNode[AssistantState, None, AssistantTurnResult]):
     async def run(self, ctx: GraphRunContext[AssistantState, None]) -> PlanNode:
         assert ctx.state.pending_lookups is not None
         with _timed(ctx.state.timing, "ExploreNode"):
+            ctx.state.stage("Querying published data")
             by_key: dict[str, ListDimensionValuesStep] = {}
             for lookup in ctx.state.pending_lookups:
                 by_key.setdefault(_dedup_key(lookup.tool, _step_args(lookup)), lookup)
@@ -1259,6 +1636,7 @@ class ExecuteNode(BaseNode[AssistantState, None, AssistantTurnResult]):
     ) -> SynthesizeNode | PlanNode | End[AssistantTurnResult]:
         assert ctx.state.plan is not None
         with _timed(ctx.state.timing, "ExecuteNode"):
+            ctx.state.stage("Querying published data")
             outcome = await self._execute(ctx)
         if not isinstance(outcome, SynthesizeNode):
             return outcome
@@ -1332,6 +1710,7 @@ class SynthesizeNode(BaseNode[AssistantState, None, AssistantTurnResult]):
 
     async def run(self, ctx: GraphRunContext[AssistantState, None]) -> End[AssistantTurnResult]:
         with _timed(ctx.state.timing, "SynthesizeNode"):
+            ctx.state.stage("Preparing answer")
             agent = Agent(_agent_model(ctx.state), instructions=_SYNTHESIZE_INSTRUCTIONS)
             gathered = (
                 "\n".join(_describe_step(step) for step in ctx.state.steps)
@@ -1340,10 +1719,11 @@ class SynthesizeNode(BaseNode[AssistantState, None, AssistantTurnResult]):
             prompt = f"User question: {ctx.state.question}\n\nData gathered:\n{gathered}"
             result = await agent.run(
                 prompt,
-                message_history=ctx.state.history,
+                message_history=_history_for_model(ctx.state.history),
                 usage_limits=UsageLimits(request_limit=_OUTPUT_REQUEST_LIMIT),
             )
         ctx.state.usage.incr(result.usage)
+        ctx.state.timing.output_retries += max(0, result.usage.requests - 1)
         ctx.state.timing.outcome = "answer"
         ctx.state.timing.answer_source = "model"
         return End(AssistantTurnResult(text=result.output, steps=ctx.state.steps))
@@ -1384,6 +1764,7 @@ async def run_turn(
     base_url: str | None,
     session_id: str,
     answering_clarification: bool = False,
+    on_stage: Callable[[str], None] | None = None,
 ) -> AssistantTurnResult:
     """Run one user turn to completion: Plan -> [Explore -> re-Plan, at most
     once] -> Execute -> Synthesize.
@@ -1411,6 +1792,7 @@ async def run_turn(
         model=model,
         base_url=base_url,
         allow_clarify=not answering_clarification,
+        stage_callback=on_stage,
     )
     reasoning: list[str] = []
     _reasoning_sink.set(reasoning)
@@ -1420,6 +1802,10 @@ async def run_turn(
     started = time.perf_counter()
 
     def _log(result: AssistantTurnResult) -> AssistantTurnResult:
+        state.timing.route = result.route
+        state.timing.intent = result.intent
+        if state.timing.time_to_first_result_ms is None:
+            state.timing.time_to_first_result_ms = round((time.perf_counter() - started) * 1000, 1)
         timings = state.timing.columns(
             duration_ms=(time.perf_counter() - started) * 1000,
             # pydantic-ai's own count, so a structured-output retry shows up as
@@ -1438,9 +1824,25 @@ async def run_turn(
             timings=timings,
         )
         logger.info("assistant_turn_timing", model=model, **timings)
-        return result
+        return replace(result, time_to_first_result_ms=state.timing.time_to_first_result_ms)
 
     try:
+        intent = _fast_intent(question)
+        if intent is not None:
+            state.stage("Understanding question")
+            state.stage("Querying published data")
+            result = await _run_fast_path(intent)
+            if result is not None:
+                state.timing.outcome = "answer"
+                state.timing.answer_source = "deterministic"
+                state.timing.time_to_first_result_ms = round(
+                    (time.perf_counter() - started) * 1000, 1
+                )
+                messages.append(ModelRequest.user_text_prompt(question))
+                messages.append(ModelResponse(parts=[TextPart(result.text)]))
+                return _log(
+                    replace(result, time_to_first_result_ms=state.timing.time_to_first_result_ms)
+                )
         return await _run_graph(state, messages, question, api_key, reasoning, _log)
     finally:
         for client in http_clients:

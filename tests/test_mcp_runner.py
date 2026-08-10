@@ -138,8 +138,7 @@ def test_stop_kills_a_child_that_ignores_terminate(monkeypatch: pytest.MonkeyPat
 def test_a_failed_start_is_reported_as_output_not_an_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`mcp serve` exits with a message when it refuses (FLASHLIGHT_DEMO=1) or the port is
-    taken. That belongs in the page's log, not as a traceback."""
+    """A failed MCP process belongs in the page's log, not as a traceback."""
     _stub(monkeypatch, "import sys; print('Refusing to start', file=sys.stderr); sys.exit(1)")
 
     async def _run() -> None:
@@ -170,7 +169,6 @@ def test_the_page_shows_the_endpoint_and_tools(monkeypatch) -> None:  # type: ig
 
     from flashlight.dashboard.router import build_pages
 
-    monkeypatch.delenv("FLASHLIGHT_DEMO", raising=False)
     get_settings.cache_clear()
 
     async def _check() -> None:
@@ -198,7 +196,6 @@ def test_the_buttons_start_and_stop_the_server_and_the_status_follows(monkeypatc
 
     from flashlight.dashboard.router import build_pages
 
-    monkeypatch.delenv("FLASHLIGHT_DEMO", raising=False)
     get_settings.cache_clear()
 
     running = False
@@ -242,7 +239,6 @@ def test_the_page_says_it_cannot_stop_a_server_it_did_not_start(monkeypatch) -> 
 
     from flashlight.dashboard.router import build_pages
 
-    monkeypatch.delenv("FLASHLIGHT_DEMO", raising=False)
     get_settings.cache_clear()
     monkeypatch.setattr(mcp_runner, "is_running", lambda: False)
     monkeypatch.setattr(mcp_runner, "is_listening", lambda: True)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal
 
@@ -361,7 +362,7 @@ def effective_connector_name(cfg: BaseModel) -> str:
     return name or ctype
 
 
-def _validate_connectors(configs: list[BaseModel]) -> None:
+def _validate_connectors(configs: Sequence[BaseModel]) -> None:
     """Cross-connector checks that a single config can't make on its own — run on
     both load (:func:`_parse_entries`) and save (:func:`save_connections`), so a
     dashboard edit is rejected at write time, not just on the next ingest run.
@@ -374,18 +375,10 @@ def _validate_connectors(configs: list[BaseModel]) -> None:
     if duplicates:
         raise ConfigError(f"Connection names must be unique; duplicated: {duplicates}")
 
-    # Redshift never pulls its own cost — it flows through aws_focus (AWS Data
-    # Exports FOCUS carries Redshift's SKUs). Without an enabled aws_focus
-    # connector, an enabled redshift one would ingest efficiency telemetry with
-    # no cost ever attributed to it. See RedshiftConfig's docstring.
-    has_enabled_redshift = any(isinstance(c, RedshiftConfig) and c.enabled for c in configs)
-    has_enabled_aws_focus = any(isinstance(c, AwsFocusConfig) and c.enabled for c in configs)
-    if has_enabled_redshift and not has_enabled_aws_focus:
-        raise ConfigError(
-            "an enabled redshift connector requires an enabled aws_focus connector "
-            "— Redshift cost flows through aws_focus, redshift only supplies "
-            "efficiency telemetry"
-        )
+    # Redshift cost is supplied by aws_focus, but Redshift itself remains useful
+    # without it: its read-only pulls collect efficiency telemetry. Keep this a
+    # non-blocking relationship so users can save and run a telemetry-only
+    # Redshift connection while they finish configuring AWS FOCUS.
 
 
 def _parse_entries(raw: dict[str, Any]) -> list[BaseModel]:
@@ -430,14 +423,13 @@ def load_connections(path: str | None = None) -> list[BaseModel]:
     return [cfg for cfg in load_all_connections(path) if getattr(cfg, "enabled", True)]
 
 
-def save_connections(entries: list[BaseModel], path: str | None = None) -> None:
+def save_connections(entries: Sequence[BaseModel], path: str | None = None) -> None:
     """Write connector configs back to the connections YAML (full overwrite).
 
     Round-trips through the same Pydantic models :func:`load_all_connections` reads
     back, so a save immediately followed by a load returns equivalent configs. Runs
-    the same cross-connector checks :func:`load_all_connections` does (e.g. the
-    redshift/aws_focus pairing) before writing, so a bad dashboard edit is rejected
-    here rather than only on the next load.
+    the same cross-connector checks :func:`load_all_connections` does (such as
+    connection-name uniqueness) before writing.
     """
     _validate_connectors(entries)
     cfg_path = Path(path) if path else paths.connections_path()

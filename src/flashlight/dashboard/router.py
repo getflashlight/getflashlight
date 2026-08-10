@@ -22,7 +22,7 @@ from fastapi.responses import RedirectResponse, Response
 from nicegui import ui
 
 from flashlight.core.settings import get_settings
-from flashlight.dashboard import chrome
+from flashlight.dashboard import chrome, ingest_runner
 from flashlight.dashboard.data import (
     NO_DATA_MSG,
     gold_df,
@@ -43,15 +43,8 @@ def range_has_partial_month(end: date) -> bool:
 
 # ── Nav ──────────────────────────────────────────────────────────────────────
 def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
-    """The always-present nav rows, minus the pages a public demo must not offer
-    (Connections: edits connections.yml + spawns an ingest subprocess; Assistant: BYOK key
-    storage + outbound LLM calls; MCP server: spawns a process that opens an
-    unauthenticated port — which ``mcp/server.py`` refuses to do in demo mode anyway) —
-    see ``build_pages``'s matching route gate. Plus a Docs entry when a static docs site
-    is mounted.
-    """
-    # Home (read-only) first, write surfaces after it — the demo filter below strips the
-    # tail. Home is the only cross-provider page there is: utilization and the owner/tag
+    """The always-present navigation rows, plus Docs when a static site is mounted."""
+    # Home first. It is the only cross-provider page: utilization and the owner/tag
     # leaderboards used to sit here too, and are now tabs on each provider page (see
     # _RETIRED_ROUTES).
     nav = [
@@ -60,12 +53,6 @@ def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
         ("/assistant", "Assistant", "assistant"),
         ("/mcp-server", "MCP server", "hub"),
     ]
-    if get_settings().demo:
-        nav = [
-            item
-            for item in nav
-            if item[0] not in ("/connections", "/assistant", "/mcp-server")
-        ]
     if get_settings().docs_dir:
         nav.append(("/docs", "Docs", "menu_book"))
     return tuple(nav)
@@ -74,8 +61,7 @@ def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
 # Provider groups that lead the "BY PROVIDER" nav, in this order, ahead of every
 # remaining group in alphabetical order. Databricks is the platform users come here
 # for; the cloud underneath it reads as supporting detail, so it sorts first even
-# though "aws" would win alphabetically. Snowflake is always listed (even before its
-# first GOLD publish) so the visibility UX is reachable with synthetic fallback.
+# though "aws" would win alphabetically.
 _NAV_GROUP_ORDER: tuple[str, ...] = ("databricks", "snowflake")
 
 _SIDEBAR_PROVIDER_LOGOS: dict[str, str] = {
@@ -89,14 +75,13 @@ def _nav_groups() -> list[str]:
     """Provider groups in nav order: :data:`_NAV_GROUP_ORDER` first, then the rest
     in the alphabetical order ``discover_provider_groups`` already returns.
 
-    Snowflake is always included so ``/snowflake`` stays reachable before the first
-    ingest publishes ``gold/snowflake/`` (visibility falls back to synthetic Parquet).
+    Active dashboard syncs are included before their first GOLD publish, so a newly
+    connected provider is visible while its initial ingestion is still running.
     """
-    groups = discover_provider_groups()
-    if "snowflake" not in groups:
-        groups = [*groups, "snowflake"]
+    groups = set(discover_provider_groups())
+    groups.update(ingest_runner.active_provider_groups())
     lead = [g for g in _NAV_GROUP_ORDER if g in groups]
-    return lead + [g for g in groups if g not in lead]
+    return lead + sorted(g for g in groups if g not in lead)
 
 
 def _nav_label(group: str) -> str:
@@ -116,7 +101,13 @@ def _logo() -> None:
 
 
 def _nav_row(
-    *, label: str, icon: str, href: str, active: bool, logo_source: str | None = None
+    *,
+    label: str,
+    icon: str,
+    href: str,
+    active: bool,
+    logo_source: str | None = None,
+    syncing: bool = False,
 ) -> None:
     row = ui.row().classes(
         "fl-sidebar-row items-center gap-2 w-full px-2 py-2 cursor-pointer"
@@ -134,6 +125,11 @@ def _nav_row(
         ui.link(label, href).classes("fl-sidebar-label text-sm no-underline").style(
             f"color:{chrome.INK_PRIMARY}"
         )
+        if syncing:
+            ui.spinner(size="14px").classes("flex-none").style(f"color:{chrome.ACCENT}")
+            ui.label("Syncing").classes("fl-sidebar-label text-xs").style(
+                f"color:{chrome.INK_MUTED}"
+            )
     row.on("click", lambda: ui.navigate.to(href))
 
 
@@ -206,6 +202,7 @@ def shell(active_path: str, *, full_height: bool = False) -> ui.column:
                             href=href,
                             active=active_path == href,
                             logo_source=_SIDEBAR_PROVIDER_LOGOS.get(group),
+                            syncing=group in ingest_runner.active_provider_groups(),
                         )
 
     with ui.header().classes("items-center justify-between px-6 py-3").style(
@@ -332,6 +329,57 @@ def no_data_page(title: str) -> None:
     ui.label(NO_DATA_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
 
 
+def snowflake_empty_state() -> None:
+    """Guide users from Snowflake's always-reachable page to its setup path."""
+    with chrome.panel():
+        chrome.empty_state(
+            "ac_unit",
+            "Snowflake visibility",
+            "Add an enabled Snowflake connection and run a sync to see your organization's spend.",
+            button_label="Add an enabled Snowflake connection",
+            on_click=lambda: ui.navigate.to("/connections"),
+        )
+
+
+def home_empty_state() -> None:
+    """First-run Home guidance, with Connections as the single setup surface."""
+    with chrome.panel():
+        chrome.empty_state(
+            "cable",
+            "Connect your first data source",
+            "Add a billing source, then run a sync to populate your spend dashboard.",
+            button_label="Connect a data source",
+            on_click=lambda: ui.navigate.to("/connections"),
+        )
+
+
+def sync_in_progress_banner(group: str) -> None:
+    """A non-blocking notice above a provider report during a dashboard sync."""
+    if group not in ingest_runner.active_provider_groups():
+        return
+    with ui.row().classes("w-full items-center gap-2 px-3 py-2").style(
+        f"background:rgba(57,135,229,0.12);border:1px solid {chrome.BORDER};border-radius:8px;"
+    ):
+        ui.spinner(size="1rem").style(f"color:{chrome.ACCENT}")
+        ui.label(
+            "Sync in progress — this dashboard will refresh with the latest data when it completes."
+        ).classes("text-sm").style(f"color:{chrome.INK_SECONDARY}")
+
+
+def sync_in_progress_page(label: str) -> None:
+    """First-sync destination for a provider whose GOLD report does not exist yet."""
+    with chrome.panel():
+        with ui.column().classes("w-full items-center gap-3").style("padding:32px 0;"):
+            ui.spinner(size="2rem").style(f"color:{chrome.ACCENT}")
+            ui.label(f"Syncing {label}").classes("text-lg font-semibold").style(
+                f"color:{chrome.INK_PRIMARY}"
+            )
+            ui.label(
+                "Sync in progress. Your dashboard will be available when the first data publish "
+                "finishes."
+            ).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+
+
 def build_pages() -> None:
     """Register every ``@ui.page()`` route. Call once, before ``ui.run()``."""
     from nicegui import app
@@ -366,44 +414,33 @@ def build_pages() -> None:
         # call inside it — see data.gold_session's docstring.
         with gold_session(), shell("/"):
             if not has_data():
-                no_data_page("Flashlight")
+                home_empty_state()
             else:
                 home_overview.render()
 
     # Every literal top-level route must be registered explicitly: `/{group}` below is a
     # catch-all, so an unregistered `/foo` lands in _provider_page and 404s there instead.
-    # Connections (edits connections.yml, spawns an ingest subprocess) and Assistant
-    # (BYOK key storage, outbound LLM calls, in-process MCP tool calls including
-    # run_sql) are the dashboard's only write/mutation surfaces — routes aren't
-    # registered at all in demo mode, so they 404 instead of just being hidden from
-    # nav (see _fixed_nav above). /usage belongs to this group too: it reads the assistant
-    # turn log, its only inbound link is a button on the assistant page, and its Parquet
-    # root doesn't exist in the demo image — so leaving it registered meant the demo
-    # advertised a page that 404s. /mcp-server joins them: it launches a subprocess that
-    # opens an unauthenticated port serving ad-hoc SQL, which `mcp serve` itself refuses
-    # to do under FLASHLIGHT_DEMO — so the page would only ever show that refusal.
-    if not settings.demo:
-        from flashlight.dashboard.views import assistant, connections, mcp_server, usage
+    from flashlight.dashboard.views import assistant, connections, mcp_server, usage
 
-        @ui.page("/connections")
-        def _connections() -> None:
-            with shell("/connections"):
-                connections.render()
+    @ui.page("/connections")
+    def _connections() -> None:
+        with shell("/connections"):
+            connections.render()
 
-        @ui.page("/assistant")
-        async def _assistant() -> None:
-            with shell("/assistant", full_height=True):
-                await assistant.render()
+    @ui.page("/assistant")
+    async def _assistant() -> None:
+        with shell("/assistant", full_height=True):
+            await assistant.render()
 
-        @ui.page("/usage")
-        def _usage() -> None:
-            with shell("/usage"):
-                usage.render()
+    @ui.page("/usage")
+    def _usage() -> None:
+        with shell("/usage"):
+            usage.render()
 
-        @ui.page("/mcp-server")
-        async def _mcp_server() -> None:
-            with shell("/mcp-server"):
-                await mcp_server.render()
+    @ui.page("/mcp-server")
+    async def _mcp_server() -> None:
+        with shell("/mcp-server"):
+            await mcp_server.render()
 
     if settings.docs_dir and Path(settings.docs_dir).is_dir():
         from fastapi.staticfiles import StaticFiles
@@ -485,48 +522,13 @@ def build_pages() -> None:
             show_alerts=False,
         )
 
-    def _render_snowflake_visibility_only() -> None:
-        """Snowflake visibility UX without GOLD spend yet — synthetic Parquet fallback.
-
-        No live Snowflake connection is made from the dashboard. Leaderboard + Visibility
-        read ``snowflake/synthetic_data/*.parquet`` until ``flashlight ingest`` publishes
-        ``gold/snowflake/``.
-        """
-        from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
-
-        with ui.tabs().classes("w-full").props("dense") as tabs:
-            tab_exec = ui.tab("LeaderBoard")
-            tab_vis = ui.tab("Visibility")
-        loaded: dict[str, bool] = {"LeaderBoard": False}
-        panels: dict[str, ui.tab_panel] = {}
-        with ui.tab_panels(tabs, value=tab_exec).classes("w-full").style(
-            "background:transparent;"
-        ):
-            panels["LeaderBoard"] = ui.tab_panel(tab_exec)
-            panels["Visibility"] = ui.tab_panel(tab_vis)
-        with panels["LeaderBoard"]:
-            snowflake_visibility.render_leaderboard()
-        loaded["LeaderBoard"] = True
-
-        def _on_tab_change(e: object) -> None:
-            name = getattr(e, "value", None)
-            if name == "Visibility" and name not in loaded:
-                loaded[name] = True
-                with panels["Visibility"]:
-                    snowflake_visibility.render()
-
-        tabs.on_value_change(_on_tab_change)
-
     def _render_snowflake_page(label: str) -> None:
-        """FOCUS spend via provider_focus, plus Snowflake visibility + driver health."""
-        from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
+        """Render Snowflake exclusively from materialized lake data."""
 
         provider_focus.render(
             "snowflake",
             label,
             extra_tabs=[
-                ("LeaderBoard", snowflake_visibility.render_leaderboard),
-                ("Visibility", snowflake_visibility.render),
                 (
                     "Client Driver Health",
                     lambda: driver_health.render("Snowflake", "Snowflake"),
@@ -535,16 +537,17 @@ def build_pages() -> None:
             show_alerts=False,
         )
 
-    # Explicit /snowflake before the catch-all: always reachable for the visibility UX
-    # even when gold/snowflake/ has not been published yet.
+    # Explicit /snowflake before the catch-all so its label and telemetry tab stay
+    # stable. Like every other provider route, it reads only published GOLD data.
     @ui.page("/snowflake")
     def _snowflake_page() -> None:
         label = provider_label("snowflake")
         with gold_session(), shell("/snowflake"):
+            sync_in_progress_banner("snowflake")
             if "snowflake" in discover_provider_groups() and has_data():
                 _render_snowflake_page(label)
             else:
-                _render_snowflake_visibility_only()
+                snowflake_empty_state()
 
     # One parameterized route, not one @ui.page per group discovered right now —
     # discover_provider_groups() reads gold/ live, so it can (and does) return a
@@ -556,7 +559,7 @@ def build_pages() -> None:
     # instead means a group's page and its nav link agree at all times.
     @ui.page("/{group}")
     def _provider_page(group: str) -> None:
-        # /snowflake is registered explicitly above (visibility fallback before GOLD).
+        # /snowflake is registered explicitly above.
         # Starlette matches in registration order, so this catch-all should not see it;
         # if it does, mirror the dedicated page rather than 404.
         if group == "snowflake":
@@ -565,20 +568,26 @@ def build_pages() -> None:
                 if "snowflake" in discover_provider_groups() and has_data():
                     _render_snowflake_page(label)
                 else:
-                    _render_snowflake_visibility_only()
+                    snowflake_empty_state()
             return
-        if group not in discover_provider_groups():
+        published_groups = set(discover_provider_groups())
+        syncing = group in ingest_runner.active_provider_groups()
+        if group not in published_groups and not syncing:
             raise HTTPException(status_code=404)
         label = provider_label(group)
         # One registered connection for the whole render, reused by every gold_df()
         # call inside it (the Databricks page alone issues ~50 today) — see
         # data.gold_session's docstring.
         with gold_session(), shell(f"/{group}"):
-            if not has_data():
+            if group not in published_groups and syncing:
+                sync_in_progress_page(label)
+            elif not has_data():
                 no_data_page(f"{label} spend")
-            elif group == "aws":
-                redshift_focus.render()
-            elif group == "databricks":
-                _render_databricks_page(label)
             else:
-                provider_focus.render(group, label)
+                sync_in_progress_banner(group)
+                if group == "aws":
+                    redshift_focus.render()
+                elif group == "databricks":
+                    _render_databricks_page(label)
+                else:
+                    provider_focus.render(group, label)

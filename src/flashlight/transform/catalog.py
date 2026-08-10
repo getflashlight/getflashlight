@@ -439,8 +439,11 @@ PROVIDER_BASE_VIEWS: tuple[ViewSpec, ...] = (
         view="spend_untagged_by_resource_month",
         title="Untagged spend by resource / month",
         description="Untagged charges only (empty Tags, credits excluded), ranked per "
-        "resource. Answers 'what do I open and tag?' under a service gap from "
-        "spend_untagged_by_service_month — summing untagged_cost for one service "
+        "resource. A remediation drill-down under a service gap from "
+        "spend_untagged_by_service_month, not an owner/team allocation: absent tags "
+        "cannot identify an owner. For a reservation or commitment, use it to identify "
+        "the scope for an allocation rule rather than assuming the commitment itself can "
+        "be tagged. Summing untagged_cost for one service "
         "reconciles to that service's untagged_cost. resource_id/name/type and "
         "workspace/region coalesced like resource_month so lines with no resource id "
         "stay visible as '(none)' / '(unattributed)'.",
@@ -552,7 +555,8 @@ EFFICIENCY_BASE_VIEWS: tuple[ViewSpec, ...] = (
         description="One row per (entity, month, waste_category): the classified, "
         "standardized waste record across platforms. recoverable_cost is the estimated "
         "recoverable spend; lens splits WASTE (tune it) from OPPORTUNITY (move it). "
-        "confidence is high vs candidate. underutilized is never emitted for shared compute.",
+        "confidence is high vs candidate; detail is the rule-specific evidence for the "
+        "classification. underutilized is never emitted for shared compute.",
         cost_metric=CostMetric.EFFECTIVE_COST,
         dimensions=(
             "provider_name",
@@ -565,6 +569,7 @@ EFFICIENCY_BASE_VIEWS: tuple[ViewSpec, ...] = (
             "waste_category",
             "lens",
             "confidence",
+            "detail",
         ),
         measures=("billed_cost", "recoverable_cost"),
     ),

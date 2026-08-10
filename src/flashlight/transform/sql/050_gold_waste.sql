@@ -37,6 +37,7 @@ SELECT DISTINCT
     entity_id,
     entity_name,
     owner_user,
+    utilization_pct,
     activity_count,
     cause_detail,
     -- Cast to DATE, same as gold.waste_record's own charge_month — metrics.efficiency_
