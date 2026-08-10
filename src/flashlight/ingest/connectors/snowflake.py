@@ -73,7 +73,15 @@ SELECT
     USAGE_IN_CURRENCY AS "EffectiveCost",
     USAGE_IN_CURRENCY AS "ListCost",
     USAGE_IN_CURRENCY AS "ContractedCost",
-    IFF(IS_ADJUSTMENT, 'Adjustment', 'Usage') AS "ChargeCategory",
+    CASE
+        -- A negative adjustment reduces what the organization owes. Preserve it as
+        -- a FOCUS Credit so gross-vs-net spend and the Credits & Discounts card
+        -- identify the swing rather than treating it as ordinary usage.
+        WHEN USAGE_IN_CURRENCY < 0
+          OR LOWER(BILLING_TYPE) IN ('support_credit', 'rebate') THEN 'Credit'
+        WHEN IS_ADJUSTMENT THEN 'Adjustment'
+        ELSE 'Usage'
+    END AS "ChargeCategory",
     USAGE_TYPE AS "ChargeDescription",
     CASE UPPER(SERVICE_TYPE)
         WHEN 'WAREHOUSE_METERING' THEN 'Compute'
@@ -250,9 +258,12 @@ class SnowflakeConnector(Connector):
         charge_end = charge_start + timedelta(days=1)
 
         cost = Decimal(str(row.get("USAGE_IN_CURRENCY") or 0))
+        billing_type = str(row.get("BILLING_TYPE") or "").lower()
         is_adjustment = row.get("IS_ADJUSTMENT")
         charge_category = (
-            ChargeCategory.ADJUSTMENT if is_adjustment else ChargeCategory.USAGE
+            ChargeCategory.CREDIT
+            if cost < 0 or billing_type in {"support_credit", "rebate"}
+            else (ChargeCategory.ADJUSTMENT if is_adjustment else ChargeCategory.USAGE)
         )
 
         service_type = row.get("SERVICE_TYPE") or "OTHER"

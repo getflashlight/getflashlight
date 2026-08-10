@@ -7,13 +7,11 @@ and telemetry so every dashboard drill-down uses the normal read path.
 
 from __future__ import annotations
 
-import runpy
 import shutil
 from calendar import monthrange
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
 
 import pyarrow.parquet as pq
 import typer
@@ -44,27 +42,7 @@ from flashlight.transform.runner import build_gold
 SAMPLE_CONNECTOR = "flashlight_demo_focus"
 REDSHIFT_CONNECTOR = "flashlight_demo_redshift"
 DATABRICKS_CONNECTOR = "flashlight_demo_databricks"
-_SNOWFLAKE_SYNTHETIC_DIR = Path(__file__).resolve().parents[2] / "snowflake" / "synthetic_data"
-
-
-def generate_snowflake_dashboard_demo() -> None:
-    """Generate the synthetic ACCOUNT_USAGE files used by the Snowflake demo UI.
-
-    The generator remains beside its source data specification in the repository, but
-    this is the single supported entry point so ``fl sample`` seeds every dashboard
-    demo in one command.
-    """
-    generator = _SNOWFLAKE_SYNTHETIC_DIR / "generate.py"
-    namespace = runpy.run_path(str(generator))
-    namespace["main"]()
-
-
-def cleanup_snowflake_dashboard_demo() -> None:
-    """Remove only generated Snowflake demo Parquet files, never the generator."""
-    for parquet in _SNOWFLAKE_SYNTHETIC_DIR.glob("*.parquet"):
-        parquet.unlink()
-
-
+SNOWFLAKE_CONNECTOR = "flashlight_demo_snowflake"
 @dataclass(frozen=True)
 class DemoSku:
     """A production-shaped Databricks SKU family and its relative direct-cost weight."""
@@ -413,10 +391,18 @@ def _cost(
         resource_type=(
             resource_type
             if resource_type is not None
-            else ("cluster" if "redshift" in entity.id else "workspace-resource")
+            else (
+                "warehouse"
+                if provider == "Snowflake"
+                else ("cluster" if "redshift" in entity.id else "workspace-resource")
+            )
         ),
         consumed_quantity=float(amount),
-        consumed_unit="DBU" if provider == "Databricks" else "Hrs",
+        consumed_unit=(
+            "DBU"
+            if provider == "Databricks"
+            else ("Credits" if provider == "Snowflake" else "Hrs")
+        ),
         tags=tags,
         x_compute_class=compute_class,
         x_source_connector=connector,
@@ -619,6 +605,130 @@ def _records(
             _databricks_allocation(index, month),
             _redshift_allocation(index, month),
         )
+        # Snowflake uses the same FOCUS BRONZE writer as a real Snowflake ingest.
+        # These are daily Account Usage-shaped cost families, not dashboard-local
+        # Parquet fixtures, so every Snowflake screen exercises the published GOLD path.
+        snowflake_services = (
+            ("WAREHOUSE_METERING", ServiceCategory.COMPUTE, Decimal("0.72")),
+            ("CLOUD_SERVICES", ServiceCategory.COMPUTE, Decimal("0.11")),
+            ("STORAGE", ServiceCategory.STORAGE, Decimal("0.10")),
+            ("AI_FUNCTIONS", ServiceCategory.AI_AND_MACHINE_LEARNING, Decimal("0.07")),
+        )
+        snowflake_total = Decimal("18400") + Decimal(index * 1100)
+        for entity, entity_amount in zip(
+            data.redshift_clusters,
+            weighted_split(snowflake_total, (Decimal("0.61"), Decimal("0.39"))),
+            strict=True,
+        ):
+            for service, category, share in snowflake_services:
+                costs.extend(
+                    _monthly_cost(
+                        entity,
+                        month,
+                        (entity_amount * share).quantize(Decimal("0.01")),
+                        provider="Snowflake",
+                        service=service,
+                        category=category,
+                        connector=SNOWFLAKE_CONNECTOR,
+                        resource_id=f"warehouse:{entity.id}",
+                        resource_name=f"{entity.name} warehouse",
+                        resource_type="warehouse",
+                        sku_id=service,
+                        extra_tags={"account": "northstar-snowflake-prod"},
+                        days=days,
+                    )
+                )
+            warehouse_id = f"warehouse:{entity.id}"
+            # The same typed efficiency plane drives both the recovery queue and
+            # warehouse governance checks. One warehouse is deliberately healthy;
+            # the other is low-utilization with permissive auto-suspend, making the
+            # demonstration show measured findings rather than invented blank states.
+            is_primary = entity.id.endswith("prod-analytics")
+            efficiency.append(
+                EfficiencyRecord(
+                    provider_name="Snowflake",
+                    charge_month=month,
+                    entity_type=EntityType.SQL_WAREHOUSE,
+                    entity_id=warehouse_id,
+                    entity_name=f"{entity.name} warehouse",
+                    owner_user=str(entity.owner_email),
+                    owner_project=entity.project,
+                    billed_cost=entity_amount,
+                    native_quantity=float(entity_amount / Decimal("3")),
+                    native_unit="credits",
+                    utilization_pct=78.0 if is_primary else 18.0,
+                    activity_count=1_400 + index * 95 if is_primary else 180 + index * 20,
+                    cause_detail={
+                        "tag_count": 4 if is_primary else 0,
+                        "auto_stop_minutes": 10 if is_primary else 120,
+                        "idle_cost": float(
+                            entity_amount * (Decimal("0.01") if is_primary else Decimal("0.18"))
+                        ),
+                    },
+                    x_source_connector=SNOWFLAKE_CONNECTOR,
+                )
+            )
+            health.append(
+                DriverHealthRecord(
+                    provider_name="Snowflake",
+                    charge_month=month,
+                    client_driver=(
+                        "PythonConnector 3.10.1" if is_primary else "PythonConnector 3.6.0"
+                    ),
+                    client_application="dbt Cloud" if is_primary else "Tableau",
+                    executed_by=str(entity.owner_email),
+                    cluster_id=warehouse_id,
+                    query_count=2_200 + index * 120 if is_primary else 420 + index * 55,
+                    support_status="supported" if is_primary else "unsupported",
+                    x_source_connector=SNOWFLAKE_CONNECTOR,
+                )
+            )
+            if not is_primary:
+                # The same warehouse also has a current driver in use. This makes
+                # the 3.6.0 Tableau connection a real, comparable stale-driver
+                # finding rather than merely an old-looking version with no baseline.
+                health.append(
+                    DriverHealthRecord(
+                        provider_name="Snowflake",
+                        charge_month=month,
+                        client_driver="PythonConnector 3.10.1",
+                        client_application="Airflow",
+                        executed_by="noah.williams@northstar.example",
+                        cluster_id=warehouse_id,
+                        query_count=880 + index * 70,
+                        support_status="supported",
+                        x_source_connector=SNOWFLAKE_CONNECTOR,
+                    )
+                )
+        if month.month == 7:
+            # Account-level support credit: a separate FOCUS Credit line rather
+            # than a fake reduction to a warehouse's usage. It is consequently
+            # itemized by credits_month and reduces the provider's net bill, while
+            # gross warehouse spend remains attributable to the real workloads.
+            support_credit = _cost(
+                data.redshift_clusters[0],
+                month,
+                Decimal("-420.00"),
+                provider="Snowflake",
+                service="Snowflake Support Credit",
+                category=ServiceCategory.OTHER,
+                connector=SNOWFLAKE_CONNECTOR,
+                charge_category=ChargeCategory.CREDIT,
+            ).model_copy(
+                update={
+                    "charge_description": "Snowflake support credit",
+                    "service_name": None,
+                    "sku_id": None,
+                    "resource_id": None,
+                    "resource_name": None,
+                    "resource_type": None,
+                    # A credit has no independent list price. Keeping every cost
+                    # field at its signed billed amount prevents a fake discount.
+                    "list_cost": Decimal("-420.00"),
+                    "contracted_cost": Decimal("-420.00"),
+                }
+            )
+            costs.append(support_credit)
         for cluster_index, entity in enumerate(data.redshift_clusters):
             amount = Decimal("0")
             for subcategory in (
@@ -1177,7 +1287,7 @@ def cleanup() -> None:
 
 
 def load_sample(*, force: bool = False) -> None:
-    """Generate and publish the deterministic Redshift + Databricks + FOCUS demo."""
+    """Generate and publish the deterministic cross-cloud FOCUS demo."""
     del force  # Generation is deterministic and always replaces its sample window.
     data = scenario()
     costs, efficiency, health, instances, usage, storage, policies = _records(data)
@@ -1209,7 +1319,7 @@ def load_sample(*, force: bool = False) -> None:
     _audit_gold_contract()
     _audit_demo_accounting()
     typer.echo(
-        f"Generated {written} reconciled FOCUS records plus Redshift and "
-        f"Databricks telemetry → {published} GOLD views."
+        f"Generated {written} reconciled FOCUS records plus Redshift, Databricks, "
+        f"and Snowflake data → {published} GOLD views."
     )
     typer.echo("Next: flashlight dashboard serve   # http://127.0.0.1:8501")

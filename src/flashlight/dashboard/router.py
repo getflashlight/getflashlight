@@ -500,59 +500,13 @@ def build_pages() -> None:
             show_alerts=False,
         )
 
-    def _render_snowflake_visibility_only() -> None:
-        """Render Snowflake visibility from a live connection or the bundled demo data."""
-        from flashlight.dashboard.snowflake import live_data, visibility_data
-        from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
-
-        # Prefer the customer's configured account.  The synthetic source is solely a
-        # demo fallback; selecting it when its Parquet files are absent caused DuckDB to
-        # interpret ACCOUNT_USAGE table names as local tables and return a 500.
-        if live_data.is_configured():
-            data = live_data
-        elif visibility_data.has_synthetic_data():
-            data = visibility_data
-        else:
-            no_data_page("Snowflake visibility")
-            ui.label(
-                "Add an enabled Snowflake connection on the Connections page, or "
-                "generate the bundled demo data."
-            ).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
-            return
-
-        with ui.tabs().classes("w-full").props("dense") as tabs:
-            tab_exec = ui.tab("LeaderBoard")
-            tab_vis = ui.tab("Visibility")
-        loaded: dict[str, bool] = {"LeaderBoard": False}
-        panels: dict[str, ui.tab_panel] = {}
-        with ui.tab_panels(tabs, value=tab_exec).classes("w-full").style(
-            "background:transparent;"
-        ):
-            panels["LeaderBoard"] = ui.tab_panel(tab_exec)
-            panels["Visibility"] = ui.tab_panel(tab_vis)
-        with panels["LeaderBoard"]:
-            snowflake_visibility.render_leaderboard(data)
-        loaded["LeaderBoard"] = True
-
-        def _on_tab_change(e: object) -> None:
-            name = getattr(e, "value", None)
-            if name == "Visibility" and name not in loaded:
-                loaded[name] = True
-                with panels["Visibility"]:
-                    snowflake_visibility.render(data)
-
-        tabs.on_value_change(_on_tab_change)
-
     def _render_snowflake_page(label: str) -> None:
-        """FOCUS spend via provider_focus, plus Snowflake visibility + driver health."""
-        from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
+        """Render Snowflake exclusively from materialized lake data."""
 
         provider_focus.render(
             "snowflake",
             label,
             extra_tabs=[
-                ("LeaderBoard", snowflake_visibility.render_leaderboard),
-                ("Visibility", snowflake_visibility.render),
                 (
                     "Client Driver Health",
                     lambda: driver_health.render("Snowflake", "Snowflake"),
@@ -561,8 +515,8 @@ def build_pages() -> None:
             show_alerts=False,
         )
 
-    # Explicit /snowflake before the catch-all: always reachable for the visibility UX
-    # even when gold/snowflake/ has not been published yet.
+    # Explicit /snowflake before the catch-all so its label and telemetry tab stay
+    # stable. Like every other provider route, it reads only published GOLD data.
     @ui.page("/snowflake")
     def _snowflake_page() -> None:
         label = provider_label("snowflake")
@@ -571,7 +525,7 @@ def build_pages() -> None:
             if "snowflake" in discover_provider_groups() and has_data():
                 _render_snowflake_page(label)
             else:
-                _render_snowflake_visibility_only()
+                no_data_page("Snowflake spend")
 
     # One parameterized route, not one @ui.page per group discovered right now —
     # discover_provider_groups() reads gold/ live, so it can (and does) return a
@@ -583,7 +537,7 @@ def build_pages() -> None:
     # instead means a group's page and its nav link agree at all times.
     @ui.page("/{group}")
     def _provider_page(group: str) -> None:
-        # /snowflake is registered explicitly above (visibility fallback before GOLD).
+        # /snowflake is registered explicitly above.
         # Starlette matches in registration order, so this catch-all should not see it;
         # if it does, mirror the dedicated page rather than 404.
         if group == "snowflake":
@@ -592,7 +546,7 @@ def build_pages() -> None:
                 if "snowflake" in discover_provider_groups() and has_data():
                     _render_snowflake_page(label)
                 else:
-                    _render_snowflake_visibility_only()
+                    no_data_page("Snowflake spend")
             return
         published_groups = set(discover_provider_groups())
         syncing = group in ingest_runner.active_provider_groups()

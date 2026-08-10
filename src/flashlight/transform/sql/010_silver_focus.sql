@@ -51,7 +51,11 @@ SELECT
     -- Derived dimensions.
     date_trunc('day', f.charge_period_start)::date     AS charge_day,
     date_trunc('month', f.charge_period_start)::date   AS charge_month,
-    (f.charge_category = 'Credit')                     AS is_credit,
+    -- A source may correctly label a correction as Adjustment while its signed
+    -- amount still reduces the invoice. Treat every negative line as a credit for
+    -- gross-vs-net reporting, including Bronze history written before a connector
+    -- learned the provider-specific credit label.
+    (f.charge_category = 'Credit' OR f.effective_cost < 0) AS is_credit,
     (f.charge_class = 'Correction')                    AS is_correction,
     -- True when the row's month is the current (still-accruing) calendar month.
     (date_trunc('month', f.charge_period_start)

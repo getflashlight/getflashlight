@@ -33,7 +33,8 @@ Auth priority: `private_key_path` → `authenticator` → password from `passwor
 
 ## Dashboard
 
-`/snowflake` is always reachable. When GOLD for Snowflake exists, the page is the
-standard provider spend surface plus LeaderBoard / Visibility / Client Driver Health
-tabs. Before the first ingest, LeaderBoard + Visibility fall back to synthetic
-Parquet under `snowflake/synthetic_data/`. See [Snowflake docs](../snowflake/user-guide.md).
+`/snowflake` is the standard provider spend surface, backed only by materialized
+Snowflake GOLD data. Run `fl ingest` after configuring the connection; before the
+first successful ingest the page shows an empty state. It never queries Snowflake
+from the dashboard process and has no local synthetic-data fallback. See
+[Snowflake docs](../snowflake/user-guide.md).

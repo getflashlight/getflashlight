@@ -30,6 +30,44 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
     resources = query_view("databricks.resource_month")
     assert sum(row["net_cost"] for row in parent) == sum(row["net_cost"] for row in resources)
 
+    # Snowflake is seeded through the same FOCUS BRONZE writer and is consequently
+    # published as an ordinary provider GOLD group, not a dashboard-local fixture.
+    snowflake = query_view("snowflake.monthly_bill")
+    snowflake_resources = query_view("snowflake.resource_month")
+    assert snowflake
+    assert sum(row["net_cost"] for row in snowflake) == sum(
+        row["net_cost"] for row in snowflake_resources
+    )
+    snowflake_credits = run_select(
+        "SELECT sum(net_cost) AS total FROM snowflake.credits_month "
+        "WHERE charge_description = 'Snowflake support credit'"
+    )[0]["total"]
+    assert float(snowflake_credits) == pytest.approx(-420.0)
+    snowflake_efficiency = run_select(
+        "SELECT count(*) AS count FROM efficiency.waste_record "
+        "WHERE provider_name = 'Snowflake'"
+    )[0]["count"]
+    snowflake_policy = run_select(
+        "SELECT count(*) AS count FROM policy.policy_record "
+        "WHERE provider_name = 'Snowflake'"
+    )[0]["count"]
+    snowflake_drivers = run_select(
+        "SELECT count(*) AS count FROM driver_health.driver_health "
+        "WHERE provider_name = 'Snowflake'"
+    )[0]["count"]
+    assert snowflake_efficiency > 0
+    assert snowflake_policy > 0
+    assert snowflake_drivers > 0
+    finance_driver_versions = {
+        row["client_driver"]
+        for row in run_select(
+            "SELECT DISTINCT client_driver FROM driver_health.driver_health "
+            "WHERE provider_name = 'Snowflake' "
+            "AND cluster_id = 'warehouse:redshift-finance'"
+        )
+    }
+    assert finance_driver_versions == {"PythonConnector 3.6.0", "PythonConnector 3.10.1"}
+
     # The Home page folds AWS-billed Databricks storage and compute into the Databricks
     # stack, while aws.* intentionally remains Redshift-only.  Assert that every mock
     # cost is represented exactly once in that visible, cross-page accounting model.
@@ -80,7 +118,8 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
     assert home_total == pytest.approx(databricks_total + float(aws))
 
     # The mocked utilization/efficiency queue is a separate, non-additive action
-    # layer: its priced opportunities are exactly 10% of each all-in platform total.
+    # layer. The Redshift/Databricks amounts remain the existing 10% demo model;
+    # Snowflake adds its independently measured low-utilization warehouse finding.
     opportunities = {
         row["provider_name"]: float(row["recoverable_cost"])
         for row in run_select(
@@ -89,8 +128,12 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
             "GROUP BY provider_name"
         )
     }
-    assert opportunities == pytest.approx({"Databricks": 4420.0, "AWS": 5860.0})
-    assert sum(opportunities.values()) == pytest.approx(home_total * 0.10)
+    assert opportunities == pytest.approx(
+        {"Databricks": 4420.0, "AWS": 5860.0, "Snowflake": 6587.88}
+    )
+    assert opportunities["Databricks"] + opportunities["AWS"] == pytest.approx(
+        home_total * 0.10
+    )
 
     # A daily chart and a date-range control should see a real month-shaped mock bill,
     # not a single synthetic point on the fifteenth.

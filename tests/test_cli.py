@@ -76,33 +76,28 @@ def test_dashboard_dev_mode_uses_the_flashlight_watcher(monkeypatch) -> None:  #
     assert watched == [True]
 
 
-def test_sample_generates_cross_cloud_and_snowflake_demo_data(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_sample_generates_cross_cloud_demo_data(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from flashlight import sample
 
     generated: list[str] = []
     monkeypatch.setattr(sample, "load_sample", lambda: generated.append("cross_cloud"))
-    monkeypatch.setattr(
-        sample, "generate_snowflake_dashboard_demo", lambda: generated.append("snowflake")
-    )
 
     result = runner.invoke(app, ["sample"])
 
     assert result.exit_code == 0
-    assert generated == ["cross_cloud", "snowflake"]
+    assert generated == ["cross_cloud"]
 
 
-def test_sample_clean_removes_cross_cloud_and_snowflake_demo_data(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_sample_clean_removes_cross_cloud_demo_data(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     from flashlight import sample
 
     cleaned: list[str] = []
     monkeypatch.setattr(sample, "cleanup", lambda: cleaned.append("cross_cloud"))
-    monkeypatch.setattr(
-        sample, "cleanup_snowflake_dashboard_demo", lambda: cleaned.append("snowflake"))
 
     result = runner.invoke(app, ["sample", "--clean"])
 
     assert result.exit_code == 0
-    assert cleaned == ["cross_cloud", "snowflake"]
+    assert cleaned == ["cross_cloud"]
 
 
 def test_aws_group_lists_all_subcommands() -> None:

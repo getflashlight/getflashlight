@@ -68,24 +68,20 @@ def sample(
         False, "--clean", help="Remove generated demo data instead of generating it"
     ),
 ) -> None:
-    """Generate the reconciled cross-cloud and Snowflake dashboard demos.
+    """Generate the reconciled cross-cloud FOCUS demo.
 
     The scenario is deterministic and schema-validated: cluster names, owners,
     emails, tags, cost records, and telemetry all refer to the same entities.
     """
     from flashlight.sample import (
         cleanup,
-        cleanup_snowflake_dashboard_demo,
-        generate_snowflake_dashboard_demo,
         load_sample,
     )
 
     if clean:
         cleanup()
-        cleanup_snowflake_dashboard_demo()
         return
     load_sample()
-    generate_snowflake_dashboard_demo()
 
 
 @mcp_app.command("serve")

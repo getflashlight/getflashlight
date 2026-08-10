@@ -53,20 +53,6 @@ def test_load_connections_registers_snowflake(tmp_path: Path) -> None:
     assert configs[0].account == "xy12345.us-east-1"
 
 
-def test_live_dashboard_detects_enabled_snowflake_connection(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """The dashboard must select live data instead of its optional demo files."""
-    config_dir = tmp_path / "config"
-    config_dir.mkdir()
-    (config_dir / "connections.yml").write_text(
-        "connectors:\n  - type: snowflake\n    enabled: true\n    account: xy12345.us-east-1\n"
-    )
-    monkeypatch.setenv("FLASHLIGHT_HOME", str(tmp_path))
-
-    from flashlight.dashboard.snowflake import live_data
-
-    assert live_data.is_configured() is True
-
-
 def test_build_connector_returns_real_snowflake_connector() -> None:
     cfg = SnowflakeConfig(account="xy12345", name="Org")
     connector = build_connector(cfg)
@@ -194,6 +180,25 @@ def test_map_row_marks_adjustment() -> None:
     assert record is not None
     assert record.charge_category == ChargeCategory.ADJUSTMENT
     assert record.service_category == ServiceCategory.STORAGE
+
+
+def test_map_row_marks_negative_adjustment_as_credit() -> None:
+    connector = SnowflakeConnector(SnowflakeConfig(account="xy12345"))
+    record = connector._map_row(
+        {
+            "USAGE_DATE": "2026-03-01",
+            "USAGE_IN_CURRENCY": "-1.25",
+            "IS_ADJUSTMENT": True,
+            "SERVICE_TYPE": "CLOUD_SERVICES",
+            "USAGE_TYPE": "support adjustment",
+            "ORGANIZATION_NAME": "ACME",
+            "CURRENCY": "USD",
+            "USAGE": 0,
+        }
+    )
+    assert record is not None
+    assert record.charge_category == ChargeCategory.CREDIT
+    assert record.effective_cost == Decimal("-1.25")
 
 
 def test_map_row_skips_null_usage_date() -> None:
