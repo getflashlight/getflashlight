@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from types import ModuleType
 
 from fastapi import HTTPException
 from fastapi.responses import RedirectResponse, Response
@@ -524,7 +525,7 @@ def build_pages() -> None:
         # demo fallback; selecting it when its Parquet files are absent caused DuckDB to
         # interpret ACCOUNT_USAGE table names as local tables and return a 500.
         if live_data.is_configured():
-            data = live_data
+            data: ModuleType = live_data
         elif visibility_data.has_synthetic_data():
             data = visibility_data
         else:

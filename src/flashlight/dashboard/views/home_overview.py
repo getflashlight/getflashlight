@@ -274,15 +274,21 @@ def _snowflake_tco_by_month() -> dict[date, float]:
     sf = _snowflake_data_module()
     if sf is None:
         return {}
-    return dict(sf.tco_by_month())  # type: ignore[attr-defined]
+    tco_by_month = getattr(sf, "tco_by_month", None)
+    if tco_by_month is None:
+        return {}
+    return dict(tco_by_month())
 
 
 def _snowflake_compute_by_month() -> dict[date, float]:
     """Managed + Serverless compute cost by month-start date from ACCOUNT_USAGE."""
     sf = _snowflake_data_module()
-    if sf is None or not hasattr(sf, "cost_breakdown_monthly"):
+    if sf is None:
         return {}
-    df = sf.cost_breakdown_monthly(12)  # type: ignore[attr-defined]
+    cost_breakdown_monthly = getattr(sf, "cost_breakdown_monthly", None)
+    if cost_breakdown_monthly is None:
+        return {}
+    df = cost_breakdown_monthly(12)
     if df is None or getattr(df, "empty", True):
         return {}
     compute = df[df["category"].isin(["Managed Compute", "Serverless Compute"])]
@@ -409,7 +415,12 @@ def _recoverable_by_provider(month: date) -> pd.Series:
     if sf is not None:
         values.pop(provider_name_for_group("snowflake"), None)
         values.pop("Snowflake", None)
-        waste = float(sf.hidden_waste_summary().get("total") or 0)  # type: ignore[attr-defined]
+        hidden_waste_summary = getattr(sf, "hidden_waste_summary", None)
+        waste = (
+            float(hidden_waste_summary().get("total") or 0)
+            if hidden_waste_summary is not None
+            else 0.0
+        )
         if waste:
             values[provider_name_for_group("snowflake")] = waste
     return pd.Series(values, dtype=float)
