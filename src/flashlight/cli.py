@@ -73,7 +73,7 @@ def sample(
         "--clean-snowflake",
         help=(
             "Remove only Snowflake ACCOUNT_USAGE demo data "
-            "(repo synthetic Parquet + FLASHLIGHT_HOME/account_usage/)"
+            "(FLASHLIGHT_HOME sample data + account_usage/)"
         ),
     ),
 ) -> None:
@@ -96,7 +96,7 @@ def sample(
         cleanup_snowflake_dashboard_demo()
         typer.echo(
             "Removed Snowflake ACCOUNT_USAGE demo "
-            "(repo synthetic Parquet + FLASHLIGHT_HOME/account_usage/)."
+            "(FLASHLIGHT_HOME sample data + account_usage/)."
         )
         typer.echo("Re-run ``flashlight ingest`` to restore live ACCOUNT_USAGE dumps.")
         return
