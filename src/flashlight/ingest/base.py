@@ -11,6 +11,7 @@ from flashlight.core.exceptions import FocusValidationError
 from flashlight.core.settings import get_settings
 from flashlight.efficiency.model import EfficiencyRecord
 from flashlight.focus.model import FocusRecord
+from flashlight.lake.account_usage_schema import AccountUsageBatch
 from flashlight.lake.ai_usage_schema import AiUsageRecord
 from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
@@ -183,6 +184,19 @@ class Connector(ABC):
         historical instance activity bounded by time, not a present-tense snapshot, so
         a pull for a given window is authoritative for that window and the writer does
         a real partition-replace (see ``lake.compute_instances.write_compute_instances``).
+
+        Best-effort — a failure here must not abort the canonical cost ingest (the
+        runner warns and skips).
+        """
+        return iter(())
+
+    def fetch_account_usage(self, window: IngestWindow) -> Iterator[AccountUsageBatch]:
+        """Yield ACCOUNT_USAGE table dumps for Visibility/LeaderBoard (default: none).
+
+        Optional, non-abstract. Snowflake overrides this to pull the warehouse /
+        metering / query / storage views the dashboard Visibility stack needs. Rows
+        land under ``FLASHLIGHT_HOME/account_usage/``; the dashboard reads only that
+        lake and never opens a live Snowflake connection.
 
         Best-effort — a failure here must not abort the canonical cost ingest (the
         runner warns and skips).

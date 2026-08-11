@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import pandas as pd
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -28,6 +29,8 @@ from flashlight.ingest.base import Connector, IngestWindow, ProgressCallback
 from flashlight.ingest.config import SnowflakeConfig, effective_connector_name, env
 from flashlight.ingest.connectors._snowflake_supported_drivers import check_support_status
 from flashlight.lake import bronze
+from flashlight.lake.account_usage import group_batches_by_month, snapshot_batch
+from flashlight.lake.account_usage_schema import AccountUsageBatch
 from flashlight.lake.driver_health_schema import DriverHealthRecord
 
 logger = get_logger(__name__)
@@ -105,6 +108,27 @@ WHERE USAGE_DATE BETWEEN %(start)s AND %(end)s
 """
 
 _DRIVER_HEALTH_SQL = (Path(__file__).parent / "sql" / "snowflake_driver_health.sql").read_text()
+
+# Visibility/LeaderBoard source tables. ``date_col`` None => snapshot (no time filter).
+# Optional tables (attribution) are skipped quietly when the account lacks them.
+_ACCOUNT_USAGE_TABLES: tuple[tuple[str, str | None, bool], ...] = (
+    # (Snowflake view name, date column for window filter, optional?)
+    ("WAREHOUSE_METERING_HISTORY", "START_TIME", False),
+    ("METERING_HISTORY", "START_TIME", False),
+    ("METERING_DAILY_HISTORY", "USAGE_DATE", False),
+    ("WAREHOUSE_LOAD_HISTORY", "START_TIME", False),
+    ("QUERY_HISTORY", "START_TIME", False),
+    ("STORAGE_USAGE", "USAGE_DATE", False),
+    ("TABLE_STORAGE_METRICS", None, False),
+    ("TAG_REFERENCES", None, True),
+    ("CORTEX_AI_FUNCTIONS_USAGE_HISTORY", "START_TIME", True),
+    ("CORTEX_SEARCH_DAILY_USAGE_HISTORY", "USAGE_DATE", True),
+    ("AUTOMATIC_CLUSTERING_HISTORY", "START_TIME", True),
+    ("PIPE_USAGE_HISTORY", "START_TIME", True),
+    ("SERVERLESS_TASK_HISTORY", "START_TIME", True),
+    ("DATA_TRANSFER_HISTORY", "START_TIME", True),
+    ("QUERY_ATTRIBUTION_HISTORY", "START_TIME", True),
+)
 
 _SERVICE_TYPE_CATEGORY: dict[str, ServiceCategory] = {
     "WAREHOUSE_METERING": ServiceCategory.COMPUTE,
@@ -327,3 +351,69 @@ class SnowflakeConnector(Connector):
             support_status=check_support_status(client_driver),
             x_source_connector=self.name,
         )
+
+    def fetch_account_usage(self, window: IngestWindow) -> Iterator[AccountUsageBatch]:
+        """Dump ACCOUNT_USAGE views for the ingest window into lake batches.
+
+        One Snowflake connection for the whole pull. Per-table failures on optional
+        views are skipped; required-view failures raise so the runner can warn.
+        """
+        database = self._config.database
+        conn = self._connect()
+        try:
+            for view, date_col, optional in _ACCOUNT_USAGE_TABLES:
+                stem = view.lower()
+                try:
+                    frame = self._fetch_account_usage_table(
+                        conn, database, view, date_col, window
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if optional:
+                        logger.warning(
+                            "account_usage_table_skipped",
+                            connector=self.name,
+                            table=view,
+                            error=str(exc),
+                        )
+                        continue
+                    raise
+                if frame is None or frame.empty:
+                    continue
+                if date_col is None:
+                    yield from snapshot_batch("Snowflake", stem, frame, window)
+                else:
+                    yield from group_batches_by_month(
+                        "Snowflake", stem, frame, date_col, window
+                    )
+        finally:
+            conn.close()
+
+    def _fetch_account_usage_table(
+        self,
+        conn: snowflake.connector.SnowflakeConnection,
+        database: str,
+        view: str,
+        date_col: str | None,
+        window: IngestWindow,
+    ) -> pd.DataFrame:
+        """SELECT the view for ``window`` (or full snapshot) as a pandas DataFrame."""
+        if date_col is None:
+            sql = f'SELECT * FROM {database}.ACCOUNT_USAGE."{view}"'  # noqa: S608
+            params: dict[str, object] | None = None
+        else:
+            sql = (
+                f'SELECT * FROM {database}.ACCOUNT_USAGE."{view}" '  # noqa: S608
+                f'WHERE "{date_col}" >= %(start)s AND "{date_col}" < %(end_exclusive)s'
+            )
+            # Inclusive end date → exclusive next-day bound for TIMESTAMP columns.
+            end_exclusive = window.end + timedelta(days=1)
+            params = {"start": window.start, "end_exclusive": end_exclusive}
+        cur = conn.cursor()
+        try:
+            if params is None:
+                cur.execute(sql)
+            else:
+                cur.execute(sql, params)
+            return cur.fetch_pandas_all()
+        finally:
+            cur.close()

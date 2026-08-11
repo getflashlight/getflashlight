@@ -1188,8 +1188,12 @@ def _storage() -> None:
         with chrome.panel():
             chrome.panel_title("Top 25 Tables — Storage Breakdown")
             fig_st = go.Figure()
-            names = top_tables["table_name"].apply(
-                lambda x: x.split(".")[-1] if "." in x else x
+            names = top_tables["table_name"].map(
+                lambda x: (
+                    str(x).rsplit(".", 1)[-1]
+                    if isinstance(x, str) and "." in x
+                    else (str(x) if x is not None and x == x else "(unknown)")
+                )
             ).tolist()
             fig_st.add_trace(go.Bar(
                 y=names, x=top_tables["active_gb"], name="Active",

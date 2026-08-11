@@ -1,13 +1,9 @@
-"""Snowflake live data layer — same API as snowflake_visibility_data.py but queries the
-customer's live ACCOUNT_USAGE views instead of synthetic Parquet files.
+"""Snowflake live data layer — DEPRECATED for dashboard use.
 
-Reads the Snowflake connector config from connections.yml and uses the same auth path
-(key-pair, authenticator, or password) as the ingest connector. All functions return
-empty DataFrames or zeroed dicts gracefully when no data is available.
-
-One page render opens many ACCOUNT_USAGE queries.  Use :func:`live_session` so they
-share a single connector (mirrors ``gold_session`` for DuckDB) — otherwise each call
-opens a new TCP/TLS session and stalls NiceGUI's event loop until WebSockets die.
+Visibility/LeaderBoard now read ``FLASHLIGHT_HOME/account_usage/`` via
+:mod:`flashlight.dashboard.snowflake.visibility_data` after ingest dumps ACCOUNT_USAGE
+tables. This module is retained only as a reference for the former live SQL shapes;
+dashboard and home must not import it for page renders.
 """
 
 from __future__ import annotations
@@ -470,18 +466,25 @@ def hidden_waste_compute() -> pd.DataFrame:
     return _query(f"""
         WITH metering AS (
             SELECT warehouse_name,
-                   warehouse_size,
                    SUM(credits_used) AS credits_used
             FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
             WHERE warehouse_id > 0
               AND start_time >= DATEADD('day', -30, CURRENT_DATE())
-            GROUP BY warehouse_name, warehouse_size
+            GROUP BY warehouse_name
         ),
         load AS (
             SELECT warehouse_name,
                    AVG(avg_running) AS avg_running
             FROM ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY
             WHERE start_time >= DATEADD('day', -30, CURRENT_DATE())
+            GROUP BY warehouse_name
+        ),
+        sizes AS (
+            SELECT warehouse_name,
+                   MAX(warehouse_size) AS warehouse_size
+            FROM ACCOUNT_USAGE.QUERY_HISTORY
+            WHERE warehouse_size IS NOT NULL
+              AND start_time >= DATEADD('day', -30, CURRENT_DATE())
             GROUP BY warehouse_name
         )
         SELECT m.warehouse_name AS warehouse_name,
@@ -498,9 +501,10 @@ def hidden_waste_compute() -> pd.DataFrame:
                     THEN 'Enable auto-suspend (60s); consider X-Small for dev'
                     ELSE 'Scale down warehouse size; review concurrent usage'
                END AS recommendation,
-               COALESCE(m.warehouse_size, 'UNKNOWN') AS size
+               COALESCE(s.warehouse_size, 'UNKNOWN') AS size
         FROM metering m
         LEFT JOIN load l USING (warehouse_name)
+        LEFT JOIN sizes s USING (warehouse_name)
         WHERE m.credits_used >= 10
           AND COALESCE(l.avg_running, 0) < 0.50
         ORDER BY wasted_cost_usd DESC
@@ -580,7 +584,10 @@ def hidden_waste_summary() -> dict[str, Any]:
 # ── TCO Trend & Forecast ──────────────────────────────────────────────────────
 
 def tco_monthly_trend_and_forecast() -> pd.DataFrame:
-    """Monthly TCO — actuals for complete months, linear-regression forecast for 6 ahead."""
+    """Monthly TCO — actuals for complete months, linear-regression forecast for 6 ahead.
+
+    Six projected bars = current partial month + next 5 complete months.
+    """
     df = _query("""
         WITH wh AS (
             SELECT DATE_TRUNC('month', start_time) AS month,
@@ -626,7 +633,7 @@ def tco_monthly_trend_and_forecast() -> pd.DataFrame:
         y = df["tco"].values.astype(float)
         slope, intercept = np.polyfit(x, y, 1)
         forecast_rows = []
-        for i in range(7):
+        for i in range(6):
             future_month = df["month"].max() + pd.DateOffset(months=i + 1)
             projected = intercept + slope * (len(df) - 1 + i + 1)
             forecast_rows.append({
@@ -1302,9 +1309,11 @@ def cost_breakdown_monthly(months: int = 12) -> pd.DataFrame:
                 if df.empty:
                     return pd.DataFrame()
 
+                month = pd.to_datetime(df["month"], utc=True, errors="coerce")
+                df["month"] = month.dt.tz_localize(None)
                 df = df.groupby(["month", "category"], as_index=False)["cost_usd"].sum()
                 df["cost_usd"] = df["cost_usd"].round(2)
-                df["month"] = pd.to_datetime(df["month"]).dt.strftime("%Y-%m")
+                df["month"] = df["month"].dt.strftime("%Y-%m")
                 df = df.sort_values(["month", "category"])
                 return df
             finally:

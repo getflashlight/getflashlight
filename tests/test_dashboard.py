@@ -95,20 +95,15 @@ def test_snowflake_page_without_connection_or_demo_shows_empty_state(
 ) -> None:  # type: ignore[no-untyped-def]
     """An optional demo dataset must not turn the always-reachable route into a 500.
 
-    Force both live config and the repo-local synthetic Parquet off — developers often
-    have ``snowflake/synthetic_data/*.parquet`` (gitignored) or a project
-    ``config/connections.yml`` that ``live_data._sf_config`` falls back to.
+    Force local ACCOUNT_USAGE off — developers often have
+    ``snowflake/synthetic_data/*.parquet`` (gitignored) or lake leftovers.
     """
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.dashboard.router import build_pages
 
     monkeypatch.setattr(
-        "flashlight.dashboard.snowflake.live_data.is_configured",
-        lambda: False,
-    )
-    monkeypatch.setattr(
-        "flashlight.dashboard.snowflake.visibility_data.has_synthetic_data",
+        "flashlight.dashboard.snowflake.visibility_data.has_local_data",
         lambda: False,
     )
 
@@ -2353,8 +2348,8 @@ def test_provider_nav_rows_are_bare_labels_with_databricks_first(lake_home) -> N
     """The "BY PROVIDER" nav rows read "Databricks" / "AWS Redshift", not
     "<label> spend" (the section heading already says these are spend pages), and
     order is Databricks → Snowflake → Redshift even though discover_provider_groups()
-    returns "aws" first alphabetically. Snowflake is force-included when the bundled
-    synthetic Visibility Parquet is present.
+    returns "aws" first alphabetically. Snowflake is force-included when local
+    ACCOUNT_USAGE Parquet is present (ingest or sample).
     """
     from flashlight.dashboard.router import _nav_groups, _nav_label
     from flashlight.dashboard.snowflake import visibility_data
@@ -2374,7 +2369,7 @@ def test_provider_nav_rows_are_bare_labels_with_databricks_first(lake_home) -> N
     bronze.write_window("t", window, [aws, dbx], ingest_run_id="r1")
     build_gold()
 
-    if visibility_data.has_synthetic_data():
+    if visibility_data.has_local_data():
         assert _nav_groups() == ["databricks", "snowflake", "aws"]
         assert [_nav_label(group) for group in _nav_groups()] == [
             "Databricks",

@@ -37,9 +37,10 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
     ]
     assert parent == resources
 
-    # Snowflake By Provider uses ACCOUNT_USAGE synthetic Parquet (Visibility), not a
-    # FOCUS ``snowflake.*`` GOLD group — ``fl sample`` writes those fixtures beside
-    # ``load_sample`` rather than emitting thin FOCUS BRONZE rows here.
+    # Snowflake By Provider uses ACCOUNT_USAGE Parquet under FLASHLIGHT_HOME
+    # (Visibility), not a FOCUS ``snowflake.*`` GOLD group — ``fl sample`` installs
+    # those fixtures into the lake rather than emitting thin FOCUS BRONZE rows here.
+    from flashlight.lake import account_usage
     from flashlight.sample import (
         _SNOWFLAKE_SYNTHETIC_DIR,
         cleanup_snowflake_dashboard_demo,
@@ -51,7 +52,11 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
     assert list(_SNOWFLAKE_SYNTHETIC_DIR.glob("*.parquet")), (
         "expected Snowflake ACCOUNT_USAGE demo Parquet under snowflake/synthetic_data/"
     )
+    assert account_usage.has_parquet(), (
+        "expected ACCOUNT_USAGE demo installed under FLASHLIGHT_HOME/account_usage/"
+    )
     cleanup_snowflake_dashboard_demo()
+    assert not account_usage.has_parquet()
 
     # The Home page folds AWS-billed Databricks storage and compute into the Databricks
     # stack, while aws.* intentionally remains Redshift-only.  Assert that every mock

@@ -48,21 +48,38 @@ _SNOWFLAKE_SYNTHETIC_DIR = Path(__file__).resolve().parents[2] / "snowflake" / "
 
 
 def generate_snowflake_dashboard_demo() -> None:
-    """Generate the synthetic ACCOUNT_USAGE files used by the Snowflake demo UI.
+    """Generate synthetic ACCOUNT_USAGE and install it under FLASHLIGHT_HOME.
 
     The generator remains beside its source data specification in the repository, but
-    this is the single supported entry point so ``fl sample`` seeds every dashboard
-    demo in one command.
+    ``fl sample`` installs the Parquet into ``account_usage_dir()`` so the dashboard
+    reads the same lake layout as a live ingest.
     """
+    from flashlight.lake import account_usage, paths
+
     generator = _SNOWFLAKE_SYNTHETIC_DIR / "generate.py"
     namespace = runpy.run_path(str(generator))
+    # Write flat Parquet next to the generator, then copy into the lake Hive layout.
     namespace["main"]()
+    paths.ensure_layout()
+    # Demo window ends 2026-08-08 — stamp partitions under that month.
+    account_usage.install_flat_parquets(
+        _SNOWFLAKE_SYNTHETIC_DIR,
+        charge_month="2026-08",
+    )
 
 
 def cleanup_snowflake_dashboard_demo() -> None:
-    """Remove only generated Snowflake demo Parquet files, never the generator."""
+    """Remove Snowflake demo Parquet (repo + lake ACCOUNT_USAGE), never the generator.
+
+    Clears ``FLASHLIGHT_HOME/account_usage/`` entirely — that root holds both sample
+    installs and live ingest dumps, so re-run ``flashlight ingest`` afterward if you
+    still need live Visibility data.
+    """
+    from flashlight.lake import account_usage
+
     for parquet in _SNOWFLAKE_SYNTHETIC_DIR.glob("*.parquet"):
         parquet.unlink()
+    account_usage.clear_account_usage()
 
 
 @dataclass(frozen=True)

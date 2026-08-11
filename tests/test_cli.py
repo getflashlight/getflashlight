@@ -93,11 +93,37 @@ def test_sample_clean_removes_cross_cloud_demo_data(monkeypatch) -> None:  # typ
 
     cleaned: list[str] = []
     monkeypatch.setattr(sample, "cleanup", lambda: cleaned.append("cross_cloud"))
+    monkeypatch.setattr(
+        sample, "cleanup_snowflake_dashboard_demo", lambda: cleaned.append("snowflake")
+    )
 
     result = runner.invoke(app, ["sample", "--clean"])
 
     assert result.exit_code == 0
-    assert cleaned == ["cross_cloud"]
+    assert cleaned == ["cross_cloud", "snowflake"]
+
+
+def test_sample_clean_snowflake_only(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from flashlight import sample
+
+    cleaned: list[str] = []
+    monkeypatch.setattr(
+        sample, "cleanup", lambda: cleaned.append("cross_cloud")
+    )
+    monkeypatch.setattr(
+        sample, "cleanup_snowflake_dashboard_demo", lambda: cleaned.append("snowflake")
+    )
+
+    result = runner.invoke(app, ["sample", "--clean-snowflake"])
+
+    assert result.exit_code == 0
+    assert cleaned == ["snowflake"]
+    assert "Snowflake ACCOUNT_USAGE demo" in result.output
+
+
+def test_sample_clean_and_clean_snowflake_conflict() -> None:
+    result = runner.invoke(app, ["sample", "--clean", "--clean-snowflake"])
+    assert result.exit_code != 0
 
 
 def test_aws_group_lists_all_subcommands() -> None:

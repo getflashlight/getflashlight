@@ -40,6 +40,7 @@ from flashlight.ingest.connectors import (
     SnowflakeConnector,
 )
 from flashlight.lake import (
+    account_usage,
     ai_usage,
     bronze,
     compute_instances,
@@ -50,6 +51,7 @@ from flashlight.lake import (
     runlog,
     storage_locations,
 )
+from flashlight.lake.account_usage_schema import AccountUsageBatch
 from flashlight.lake.ai_usage_schema import AiUsageRecord
 from flashlight.lake.compute_instance_schema import ComputeInstanceRecord
 from flashlight.lake.driver_health_schema import DriverHealthRecord
@@ -331,6 +333,7 @@ def _run_supplemental(
         lambda: _run_ai_usage(window, connectors, max_workers=1),
         lambda: _run_storage_locations(window, connectors, max_workers=1),
         lambda: _run_compute_instances(window, connectors, max_workers=1),
+        lambda: _run_account_usage(window, connectors, max_workers=1),
     )
     with ThreadPoolExecutor(max_workers=_max_workers(len(phases))) as pool:
         # Consume results so an unexpected programmer error keeps the former fail-fast
@@ -567,4 +570,36 @@ def _run_compute_instances(
         return 0
     written = compute_instances.write_compute_instances(window, all_records)
     logger.info("compute_instances_written", rows=written)
+    return written
+
+
+def _run_account_usage(
+    window: IngestWindow, connectors: list[Connector], *, max_workers: int | None = None
+) -> int:
+    """Pull ACCOUNT_USAGE table dumps for Visibility/LeaderBoard (best-effort).
+
+    Same never-block-cost-ingest guarantee and single-write merge as the other
+    supplemental planes. Only Snowflake emits these today; the dashboard reads the
+    resulting ``FLASHLIGHT_HOME/account_usage/`` Parquet and never connects live.
+    """
+
+    def _pull(connector: Connector) -> list[AccountUsageBatch]:
+        name = connector.name
+        try:
+            batches = list(connector.fetch_account_usage(window))
+        except Exception as exc:  # noqa: BLE001 - secondary signal; never block ingest
+            logger.warning("account_usage_pull_failed", connector=name, error=str(exc))
+            return []
+        if batches:
+            rows = sum(len(b.frame) for b in batches)
+            logger.info("account_usage_fetched", connector=name, batches=len(batches), rows=rows)
+        return batches
+
+    with ThreadPoolExecutor(max_workers=max_workers or _max_workers(len(connectors))) as pool:
+        all_batches = [batch for group in pool.map(_pull, connectors) for batch in group]
+
+    if not all_batches:
+        return 0
+    written = account_usage.write_account_usage(window, all_batches)
+    logger.info("account_usage_written", rows=written)
     return written

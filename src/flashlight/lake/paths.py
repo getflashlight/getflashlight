@@ -143,6 +143,18 @@ def compute_instances_dir() -> Path:
     return home() / "compute_instances"
 
 
+def account_usage_dir() -> Path:
+    """Snowflake ACCOUNT_USAGE snapshot root for Visibility/LeaderBoard.
+
+    A sibling of :func:`metrics_dir` so its differently-shaped rows cannot collide with
+    ``duck.register_metrics`` globs ``metrics_dir()/**/*.parquet`` recursively with
+    ``union_by_name=true``. Layout is either flat ``<table>.parquet`` (demo install) or
+    Hive ``provider_name=…/<table>/charge_month=…/*.parquet`` (ingest). The dashboard
+    reads only this lake (or a repo synthetic fallback) — never live Snowflake.
+    """
+    return home() / "account_usage"
+
+
 def gold_dir() -> Path:
     """GOLD root — one ``<view>.parquet`` per catalogued metric (consumer surface)."""
     return home() / "gold"
@@ -242,6 +254,7 @@ def ensure_layout() -> None:
         ai_usage_dir(),
         storage_locations_dir(),
         compute_instances_dir(),
+        account_usage_dir(),
         gold_dir(),
         runs_dir(),
         sync_logs_dir(),

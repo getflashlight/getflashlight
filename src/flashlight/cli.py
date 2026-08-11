@@ -2,7 +2,8 @@
 
     flashlight init               scaffold the lake home (config skeleton + connections.yml)
     flashlight sample             generate Redshift, Databricks, FOCUS, and Snowflake demos
-    flashlight sample --clean     remove generated demo data, then rebuild GOLD
+    flashlight sample --clean     remove generated demo data (all providers)
+    flashlight sample --clean-snowflake  remove only Snowflake ACCOUNT_USAGE demo data
     flashlight ingest             pull billing → BRONZE Parquet, then rebuild GOLD
     flashlight transform          rebuild GOLD Parquet from BRONZE
     flashlight cleanup            remove ALL lake data (BRONZE/GOLD Parquet + run log)
@@ -67,6 +68,14 @@ def sample(
     clean: bool = typer.Option(
         False, "--clean", help="Remove generated demo data instead of generating it"
     ),
+    clean_snowflake: bool = typer.Option(
+        False,
+        "--clean-snowflake",
+        help=(
+            "Remove only Snowflake ACCOUNT_USAGE demo data "
+            "(repo synthetic Parquet + FLASHLIGHT_HOME/account_usage/)"
+        ),
+    ),
 ) -> None:
     """Generate the reconciled cross-cloud and Snowflake dashboard demos.
 
@@ -81,9 +90,20 @@ def sample(
         load_sample,
     )
 
+    if clean and clean_snowflake:
+        raise typer.BadParameter("Use --clean or --clean-snowflake, not both")
+    if clean_snowflake:
+        cleanup_snowflake_dashboard_demo()
+        typer.echo(
+            "Removed Snowflake ACCOUNT_USAGE demo "
+            "(repo synthetic Parquet + FLASHLIGHT_HOME/account_usage/)."
+        )
+        typer.echo("Re-run ``flashlight ingest`` to restore live ACCOUNT_USAGE dumps.")
+        return
     if clean:
         cleanup()
         cleanup_snowflake_dashboard_demo()
+        typer.echo("Removed all generated demo data.")
         return
     load_sample()
     generate_snowflake_dashboard_demo()
