@@ -105,6 +105,15 @@ def _connect(cfg: SnowflakeConfig) -> snowflake.connector.SnowflakeConnection:
     return snowflake.connector.connect(**params)
 
 
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Lowercase Snowflake result columns — connector returns UPPERCASE by default."""
+    if df.columns.empty:
+        return df
+    out = df.copy()
+    out.columns = [str(c).lower() for c in out.columns]
+    return out
+
+
 def _query(sql: str) -> pd.DataFrame:
     """Run sql against the live Snowflake account; return empty DF on any error."""
     cfg = _sf_config()
@@ -115,7 +124,7 @@ def _query(sql: str) -> pd.DataFrame:
         try:
             cur = conn.cursor()
             cur.execute(sql)
-            return cur.fetch_pandas_all()
+            return _normalize_columns(cur.fetch_pandas_all())
         finally:
             conn.close()
     except Exception:  # noqa: BLE001
@@ -521,6 +530,9 @@ def tco_monthly_trend_and_forecast() -> pd.DataFrame:
         ORDER BY month
     """)
     if df.empty:
+        return pd.DataFrame()
+    if "total_credits" not in df.columns or "month" not in df.columns:
+        # Defensive: older connector paths or unexpected SELECT aliases.
         return pd.DataFrame()
     st = _fetchone(
         "SELECT ROUND((storage_bytes + stage_bytes + failsafe_bytes) "
