@@ -44,25 +44,7 @@ from flashlight.transform.runner import build_gold
 SAMPLE_CONNECTOR = "flashlight_demo_focus"
 REDSHIFT_CONNECTOR = "flashlight_demo_redshift"
 DATABRICKS_CONNECTOR = "flashlight_demo_databricks"
-_SNOWFLAKE_SYNTHETIC_DIR = Path(__file__).resolve().parents[2] / "snowflake" / "synthetic_data"
-
-
-def generate_snowflake_dashboard_demo() -> None:
-    """Generate the synthetic ACCOUNT_USAGE files used by the Snowflake demo UI.
-
-    The generator remains beside its source data specification in the repository, but
-    this is the single supported entry point so ``fl sample`` seeds every dashboard
-    demo in one command.
-    """
-    generator = _SNOWFLAKE_SYNTHETIC_DIR / "generate.py"
-    namespace = runpy.run_path(str(generator))
-    namespace["main"]()
-
-
-def cleanup_snowflake_dashboard_demo() -> None:
-    """Remove only generated Snowflake demo Parquet files, never the generator."""
-    for parquet in _SNOWFLAKE_SYNTHETIC_DIR.glob("*.parquet"):
-        parquet.unlink()
+SNOWFLAKE_CONNECTOR = "flashlight_demo_snowflake"
 
 
 @dataclass(frozen=True)
@@ -180,6 +162,64 @@ _DATABRICKS_SKUS: tuple[DemoSku, ...] = (
     DemoSku(
         "GENIE",
         "GENIE_FREE_USAGE",
+        Decimal("1"),
+        ServiceCategory.AI_AND_MACHINE_LEARNING,
+        ComputeClass.SERVERLESS,
+    ),
+    # Keep the visible attribution table production-shaped: the long tail matters
+    # when demonstrating filtering/exporting, even though it is small in dollar terms.
+    DemoSku(
+        "INTERACTIVE",
+        "ENTERPRISE_INTERACTIVE_COMPUTE",
+        Decimal("6844"),
+        ServiceCategory.ANALYTICS,
+        ComputeClass.CLASSIC,
+    ),
+    DemoSku(
+        "PREDICTIVE_OPTIMIZATION",
+        "PREDICTIVE_OPTIMIZATION",
+        Decimal("4937"),
+        ServiceCategory.ANALYTICS,
+        ComputeClass.SERVERLESS,
+    ),
+    DemoSku(
+        "APPS",
+        "DATABRICKS_APPS",
+        Decimal("2401"),
+        ServiceCategory.ANALYTICS,
+        ComputeClass.SERVERLESS,
+    ),
+    DemoSku(
+        "ONLINE_TABLES",
+        "ONLINE_TABLES",
+        Decimal("1178"),
+        ServiceCategory.DATABASES,
+        ComputeClass.SERVERLESS,
+    ),
+    DemoSku(
+        "LAKEBASE",
+        "LAKEBASE_COMPUTE",
+        Decimal("707"),
+        ServiceCategory.DATABASES,
+        ComputeClass.SERVERLESS,
+    ),
+    DemoSku(
+        "DATA_SHARING",
+        "DELTA_SHARING",
+        Decimal("70"),
+        ServiceCategory.ANALYTICS,
+        ComputeClass.SERVERLESS,
+    ),
+    DemoSku(
+        "FINE_GRAINED_ACCESS_CONTROL",
+        "FINE_GRAINED_ACCESS_CONTROL",
+        Decimal("1"),
+        ServiceCategory.ANALYTICS,
+        ComputeClass.NOT_APPLICABLE,
+    ),
+    DemoSku(
+        "AI_GATEWAY",
+        "AI_GATEWAY",
         Decimal("1"),
         ServiceCategory.AI_AND_MACHINE_LEARNING,
         ComputeClass.SERVERLESS,
@@ -306,6 +346,79 @@ def scenario() -> DemoScenario:
                 owner_email="avery.chen@northstar.example",
                 project="data-platform",
             ),
+            *[
+                DemoEntity(
+                    id=(
+                        f"job-{1059200000000000 + job_index}-"
+                        f"run-{403840000000000 + job_index * 7919}-pipeline-cluster"
+                    ),
+                    name=(
+                        f"job-{domain}-{job_index + 1:03d}-"
+                        f"{'photon' if job_index % 5 == 0 else 'standard'}"
+                    ),
+                    owner_email=(
+                        "jordan.patel@northstar.example",
+                        "morgan.reyes@northstar.example",
+                        "priya.shah@northstar.example",
+                        "avery.chen@northstar.example",
+                        "elena.garcia@northstar.example",
+                        "noah.williams@northstar.example",
+                    )[job_index % 6],
+                    project=domain,
+                )
+                for job_index, domain in enumerate(
+                    (
+                        "analytics",
+                        "ml-platform",
+                        "risk",
+                        "data-platform",
+                        "product-analytics",
+                        "finance",
+                    )
+                    * 12
+                )
+            ],
+            *[
+                DemoEntity(
+                    id=f"interactive-{cluster_index + 1:03d}",
+                    name=(
+                        f"Single User Cluster - {owner}"
+                        if cluster_index % 3 == 0
+                        else f"{project}-shared-notebook-{cluster_index + 1:02d}"
+                    ),
+                    owner_email=owner,
+                    project=project,
+                )
+                for cluster_index, (owner, project) in enumerate(
+                    [
+                        ("jordan.patel@northstar.example", "analytics"),
+                        ("morgan.reyes@northstar.example", "ml-platform"),
+                        ("priya.shah@northstar.example", "risk"),
+                        ("avery.chen@northstar.example", "data-platform"),
+                        ("elena.garcia@northstar.example", "product-analytics"),
+                        ("noah.williams@northstar.example", "finance"),
+                    ]
+                    * 5
+                )
+            ],
+            *[
+                DemoEntity(
+                    id=f"sql-warehouse-{warehouse_index + 1:02d}",
+                    name=f"{project}-sql-warehouse-{warehouse_index + 1:02d}",
+                    owner_email=owner,
+                    project=project,
+                )
+                for warehouse_index, (owner, project) in enumerate(
+                    [
+                        ("jordan.patel@northstar.example", "analytics"),
+                        ("elena.garcia@northstar.example", "product-analytics"),
+                        ("noah.williams@northstar.example", "finance"),
+                        ("priya.shah@northstar.example", "risk"),
+                        ("avery.chen@northstar.example", "data-platform"),
+                        ("morgan.reyes@northstar.example", "ml-platform"),
+                    ]
+                )
+            ],
         ],
         endpoints=[
             DemoEntity(
@@ -421,9 +534,7 @@ def _cost(
         ),
         consumed_quantity=float(amount),
         consumed_unit=(
-            "DBU"
-            if provider == "Databricks"
-            else ("Credits" if provider == "Snowflake" else "Hrs")
+            "DBU" if provider == "Databricks" else ("Credits" if provider == "Snowflake" else "Hrs")
         ),
         tags=tags,
         x_compute_class=compute_class,
@@ -462,18 +573,27 @@ def _monthly_cost(
     if not 1 <= charge_days <= monthrange(month.year, month.month)[1]:
         raise ValueError(f"invalid mock charge-day count for {month}: {charge_days}")
     # Use a deterministic workload-shaped daily profile instead of an even division.
-    # This creates weekday/weekend variation and occasional batch spikes while keeping
-    # the resource × SKU monthly total exact to the cent.
+    # Allocate integer cents with a largest-remainder pass: independently rounding
+    # each day can otherwise make tiny resource/SKU allocations finish with a negative
+    # last day. A negative usage line is a credit in GOLD, which incorrectly raises the
+    # visible gross cost above the month's intended allocation.
     seed = sum(ord(char) for char in f"{entity.id}:{service}:{sku_id or ''}") % 17
     weights = [
-        Decimal(70 + ((day * 11 + seed * 7) % 53) + (42 if (day + seed) % 13 == 0 else 0))
+        70 + ((day * 11 + seed * 7) % 53) + (42 if (day + seed) % 13 == 0 else 0)
         for day in range(1, charge_days + 1)
     ]
-    weight_total = sum(weights, Decimal("0"))
-    daily_amounts = [
-        (amount * weight / weight_total).quantize(Decimal("0.01")) for weight in weights[:-1]
-    ]
-    daily_amounts.append(amount - sum(daily_amounts, Decimal("0")))
+    cents = int((amount * 100).to_integral_value())
+    weight_total = sum(weights)
+    daily_cents = [cents * weight // weight_total for weight in weights]
+    remaining_cents = cents - sum(daily_cents)
+    remainders = sorted(
+        range(charge_days),
+        key=lambda day: (cents * weights[day] % weight_total, -day),
+        reverse=True,
+    )
+    for day in remainders[:remaining_cents]:
+        daily_cents[day] += 1
+    daily_amounts = [Decimal(value) / 100 for value in daily_cents]
     records = [
         _cost(
             entity,
@@ -541,11 +661,16 @@ def _databricks_allocation(index: int, month: date) -> dict[str, Decimal]:
     total = (full_month_total * Decimal(_mock_charge_days(month)) / full_days).quantize(
         Decimal("0.01")
     )
+    # Allocate to cents before creating daily FOCUS records. The final component
+    # receives the remainder, so these three figures always reconcile exactly to
+    # the all-in total (including August's partial month).
+    dbus = (total * Decimal("0.761")).quantize(Decimal("0.01"))
+    backing_compute = (total * Decimal("0.168")).quantize(Decimal("0.01"))
     return {
         "total": total,
-        "dbus": total * Decimal("0.761"),
-        "backing_compute": total * Decimal("0.168"),
-        "backing_storage": total * Decimal("0.071"),
+        "dbus": dbus,
+        "backing_compute": backing_compute,
+        "backing_storage": total - dbus - backing_compute,
     }
 
 
@@ -665,19 +790,106 @@ def _records(
                     provider_name="AWS",
                     charge_month=month,
                     entity_type=EntityType.SQL_WAREHOUSE,
-                    entity_id=entity.id,
+                    # Redshift's cluster identifier in both the AWS ARN and telemetry
+                    # is the bare identifier, not the sample's internal `redshift-`
+                    # label. Keeping this join key identical prevents the dashboard
+                    # from presenting an uninstrumented duplicate tab.
+                    entity_id=entity.id.removeprefix("redshift-"),
                     entity_name=entity.name,
                     owner_user=str(entity.owner_email),
                     owner_project=entity.project,
                     billed_cost=amount,
                     native_quantity=float(amount / 10),
                     native_unit="node-hours",
-                    utilization_pct=81.0 + cluster_index * 8,
-                    activity_count=320 + index * 25,
-                    cause_detail={"failed_cost": float(amount * Decimal("0.10"))},
+                    utilization_pct=22.0 + cluster_index * 51,
+                    activity_count=1_600 + index * 180 + cluster_index * 460,
+                    cause_detail={
+                        "compute_cost": float(redshift["compute"] / len(data.redshift_clusters)),
+                        "concurrency_scaling_cost": float(
+                            redshift["concurrency_scaling"] / len(data.redshift_clusters)
+                        ),
+                        "storage_cost": float(redshift["storage"] / len(data.redshift_clusters)),
+                        "spectrum_scan_cost": float(
+                            redshift["spectrum_scan"] / len(data.redshift_clusters)
+                        ),
+                        "on_demand_node_hours": 980 + index * 45 + cluster_index * 160,
+                        "reserved_node_hours": 220 + cluster_index * 110,
+                        "disk_spill_query_count": 75 + index * 12 + cluster_index * 20,
+                        "wlm_queue_wait_ms_p95": 6_400 + cluster_index * 1_800,
+                        "wlm_queue_wait_ms_p99": 14_000 + cluster_index * 2_000,
+                        "cluster_cpu_utilization_avg_pct": 21 + cluster_index * 52,
+                        "cluster_cpu_utilization_max_pct": 46 + cluster_index * 47,
+                        "cluster_disk_space_used_avg_pct": 48 + cluster_index * 19,
+                        "cluster_disk_space_used_max_pct": 76 + cluster_index * 14,
+                        "concurrency_scaling_active_seconds": 16_000 + index * 1_800,
+                        "failed_cost": float(amount * Decimal("0.04")),
+                    },
                     x_source_connector=REDSHIFT_CONNECTOR,
                 )
             )
+            cluster_id = entity.id.removeprefix("redshift-")
+            # Query-pattern and table facts are derived telemetry: they deliberately
+            # carry $0 because Redshift bills shared cluster capacity, not a statement
+            # or table. They enrich drill-throughs without creating a second bill.
+            for query_index in range(60):
+                efficiency.append(
+                    EfficiencyRecord(
+                        provider_name="AWS",
+                        charge_month=month,
+                        entity_type=EntityType.QUERY_PATTERN,
+                        entity_id=f"{cluster_id}:query-{query_index + 1:03d}",
+                        entity_name=f"query-pattern-{query_index + 1:03d}",
+                        owner_user=str(data.people[query_index % len(data.people)].email),
+                        owner_project=entity.project,
+                        activity_count=8 + query_index * 3,
+                        cause_detail={
+                            "run_count": 8 + query_index * 3,
+                            "pct_runs_spilling": 0.55 if query_index % 3 else 0.18,
+                            "avg_disk_spill_gb": 2.5 + query_index / 3,
+                            "avg_skew_ratio": 2.3 if query_index % 4 else 1.2,
+                            "max_skew_ratio": 4.2 + query_index / 8,
+                            "sample_query_text": (
+                                "SELECT customer_id, SUM(amount) FROM fact_orders GROUP BY 1"
+                            ),
+                        },
+                        x_source_connector=REDSHIFT_CONNECTOR,
+                    )
+                )
+            for table_index in range(120):
+                spectrum_table = table_index % 5 == 0
+                efficiency.append(
+                    EfficiencyRecord(
+                        provider_name="AWS",
+                        charge_month=month,
+                        entity_type=EntityType.TABLE,
+                        entity_id=f"{cluster_id}:table-{table_index + 1:03d}",
+                        entity_name=f"{entity.project}_fact_{table_index + 1:03d}",
+                        owner_user=str(entity.owner_email),
+                        owner_project=entity.project,
+                        native_quantity=80.0 + table_index * 6.5,
+                        native_unit="GB",
+                        cause_detail={
+                            "encoded": "N" if table_index % 4 == 0 else "Y",
+                            "tbl_rows": 200_000 + table_index * 41_000,
+                            "unsorted_pct": 28.0 if table_index % 3 == 0 else 4.0,
+                            "stats_off_pct": 31.0 if table_index % 6 == 0 else 6.0,
+                            "days_since_last_access": 120 if table_index % 7 == 0 else 14,
+                            "spectrum_scan_count": 14 + table_index if spectrum_table else None,
+                            "spectrum_scanned_gb": 90.0 + table_index * 2.0
+                            if spectrum_table
+                            else None,
+                            "spectrum_returned_gb": 4.0 + table_index / 10
+                            if spectrum_table
+                            else None,
+                            "spectrum_allocated_cost": float(
+                                redshift["spectrum_scan"] / Decimal("48")
+                            )
+                            if spectrum_table
+                            else None,
+                        },
+                        x_source_connector=REDSHIFT_CONNECTOR,
+                    )
+                )
             health.append(
                 DriverHealthRecord(
                     provider_name="AWS",
@@ -709,22 +921,11 @@ def _records(
         dbx_totals: dict[str, Decimal] = {entity.id: Decimal("0") for entity in dbx_entities}
         for sku, sku_amount in _databricks_sku_allocation(databricks["dbus"]):
             targets = data.endpoints if sku.service == "MODEL_SERVING" else data.databricks_clusters
-            weights = (
-                (
-                    Decimal("0.31"),
-                    Decimal("0.22"),
-                    Decimal("0.18"),
-                    Decimal("0.17"),
-                    Decimal("0.12"),
-                )
-                if sku.service != "MODEL_SERVING"
-                else (
-                    Decimal("0.34"),
-                    Decimal("0.23"),
-                    Decimal("0.18"),
-                    Decimal("0.15"),
-                    Decimal("0.10"),
-                )
+            # A deterministic, non-uniform distribution makes every workload visibly
+            # different while weighted_split preserves the exact SKU/month total.
+            weights = tuple(
+                Decimal(10 + ((position * 17 + len(sku.service) * 5) % 41))
+                for position in range(len(targets))
             )
             for entity, amount in zip(targets, weighted_split(sku_amount, weights), strict=True):
                 costs.extend(
@@ -747,8 +948,11 @@ def _records(
                 )
                 dbx_totals[entity.id] += amount
 
-        for entity in data.databricks_clusters:
-            instance_id = f"i-demo-{entity.id[-8:]}-{index}"
+        for entity_index, entity in enumerate(data.databricks_clusters):
+            # Job-run resource ids commonly end in the same `-cluster` suffix.
+            # Use the fleet position, not that suffix, so every backing EC2 node has
+            # a distinct physical instance identity and cannot be deduplicated.
+            instance_id = f"i-demo-{entity_index:04d}-{index}"
             instances.append(
                 ComputeInstanceRecord(
                     provider_name="Databricks",
@@ -775,28 +979,24 @@ def _records(
                     x_source_connector=DATABRICKS_CONNECTOR,
                 )
             )
-        for entity, amount, pricing in zip(
-            data.databricks_clusters,
-            weighted_split(
-                databricks["backing_compute"],
-                (
-                    Decimal("0.34"),
-                    Decimal("0.24"),
-                    Decimal("0.19"),
-                    Decimal("0.14"),
-                    Decimal("0.09"),
-                ),
-            ),
-            (
-                PricingCategory.COMMITTED,
-                PricingCategory.DYNAMIC,
-                PricingCategory.STANDARD,
-                PricingCategory.COMMITTED,
-                PricingCategory.DYNAMIC,
-            ),
-            strict=True,
+        backing_weights = tuple(
+            Decimal(10 + ((position * 19 + 7) % 37))
+            for position in range(len(data.databricks_clusters))
+        )
+        pricing_cycle = (
+            PricingCategory.COMMITTED,
+            PricingCategory.DYNAMIC,
+            PricingCategory.STANDARD,
+        )
+        for entity_index, (entity, amount) in enumerate(
+            zip(
+                data.databricks_clusters,
+                weighted_split(databricks["backing_compute"], backing_weights),
+                strict=True,
+            )
         ):
-            instance_id = f"i-demo-{entity.id[-8:]}-{index}"
+            pricing = pricing_cycle[entity_index % len(pricing_cycle)]
+            instance_id = f"i-demo-{entity_index:04d}-{index}"
             costs.extend(
                 _monthly_cost(
                     entity,
@@ -873,37 +1073,96 @@ def _records(
                 )
 
         opportunities = split(
-            (databricks["total"] * Decimal("0.10")).quantize(Decimal("0.01")),
-            len(dbx_entities),
-        )
-        entity_types = (
-            EntityType.JOB,
-            EntityType.JOB,
-            EntityType.INTERACTIVE,
-            EntityType.SQL_WAREHOUSE,
-            EntityType.INTERACTIVE,
+            (databricks["total"] * Decimal("0.10")).quantize(Decimal("0.01")), len(dbx_entities)
         )
         for entity_index, (entity, opportunity) in enumerate(
             zip(dbx_entities, opportunities, strict=True)
         ):
             amount = dbx_totals[entity.id]
             entity_type = (
-                EntityType.ENDPOINT if entity in data.endpoints else entity_types[entity_index]
+                EntityType.ENDPOINT
+                if entity in data.endpoints
+                else EntityType.SQL_WAREHOUSE
+                if entity.id.startswith("sql-warehouse-")
+                else EntityType.INTERACTIVE
+                if entity.id.startswith("interactive-")
+                or entity.id in {"0301-shared-analytics", "0301-orchestration"}
+                else EntityType.JOB
             )
             policy_facts: dict[str, int | str] = {}
             if entity_type == EntityType.INTERACTIVE:
                 policy_facts = {
-                    "auto_termination_minutes": 45 if entity_index == 2 else 120,
-                    "min_autoscale_workers": 2,
-                    "max_autoscale_workers": 8 if entity_index == 2 else 2,
-                    "tag_count": 5 if entity_index == 2 else 0,
+                    "auto_termination_minutes": 10 + (entity_index % 7) * 15,
+                    "min_autoscale_workers": 1 + entity_index % 3,
+                    "max_autoscale_workers": 2 + entity_index % 10,
+                    "tag_count": entity_index % 5,
                 }
-                if entity_index == 2:
-                    policy_facts["policy_id"] = "shared-analytics-guardrails"
+                if entity_index % 3:
+                    policy_facts["policy_id"] = f"interactive-guardrails-{entity_index % 8 + 1}"
             elif entity_type == EntityType.SQL_WAREHOUSE:
-                policy_facts = {"tag_count": 4, "auto_stop_minutes": 20}
+                policy_facts = {
+                    "tag_count": 1 + entity_index % 6,
+                    "auto_stop_minutes": 5 + entity_index % 7 * 10,
+                }
             elif entity_type == EntityType.ENDPOINT:
                 policy_facts = {"tag_count": 4 if entity_index % 2 else 0}
+            telemetry: dict[str, int | float | str | bool] = {
+                "failed_cost": float(opportunity),
+                "scale_to_zero_enabled": entity not in data.endpoints[:2],
+            }
+            if entity_type == EntityType.JOB:
+                telemetry.update(
+                    {
+                        "pct_runs_underutilized": 0.85 if entity_index % 4 == 0 else 0.42,
+                        "photon": entity_index % 5 == 0,
+                        "max_cpu_pct": 63.0 + entity_index % 34,
+                        "max_mem_pct": 58.0 + entity_index % 37,
+                        "pct_time_high_cpu_wait": 0.18 if entity_index % 3 == 0 else 0.04,
+                        "pct_time_high_mem_swap": 0.15 if entity_index % 5 == 0 else 0.03,
+                        "min_local_disk_free_bytes": 7_000_000_000
+                        if entity_index % 7 == 0
+                        else 42_000_000_000,
+                        "network_bytes": 780_000_000_000
+                        if entity_index % 4 == 0
+                        else 180_000_000_000,
+                        "avg_run_seconds": 480 + entity_index * 9,
+                        "worker_node_type": "m5d.4xlarge" if entity_index % 3 else "r5d.8xlarge",
+                    }
+                )
+            elif entity_type == EntityType.INTERACTIVE:
+                telemetry.update(
+                    {
+                        "photon": entity_index % 4 == 0,
+                        "worker_node_type": "m5d.4xlarge" if entity_index % 3 else "r5d.8xlarge",
+                        "core_count": 16 if entity_index % 3 else 32,
+                        "availability": "ON_DEMAND" if entity_index % 2 else "SPOT_WITH_FALLBACK",
+                        "job_shaped_cost": float(amount * Decimal("0.35"))
+                        if entity_index % 3 == 0
+                        else 0.0,
+                        "jobs_priced_cost": float(amount * Decimal("0.19"))
+                        if entity_index % 3 == 0
+                        else 0.0,
+                        "top_job_name": f"scheduled-refresh-{entity_index:03d}",
+                        "top_job_owner": str(entity.owner_email),
+                    }
+                )
+            elif entity_type == EntityType.SQL_WAREHOUSE:
+                telemetry.update(
+                    {
+                        "warehouse_type": "SERVERLESS" if entity_index % 2 else "PRO",
+                        "cache_hit_pct": 2.0 if entity_index % 2 else 38.0,
+                        "query_count": 1_400 + entity_index * 90,
+                        "spill_query_count": 45 + entity_index * 4,
+                        "spilled_bytes": 180_000_000_000 + entity_index * 8_000_000_000,
+                    }
+                )
+            elif entity_type == EntityType.ENDPOINT:
+                telemetry.update(
+                    {
+                        "request_count": 260 + entity_index * 35,
+                        "workload_type": "GPU_MEDIUM" if entity_index % 2 == 0 else "CPU",
+                    }
+                )
             efficiency.append(
                 EfficiencyRecord(
                     provider_name="Databricks",
@@ -918,16 +1177,56 @@ def _records(
                     native_unit="DBU",
                     utilization_pct=90.0
                     if entity in data.endpoints
-                    else 76.0 + (len(entity.id) % 15),
-                    activity_count=600 + index * 75,
+                    else float(35 + (entity_index * 11 + index * 7) % 61),
+                    activity_count=90 + entity_index * 13 + index * 75,
                     cause_detail={
-                        "failed_cost": float(opportunity),
-                        "scale_to_zero_enabled": entity not in data.endpoints[:2],
+                        **telemetry,
                         **policy_facts,
                     },
                     x_source_connector=DATABRICKS_CONNECTOR,
                 )
             )
+            if entity_type == EntityType.SQL_WAREHOUSE:
+                # Per-user allocations are visibility-only. Their $0 billed cost avoids
+                # double charging the warehouse while making concentration and cadence
+                # drill-throughs useful on every warehouse.
+                for user_index in range(18):
+                    person = data.people[user_index % len(data.people)]
+                    efficiency.append(
+                        EfficiencyRecord(
+                            provider_name="Databricks",
+                            charge_month=month,
+                            entity_type=EntityType.SQL_WAREHOUSE_USER,
+                            entity_id=f"{entity.id}:user-{user_index + 1:02d}",
+                            entity_name=f"{entity.name} / {person.name}",
+                            owner_user=str(person.email),
+                            owner_project=entity.project,
+                            activity_count=25 + user_index * 18,
+                            cause_detail={
+                                "warehouse_type": "SERVERLESS" if entity_index % 2 else "PRO",
+                                "duration_share_pct": 52.0 if user_index == 0 else 48.0 / 17,
+                                "query_count": 140 + user_index * 21,
+                                "avg_interval_minutes": 20 + user_index % 5 * 15,
+                            },
+                            x_source_connector=DATABRICKS_CONNECTOR,
+                        )
+                    )
+            if entity_type == EntityType.JOB and entity_index % 2 == 0:
+                for notebook_index in range(2):
+                    efficiency.append(
+                        EfficiencyRecord(
+                            provider_name="Databricks",
+                            charge_month=month,
+                            entity_type=EntityType.NOTEBOOK,
+                            entity_id=f"{entity.id}:notebook-{notebook_index + 1}",
+                            entity_name=f"{entity.name} notebook {notebook_index + 1}",
+                            owner_user=str(entity.owner_email),
+                            owner_project=entity.project,
+                            activity_count=12 + notebook_index * 7,
+                            cause_detail={"jobs_priced_cost": 0.0},
+                            x_source_connector=DATABRICKS_CONNECTOR,
+                        )
+                    )
         for endpoint_index, endpoint in enumerate(data.endpoints):
             # One canonical owning requester per endpoint keeps allocated token cost
             # exactly equal to the endpoint's FOCUS charge, while endpoints themselves
@@ -1000,6 +1299,21 @@ def _assert_reconciled(costs: list[FocusRecord], efficiency: list[EfficiencyReco
         focus_totals[key] = focus_totals.get(key, Decimal("0")) + record.effective_cost
         if record.provider_name == "AWS" and ":cluster:" in (record.resource_id or ""):
             cluster_id = (record.resource_id or "").rsplit(":cluster:", 1)[1]
+            # Redshift telemetry uses the physical bare cluster id; the sample's
+            # human-readable demo entity retains a `redshift-` prefix.
+            focus_totals[
+                (record.provider_name, cluster_id, record.charge_period_start.date().replace(day=1))
+            ] = (
+                focus_totals.get(
+                    (
+                        record.provider_name,
+                        cluster_id,
+                        record.charge_period_start.date().replace(day=1),
+                    ),
+                    Decimal("0"),
+                )
+                + record.effective_cost
+            )
             legacy_key = (
                 record.provider_name,
                 f"redshift-{cluster_id}",
@@ -1009,6 +1323,11 @@ def _assert_reconciled(costs: list[FocusRecord], efficiency: list[EfficiencyReco
                 focus_totals.get(legacy_key, Decimal("0")) + record.effective_cost
             )
     for efficiency_record in efficiency:
+        # Derived telemetry (query patterns, tables, notebook/user attribution) is
+        # intentionally unbilled. It supplies drill-through evidence only and must
+        # never be forced into a made-up FOCUS resource allocation.
+        if efficiency_record.billed_cost == 0:
+            continue
         key = (
             efficiency_record.provider_name,
             efficiency_record.entity_id,
@@ -1137,27 +1456,24 @@ def _audit_demo_accounting() -> None:
                 )
                 equal(f"Redshift {subcategory} share", component, amount)
 
-            # Utilization/efficiency is another drill-through, not another bill. The
-            # mocked retry opportunities intentionally add to 10% of each provider's
-            # all-in cost, while the source bill itself remains unchanged.
-            dbx_opportunity = scalar(
-                "SELECT sum(recoverable_cost) FROM efficiency.waste_record "
-                f"WHERE provider_name = 'Databricks' AND charge_month = '{stamp}'"
-            )
-            aws_opportunity = scalar(
-                "SELECT sum(recoverable_cost) FROM efficiency.waste_record "
-                f"WHERE provider_name = 'AWS' AND charge_month = '{stamp}'"
-            )
-            equal(
-                "Databricks efficiency opportunity",
-                dbx_opportunity,
-                (databricks["total"] * Decimal("0.10")).quantize(Decimal("0.01")),
-            )
-            equal(
-                "Redshift efficiency opportunity",
-                aws_opportunity,
-                (redshift["total"] * Decimal("0.10")).quantize(Decimal("0.01")),
-            )
+            # Efficiency is an evidence plane, not another bill. The richer sample
+            # deliberately gives one entity several supporting recommendations, so
+            # summing every rule would double count. The dashboard instead shows the
+            # best-priced action per entity; prove that conservative roll-up never
+            # claims more than the entity's own billed cost.
+            for provider in ("Databricks", "AWS"):
+                over_billed = scalar(
+                    "SELECT count(*) FROM ("
+                    "SELECT entity_id, max(recoverable_cost) AS potential, "
+                    "max(billed_cost) AS billed FROM efficiency.waste_record "
+                    f"WHERE provider_name = '{provider}' AND charge_month = '{stamp}' "
+                    "GROUP BY entity_id"
+                    # Derived query/table evidence can honestly carry no direct
+                    # billed amount; it is not a second provider bill. Only compare
+                    # an opportunity to the billed entity when that entity has one.
+                    ") WHERE billed > 0 AND potential > billed + 0.001"
+                )
+                equal(f"{provider} best efficiency action ≤ billed cost", over_billed, Decimal("0"))
     finally:
         con.close()
 

@@ -1,11 +1,15 @@
 [project]
 name = "getflashlight"
-version = "0.2.0"
+version = "0.2.1"
 description = "FOCUS-based multi-cloud spend-visualization platform"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
+    { name = "Yuga Chaparala", email = "ychaparala@gmail.com" },
+    { name = "Velu Natarajan", email = "velunatsf@gmail.com" },
+]
+maintainers = [
     { name = "Yuga Chaparala", email = "ychaparala@gmail.com" },
     { name = "Velu Natarajan", email = "velunatsf@gmail.com" },
 ]
