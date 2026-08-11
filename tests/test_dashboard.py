@@ -91,8 +91,8 @@ def test_provider_page_renders_when_data_starts_midmonth(lake_home) -> None:  # 
 
 
 def test_snowflake_page_without_connection_or_demo_shows_empty_state(
-    lake_home, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+    lake_home: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """An optional demo dataset must not turn the always-reachable route into a 500.
 
     Force local ACCOUNT_USAGE off — developers often have

@@ -20,7 +20,7 @@ from flashlight.lake.account_usage_schema import AccountUsageBatch
 _WINDOW = IngestWindow(date(2026, 7, 1), date(2026, 7, 31))
 
 # Public APIs exercised by Visibility tabs, LeaderBoard, and Home.
-_SCREEN_CALLS: list[tuple[str, tuple, dict]] = [
+_SCREEN_CALLS: list[tuple[str, tuple[object, ...], dict[str, object]]] = [
     ("has_local_data", (), {}),
     ("kpi_summary", (), {}),
     ("cost_breakdown", (), {}),
@@ -257,7 +257,12 @@ def _seed_minimal_live_shaped_lake() -> None:
     )
 
 
-def _assert_screen_call(visibility_data: object, name: str, args: tuple, kwargs: dict) -> None:
+def _assert_screen_call(
+    visibility_data: object,
+    name: str,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> None:
     result = getattr(visibility_data, name)(*args, **kwargs)
     if isinstance(result, pd.DataFrame):
         # UI label helpers previously blew up on NaN table/object names.

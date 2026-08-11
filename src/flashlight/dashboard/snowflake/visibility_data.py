@@ -154,8 +154,14 @@ def _as_float(value: object, default: float = 0.0) -> float:
     """Coerce DuckDB/Snowflake Decimals (and None) to float for Python arithmetic."""
     if value is None:
         return default
+    if isinstance(value, (bool, int, float, str)):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+    # Decimal and other SupportsFloat-ish objects from the connector.
     try:
-        return float(value)
+        return float(str(value))
     except (TypeError, ValueError):
         return default
 
