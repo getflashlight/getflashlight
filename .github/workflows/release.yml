@@ -4,8 +4,6 @@ name: Release
 # a GitHub Release, and publish to PyPI (trusted publishing, no token).
 # Tag and pyproject version must match.
 #
-#   git tag v0.2.2 && git push origin v0.2.2
-#
 # To dry-run the build/publish pipeline against TestPyPI without cutting a
 # real release, trigger manually from the Actions tab (workflow_dispatch).
 
