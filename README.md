@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/getflashlight/getflashlight/actions/workflows/ci.yml"><img src="https://github.com/getflashlight/getflashlight/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://pypi.org/project/getflashlight/"><img src="https://img.shields.io/badge/PyPI-0.2.0-blue" alt="PyPI 0.2.0"></a>
+  <a href="https://pypi.org/project/getflashlight/"><img src="https://img.shields.io/pypi/v/getflashlight" alt="PyPI"></a>
   <a href="https://pypi.org/project/getflashlight/"><img src="https://img.shields.io/badge/Python-3.12%2B-blue" alt="Python 3.12 or later"></a>
   <a href="https://github.com/getflashlight/getflashlight/blob/main/LICENSE"><img src="https://img.shields.io/github/license/getflashlight/getflashlight" alt="Apache-2.0 license"></a>
 </p>

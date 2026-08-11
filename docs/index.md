@@ -2,7 +2,7 @@
 
 *Finds what's burning money in the dark.*
 
-![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Version](https://img.shields.io/pypi/v/getflashlight)
 ![Python versions](https://img.shields.io/badge/python-3.12%2B-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
