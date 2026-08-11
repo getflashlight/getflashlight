@@ -166,48 +166,79 @@ def _home_movers(month: date, prior: date, *, limit: int = 8) -> pd.DataFrame:
     residual-split — only inject each mapped delta under Databricks, as its own driver row
     (never combined into one "Databricks backing spend" row — a reader asking "what moved"
     needs to know whether it was the storage bill or the compute bill that moved).
+
+    When ACCOUNT_USAGE data is available, GOLD ``snowflake.*`` service movers are replaced
+    by Snowflake compute (Managed + Serverless) MoM so the table matches Visibility.
     """
     movers = cross_provider_movers(month, prior, exclude_credits=True, limit=max(limit, 32))
-    if "databricks" not in discover_provider_groups():
-        return movers.head(limit) if not movers.empty else movers
     frames: list[pd.DataFrame] = []
+    sf_label = provider_label("snowflake")
+    sf_compute = _snowflake_compute_by_month()
     if not movers.empty:
-        frames.append(movers)
-    for by_month, driver, kind in (
-        (_databricks_storage_by_month(prior, month), _DBX_STORAGE_DRIVER, "Storage"),
-        (_databricks_compute_by_month(prior, month), _DBX_COMPUTE_DRIVER, "Compute"),
-    ):
-        mapped_cur = by_month.get(month, 0.0)
-        mapped_prev = by_month.get(prior, 0.0)
-        mapped_delta = mapped_cur - mapped_prev
-        if abs(mapped_delta) > 1e-9:
-            frames.append(
-                pd.DataFrame(
-                    [
-                        {
-                            "provider": provider_label("databricks"),
-                            "driver": driver,
-                            "cost_delta": mapped_delta,
-                            "cost_pct_change": (
-                                round(100 * mapped_delta / mapped_prev, 1)
-                                if mapped_prev
-                                else None
-                            ),
-                            "type": kind,
-                        }
-                    ]
+        if sf_compute:
+            movers = movers[movers["provider"].astype(str) != sf_label]
+        if not movers.empty:
+            frames.append(movers)
+    if "databricks" in discover_provider_groups():
+        for by_month, driver, kind in (
+            (_databricks_storage_by_month(prior, month), _DBX_STORAGE_DRIVER, "Storage"),
+            (_databricks_compute_by_month(prior, month), _DBX_COMPUTE_DRIVER, "Compute"),
+        ):
+            mapped_cur = by_month.get(month, 0.0)
+            mapped_prev = by_month.get(prior, 0.0)
+            mapped_delta = mapped_cur - mapped_prev
+            if abs(mapped_delta) > 1e-9:
+                frames.append(
+                    pd.DataFrame(
+                        [
+                            {
+                                "provider": provider_label("databricks"),
+                                "driver": driver,
+                                "cost_delta": mapped_delta,
+                                "cost_pct_change": (
+                                    round(100 * mapped_delta / mapped_prev, 1)
+                                    if mapped_prev
+                                    else None
+                                ),
+                                "type": kind,
+                            }
+                        ]
+                    )
                 )
+    sf_frame: pd.DataFrame | None = None
+    if sf_compute:
+        cur = float(sf_compute.get(month, 0.0))
+        prev = float(sf_compute.get(prior, 0.0))
+        delta = cur - prev
+        if abs(delta) > 1e-9:
+            sf_frame = pd.DataFrame(
+                [
+                    {
+                        "provider": sf_label,
+                        "driver": "Compute",
+                        "cost_delta": delta,
+                        "cost_pct_change": round(100 * delta / prev, 1) if prev else None,
+                        "type": "Compute",
+                    }
+                ]
             )
+            frames.append(sf_frame)
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
     out["abs_delta"] = out["cost_delta"].abs()
-    return (
-        out.sort_values("abs_delta", ascending=False)
-        .head(limit)
-        .drop(columns=["abs_delta"])
-        .reset_index(drop=True)
-    )
+    out = out.sort_values("abs_delta", ascending=False).reset_index(drop=True)
+    # Keep Snowflake compute visible even when its MoM $ is smaller than SKU movers.
+    if sf_frame is not None and limit > 1:
+        sf_mask = out["provider"].astype(str).eq(sf_label)
+        others = out.loc[~sf_mask].head(limit - 1)
+        snow = out.loc[sf_mask].head(1)
+        out = pd.concat([others, snow], ignore_index=True)
+        out["abs_delta"] = out["cost_delta"].abs()
+        out = out.sort_values("abs_delta", ascending=False).reset_index(drop=True)
+    else:
+        out = out.head(limit)
+    return out.drop(columns=["abs_delta"])
 
 
 def _provider_months(group: str, month: date, prior: date) -> tuple[float, float]:
@@ -217,6 +248,88 @@ def _provider_months(group: str, month: date, prior: date) -> tuple[float, float
         f'FROM "{group}".monthly_bill'
     ).iloc[0]
     return float(row["cur"]), float(row["prev"])
+
+
+def _provider_display_order(groups: list[str]) -> list[str]:
+    """Databricks → Snowflake → Redshift (aws), then any other groups alphabetically."""
+    lead = ("databricks", "snowflake", "aws")
+    present = set(groups)
+    ordered = [g for g in lead if g in present]
+    ordered.extend(sorted(g for g in present if g not in lead))
+    return ordered
+
+
+def _snowflake_data_module() -> object | None:
+    """Live ACCOUNT_USAGE when configured, else bundled synthetic Parquet."""
+    from flashlight.dashboard.snowflake import live_data, visibility_data
+
+    if live_data.is_configured():
+        return live_data
+    if visibility_data.has_synthetic_data():
+        return visibility_data
+    return None
+
+
+def _snowflake_tco_by_month() -> dict[date, float]:
+    sf = _snowflake_data_module()
+    if sf is None:
+        return {}
+    tco_by_month = getattr(sf, "tco_by_month", None)
+    if tco_by_month is None:
+        return {}
+    return dict(tco_by_month())
+
+
+def _snowflake_compute_by_month() -> dict[date, float]:
+    """Managed + Serverless compute cost by month-start date from ACCOUNT_USAGE."""
+    sf = _snowflake_data_module()
+    if sf is None:
+        return {}
+    cost_breakdown_monthly = getattr(sf, "cost_breakdown_monthly", None)
+    if cost_breakdown_monthly is None:
+        return {}
+    df = cost_breakdown_monthly(12)
+    if df is None or getattr(df, "empty", True):
+        return {}
+    compute = df[df["category"].isin(["Managed Compute", "Serverless Compute"])]
+    if compute.empty:
+        return {}
+    by_month = compute.groupby("month", as_index=True)["cost_usd"].sum()
+    out: dict[date, float] = {}
+    for key, amount in by_month.items():
+        month = pd.Timestamp(str(key) + "-01" if len(str(key)) == 7 else str(key)).date()
+        month = month.replace(day=1)
+        out[month] = float(amount)
+    return out
+
+
+def _with_snowflake_tco(
+    history: pd.DataFrame, tco: dict[date, float], start: date, end: date
+) -> pd.DataFrame:
+    """Replace GOLD snowflake monthly_bill with ACCOUNT_USAGE TCO in the trend."""
+    if not tco:
+        return history
+    frames: list[pd.DataFrame] = []
+    if not history.empty:
+        frames.append(history[history["group"] != "snowflake"])
+    rows = [
+        {
+            # Match GOLD history's datetime64 charge_month — mixing date with
+            # Timestamp breaks sort_values under pandas 2.x.
+            "charge_month": pd.Timestamp(month),
+            "net_cost": amount,
+            "provider": provider_label("snowflake"),
+            "group": "snowflake",
+            "month": month.strftime("%Y-%m"),
+        }
+        for month, amount in sorted(tco.items())
+        if start <= month <= end
+    ]
+    if rows:
+        frames.append(pd.DataFrame(rows))
+    if not frames:
+        return history
+    return pd.concat(frames, ignore_index=True).sort_values("charge_month")
 
 
 def _credits_by_group(month: date) -> dict[str, float]:
@@ -273,32 +386,60 @@ def _recoverable_by_provider(month: date) -> pd.Series:
     priced finding per entity/lens, rather than summing overlapping findings. The two
     remedy lanes remain distinct in that tab, but this home-page total is their combined
     navigation summary and carries a non-additivity note wherever it is rendered.
+
+    Snowflake uses Visibility hidden-waste savings when that plane is available
+    (same total as the Snowflake page), not FOCUS ``efficiency.waste_record``.
     """
+    values: dict[str, float] = {}
     try:
         df = gold_df(
             "SELECT * FROM efficiency.waste_record "
             f"WHERE charge_month = '{month}'"
         )
     except Exception:  # noqa: BLE001 - view may be unbuilt
-        return pd.Series(dtype=float)
-    if df.empty:
-        return pd.Series(dtype=float)
-    # AWS can carry non-Redshift records (for example S3 storage), while the AWS
-    # provider page is explicitly the Redshift view. Keep this headline scoped to the
-    # two Efficiency & Waste surfaces a reader can reconcile it against: Databricks and
-    # Redshift. This is the same Redshift identification contract as redshift_focus:
-    # Redshift-specific rules, plus the two SQL warehouse entity types whose generic
-    # rules are emitted by Redshift under provider_name='AWS'.
-    aws = df["provider_name"].astype(str).eq("AWS")
-    redshift_aws = df["waste_category"].astype(str).str.startswith("redshift_") | df[
-        "entity_type"
-    ].isin(["sql_warehouse", "sql_warehouse_user"])
-    df = df.loc[~aws | redshift_aws]
-    values = {
-        str(provider): float(action_group_rows(rows)["potential_savings"].sum())
-        for provider, rows in df.groupby("provider_name")
-    }
+        df = pd.DataFrame()
+    if not df.empty:
+        # AWS can carry non-Redshift records (for example S3 storage), while the AWS
+        # provider page is explicitly the Redshift view. Keep this headline scoped to the
+        # Efficiency & Waste surfaces a reader can reconcile it against.
+        aws = df["provider_name"].astype(str).eq("AWS")
+        redshift_aws = df["waste_category"].astype(str).str.startswith("redshift_") | df[
+            "entity_type"
+        ].isin(["sql_warehouse", "sql_warehouse_user"])
+        df = df.loc[~aws | redshift_aws]
+        values = {
+            str(provider): float(action_group_rows(rows)["potential_savings"].sum())
+            for provider, rows in df.groupby("provider_name")
+        }
+    sf = _snowflake_data_module()
+    if sf is not None:
+        values.pop(provider_name_for_group("snowflake"), None)
+        values.pop("Snowflake", None)
+        hidden_waste_summary = getattr(sf, "hidden_waste_summary", None)
+        waste = (
+            float(hidden_waste_summary().get("total") or 0)
+            if hidden_waste_summary is not None
+            else 0.0
+        )
+        if waste:
+            values[provider_name_for_group("snowflake")] = waste
     return pd.Series(values, dtype=float)
+
+
+def _savings_providers_caption(recoverable: pd.Series) -> str:
+    """Short list of providers contributing to the actionable-savings KPI."""
+    labels: list[str] = []
+    name_to_label = {
+        "Databricks": "Databricks",
+        "Snowflake": "Snowflake",
+        "AWS": "Redshift",
+    }
+    for name, label in name_to_label.items():
+        if name in recoverable.index and float(recoverable.get(name, 0.0) or 0.0) > 0:
+            labels.append(label)
+    if not labels:
+        return "tune + move options"
+    return " + ".join(labels)
 
 
 def _credits_note(month: date) -> None:
@@ -372,12 +513,25 @@ def render() -> None:
         ) if "databricks" in groups else {}
         storage_cur = backing.get(month, 0.0)
         storage_prev = backing.get(prior, 0.0)
+        # Snowflake Visibility TCO (complete months) — replaces thin FOCUS
+        # snowflake.monthly_bill when live/synthetic ACCOUNT_USAGE is available.
+        sf_tco = _snowflake_tco_by_month()
+        # Build provider rows in nav order (Databricks → Snowflake → Redshift).
+        display_groups = _provider_display_order(
+            list(groups) + (["snowflake"] if sf_tco and "snowflake" not in groups else [])
+        )
         rows: list[dict[str, object]] = []
         total_cur = total_prev = 0.0
-        for group in groups:
+        for group in display_groups:
             label = provider_label(group)
-            cur, prev = _provider_months(group, month, prior)
-            cur, prev = _include_storage(group, cur, prev, storage_cur, storage_prev)
+            if group == "snowflake" and sf_tco:
+                cur = float(sf_tco.get(month, 0.0))
+                prev = float(sf_tco.get(prior, 0.0))
+            elif group == "snowflake" and group not in groups:
+                continue
+            else:
+                cur, prev = _provider_months(group, month, prior)
+                cur, prev = _include_storage(group, cur, prev, storage_cur, storage_prev)
             if not cur and not prev:
                 continue
             delta = cur - prev
@@ -404,19 +558,21 @@ def render() -> None:
             ).style(f"color:{chrome.INK_MUTED}")
             return
 
-        breakdown = pd.DataFrame(rows).sort_values("net_cost", ascending=False)
+        # Preserve Databricks → Snowflake → Redshift card order (not spend rank).
+        breakdown = pd.DataFrame(rows)
         total_delta = total_cur - total_prev
         total_pct = f"{100 * total_delta / total_prev:+.1f}%" if total_prev else "—"
         sign = "↑" if total_delta >= 0 else "↓"
 
         recoverable = _recoverable_by_provider(month)
         total_recoverable = float(recoverable.sum()) if not recoverable.empty else 0.0
+        savings_who = _savings_providers_caption(recoverable)
         chrome.kpi_row(
             [
                 (
-                    f"Total · {month:%b %Y}",
+                    f"TCO - {month:%b %Y} MTD",
                     compact_money(total_cur),
-                    "charges across providers",
+                    "across providers",
                 ),
                 (
                     "Change vs prior month",
@@ -427,9 +583,9 @@ def render() -> None:
                 (
                     "Actionable savings potential",
                     compact_money(total_recoverable) if total_recoverable else "—",
-                    f"{100 * total_recoverable / total_cur:.1f}% of spend · Databricks + Redshift"
+                    f"{100 * total_recoverable / total_cur:.1f}% of spend · {savings_who}"
                     if total_cur and total_recoverable
-                    else "Databricks + Redshift tune + move options",
+                    else savings_who,
                     "unattributed",
                 ),
             ],
@@ -439,23 +595,25 @@ def render() -> None:
 
         history = _provider_history(groups, start, end)
         sm, cap = start.replace(day=1), end.replace(day=1)
+        history = _with_snowflake_tco(history, sf_tco, sm, cap)
         trend_extras: list[str] = []
         if "databricks" in groups:
             if _databricks_storage_by_month(sm, cap):
                 trend_extras.append("storage (AWS-billed S3)")
             if _databricks_compute_by_month(sm, cap):
                 trend_extras.append("compute (AWS-billed EC2)")
+        trend_caption = (
+            "Stacked monthly charges — Databricks includes its managed "
+            + " and ".join(trend_extras) + "."
+            if trend_extras
+            else "Stacked monthly charges — each color is a cloud provider."
+        )
         with ui.row().classes("w-full gap-4 items-stretch"):
             with ui.column().classes("gap-0").style("flex:2;min-width:0;"):
                 if not history.empty:
                     with chrome.panel():
                         chrome.panel_title("Spend trend by provider")
-                        chrome.section_caption(
-                            "Stacked monthly charges — Databricks includes its managed "
-                            + " and ".join(trend_extras) + "."
-                            if trend_extras
-                            else "Stacked monthly charges — each color is a cloud provider."
-                        )
+                        chrome.section_caption(trend_caption)
                         colors = provider_color_map(
                             history["provider"].unique(), groups=history["group"].unique()
                         )
@@ -482,7 +640,7 @@ def render() -> None:
             with ui.column().classes("gap-0").style("flex:1;min-width:0;"):
                 with chrome.panel():
                     chrome.panel_title("Provider share")
-                    chrome.section_caption(f"{month:%b %Y} charge mix")
+                    chrome.section_caption(f"{month:%b %Y} MTD charge")
                     colors = provider_color_map(breakdown["provider"], groups=breakdown["group"])
                     pie = px.pie(
                         breakdown,
@@ -548,6 +706,7 @@ def render() -> None:
                         else f"Flat vs {prior:%b %Y}"
                     )
                     rec = float(recoverable.get(row.provider_name, 0.0))
+                    note = f"{compact_money(rec)} action potential" if rec else None
                     with ui.column().style("min-width:220px;flex:1;"):
                         chrome.provider_card(
                             name=f"{row.provider} · {month:%b %Y}",
@@ -556,7 +715,7 @@ def render() -> None:
                             color=color,
                             delta_color=delta_hex,
                             href=f"/{row.group}",
-                            note=f"{compact_money(rec)} action potential" if rec else None,
+                            note=note,
                         )
 
     body()

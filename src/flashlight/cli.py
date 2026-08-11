@@ -1,7 +1,7 @@
 """Unified ``flashlight`` command — the one operator interface.
 
     flashlight init               scaffold the lake home (config skeleton + connections.yml)
-    flashlight sample             generate the linked Redshift, Databricks, and FOCUS demo
+    flashlight sample             generate Redshift, Databricks, FOCUS, and Snowflake demos
     flashlight sample --clean     remove generated demo data, then rebuild GOLD
     flashlight ingest             pull billing → BRONZE Parquet, then rebuild GOLD
     flashlight transform          rebuild GOLD Parquet from BRONZE
@@ -68,20 +68,30 @@ def sample(
         False, "--clean", help="Remove generated demo data instead of generating it"
     ),
 ) -> None:
-    """Generate the reconciled cross-cloud FOCUS demo.
+    """Generate the reconciled cross-cloud and Snowflake dashboard demos.
 
     The scenario is deterministic and schema-validated: cluster names, owners,
     emails, tags, cost records, and telemetry all refer to the same entities.
     """
     from flashlight.sample import (
+        _SNOWFLAKE_SYNTHETIC_DIR,
         cleanup,
+        cleanup_snowflake_dashboard_demo,
+        generate_snowflake_dashboard_demo,
         load_sample,
     )
 
     if clean:
         cleanup()
+        cleanup_snowflake_dashboard_demo()
         return
     load_sample()
+    generate_snowflake_dashboard_demo()
+    snowflake_files = len(list(_SNOWFLAKE_SYNTHETIC_DIR.glob("*.parquet")))
+    typer.echo(
+        f"Generated Snowflake ACCOUNT_USAGE synthetic datasets → {snowflake_files} files."
+    )
+    typer.echo("Next: flashlight dashboard serve   # http://127.0.0.1:8501")
 
 
 @mcp_app.command("serve")

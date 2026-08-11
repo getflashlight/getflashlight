@@ -37,45 +37,21 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
     ]
     assert parent == resources
 
-    # Snowflake is seeded through the same FOCUS BRONZE writer and is consequently
-    # published as an ordinary provider GOLD group, not a dashboard-local fixture.
-    snowflake = run_select(
-        "SELECT sum(net_cost) AS total FROM snowflake.monthly_bill"
-    )[0]["total"]
-    snowflake_resources = run_select(
-        "SELECT sum(net_cost) AS total FROM snowflake.resource_month"
-    )[0]["total"]
-    assert snowflake is not None
-    assert snowflake == snowflake_resources
-    snowflake_credits = run_select(
-        "SELECT sum(net_cost) AS total FROM snowflake.credits_month "
-        "WHERE charge_description = 'Snowflake support credit'"
-    )[0]["total"]
-    assert float(snowflake_credits) == pytest.approx(-420.0)
-    snowflake_efficiency = run_select(
-        "SELECT count(*) AS count FROM efficiency.waste_record "
-        "WHERE provider_name = 'Snowflake'"
-    )[0]["count"]
-    snowflake_policy = run_select(
-        "SELECT count(*) AS count FROM policy.policy_record "
-        "WHERE provider_name = 'Snowflake'"
-    )[0]["count"]
-    snowflake_drivers = run_select(
-        "SELECT count(*) AS count FROM driver_health.driver_health "
-        "WHERE provider_name = 'Snowflake'"
-    )[0]["count"]
-    assert snowflake_efficiency > 0
-    assert snowflake_policy > 0
-    assert snowflake_drivers > 0
-    finance_driver_versions = {
-        row["client_driver"]
-        for row in run_select(
-            "SELECT DISTINCT client_driver FROM driver_health.driver_health "
-            "WHERE provider_name = 'Snowflake' "
-            "AND cluster_id = 'warehouse:redshift-finance'"
-        )
-    }
-    assert finance_driver_versions == {"PythonConnector 3.6.0", "PythonConnector 3.10.1"}
+    # Snowflake By Provider uses ACCOUNT_USAGE synthetic Parquet (Visibility), not a
+    # FOCUS ``snowflake.*`` GOLD group — ``fl sample`` writes those fixtures beside
+    # ``load_sample`` rather than emitting thin FOCUS BRONZE rows here.
+    from flashlight.sample import (
+        _SNOWFLAKE_SYNTHETIC_DIR,
+        cleanup_snowflake_dashboard_demo,
+        generate_snowflake_dashboard_demo,
+    )
+
+    cleanup_snowflake_dashboard_demo()
+    generate_snowflake_dashboard_demo()
+    assert list(_SNOWFLAKE_SYNTHETIC_DIR.glob("*.parquet")), (
+        "expected Snowflake ACCOUNT_USAGE demo Parquet under snowflake/synthetic_data/"
+    )
+    cleanup_snowflake_dashboard_demo()
 
     # The Home page folds AWS-billed Databricks storage and compute into the Databricks
     # stack, while aws.* intentionally remains Redshift-only.  Assert that every mock
@@ -139,7 +115,8 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
             ") GROUP BY provider_name"
         )
     }
-    assert {"Databricks", "AWS", "Snowflake"} <= opportunities.keys()
+    assert {"Databricks", "AWS"} <= opportunities.keys()
+    assert "Snowflake" not in opportunities
     assert all(amount > 0 for amount in opportunities.values())
     over_billed = run_select(
         "SELECT count(*) AS count FROM ("

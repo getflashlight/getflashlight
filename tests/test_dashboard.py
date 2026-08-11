@@ -2336,9 +2336,12 @@ def test_provider_page_explains_a_suppressed_trend_forecast(lake_home) -> None: 
 def test_provider_nav_rows_are_bare_labels_with_databricks_first(lake_home) -> None:  # type: ignore[no-untyped-def]
     """The "BY PROVIDER" nav rows read "Databricks" / "AWS Redshift", not
     "<label> spend" (the section heading already says these are spend pages), and
-    Databricks sorts above the AWS/Redshift row even though discover_provider_groups()
-    returns "aws" first alphabetically."""
+    order is Databricks → Snowflake → Redshift even though discover_provider_groups()
+    returns "aws" first alphabetically. Snowflake is force-included when the bundled
+    synthetic Visibility Parquet is present.
+    """
     from flashlight.dashboard.router import _nav_groups, _nav_label
+    from flashlight.dashboard.snowflake import visibility_data
     from flashlight.lake import bronze
     from flashlight.transform.runner import build_gold
 
@@ -2355,11 +2358,19 @@ def test_provider_nav_rows_are_bare_labels_with_databricks_first(lake_home) -> N
     bronze.write_window("t", window, [aws, dbx], ingest_run_id="r1")
     build_gold()
 
-    assert _nav_groups() == ["databricks", "aws"]
-    assert [_nav_label(group) for group in _nav_groups()] == [
-        "Databricks",
-        "AWS Redshift",
-    ]
+    if visibility_data.has_synthetic_data():
+        assert _nav_groups() == ["databricks", "snowflake", "aws"]
+        assert [_nav_label(group) for group in _nav_groups()] == [
+            "Databricks",
+            "Snowflake",
+            "AWS Redshift",
+        ]
+    else:
+        assert _nav_groups() == ["databricks", "aws"]
+        assert [_nav_label(group) for group in _nav_groups()] == [
+            "Databricks",
+            "AWS Redshift",
+        ]
 
 
 def test_syncing_provider_is_in_nav_before_its_first_publish(lake_home, monkeypatch) -> None:  # type: ignore[no-untyped-def]

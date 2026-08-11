@@ -5,13 +5,13 @@ description = "FOCUS-based multi-cloud spend-visualization platform"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+# Single Author entry so PyPI's Credits sidebar shows both names (Warehouse only
+# renders one author from a multi-entry authors list).
 authors = [
-    { name = "Yuga Chaparala", email = "ychaparala@gmail.com" },
-    { name = "Velu Natarajan", email = "velunatsf@gmail.com" },
+    { name = "Yuga Chaparala and Velu Natarajan" },
 ]
 maintainers = [
-    { name = "Yuga Chaparala", email = "ychaparala@gmail.com" },
-    { name = "Velu Natarajan", email = "velunatsf@gmail.com" },
+    { name = "Yuga Chaparala and Velu Natarajan" },
 ]
 requires-python = ">=3.12"
 classifiers = [
