@@ -260,12 +260,10 @@ def _provider_display_order(groups: list[str]) -> list[str]:
 
 
 def _snowflake_data_module() -> object | None:
-    """Live ACCOUNT_USAGE when configured, else bundled synthetic Parquet."""
-    from flashlight.dashboard.snowflake import live_data, visibility_data
+    """Local ACCOUNT_USAGE Parquet (ingest/sample) for Home Snowflake figures."""
+    from flashlight.dashboard.snowflake import visibility_data
 
-    if live_data.is_configured():
-        return live_data
-    if visibility_data.has_synthetic_data():
+    if visibility_data.has_local_data():
         return visibility_data
     return None
 

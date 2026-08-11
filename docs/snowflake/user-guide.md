@@ -33,33 +33,37 @@ uv run fl ingest --connector Snowflake-prod
 ```
 
 The connector projects FOCUS-shaped cost rows in Snowflake SQL and writes them to shared
-BRONZE Parquet. The normal transform then publishes Snowflake GOLD views. The dashboard
-and MCP server read only those materialized views; neither opens a Snowflake connection.
+BRONZE Parquet. The normal transform then publishes Snowflake GOLD views. Separately, it
+dumps ACCOUNT_USAGE tables into `<home>/account_usage/` for Visibility/LeaderBoard.
+The dashboard and MCP never open a Snowflake connection at request time — ingest is the
+only writer that talks to Snowflake.
 
 ## Dashboard
 
-Open `/snowflake` after a successful ingest. It is the standard provider spend page with
-the common spend, allocation, efficiency, and policy surfaces plus Snowflake client-driver
-health where telemetry is available. Before the first successful ingest it shows an empty
-state. There is no local synthetic-data fallback.
+Open `/snowflake` after a successful ingest (or `flashlight sample`). It is the
+Visibility/LeaderBoard surface over local `account_usage/` Parquet. Before the first
+successful ACCOUNT_USAGE pull it shows an empty state. FOCUS `gold/snowflake/` still
+exists for MCP and shared GOLD consumers; the `/snowflake` page itself is Visibility.
 
 ## Data layout
 
 | Layer | Location | Writer | Reader |
 |---|---|---|---|
 | BRONZE | `<home>/bronze/` | `fl ingest` | transform |
+| ACCOUNT_USAGE | `<home>/account_usage/` | `fl ingest` / `fl sample` | Visibility dashboard |
 | SILVER | transform working views | transform | transform |
-| GOLD | `<home>/gold/snowflake/` | transform | dashboard and MCP |
+| GOLD | `<home>/gold/snowflake/` | transform | MCP / GOLD consumers |
 
 ## Operational notes
 
 - Snowflake Account Usage can have source-side latency. Re-run ingest after the
   accounting period settles when reconciling finalized charges.
-- Give the configured role access to the cost views required by the connector.
+- Give the configured role access to the cost views and ACCOUNT_USAGE views required
+  by the connector.
 - Use `fl ingest --full-refresh --connector Snowflake-prod --start YYYY-MM-DD` when
   a configuration change requires rebuilding retained Snowflake BRONZE history.
- - `fl sample` seeds Snowflake FOCUS cost records through the same shared BRONZE-to-GOLD
-   path as a real ingest; it does not create a separate dashboard dataset.
+- `fl sample` installs synthetic ACCOUNT_USAGE into the same `account_usage/` lake
+  layout a live ingest uses.
 
 For field-level categorization, see [FOCUS mapping](focus-mapping.md) and
 [Snowflake service types](service-types.md).

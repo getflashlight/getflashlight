@@ -229,3 +229,13 @@ def test_check_support_status_known_versions() -> None:
     assert check_support_status("PythonConnector 3.6.0") == "unsupported"
     assert check_support_status("Snowsight") == "unknown"
     assert check_support_status(None) == "unknown"
+
+
+def test_live_data_normalizes_uppercase_snowflake_columns() -> None:
+    """fetch_pandas_all returns UPPERCASE names; Visibility expects lowercase."""
+    from flashlight.dashboard.snowflake.live_data import _normalize_columns
+
+    df = pd.DataFrame({"TOTAL_CREDITS": [12.5], "MONTH": ["2026-07-01"]})
+    out = _normalize_columns(df)
+    assert list(out.columns) == ["total_credits", "month"]
+    assert float(out["total_credits"].iloc[0]) == 12.5

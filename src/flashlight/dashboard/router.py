@@ -76,15 +76,15 @@ def _nav_groups() -> list[str]:
 
     Active dashboard syncs are included before their first GOLD publish, so a newly
     connected provider is visible while its initial ingestion is still running.
-    Snowflake is force-included when a live connection is configured or the bundled
-    synthetic visibility Parquet is present, so ``/snowflake`` stays reachable even
-    without a published ``gold/snowflake/`` group.
+    Snowflake is force-included when local ACCOUNT_USAGE Parquet is present (ingest
+    or sample), so ``/snowflake`` stays reachable even without a published
+    ``gold/snowflake/`` group.
     """
     groups = set(discover_provider_groups())
     groups.update(ingest_runner.active_provider_groups())
-    from flashlight.dashboard.snowflake import live_data, visibility_data
+    from flashlight.dashboard.snowflake import visibility_data
 
-    if live_data.is_configured() or visibility_data.has_synthetic_data():
+    if visibility_data.has_local_data():
         groups.add("snowflake")
     lead = [g for g in _NAV_GROUP_ORDER if g in groups]
     return lead + sorted(g for g in groups if g not in lead)
@@ -517,25 +517,23 @@ def build_pages() -> None:
         )
 
     def _render_snowflake_visibility_only() -> None:
-        """Render Snowflake visibility from a live connection or the bundled demo data."""
-        from flashlight.dashboard.snowflake import live_data, visibility_data
+        """Render Snowflake Visibility/LeaderBoard from local ACCOUNT_USAGE Parquet.
+
+        Data comes from ``FLASHLIGHT_HOME/account_usage/`` (ingest or sample) or the
+        repo synthetic fallback — never a live Snowflake connection from the dashboard.
+        """
+        from flashlight.dashboard.snowflake import visibility_data
         from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
 
-        # Prefer the customer's configured account.  The synthetic source is solely a
-        # demo fallback; selecting it when its Parquet files are absent caused DuckDB to
-        # interpret ACCOUNT_USAGE table names as local tables and return a 500.
-        if live_data.is_configured():
-            data: ModuleType = live_data
-        elif visibility_data.has_synthetic_data():
-            data = visibility_data
-        else:
+        if not visibility_data.has_local_data():
             no_data_page("Snowflake visibility")
             ui.label(
-                "Add an enabled Snowflake connection on the Connections page, or "
-                "generate the bundled demo data."
+                "Add an enabled Snowflake connection and run a sync, or generate "
+                "the bundled demo data with ``flashlight sample``."
             ).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
             return
 
+        data: ModuleType = visibility_data
         with ui.tabs().classes("w-full").props("dense") as tabs:
             tab_exec = ui.tab("LeaderBoard")
             tab_vis = ui.tab("Visibility")
@@ -560,7 +558,7 @@ def build_pages() -> None:
         tabs.on_value_change(_on_tab_change)
 
     # Explicit /snowflake before the catch-all: always the Visibility/LeaderBoard stack
-    # (live ACCOUNT_USAGE or synthetic Parquet), not the FOCUS provider_focus hybrid.
+    # from local ACCOUNT_USAGE Parquet (ingest or sample), not the FOCUS provider_focus hybrid.
     @ui.page("/snowflake")
     def _snowflake_page() -> None:
         with gold_session(), shell("/snowflake"):

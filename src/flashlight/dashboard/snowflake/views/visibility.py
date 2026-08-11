@@ -73,13 +73,18 @@ def _service_category_order(bills: pd.DataFrame) -> list[str]:
     return known + rest
 
 
-def render_leaderboard(data: Any = None) -> None:
-    """Public entry point for LeaderBoard — called from router."""
+def render_leaderboard(data: Any = None, snapshot: dict[str, Any] | None = None) -> None:
+    """Public entry point for LeaderBoard — called from router.
+
+    ``snapshot`` is optional pre-fetched data (from ``leaderboard_snapshot`` run
+    off the event loop via ``run.io_bound``) so live Snowflake I/O does not stall
+    NiceGUI's WebSocket heartbeat.
+    """
     global sf_data
     sf_data = data if data is not None else _sf_data_default
     try:
         chrome.section_title("LeaderBoard")
-        _leaderboard()
+        _leaderboard(snapshot)
     finally:
         sf_data = _sf_data_default
 
@@ -140,12 +145,13 @@ def render(data: Any = None) -> None:
 # LeaderBoard (3-Pillar View)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _leaderboard() -> None:
+def _leaderboard(snapshot: dict[str, Any] | None = None) -> None:
     """Three cost-driver pillars plus shared attribution layer."""
-    kpis = sf_data.kpi_summary()
-    ai = sf_data.ai_spend_summary()
+    snap = snapshot if snapshot is not None else sf_data.leaderboard_snapshot()
+    kpis = snap["kpis"]
+    ai = snap["ai"]
     ai_pct = round(ai["ai_cost"] / max(kpis["total_cost"], 1) * 100, 0)
-    sw = sf_data.hidden_waste_summary()
+    sw = snap["sw"]
     chrome.kpi_row([
         (f"TCO ({kpis['month_label']})", f"${kpis['total_cost']:,.0f}",
          f"{kpis['total_credits']:,.0f} credits"),
@@ -163,8 +169,8 @@ def _leaderboard() -> None:
     ], columns=3)
 
     # ── TCO Trend & Forecast (stacked bars by service, like Databricks) ───
-    forecast_df = sf_data.tco_monthly_trend_and_forecast()
-    monthly = sf_data.cost_breakdown_monthly(12)
+    forecast_df = snap["forecast"]
+    monthly = snap["monthly"]
     if not forecast_df.empty or not monthly.empty:
         actual_months: set[str] = set()
         if not forecast_df.empty:
@@ -388,7 +394,7 @@ def _leaderboard() -> None:
                             "font-size:12px;"
                         )
     # ── Cost Breakdown Pie Chart ───────────────────────────────────────────
-    breakdown = sf_data.cost_breakdown()
+    breakdown = snap["breakdown"]
     if breakdown:
         labels = [item["label"] for item in breakdown if item["cost"] > 0]
         values = [item["cost"] for item in breakdown if item["cost"] > 0]
@@ -411,7 +417,7 @@ def _leaderboard() -> None:
             chrome.plot(fig)
 
     # ── Monthly Cost by Service — 12-month stacked bar ────────────────────
-    monthly = sf_data.cost_breakdown_monthly(12)
+    monthly = snap["monthly"]
     if not monthly.empty:
         with chrome.panel():
             chrome.panel_title(
@@ -437,7 +443,7 @@ def _leaderboard() -> None:
         with ui.column().classes("flex-1"):
             with chrome.panel():
                 chrome.panel_title("AI & ML Cost Breakdown")
-                ai_bd = sf_data.ai_cost_breakdown()
+                ai_bd = snap["ai_cost_breakdown"]
                 if ai_bd:
                     ai_labels = [item["label"] for item in ai_bd if item["cost"] > 0]
                     ai_values = [item["cost"] for item in ai_bd if item["cost"] > 0]
@@ -456,7 +462,7 @@ def _leaderboard() -> None:
         with ui.column().classes("flex-1"):
             with chrome.panel():
                 chrome.panel_title("Serverless Compute Breakdown")
-                svl_bd = sf_data.serverless_cost_breakdown()
+                svl_bd = snap["serverless_cost_breakdown"]
                 if svl_bd:
                     svl_labels = [item["label"] for item in svl_bd
                                   if item["cost"] > 0]
@@ -474,7 +480,7 @@ def _leaderboard() -> None:
                     chrome.plot(fig_svl)
 
     # ── Account Storage Breakdown (donut) ─────────────────────────────────
-    top_tables = sf_data.top_tables_storage(25)
+    top_tables = snap["top_tables_storage"]
     if not top_tables.empty:
         total_active = top_tables["active_gb"].sum()
         total_tt = top_tables["time_travel_gb"].sum()
@@ -501,7 +507,7 @@ def _leaderboard() -> None:
     waste_rows = []
 
     # Compute waste
-    compute_df = sf_data.hidden_waste_compute()
+    compute_df = snap["hidden_waste_compute"]
     if not compute_df.empty:
         for _, row in compute_df.iterrows():
             waste_rows.append({
@@ -515,7 +521,7 @@ def _leaderboard() -> None:
             })
 
     # Storage waste
-    storage_df = sf_data.hidden_waste_storage()
+    storage_df = snap["hidden_waste_storage"]
     if not storage_df.empty:
         for _, row in storage_df.iterrows():
             actual_annual = row["actual_cost_usd"] * 12
@@ -531,7 +537,7 @@ def _leaderboard() -> None:
             })
 
     # AI waste
-    ai_df = sf_data.hidden_waste_ai()
+    ai_df = snap["hidden_waste_ai"]
     if not ai_df.empty:
         for _, row in ai_df.iterrows():
             waste_rows.append({
@@ -564,9 +570,9 @@ def _leaderboard() -> None:
             )
 
     # ── Hidden Waste by Category (pie) ────────────────────────────────────
-    _compute = sf_data.hidden_waste_compute()
-    _storage = sf_data.hidden_waste_storage()
-    _ai = sf_data.hidden_waste_ai()
+    _compute = snap["hidden_waste_compute"]
+    _storage = snap["hidden_waste_storage"]
+    _ai = snap["hidden_waste_ai"]
 
     waste_slices = []
     # Compute breakdown
@@ -606,7 +612,7 @@ def _leaderboard() -> None:
             chrome.plot(fig_hw)
 
     # ── Top 5 Users Contributing to Hidden Waste ──────────────────────────
-    user_waste = sf_data.top_users_hidden_waste(5)
+    user_waste = snap["top_users_hidden_waste"]
     if not user_waste.empty:
         with chrome.panel():
             chrome.panel_title("Top 5 Users Contributing to Hidden Waste")
@@ -1182,8 +1188,12 @@ def _storage() -> None:
         with chrome.panel():
             chrome.panel_title("Top 25 Tables — Storage Breakdown")
             fig_st = go.Figure()
-            names = top_tables["table_name"].apply(
-                lambda x: x.split(".")[-1] if "." in x else x
+            names = top_tables["table_name"].map(
+                lambda x: (
+                    str(x).rsplit(".", 1)[-1]
+                    if isinstance(x, str) and "." in x
+                    else (str(x) if x is not None and x == x else "(unknown)")
+                )
             ).tolist()
             fig_st.add_trace(go.Bar(
                 y=names, x=top_tables["active_gb"], name="Active",

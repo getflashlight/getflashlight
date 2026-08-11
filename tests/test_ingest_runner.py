@@ -203,10 +203,11 @@ def test_supplemental_phases_share_a_bounded_parallel_pool(monkeypatch) -> None:
     monkeypatch.setattr(runner, "_run_ai_usage", _phase)
     monkeypatch.setattr(runner, "_run_storage_locations", _phase)
     monkeypatch.setattr(runner, "_run_compute_instances", _phase)
+    monkeypatch.setattr(runner, "_run_account_usage", _phase)
 
     runner._run_supplemental(object(), [object()])  # type: ignore[arg-type, list-item]
 
-    assert completed == 7
+    assert completed == 8
     assert 2 <= peak <= 3
 
 
