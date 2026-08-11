@@ -1,6 +1,6 @@
 [project]
 name = "getflashlight"
-version = "0.2.1"
+version = "0.2.2"
 description = "FOCUS-based multi-cloud spend-visualization platform"
 readme = "README.md"
 license = "Apache-2.0"
