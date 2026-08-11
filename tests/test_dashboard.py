@@ -101,11 +101,9 @@ def test_snowflake_page_without_connection_or_demo_shows_empty_state(
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.dashboard.router import build_pages
+    from flashlight.dashboard.snowflake import visibility_data
 
-    monkeypatch.setattr(
-        "flashlight.dashboard.snowflake.visibility_data.has_local_data",
-        lambda: False,
-    )
+    monkeypatch.setattr(visibility_data, "has_local_data", lambda: False)
 
     async def _check() -> None:
         async with user_simulation() as user:
@@ -2390,8 +2388,11 @@ def test_syncing_provider_is_in_nav_before_its_first_publish(lake_home, monkeypa
 
     from flashlight.dashboard import ingest_runner
     from flashlight.dashboard.router import _nav_groups, build_pages
+    from flashlight.dashboard.snowflake import visibility_data
 
     monkeypatch.setattr(ingest_runner, "active_provider_groups", lambda: frozenset({"databricks"}))
+    # Isolate from local ACCOUNT_USAGE / repo synthetic Parquet.
+    monkeypatch.setattr(visibility_data, "has_local_data", lambda: False)
     assert _nav_groups() == ["databricks"]
 
     async def _check() -> None:
