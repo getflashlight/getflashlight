@@ -9,6 +9,10 @@ authors = [
     { name = "Yuga Chaparala", email = "ychaparala@gmail.com" },
     { name = "Velu Natarajan", email = "velunatsf@gmail.com" },
 ]
+maintainers = [
+    { name = "Yuga Chaparala", email = "ychaparala@gmail.com" },
+    { name = "Velu Natarajan", email = "velunatsf@gmail.com" },
+]
 requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
