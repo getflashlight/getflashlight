@@ -139,7 +139,7 @@ not carried over).
 
 The `databricks` connector does **not** hand-roll the billing math. It runs the
 authoritative **Databricks System Tables → FOCUS 1.3** query, vendored verbatim at
-[`src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql`](https://github.com/ychaparala/flashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql)
+[`src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql`](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql)
 from the Databricks solution accelerator
 [`databricks-solutions/cloud-infra-costs`](https://github.com/databricks-solutions/cloud-infra-costs/blob/main/focus/focus_query.sql).
 The connector executes it on a SQL warehouse, then feeds the FOCUS-columned output

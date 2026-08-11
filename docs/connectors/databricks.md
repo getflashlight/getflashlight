@@ -45,11 +45,11 @@ query-history access.
 
 The exact statements are versioned with the package rather than copied into this guide:
 
-- [FOCUS cost mapping](https://github.com/ychaparala/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql)
-- [Efficiency aggregation](https://github.com/ychaparala/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_efficiency.sql)
-- [Driver-health aggregation](https://github.com/ychaparala/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_driver_health.sql)
-- [Compute-instance aggregation](https://github.com/ychaparala/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_compute_instances.sql)
-- [AI-usage aggregation](https://github.com/ychaparala/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_ai_usage.sql)
+- [FOCUS cost mapping](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql)
+- [Efficiency aggregation](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_efficiency.sql)
+- [Driver-health aggregation](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_driver_health.sql)
+- [Compute-instance aggregation](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_compute_instances.sql)
+- [AI-usage aggregation](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_ai_usage.sql)
 
 These statements only submit `SELECT`, `DESCRIBE DETAIL`, and metadata-list operations;
 Flashlight does not issue DDL, DML, or permission changes against Databricks. See the

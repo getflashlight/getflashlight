@@ -1,8 +1,8 @@
 site_name: Flashlight
 site_description: FOCUS-based, multi-cloud spend visualization. Finds what's burning money in the dark.
 site_url: https://getflashlight.app/
-repo_url: https://github.com/ychaparala/getflashlight
-repo_name: ychaparala/getflashlight
+repo_url: https://github.com/getflashlight/getflashlight
+repo_name: getflashlight/getflashlight
 
 theme:
   name: material

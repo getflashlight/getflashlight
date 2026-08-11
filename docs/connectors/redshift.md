@@ -80,10 +80,10 @@ only partly measurable instead of presenting old missing data as zero.
 | Driver health | `stl_connection_log` | Aggregates client driver/application and connection counts by month; it is a fleet-health signal, not a cost calculation. |
 
 The complete, executable statements are part of the installed package and linked here for
-review: [activity](https://github.com/ychaparala/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/redshift_efficiency.sql),
-[query patterns](https://github.com/ychaparala/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/redshift_query_pattern_metrics.sql),
-[user activity](https://github.com/ychaparala/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/redshift_user_activity.sql),
-and [driver health](https://github.com/ychaparala/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/redshift_driver_health.sql).
+review: [activity](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/redshift_efficiency.sql),
+[query patterns](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/redshift_query_pattern_metrics.sql),
+[user activity](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/redshift_user_activity.sql),
+and [driver health](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/redshift_driver_health.sql).
 
 Sync at least six months and verify that AWS FOCUS data exists for the same time range
 before assessing dollar-backed efficiency findings. Six months gives the efficiency views a

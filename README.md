@@ -7,10 +7,10 @@
 <p align="center"><em>Make cloud spend easy to see.</em></p>
 
 <p align="center">
-  <a href="https://github.com/ychaparala/getflashlight/actions/workflows/ci.yml"><img src="https://github.com/ychaparala/getflashlight/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/getflashlight/getflashlight/actions/workflows/ci.yml"><img src="https://github.com/getflashlight/getflashlight/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://pypi.org/project/getflashlight/"><img src="https://img.shields.io/pypi/v/getflashlight" alt="PyPI"></a>
   <a href="https://pypi.org/project/getflashlight/"><img src="https://img.shields.io/pypi/pyversions/getflashlight" alt="Python versions"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/ychaparala/getflashlight" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/getflashlight/getflashlight" alt="License"></a>
 </p>
 
 **FOCUS-based, multi-cloud cloud-spend visualization.**
