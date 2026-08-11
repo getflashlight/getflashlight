@@ -57,4 +57,4 @@ MCP listener to the public internet; use a private network or authenticated prox
 
 Collect the command, non-secret configuration shape, selected time window, connector
 name, and complete sanitized error. Open an issue at
-[GitHub Issues](https://github.com/ychaparala/getflashlight/issues) with those details.
+[GitHub Issues](https://github.com/getflashlight/getflashlight/issues) with those details.

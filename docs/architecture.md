@@ -1,17 +1,51 @@
 # Architecture
 
-```
-sources ──▶ flashlight ingest ──▶ Parquet lake (FLASHLIGHT_HOME) ──▶ readers
- AWS FOCUS export    (writer)     bronze/  partitioned, source of truth   flashlight mcp serve
- Databricks tables                gold/    *.parquet ◀── the only surface  flashlight dashboard serve
- AWS Cost Explorer                         consumers read                 (each: own in-mem DuckDB)
+```mermaid
+flowchart LR
+    subgraph sources[Cloud sources]
+        aws_export["AWS FOCUS Data Export"]
+        aws_ce["AWS Cost Explorer"]
+        databricks["Databricks system tables"]
+        redshift["Amazon Redshift telemetry"]
+        snowflake["Snowflake usage and telemetry"]
+    end
+
+    subgraph writer[One writer]
+        ingest["flashlight ingest"]
+    end
+
+    subgraph lake[Parquet lake · FLASHLIGHT_HOME]
+        bronze["BRONZE<br/>canonical source records"]
+        silver["SILVER<br/>normalized in memory"]
+        gold["GOLD<br/>published metric views"]
+    end
+
+    subgraph readers[Read-only consumers]
+        dashboard["Dashboard<br/>human interface"]
+        mcp["MCP server<br/>agent interface"]
+    end
+
+    aws_export --> ingest
+    aws_ce --> ingest
+    databricks --> ingest
+    redshift --> ingest
+    snowflake --> ingest
+    ingest --> bronze --> silver --> gold
+    gold --> dashboard
+    gold --> mcp
 ```
 
-Three independent processes: `ingest` is the sole writer; `mcp serve` and
-`dashboard serve` are read-only. Concurrency is "many readers over immutable
-Parquet, publish by atomic per-file rename" — no locks, no server. There is no
-REST API, no database, and no migrations: Parquet is self-describing and the
-`FocusRecord` Pydantic model is the schema.
+## The important boundary
+
+`flashlight ingest` is the only process that writes the lake. The dashboard and MCP server
+open their own in-memory DuckDB connections over already-published GOLD Parquet; neither
+changes source data or local lake files. A publish uses atomic per-file replacement, so
+readers see either the prior complete metric or the next complete metric—not a partial one.
+
+That boundary is why a chart and an agent answer use the same metric contract, and why a
+dashboard may control an ingest without becoming a second writer. There is no database
+server, REST API, or migration layer: Parquet is the persistent store and `FocusRecord` is
+the canonical cost-record schema.
 
 The dashboard can *launch* the other two rather than doing their work: its Connections
 page shells out to `flashlight ingest` and its MCP server page starts/stops
@@ -26,20 +60,15 @@ never in these files.
 
 ## The medallion
 
-- **BRONZE** `bronze/` — canonical FOCUS records, Hive-partitioned by connector +
-  charge month; partition-replace makes re-ingest idempotent and self-purging.
-- **SILVER** (in-memory only) — the cleaned, normalized view every GOLD metric is
-  derived from: one canonical `cost` column (EffectiveCost), charge-period grain.
-- **GOLD** `gold/<group>/*.parquet` — the metrics contract the dashboard and MCP
-  both read, so a chart and an agent never disagree. Built by `transform` via
-  DuckDB `COPY`, split per provider (`aws.monthly_bill`, `databricks.monthly_bill`)
-  plus the fixed cross-provider groups: `efficiency` (waste), `driver_health`
-  (Databricks client-driver fleet health — a compliance signal, no cost metric),
-  `policy` (governance guardrails, also no cost metric), `ai_usage` (AI serving
-  tokens), and `storage` (the cloud storage bill behind a data platform — AWS S3
-  cost labelled by Unity Catalog's bucket map; cross-provider by construction,
-  since each row names both the biller and the platform. It is **never** added to
-  Databricks spend — see [Backing storage](design/backing-storage.md)).
+| Layer | Location | What belongs there | Why it exists |
+| --- | --- | --- | --- |
+| **BRONZE** | `bronze/` | Canonical FOCUS cost records and source telemetry, partitioned by connector and charge month | It is the durable source of truth. Re-ingesting a partition replaces it, so retries are idempotent. |
+| **SILVER** | In memory | The cleaned, normalized cost model | Every cost metric starts from one canonical `EffectiveCost` value at charge-period grain. |
+| **GOLD** | `gold/<group>/*.parquet` | Published metric views, including provider spend, efficiency, policy, driver health, AI usage, and backing storage/compute | It is the stable contract shared by dashboard and MCP readers. |
+
+GOLD is split by provider, such as `aws.monthly_bill` and `databricks.monthly_bill`, plus
+cross-provider groups. The `storage` group labels AWS S3 cost with Unity Catalog's bucket
+map; it is **never** added to Databricks spend. See [Backing storage](design/backing-storage.md).
 
 ### Why the billing period stops at BRONZE
 
