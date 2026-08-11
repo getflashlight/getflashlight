@@ -517,7 +517,11 @@ def build_pages() -> None:
         )
 
     def _render_snowflake_visibility_only() -> None:
-        """Render Snowflake visibility from a live connection or the bundled demo data."""
+        """Render Snowflake visibility from a live connection or the bundled demo data.
+
+        Prefer an async page entry that prefetches LeaderBoard data off-thread; this
+        sync helper remains for the catch-all route fallback and tests.
+        """
         from flashlight.dashboard.snowflake import live_data, visibility_data
         from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
 
@@ -555,17 +559,83 @@ def build_pages() -> None:
             if name == "Visibility" and name not in loaded:
                 loaded[name] = True
                 with panels["Visibility"]:
-                    snowflake_visibility.render(data)
+                    # One shared ACCOUNT_USAGE connection for every Visibility panel query.
+                    if data is live_data:
+                        with live_data.live_session():
+                            snowflake_visibility.render(data)
+                    else:
+                        snowflake_visibility.render(data)
 
         tabs.on_value_change(_on_tab_change)
+
+    async def _render_snowflake_visibility_async() -> None:
+        """Prefetch LeaderBoard off the event loop, then paint UI on the main thread."""
+        from nicegui import run
+
+        from flashlight.dashboard.snowflake import live_data, visibility_data
+        from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
+
+        if live_data.is_configured():
+            data: ModuleType = live_data
+        elif visibility_data.has_synthetic_data():
+            data = visibility_data
+        else:
+            no_data_page("Snowflake visibility")
+            ui.label(
+                "Add an enabled Snowflake connection on the Connections page, or "
+                "generate the bundled demo data."
+            ).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+            return
+
+        holder = ui.column().classes("w-full")
+        with holder:
+            ui.spinner(size="lg")
+            ui.label("Loading Snowflake ACCOUNT_USAGE…").classes("text-sm").style(
+                f"color:{chrome.INK_MUTED}"
+            )
+
+        def _fetch_snapshot() -> dict[str, object]:
+            if data is live_data:
+                with live_data.live_session():
+                    return data.leaderboard_snapshot()  # type: ignore[no-any-return]
+            return data.leaderboard_snapshot()  # type: ignore[no-any-return]
+
+        snapshot = await run.io_bound(_fetch_snapshot)
+        holder.clear()
+        with holder:
+            with ui.tabs().classes("w-full").props("dense") as tabs:
+                tab_exec = ui.tab("LeaderBoard")
+                tab_vis = ui.tab("Visibility")
+            loaded: dict[str, bool] = {"LeaderBoard": True}
+            panels: dict[str, ui.tab_panel] = {}
+            with ui.tab_panels(tabs, value=tab_exec).classes("w-full").style(
+                "background:transparent;"
+            ):
+                panels["LeaderBoard"] = ui.tab_panel(tab_exec)
+                panels["Visibility"] = ui.tab_panel(tab_vis)
+            with panels["LeaderBoard"]:
+                snowflake_visibility.render_leaderboard(data, snapshot=snapshot)
+
+            def _on_tab_change(e: object) -> None:
+                name = getattr(e, "value", None)
+                if name == "Visibility" and name not in loaded:
+                    loaded[name] = True
+                    with panels["Visibility"]:
+                        if data is live_data:
+                            with live_data.live_session():
+                                snowflake_visibility.render(data)
+                        else:
+                            snowflake_visibility.render(data)
+
+            tabs.on_value_change(_on_tab_change)
 
     # Explicit /snowflake before the catch-all: always the Visibility/LeaderBoard stack
     # (live ACCOUNT_USAGE or synthetic Parquet), not the FOCUS provider_focus hybrid.
     @ui.page("/snowflake")
-    def _snowflake_page() -> None:
+    async def _snowflake_page() -> None:
         with gold_session(), shell("/snowflake"):
             sync_in_progress_banner("snowflake")
-            _render_snowflake_visibility_only()
+            await _render_snowflake_visibility_async()
 
     # One parameterized route, not one @ui.page per group discovered right now —
     # discover_provider_groups() reads gold/ live, so it can (and does) return a
@@ -576,14 +646,14 @@ def build_pages() -> None:
     # until the dashboard process is restarted. Checking membership per request
     # instead means a group's page and its nav link agree at all times.
     @ui.page("/{group}")
-    def _provider_page(group: str) -> None:
+    async def _provider_page(group: str) -> None:
         # /snowflake is registered explicitly above (visibility stack before GOLD).
         # Starlette matches in registration order, so this catch-all should not see it;
         # if it does, mirror the dedicated page rather than 404.
         if group == "snowflake":
             with gold_session(), shell("/snowflake"):
                 sync_in_progress_banner("snowflake")
-                _render_snowflake_visibility_only()
+                await _render_snowflake_visibility_async()
             return
         published_groups = set(discover_provider_groups())
         syncing = group in ingest_runner.active_provider_groups()

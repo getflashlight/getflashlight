@@ -4,10 +4,18 @@ customer's live ACCOUNT_USAGE views instead of synthetic Parquet files.
 Reads the Snowflake connector config from connections.yml and uses the same auth path
 (key-pair, authenticator, or password) as the ingest connector. All functions return
 empty DataFrames or zeroed dicts gracefully when no data is available.
+
+One page render opens many ACCOUNT_USAGE queries.  Use :func:`live_session` so they
+share a single connector (mirrors ``gold_session`` for DuckDB) — otherwise each call
+opens a new TCP/TLS session and stalls NiceGUI's event loop until WebSockets die.
 """
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -18,6 +26,7 @@ import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
+from snowflake.connector import SnowflakeConnection
 
 from flashlight.ingest.config import SnowflakeConfig, env, load_connections
 
@@ -25,8 +34,16 @@ from flashlight.ingest.config import SnowflakeConfig, env, load_connections
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 load_dotenv(_REPO_ROOT / ".env")
 
+# Connector logs every connect() at INFO — LeaderBoard alone would spam dozens of lines.
+logging.getLogger("snowflake.connector").setLevel(logging.WARNING)
+
 CREDIT_PRICE = 3.00
 _STORAGE_COST_PER_TB = 23.0  # $/TB/month on-demand
+
+# One connection per page-render session (see :func:`live_session`).
+_session_conn: ContextVar[SnowflakeConnection | None] = ContextVar(
+    "snowflake_live_session_conn", default=None
+)
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
@@ -76,7 +93,7 @@ def is_configured() -> bool:
     return _sf_config() is not None
 
 
-def _connect(cfg: SnowflakeConfig) -> snowflake.connector.SnowflakeConnection:
+def _connect(cfg: SnowflakeConfig) -> SnowflakeConnection:
     user = env(cfg.user_env)
     params: dict[str, object] = {
         "account": cfg.account,
@@ -105,6 +122,47 @@ def _connect(cfg: SnowflakeConfig) -> snowflake.connector.SnowflakeConnection:
     return snowflake.connector.connect(**params)
 
 
+@contextmanager
+def live_session() -> Iterator[None]:
+    """Scope one Snowflake connection to everything run inside this block.
+
+    Nested calls reuse the outer connection.  Outside a session, helpers still
+    open/close a one-shot connection (scripts/tests).
+    """
+    if _session_conn.get() is not None:
+        yield
+        return
+    cfg = _sf_config()
+    if cfg is None:
+        yield
+        return
+    conn = _connect(cfg)
+    token = _session_conn.set(conn)
+    try:
+        yield
+    finally:
+        _session_conn.reset(token)
+        conn.close()
+
+
+@contextmanager
+def _borrow_conn() -> Iterator[SnowflakeConnection | None]:
+    """Yield the session connection, or a short-lived one-shot connection."""
+    existing = _session_conn.get()
+    if existing is not None:
+        yield existing
+        return
+    cfg = _sf_config()
+    if cfg is None:
+        yield None
+        return
+    conn = _connect(cfg)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Lowercase Snowflake result columns — connector returns UPPERCASE by default."""
     if df.columns.empty:
@@ -116,119 +174,137 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _query(sql: str) -> pd.DataFrame:
     """Run sql against the live Snowflake account; return empty DF on any error."""
-    cfg = _sf_config()
-    if cfg is None:
-        return pd.DataFrame()
     try:
-        conn = _connect(cfg)
-        try:
+        with _borrow_conn() as conn:
+            if conn is None:
+                return pd.DataFrame()
             cur = conn.cursor()
-            cur.execute(sql)
-            return _normalize_columns(cur.fetch_pandas_all())
-        finally:
-            conn.close()
+            try:
+                cur.execute(sql)
+                return _normalize_columns(cur.fetch_pandas_all())
+            finally:
+                cur.close()
     except Exception:  # noqa: BLE001
         return pd.DataFrame()
 
 
 def _fetchone(sql: str) -> tuple[Any, ...] | None:
     """Run sql and return the first row, or None on any error."""
-    cfg = _sf_config()
-    if cfg is None:
-        return None
     try:
-        conn = _connect(cfg)
-        try:
+        with _borrow_conn() as conn:
+            if conn is None:
+                return None
             cur = conn.cursor()
-            cur.execute(sql)
-            return cur.fetchone()
-        finally:
-            conn.close()
+            try:
+                cur.execute(sql)
+                return cur.fetchone()
+            finally:
+                cur.close()
     except Exception:  # noqa: BLE001
         return None
 
 
-# ── KPIs ──────────────────────────────────────────────────────────────────────
+def leaderboard_snapshot() -> dict[str, Any]:
+    """All LeaderBoard queries in one live session — safe to run via ``run.io_bound``."""
+    with live_session():
+        compute = hidden_waste_compute()
+        storage = hidden_waste_storage()
+        ai_waste = hidden_waste_ai()
+        monthly = cost_breakdown_monthly(12)
+        return {
+            "kpis": kpi_summary(),
+            "ai": ai_spend_summary(),
+            "sw": hidden_waste_summary(),
+            "forecast": tco_monthly_trend_and_forecast(),
+            "monthly": monthly,
+            "breakdown": cost_breakdown(),
+            "ai_cost_breakdown": ai_cost_breakdown(),
+            "serverless_cost_breakdown": serverless_cost_breakdown(),
+            "top_tables_storage": top_tables_storage(25),
+            "hidden_waste_compute": compute,
+            "hidden_waste_storage": storage,
+            "hidden_waste_ai": ai_waste,
+            "top_users_hidden_waste": top_users_hidden_waste(5),
+        }
 
 def kpi_summary() -> dict[str, Any]:
     """Top-line KPIs for the overview tab."""
-    cfg = _sf_config()
-    if cfg is None:
-        return _empty_kpi()
     try:
-        conn = _connect(cfg)
-        try:
+        with _borrow_conn() as conn:
+            if conn is None:
+                return _empty_kpi()
             cur = conn.cursor()
-            month_sql = "DATE_TRUNC('month', CURRENT_DATE())"
+            try:
+                month_sql = "DATE_TRUNC('month', CURRENT_DATE())"
 
-            def _scalar(sql: str) -> float:
-                cur.execute(sql)
-                row = cur.fetchone()
-                return float((row[0] if row else 0) or 0)
+                def _scalar(sql: str) -> float:
+                    cur.execute(sql)
+                    row = cur.fetchone()
+                    return float((row[0] if row else 0) or 0)
 
-            wh_credits = _scalar(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
-                f"WHERE start_time >= {month_sql}"
-            )
-            svc_credits = _scalar(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.METERING_HISTORY "
-                f"WHERE start_time >= {month_sql}"
-            )
-            total_credits = wh_credits + svc_credits
+                wh_credits = _scalar(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
+                    f"WHERE start_time >= {month_sql}"
+                )
+                svc_credits = _scalar(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.METERING_HISTORY "
+                    f"WHERE start_time >= {month_sql}"
+                )
+                total_credits = wh_credits + svc_credits
 
-            ai_wh_credits = _scalar(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
-                f"WHERE warehouse_name IN "
-                f"('ML_TRAINING','CORTEX_AI','CORTEX_SEARCH','CORTEX_AGENTS') "
-                f"AND start_time >= {month_sql}"
-            )
-            serverless_credits = _scalar(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.METERING_HISTORY "
-                f"WHERE start_time >= {month_sql} "
-                f"AND service_type IN ('AUTOMATIC_CLUSTERING','SNOWPIPE','SERVERLESS_TASK',"
-                f"'REPLICATION','SEARCH_OPTIMIZATION','MATERIALIZED_VIEW','QUERY_ACCELERATION',"
-                f"'SNOWPARK_CONTAINER_SERVICES')"
-            )
+                ai_wh_credits = _scalar(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
+                    f"WHERE warehouse_name IN "
+                    f"('ML_TRAINING','CORTEX_AI','CORTEX_SEARCH','CORTEX_AGENTS') "
+                    f"AND start_time >= {month_sql}"
+                )
+                serverless_credits = _scalar(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.METERING_HISTORY "
+                    f"WHERE start_time >= {month_sql} "
+                    f"AND service_type IN ('AUTOMATIC_CLUSTERING','SNOWPIPE','SERVERLESS_TASK',"
+                    f"'REPLICATION','SEARCH_OPTIMIZATION','MATERIALIZED_VIEW','QUERY_ACCELERATION',"
+                    f"'SNOWPARK_CONTAINER_SERVICES')"
+                )
 
-            cur.execute(
-                "SELECT COUNT(DISTINCT warehouse_name) "
-                "FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY"
-            )
-            wh_row = cur.fetchone()
+                cur.execute(
+                    "SELECT COUNT(DISTINCT warehouse_name) "
+                    "FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY"
+                )
+                wh_row = cur.fetchone()
 
-            cur.execute(
-                "SELECT COUNT(*) FROM ACCOUNT_USAGE.QUERY_HISTORY "
-                "WHERE execution_status = 'SUCCESS'"
-            )
-            q_row = cur.fetchone()
+                cur.execute(
+                    "SELECT COUNT(*) FROM ACCOUNT_USAGE.QUERY_HISTORY "
+                    "WHERE execution_status = 'SUCCESS'"
+                )
+                q_row = cur.fetchone()
 
-            cur.execute(
-                "SELECT AVG(avg_running) FROM ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY"
-            )
-            u_row = cur.fetchone()
+                cur.execute(
+                    "SELECT AVG(avg_running) FROM ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY"
+                )
+                u_row = cur.fetchone()
 
-            cur.execute(
-                "SELECT ROUND((storage_bytes + stage_bytes) / POWER(1024, 4), 2) "
-                "FROM ACCOUNT_USAGE.STORAGE_USAGE ORDER BY usage_date DESC LIMIT 1"
-            )
-            s_row = cur.fetchone()
+                cur.execute(
+                    "SELECT ROUND((storage_bytes + stage_bytes) / POWER(1024, 4), 2) "
+                    "FROM ACCOUNT_USAGE.STORAGE_USAGE ORDER BY usage_date DESC LIMIT 1"
+                )
+                s_row = cur.fetchone()
 
-            ytd_wh = _scalar(
-                "SELECT COALESCE(SUM(credits_used), 0) "
-                "FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
-                "WHERE start_time >= DATE_TRUNC('year', CURRENT_DATE())"
-            )
-            ytd_svc = _scalar(
-                "SELECT COALESCE(SUM(credits_used), 0) "
-                "FROM ACCOUNT_USAGE.METERING_HISTORY "
-                "WHERE start_time >= DATE_TRUNC('year', CURRENT_DATE())"
-            )
-        finally:
-            conn.close()
+                ytd_wh = _scalar(
+                    "SELECT COALESCE(SUM(credits_used), 0) "
+                    "FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
+                    "WHERE start_time >= DATE_TRUNC('year', CURRENT_DATE())"
+                )
+                ytd_svc = _scalar(
+                    "SELECT COALESCE(SUM(credits_used), 0) "
+                    "FROM ACCOUNT_USAGE.METERING_HISTORY "
+                    "WHERE start_time >= DATE_TRUNC('year', CURRENT_DATE())"
+                )
+            finally:
+                cur.close()
 
         storage_tb = float((s_row[0] if s_row else 0) or 0)
         storage_cost = round(storage_tb * _STORAGE_COST_PER_TB, 0)
@@ -265,79 +341,78 @@ def _empty_kpi() -> dict[str, Any]:
 
 def cost_breakdown() -> list[dict[str, Any]]:
     """Major cost categories for pie chart — current month spend."""
-    cfg = _sf_config()
-    if cfg is None:
-        return []
     try:
-        conn = _connect(cfg)
-        try:
+        with _borrow_conn() as conn:
+            if conn is None:
+                return []
             cur = conn.cursor()
-            m = "DATE_TRUNC('month', CURRENT_DATE())"
+            try:
+                m = "DATE_TRUNC('month', CURRENT_DATE())"
 
-            def _s(sql: str) -> float:
-                cur.execute(sql)
-                row = cur.fetchone()
-                return float((row[0] if row else 0) or 0)
+                def _s(sql: str) -> float:
+                    cur.execute(sql)
+                    row = cur.fetchone()
+                    return float((row[0] if row else 0) or 0)
 
-            managed = _s(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
-                f"WHERE start_time >= {m} "
-                f"AND warehouse_name NOT IN "
-                f"('ML_TRAINING','CORTEX_AI','CORTEX_SEARCH','CORTEX_AGENTS')"
-            ) * CREDIT_PRICE
-            serverless = _s(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.METERING_HISTORY "
-                f"WHERE start_time >= {m} "
-                f"AND service_type IN ('AUTOMATIC_CLUSTERING','SNOWPIPE','SERVERLESS_TASK',"
-                f"'REPLICATION','SEARCH_OPTIMIZATION','MATERIALIZED_VIEW','QUERY_ACCELERATION',"
-                f"'SNOWPARK_CONTAINER_SERVICES')"
-            ) * CREDIT_PRICE
-            ai_wh = _s(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
-                f"WHERE start_time >= {m} "
-                f"AND warehouse_name IN "
-                f"('ML_TRAINING','CORTEX_AI','CORTEX_SEARCH','CORTEX_AGENTS')"
-            )
-            ai_svc = _s(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.METERING_HISTORY "
-                f"WHERE start_time >= {m} "
-                f"AND service_type IN ('CORTEX_AI_FUNCTIONS','CORTEX_SEARCH',"
-                f"'AI_SERVICES','CORTEX_ANALYST','DOCUMENT_AI',"
-                f"'SNOWFLAKE_INTELLIGENCE','CORTEX_AGENTS','CORTEX_GUARDRAILS')"
-            )
-            ai_total = (ai_wh + ai_svc) * CREDIT_PRICE
-            cur.execute(
-                "SELECT storage_bytes, stage_bytes, failsafe_bytes "
-                "FROM ACCOUNT_USAGE.STORAGE_USAGE ORDER BY usage_date DESC LIMIT 1"
-            )
-            st = cur.fetchone()
-            tb = 1 / (1024 ** 4)
-            storage = (
-                float((st[0] if st else 0) or 0)
-                + float((st[1] if st else 0) or 0)
-                + float((st[2] if st else 0) or 0)
-            ) * tb * _STORAGE_COST_PER_TB
-            xfer = _s(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.METERING_HISTORY "
-                f"WHERE start_time >= {m} AND service_type = 'DATA_TRANSFER'"
-            ) * CREDIT_PRICE
-            tco_wh = _s(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY WHERE start_time >= {m}"
-            )
-            tco_svc = _s(
-                f"SELECT COALESCE(SUM(credits_used), 0) "
-                f"FROM ACCOUNT_USAGE.METERING_HISTORY WHERE start_time >= {m}"
-            )
-            tco = (tco_wh + tco_svc) * CREDIT_PRICE + storage
-            other = max(tco - managed - serverless - ai_total - storage - xfer, 0)
-        finally:
-            conn.close()
+                managed = _s(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
+                    f"WHERE start_time >= {m} "
+                    f"AND warehouse_name NOT IN "
+                    f"('ML_TRAINING','CORTEX_AI','CORTEX_SEARCH','CORTEX_AGENTS')"
+                ) * CREDIT_PRICE
+                serverless = _s(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.METERING_HISTORY "
+                    f"WHERE start_time >= {m} "
+                    f"AND service_type IN ('AUTOMATIC_CLUSTERING','SNOWPIPE','SERVERLESS_TASK',"
+                    f"'REPLICATION','SEARCH_OPTIMIZATION','MATERIALIZED_VIEW','QUERY_ACCELERATION',"
+                    f"'SNOWPARK_CONTAINER_SERVICES')"
+                ) * CREDIT_PRICE
+                ai_wh = _s(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY "
+                    f"WHERE start_time >= {m} "
+                    f"AND warehouse_name IN "
+                    f"('ML_TRAINING','CORTEX_AI','CORTEX_SEARCH','CORTEX_AGENTS')"
+                )
+                ai_svc = _s(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.METERING_HISTORY "
+                    f"WHERE start_time >= {m} "
+                    f"AND service_type IN ('CORTEX_AI_FUNCTIONS','CORTEX_SEARCH',"
+                    f"'AI_SERVICES','CORTEX_ANALYST','DOCUMENT_AI',"
+                    f"'SNOWFLAKE_INTELLIGENCE','CORTEX_AGENTS','CORTEX_GUARDRAILS')"
+                )
+                ai_total = (ai_wh + ai_svc) * CREDIT_PRICE
+                cur.execute(
+                    "SELECT storage_bytes, stage_bytes, failsafe_bytes "
+                    "FROM ACCOUNT_USAGE.STORAGE_USAGE ORDER BY usage_date DESC LIMIT 1"
+                )
+                st = cur.fetchone()
+                tb = 1 / (1024 ** 4)
+                storage = (
+                    float((st[0] if st else 0) or 0)
+                    + float((st[1] if st else 0) or 0)
+                    + float((st[2] if st else 0) or 0)
+                ) * tb * _STORAGE_COST_PER_TB
+                xfer = _s(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.METERING_HISTORY "
+                    f"WHERE start_time >= {m} AND service_type = 'DATA_TRANSFER'"
+                ) * CREDIT_PRICE
+                tco_wh = _s(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY WHERE start_time >= {m}"
+                )
+                tco_svc = _s(
+                    f"SELECT COALESCE(SUM(credits_used), 0) "
+                    f"FROM ACCOUNT_USAGE.METERING_HISTORY WHERE start_time >= {m}"
+                )
+                tco = (tco_wh + tco_svc) * CREDIT_PRICE + storage
+                other = max(tco - managed - serverless - ai_total - storage - xfer, 0)
+            finally:
+                cur.close()
         return [
             {"label": "Managed Compute", "cost": managed},
             {"label": "Serverless Compute", "cost": serverless},
@@ -1151,89 +1226,88 @@ def all_service_cost_profile() -> pd.DataFrame:
 
 def cost_breakdown_monthly(months: int = 12) -> pd.DataFrame:
     """Monthly cost breakdown by service category for the last N months."""
-    cfg = _sf_config()
-    if cfg is None:
-        return pd.DataFrame()
     try:
-        conn = _connect(cfg)
-        try:
-            cur = conn.cursor()
-            cutoff = f"DATEADD(MONTH, -{months}, DATE_TRUNC('MONTH', CURRENT_DATE()))"
-
-            # Warehouse metering
-            cur.execute(f"""
-                SELECT DATE_TRUNC('MONTH', start_time) AS month,
-                       CASE WHEN warehouse_name IN
-                         ('ML_TRAINING','CORTEX_AI','CORTEX_SEARCH','CORTEX_AGENTS')
-                         THEN 'AI & ML' ELSE 'Managed Compute'
-                       END AS category,
-                       SUM(credits_used) * {CREDIT_PRICE} AS cost_usd
-                FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
-                WHERE start_time >= {cutoff}
-                GROUP BY 1, 2
-            """)
-            wh = pd.DataFrame(
-                cur.fetchall(), columns=["month", "category", "cost_usd"]
-            )
-
-            # Serverless metering
-            cur.execute(f"""
-                SELECT DATE_TRUNC('MONTH', start_time) AS month,
-                       CASE
-                         WHEN service_type IN (
-                           'CORTEX_AI_FUNCTIONS','CORTEX_SEARCH','AI_SERVICES',
-                           'CORTEX_ANALYST','DOCUMENT_AI','SNOWFLAKE_INTELLIGENCE',
-                           'CORTEX_AGENTS','CORTEX_GUARDRAILS') THEN 'AI & ML'
-                         WHEN service_type IN (
-                           'AUTOMATIC_CLUSTERING','AUTO_CLUSTERING',
-                           'SNOWPIPE','PIPE','SNOWPIPE_STREAMING',
-                           'SERVERLESS_TASK','SERVERLESS_ALERTS',
-                           'REPLICATION','SEARCH_OPTIMIZATION','MATERIALIZED_VIEW',
-                           'QUERY_ACCELERATION','SNOWPARK_CONTAINER_SERVICES',
-                           'HYBRID_TABLE_REQUESTS',
-                           'WAREHOUSE_METERING','WAREHOUSE_METERING_READER')
-                           THEN 'Serverless Compute'
-                         WHEN service_type IN (
-                           'FAILSAFE_RECOVERY',
-                           'ARCHIVE_STORAGE_RETRIEVAL_FILE_PROCESSING',
-                           'ARCHIVE_STORAGE_WRITE',
-                           'STORAGE_LIFECYCLE_POLICY_EXECUTION') THEN 'Storage'
-                         WHEN service_type = 'DATA_TRANSFER' THEN 'Data Transfer'
-                         ELSE 'Other'
-                       END AS category,
-                       SUM(credits_used) * {CREDIT_PRICE} AS cost_usd
-                FROM ACCOUNT_USAGE.METERING_HISTORY
-                WHERE start_time >= {cutoff}
-                GROUP BY 1, 2
-            """)
-            svc = pd.DataFrame(
-                cur.fetchall(), columns=["month", "category", "cost_usd"]
-            )
-
-            # Storage
-            cur.execute(f"""
-                SELECT DATE_TRUNC('MONTH', usage_date) AS month,
-                       'Storage' AS category,
-                       AVG((storage_bytes + stage_bytes + failsafe_bytes)
-                           / POWER(1024, 4)) * 23.0 AS cost_usd
-                FROM ACCOUNT_USAGE.STORAGE_USAGE
-                WHERE usage_date >= {cutoff}
-                GROUP BY 1
-            """)
-            storage = pd.DataFrame(
-                cur.fetchall(), columns=["month", "category", "cost_usd"]
-            )
-
-            df = pd.concat([wh, svc, storage], ignore_index=True)
-            if df.empty:
+        with _borrow_conn() as conn:
+            if conn is None:
                 return pd.DataFrame()
+            cur = conn.cursor()
+            try:
+                cutoff = f"DATEADD(MONTH, -{months}, DATE_TRUNC('MONTH', CURRENT_DATE()))"
 
-            df = df.groupby(["month", "category"], as_index=False)["cost_usd"].sum()
-            df["cost_usd"] = df["cost_usd"].round(2)
-            df["month"] = pd.to_datetime(df["month"]).dt.strftime("%Y-%m")
-            df = df.sort_values(["month", "category"])
-            return df
-        finally:
-            conn.close()
+                # Warehouse metering
+                cur.execute(f"""
+                    SELECT DATE_TRUNC('MONTH', start_time) AS month,
+                           CASE WHEN warehouse_name IN
+                             ('ML_TRAINING','CORTEX_AI','CORTEX_SEARCH','CORTEX_AGENTS')
+                             THEN 'AI & ML' ELSE 'Managed Compute'
+                           END AS category,
+                           SUM(credits_used) * {CREDIT_PRICE} AS cost_usd
+                    FROM ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+                    WHERE start_time >= {cutoff}
+                    GROUP BY 1, 2
+                """)
+                wh = pd.DataFrame(
+                    cur.fetchall(), columns=["month", "category", "cost_usd"]
+                )
+
+                # Serverless metering
+                cur.execute(f"""
+                    SELECT DATE_TRUNC('MONTH', start_time) AS month,
+                           CASE
+                             WHEN service_type IN (
+                               'CORTEX_AI_FUNCTIONS','CORTEX_SEARCH','AI_SERVICES',
+                               'CORTEX_ANALYST','DOCUMENT_AI','SNOWFLAKE_INTELLIGENCE',
+                               'CORTEX_AGENTS','CORTEX_GUARDRAILS') THEN 'AI & ML'
+                             WHEN service_type IN (
+                               'AUTOMATIC_CLUSTERING','AUTO_CLUSTERING',
+                               'SNOWPIPE','PIPE','SNOWPIPE_STREAMING',
+                               'SERVERLESS_TASK','SERVERLESS_ALERTS',
+                               'REPLICATION','SEARCH_OPTIMIZATION','MATERIALIZED_VIEW',
+                               'QUERY_ACCELERATION','SNOWPARK_CONTAINER_SERVICES',
+                               'HYBRID_TABLE_REQUESTS',
+                               'WAREHOUSE_METERING','WAREHOUSE_METERING_READER')
+                               THEN 'Serverless Compute'
+                             WHEN service_type IN (
+                               'FAILSAFE_RECOVERY',
+                               'ARCHIVE_STORAGE_RETRIEVAL_FILE_PROCESSING',
+                               'ARCHIVE_STORAGE_WRITE',
+                               'STORAGE_LIFECYCLE_POLICY_EXECUTION') THEN 'Storage'
+                             WHEN service_type = 'DATA_TRANSFER' THEN 'Data Transfer'
+                             ELSE 'Other'
+                           END AS category,
+                           SUM(credits_used) * {CREDIT_PRICE} AS cost_usd
+                    FROM ACCOUNT_USAGE.METERING_HISTORY
+                    WHERE start_time >= {cutoff}
+                    GROUP BY 1, 2
+                """)
+                svc = pd.DataFrame(
+                    cur.fetchall(), columns=["month", "category", "cost_usd"]
+                )
+
+                # Storage
+                cur.execute(f"""
+                    SELECT DATE_TRUNC('MONTH', usage_date) AS month,
+                           'Storage' AS category,
+                           AVG((storage_bytes + stage_bytes + failsafe_bytes)
+                               / POWER(1024, 4)) * 23.0 AS cost_usd
+                    FROM ACCOUNT_USAGE.STORAGE_USAGE
+                    WHERE usage_date >= {cutoff}
+                    GROUP BY 1
+                """)
+                storage = pd.DataFrame(
+                    cur.fetchall(), columns=["month", "category", "cost_usd"]
+                )
+
+                df = pd.concat([wh, svc, storage], ignore_index=True)
+                if df.empty:
+                    return pd.DataFrame()
+
+                df = df.groupby(["month", "category"], as_index=False)["cost_usd"].sum()
+                df["cost_usd"] = df["cost_usd"].round(2)
+                df["month"] = pd.to_datetime(df["month"]).dt.strftime("%Y-%m")
+                df = df.sort_values(["month", "category"])
+                return df
+            finally:
+                cur.close()
     except Exception:  # noqa: BLE001
         return pd.DataFrame()

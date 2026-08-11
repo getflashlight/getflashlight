@@ -1289,3 +1289,26 @@ def cost_breakdown_monthly(months: int = 12) -> pd.DataFrame:
         return df
     finally:
         con.close()
+
+
+def leaderboard_snapshot() -> dict[str, Any]:
+    """All LeaderBoard queries in one shot — mirrors live_data.leaderboard_snapshot."""
+    compute = hidden_waste_compute()
+    storage = hidden_waste_storage()
+    ai_waste = hidden_waste_ai()
+    monthly = cost_breakdown_monthly(12)
+    return {
+        "kpis": kpi_summary(),
+        "ai": ai_spend_summary(),
+        "sw": hidden_waste_summary(),
+        "forecast": tco_monthly_trend_and_forecast(),
+        "monthly": monthly,
+        "breakdown": cost_breakdown(),
+        "ai_cost_breakdown": ai_cost_breakdown(),
+        "serverless_cost_breakdown": serverless_cost_breakdown(),
+        "top_tables_storage": top_tables_storage(25),
+        "hidden_waste_compute": compute,
+        "hidden_waste_storage": storage,
+        "hidden_waste_ai": ai_waste,
+        "top_users_hidden_waste": top_users_hidden_waste(5),
+    }
