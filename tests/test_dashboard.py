@@ -90,11 +90,27 @@ def test_provider_page_renders_when_data_starts_midmonth(lake_home) -> None:  # 
     asyncio.run(_check())
 
 
-def test_snowflake_page_without_connection_or_demo_shows_empty_state(lake_home) -> None:  # type: ignore[no-untyped-def]
-    """An optional demo dataset must not turn the always-reachable route into a 500."""
+def test_snowflake_page_without_connection_or_demo_shows_empty_state(
+    lake_home, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """An optional demo dataset must not turn the always-reachable route into a 500.
+
+    Force both live config and the repo-local synthetic Parquet off — developers often
+    have ``snowflake/synthetic_data/*.parquet`` (gitignored) or a project
+    ``config/connections.yml`` that ``live_data._sf_config`` falls back to.
+    """
     from nicegui.testing.user_simulation import user_simulation
 
     from flashlight.dashboard.router import build_pages
+
+    monkeypatch.setattr(
+        "flashlight.dashboard.snowflake.live_data.is_configured",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "flashlight.dashboard.snowflake.visibility_data.has_synthetic_data",
+        lambda: False,
+    )
 
     async def _check() -> None:
         async with user_simulation() as user:
