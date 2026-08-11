@@ -10,33 +10,60 @@ pip install getflashlight        # or: uv sync (from the repo)
 (`platformdirs`) — `~/Library/Application Support/flashlight` on macOS,
 `%LOCALAPPDATA%\flashlight\flashlight` on Windows, `~/.local/share/flashlight` on Linux
 — or set `FLASHLIGHT_HOME` to override. Secrets load from a `.env` in the working
-directory (real shell env wins).
+directory or the process environment in headless use. When entered through the dashboard,
+they are stored in the operating system credential store instead (real shell env wins).
 
-## 2. Try it with sample data (no configuration)
+## 2. Open the dashboard
 
 ```bash
-flashlight sample               # generate linked Redshift, Databricks, and FOCUS demo data
 flashlight dashboard serve      # dashboard → http://127.0.0.1:8501
 ```
 
-`flashlight sample` generates a deterministic, fully local mock organization: FOCUS
-cost records plus linked Redshift and Databricks telemetry. It makes no cloud calls and
-then rebuilds the same GOLD views the dashboard reads in production. For an isolated
-demo, set `FLASHLIGHT_HOME` to a dedicated directory for both commands so mock and real
-data can never be mixed.
+Open `http://127.0.0.1:8501`. The dashboard is the primary path for adding a connection,
+testing it, choosing a sync window, watching the sync log, and exploring the resulting
+metrics. It creates starter configuration on first use.
 
-## 3. Connect your own sources
+## 3. Connect and sync from the UI
 
-```bash
-flashlight init                 # scaffold the lake home + config/*.yml
-# edit <FLASHLIGHT_HOME>/config/connections.yml; put credentials in .env
-flashlight ingest               # pull configured connectors → BRONZE, rebuild GOLD
-```
+1. Select **Connections** in the left navigation.
+2. Select **Add connection** and choose AWS, Databricks, Amazon Redshift, or Snowflake.
+3. Enter the source details and credentials, then select **Save**. The dashboard keeps
+   credentials in your OS keychain rather than writing them to `connections.yml`.
+4. Select a continuous date range of at least six months and choose **Sync now**. This gives
+   charts enough history for trends, month-over-month movement, and savings analysis.
+5. Follow the live log, then open the relevant provider page to verify the result.
 
-For connector-specific prerequisites and least-privilege guidance, see
+![The Connections page has an Add connection action, date range, Full refresh control, and Sync now button.](assets/screenshots/connections-empty.jpg)
+
+*The dashboard keeps connection setup and the source-pull controls together on **Connections**.*
+
+For the complete workflow, permissions, and every query Flashlight triggers, see
 [Connect a real source](getting-started/real-source.md).
 
-## 4. Serve the results
+## Optional: load sample data
+
+The demo generator is a CLI convenience: it creates deterministic, fully local FOCUS cost
+records plus linked Redshift, Databricks, and Snowflake telemetry, then rebuilds the same
+GOLD views used in production.
+
+```bash
+flashlight sample
+```
+
+For an isolated demo, set `FLASHLIGHT_HOME` to a dedicated directory before running both
+the sample command and the dashboard, so mock and real data cannot mix.
+
+## Optional: use the CLI
+
+Use commands for automation, CI, and headless environments. The CLI produces the same lake
+and the same published metrics as the dashboard:
+
+```bash
+flashlight init
+flashlight ingest
+```
+
+## Other local surfaces
 
 | Surface | Command | Where |
 |---|---|---|
@@ -55,8 +82,8 @@ authentication** and serves ad-hoc read-only SQL over your lake, so keep
 
 ## Next steps
 
-Your config lives in `<home>/config/`, all of it optional and all scaffolded with
-comments by `flashlight init`:
+Your config lives in `<home>/config/`. The Connections page manages normal source setup;
+the files remain useful for version-controlled or automated deployments:
 
 | File | What it holds |
 |---|---|

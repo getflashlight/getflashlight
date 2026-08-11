@@ -41,13 +41,23 @@ markdown_extensions:
   - attr_list
   - md_in_html
   - admonition
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_div_format
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - tables
   - toc:
       title: On this page
 
 extra_css:
   - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/mermaid.js
 
 plugins:
   - search
@@ -81,7 +91,6 @@ nav:
       - Ingest and manage data: guides/ingest.md
       - Explore the dashboard: guides/dashboard.md
       - Use Flashlight with agents: guides/mcp.md
-      - Deploy the demo: guides/demo.md
   - Concepts:
       - Data architecture: architecture.md
       - FOCUS and cost integrity: concepts/focus-and-integrity.md
@@ -111,6 +120,7 @@ nav:
   - Development:
       - Contributing: development/contributing.md
       - Documentation guide: development/documentation.md
+      - Capture dashboard screenshots: development/screenshots.md
       - Design decisions:
           - Efficiency / waste: design/efficiency-waste.md
           - AI costs: design/ai-costs.md
