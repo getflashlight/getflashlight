@@ -3,7 +3,19 @@
 Flashlight exposes a streamable HTTP MCP server over the published GOLD metrics. The
 server and dashboard intentionally share the same reader, metric catalog, and data files.
 
-## Start the server
+## Start the server from the dashboard
+
+Open **MCP server** in the dashboard's left navigation and select **Start**. The page shows
+the endpoint, live process output, the exact client configuration, and the tools the running
+server exposes. It starts the same local server as the CLI command below; it does not start a
+second implementation or write to the lake.
+
+![The MCP server page shows a stopped local endpoint, a Start button, copyable client configuration, server output, and the available read-only tools.](../assets/screenshots/mcp-server.jpg)
+
+Copy the **Quick add** command for Claude Code or the **Manual config** JSON for another
+MCP-compatible client. The default endpoint is `http://127.0.0.1:8002/mcp`.
+
+## CLI alternative
 
 ```bash
 flashlight mcp serve

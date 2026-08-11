@@ -8,11 +8,13 @@
 | `snowflake` | Snowflake ORGANIZATION_USAGE | Python FOCUS mapper from `USAGE_IN_CURRENCY_DAILY` | driver fleet health (`support_status`) |
 | `bigquery` | — | stub (planned) | — |
 
-Connectors are configured in `connections.yml` (scaffolded by `flashlight init`);
-credentials come from `.env` via the `*_env` fields. Each connection also takes an
-optional `name` — falls back to its `type` for the common single-connection case,
-but needed (and enforced unique) once you have more than one connection of the
-same type, e.g. several Redshift clusters.
+The dashboard's **Connections** page is the primary setup path: it stores entered credentials
+in the operating system credential store and writes only the corresponding `*_env` references
+to `connections.yml`. For a CLI, scheduler, or headless deployment, set those named values in
+the process environment, a secret manager, or a local `.env` file. Each connection also takes
+an optional `name` — falls back to its `type` for the common single-connection case, but is
+needed (and enforced unique) once you have more than one connection of the same type, such as
+several Redshift clusters.
 
 ## AWS FOCUS setup
 
@@ -137,7 +139,7 @@ not carried over).
 
 The `databricks` connector does **not** hand-roll the billing math. It runs the
 authoritative **Databricks System Tables → FOCUS 1.3** query, vendored verbatim at
-[`src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql`](https://github.com/ychaparala/flashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql)
+[`src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql`](https://github.com/getflashlight/getflashlight/blob/main/src/flashlight/ingest/connectors/sql/databricks_focus_1_3.sql)
 from the Databricks solution accelerator
 [`databricks-solutions/cloud-infra-costs`](https://github.com/databricks-solutions/cloud-infra-costs/blob/main/focus/focus_query.sql).
 The connector executes it on a SQL warehouse, then feeds the FOCUS-columned output

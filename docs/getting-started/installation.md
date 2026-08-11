@@ -19,7 +19,7 @@ The short command `fl` is also available.
 ## Install from source
 
 ```bash
-git clone https://github.com/ychaparala/getflashlight.git
+git clone https://github.com/getflashlight/getflashlight.git
 cd getflashlight
 uv sync
 uv run flashlight --help

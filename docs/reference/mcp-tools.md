@@ -13,6 +13,28 @@ mutating SQL.
 | `list_policy_rules()` | List policy rules, status, sources, and active thresholds |
 | `run_sql(sql, limit=200)` | Run a read-only SELECT over the GOLD/SILVER query surface |
 
+## Recommended discovery flow
+
+1. Call `list_metrics()` to find a group-qualified view name.
+2. Call `describe_metric(name)` to learn its dimensions, measures, and cost metric.
+3. When a filter value is unknown, call `list_dimension_values(name, dimension)`.
+4. Call `query_metric(...)` for a catalog view, or `run_sql(...)` only when a catalog view
+   cannot express the analysis.
+
+This sequence keeps agent queries tied to Flashlight's published metric contract instead of
+guessing table or column names.
+
+## `list_metrics`
+
+Returns one object per published metric view: its group-qualified `name`, human `title` and
+`description`, the cost metric (when applicable), and its valid `dimensions` and `measures`.
+Call it before querying an unfamiliar lake.
+
+## `describe_metric`
+
+Accepts a group-qualified `name`, such as `aws.monthly_bill`, and returns the same contract
+details for that one view. An unknown name returns an `error` plus the available view names.
+
 ## `query_metric`
 
 Arguments:
@@ -26,6 +48,22 @@ Arguments:
 
 Use `describe_metric` first. An unknown view or invalid dimension returns an error together
 with available choices where possible.
+
+## `list_dimension_values`
+
+Accepts a metric `name`, a `dimension`, and an optional `limit` (default `500`). It returns
+the distinct values currently published for that dimension. Use it to discover a tag key,
+service, region, or other valid filter value before calling `query_metric`.
+
+## Rule catalogs
+
+`list_optimization_rules()` returns the waste/optimization rule pool. Each rule includes its
+category, lens, label, remediation guidance, source, required telemetry, and whether it is
+`active` or `blocked`.
+
+`list_policy_rules()` returns the policy-compliance rule pool. In addition to the common rule
+fields, it returns the thresholds currently enforced from `config/policies.yml`. These tools
+describe guidance and classification logic only; neither applies a configuration change.
 
 ## `run_sql`
 

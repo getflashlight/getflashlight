@@ -7,10 +7,10 @@
 <p align="center"><em>Make cloud spend easy to see.</em></p>
 
 <p align="center">
-  <a href="https://github.com/ychaparala/getflashlight/actions/workflows/ci.yml"><img src="https://github.com/ychaparala/getflashlight/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/getflashlight/getflashlight/actions/workflows/ci.yml"><img src="https://github.com/getflashlight/getflashlight/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://pypi.org/project/getflashlight/"><img src="https://img.shields.io/pypi/v/getflashlight" alt="PyPI"></a>
   <a href="https://pypi.org/project/getflashlight/"><img src="https://img.shields.io/pypi/pyversions/getflashlight" alt="Python versions"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/ychaparala/getflashlight" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/getflashlight/getflashlight" alt="License"></a>
 </p>
 
 **FOCUS-based, multi-cloud cloud-spend visualization.**
@@ -98,7 +98,13 @@ flashlight dashboard serve
 ```
 
 `flashlight sample` is the zero-config way to see the dashboard with deterministic,
-schema-validated demo data. For your own sources instead:
+schema-validated demo data. For your own sources, open **Connections** in the dashboard,
+select **Add connection**, and save an AWS, Databricks, Redshift, or Snowflake source. The
+dashboard stores entered credentials in the operating-system keychain, not in YAML. Choose a
+continuous sync range of at least six months before selecting **Sync now**; that establishes
+enough history for trend and month-over-month analysis. See the UI-first
+[connection guide](docs/getting-started/real-source.md) for the fields, required permissions,
+and queries. The CLI remains useful for automation and headless deployments:
 
 ```bash
 # Create <FLASHLIGHT_HOME>/config/ with commented starter files.
@@ -132,7 +138,8 @@ explicit **unattributed** bucket rather than hidden.
 | `aws_focus` | AWS Data Exports (FOCUS 1.x Parquet in S3), or Cost Explorer via `cost_source="cost_explorer"` | S3 export: already FOCUS, light coercion. Cost Explorer: coarser account-level totals, mapped in Python |
 | `databricks` | Databricks system tables | **vendored Databricks → FOCUS 1.3 SQL** (below) |
 | `redshift` | Redshift Data API or read-only SQL (efficiency telemetry only; cost arrives through AWS FOCUS) | — |
-| `bigquery` / `snowflake` | — | stubs (planned) |
+| `snowflake` | Snowflake `ORGANIZATION_USAGE` | Python FOCUS mapper from `USAGE_IN_CURRENCY_DAILY`; optional driver-health telemetry |
+| `bigquery` | — | stub (planned) |
 
 ### Databricks mapping (based on the Databricks FOCUS query)
 
@@ -153,8 +160,9 @@ also shows up as separate cloud infra lines.
   `:account_prices` parameter) to materialize a FOCUS table, export it to
   Parquet/Delta, and ingest via `aws_focus`'s S3 FOCUS export path — no live API needed.
 - **Template for other warehouses.** It's the reference pattern for *source-side*
-  FOCUS mapping; the planned `snowflake`/`bigquery` connectors follow the
-  same shape (run a warehouse-native FOCUS query, then `map_focus_row`).
+  FOCUS mapping; the planned `bigquery` connector follows the same shape (run a
+  warehouse-native FOCUS query, then `map_focus_row`). Snowflake is already live and
+  maps `ORGANIZATION_USAGE` in Python.
 - **Fork & extend.** The upstream mapping is explicitly "best-effort"; edit the
   vendored copy to add columns or refine the `billing_origin_product` taxonomy. To
   refresh it, re-pull the upstream file and re-apply the header.
