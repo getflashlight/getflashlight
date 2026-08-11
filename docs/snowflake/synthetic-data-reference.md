@@ -6,7 +6,7 @@
 
 ## Purpose
 
-The synthetic data generator (`snowflake/synthetic_data/generate.py`) produces realistic Snowflake `ACCOUNT_USAGE` telemetry for a mixed-workload enterprise account. This data drives the Flashlight Snowflake dashboard without requiring access to a live Snowflake account.
+The synthetic data generator in `src/flashlight/sample.py` produces realistic Snowflake `ACCOUNT_USAGE` telemetry for a mixed-workload enterprise account. This data drives the Flashlight Snowflake dashboard without requiring access to a live Snowflake account.
 
 **Target Profile**: Enterprise account "ACME_ANALYTICS" with ≤$50K/month and ≤$600K/year Snowflake spend across ETL, BI, ML/AI, streaming, and development workloads (all cost services retained from the larger reference profile, scaled down).
 

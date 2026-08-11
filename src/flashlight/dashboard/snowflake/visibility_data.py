@@ -1,8 +1,9 @@
 """Snowflake visibility data access — DuckDB over local ACCOUNT_USAGE Parquet.
 
 Primary source is ``FLASHLIGHT_HOME/account_usage/`` written by ingest (or
-``flashlight sample``). Falls back to repo ``snowflake/synthetic_data/*.parquet`` for
-local/dev when the lake is empty. The dashboard never opens a live Snowflake connection.
+``flashlight sample``). Falls back to its ``FLASHLIGHT_HOME/sample_data/snowflake``
+intermediate Parquet for local/dev when the lake is empty. The dashboard never opens a
+live Snowflake connection.
 
 All "current month / last N days" windows are anchored to the latest
 ``warehouse_metering_history.start_time`` in the local dataset (not the wall clock).
@@ -21,9 +22,8 @@ import pandas as pd
 from flashlight.lake import account_usage as account_usage_lake
 from flashlight.lake import paths
 
-# visibility_data.py → snowflake/ → dashboard/ → flashlight/ → src/ → repo root
-_SYNTHETIC_DIR = Path(__file__).resolve().parents[4] / "snowflake" / "synthetic_data"
-# Match snowflake/synthetic_data/generate.py ($4/credit → ≤$600K/year demo).
+_SYNTHETIC_DIR = paths.home() / "sample_data" / "snowflake"
+# Match flashlight.sample's synthetic generator ($4/credit → ≤$600K/year demo).
 CREDIT_PRICE = 4.00
 
 

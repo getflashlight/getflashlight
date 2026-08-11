@@ -22,7 +22,7 @@ cd auralake-main
 ### Generate the full dataset
 
 ```bash
-uv run python snowflake/synthetic_data/generate.py
+uv run flashlight sample
 ```
 
 Expected output:
@@ -46,7 +46,7 @@ services from the reference $4.032M profile are retained.)
 uv run flashlight dashboard serve
 ```
 
-The dashboard reads Parquet files automatically from `snowflake/synthetic_data/` — no additional configuration needed.
+The dashboard reads the generated Parquet files from `FLASHLIGHT_HOME/account_usage/` — no additional configuration needed. Intermediate generator files are kept under `FLASHLIGHT_HOME/sample_data/snowflake/`.
 
 ---
 
@@ -167,11 +167,13 @@ growth_factor = 1.0 + (months_elapsed * 0.03)   # 3%/month (aggressive growth)
 import pandas as pd
 
 # Check user-warehouse isolation (should be <= 4)
-qh = pd.read_parquet('snowflake/synthetic_data/query_history.parquet')
+from flashlight.lake import paths
+sample_dir = paths.home() / 'sample_data' / 'snowflake'
+qh = pd.read_parquet(sample_dir / 'query_history.parquet')
 print('Max warehouses per user:', qh.groupby('user_name')['warehouse_name'].nunique().max())
 
 # Check credit reconciliation
-attr = pd.read_parquet('snowflake/synthetic_data/query_attribution_history.parquet')
+attr = pd.read_parquet(sample_dir / 'query_attribution_history.parquet')
 print(f'Total attributed credits: {attr.credits_attributed_compute.sum():,.0f}')
 
 # Check bad vs good user behavior
@@ -240,7 +242,7 @@ con.execute("""
 
 No configuration file points to the data — the data layer auto-discovers Parquet files in:
 ```
-snowflake/synthetic_data/*.parquet
+FLASHLIGHT_HOME/sample_data/snowflake/*.parquet
 ```
 
 ---
@@ -341,4 +343,4 @@ When adding a new dashboard view that needs data:
 
 - Full data specification: [`docs/snowflake-synthetic-data-reference.md`](snowflake-synthetic-data-reference.md)
 - Dashboard architecture: [`.cortex/skills/snowflake-dashboard.md`](../.cortex/skills/snowflake-dashboard.md)
-- Generator source: [`snowflake/synthetic_data/generate.py`](../snowflake/synthetic_data/generate.py)
+- Generator source: [`src/flashlight/sample.py`](../../src/flashlight/sample.py)

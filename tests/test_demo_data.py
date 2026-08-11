@@ -50,7 +50,7 @@ def test_sample_is_reconciled_and_cleanup_is_scoped(lake_home) -> None:  # type:
     cleanup_snowflake_dashboard_demo()
     generate_snowflake_dashboard_demo()
     assert list(_SNOWFLAKE_SYNTHETIC_DIR.glob("*.parquet")), (
-        "expected Snowflake ACCOUNT_USAGE demo Parquet under snowflake/synthetic_data/"
+        "expected Snowflake ACCOUNT_USAGE demo Parquet under FLASHLIGHT_HOME/sample_data/"
     )
     assert account_usage.has_parquet(), (
         "expected ACCOUNT_USAGE demo installed under FLASHLIGHT_HOME/account_usage/"

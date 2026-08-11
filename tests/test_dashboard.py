@@ -96,7 +96,7 @@ def test_snowflake_page_without_connection_or_demo_shows_empty_state(
     """An optional demo dataset must not turn the always-reachable route into a 500.
 
     Force local ACCOUNT_USAGE off — developers often have
-    ``snowflake/synthetic_data/*.parquet`` (gitignored) or lake leftovers.
+    ``FLASHLIGHT_HOME/sample_data/snowflake/*.parquet`` (gitignored) or lake leftovers.
     """
     from nicegui.testing.user_simulation import user_simulation
 
