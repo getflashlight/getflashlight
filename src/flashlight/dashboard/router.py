@@ -59,10 +59,8 @@ def _fixed_nav() -> tuple[tuple[str, str, str], ...]:
 
 
 # Provider groups that lead the "BY PROVIDER" nav, in this order, ahead of every
-# remaining group in alphabetical order. Databricks is the platform users come here
-# for; the cloud underneath it reads as supporting detail, so it sorts first even
-# though "aws" would win alphabetically.
-_NAV_GROUP_ORDER: tuple[str, ...] = ("databricks", "snowflake")
+# remaining group in alphabetical order. Databricks → Snowflake → Redshift (aws).
+_NAV_GROUP_ORDER: tuple[str, ...] = ("databricks", "snowflake", "aws")
 
 _SIDEBAR_PROVIDER_LOGOS: dict[str, str] = {
     "databricks": chrome.CONNECTOR_LOGOS["databricks"],
@@ -77,9 +75,16 @@ def _nav_groups() -> list[str]:
 
     Active dashboard syncs are included before their first GOLD publish, so a newly
     connected provider is visible while its initial ingestion is still running.
+    Snowflake is force-included when a live connection is configured or the bundled
+    synthetic visibility Parquet is present, so ``/snowflake`` stays reachable even
+    without a published ``gold/snowflake/`` group.
     """
     groups = set(discover_provider_groups())
     groups.update(ingest_runner.active_provider_groups())
+    from flashlight.dashboard.snowflake import live_data, visibility_data
+
+    if live_data.is_configured() or visibility_data.has_synthetic_data():
+        groups.add("snowflake")
     lead = [g for g in _NAV_GROUP_ORDER if g in groups]
     return lead + sorted(g for g in groups if g not in lead)
 
@@ -329,18 +334,6 @@ def no_data_page(title: str) -> None:
     ui.label(NO_DATA_MSG).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
 
 
-def snowflake_empty_state() -> None:
-    """Guide users from Snowflake's always-reachable page to its setup path."""
-    with chrome.panel():
-        chrome.empty_state(
-            "ac_unit",
-            "Snowflake visibility",
-            "Add an enabled Snowflake connection and run a sync to see your organization's spend.",
-            button_label="Add an enabled Snowflake connection",
-            on_click=lambda: ui.navigate.to("/connections"),
-        )
-
-
 def home_empty_state() -> None:
     """First-run Home guidance, with Connections as the single setup surface."""
     with chrome.panel():
@@ -522,32 +515,56 @@ def build_pages() -> None:
             show_alerts=False,
         )
 
-    def _render_snowflake_page(label: str) -> None:
-        """Render Snowflake exclusively from materialized lake data."""
+    def _render_snowflake_visibility_only() -> None:
+        """Render Snowflake visibility from a live connection or the bundled demo data."""
+        from flashlight.dashboard.snowflake import live_data, visibility_data
+        from flashlight.dashboard.snowflake.views import visibility as snowflake_visibility
 
-        provider_focus.render(
-            "snowflake",
-            label,
-            extra_tabs=[
-                (
-                    "Client Driver Health",
-                    lambda: driver_health.render("Snowflake", "Snowflake"),
-                ),
-            ],
-            show_alerts=False,
-        )
+        # Prefer the customer's configured account.  The synthetic source is solely a
+        # demo fallback; selecting it when its Parquet files are absent caused DuckDB to
+        # interpret ACCOUNT_USAGE table names as local tables and return a 500.
+        if live_data.is_configured():
+            data = live_data
+        elif visibility_data.has_synthetic_data():
+            data = visibility_data
+        else:
+            no_data_page("Snowflake visibility")
+            ui.label(
+                "Add an enabled Snowflake connection on the Connections page, or "
+                "generate the bundled demo data."
+            ).classes("text-sm").style(f"color:{chrome.INK_MUTED}")
+            return
 
-    # Explicit /snowflake before the catch-all so its label and telemetry tab stay
-    # stable. Like every other provider route, it reads only published GOLD data.
+        with ui.tabs().classes("w-full").props("dense") as tabs:
+            tab_exec = ui.tab("LeaderBoard")
+            tab_vis = ui.tab("Visibility")
+        loaded: dict[str, bool] = {"LeaderBoard": False}
+        panels: dict[str, ui.tab_panel] = {}
+        with ui.tab_panels(tabs, value=tab_exec).classes("w-full").style(
+            "background:transparent;"
+        ):
+            panels["LeaderBoard"] = ui.tab_panel(tab_exec)
+            panels["Visibility"] = ui.tab_panel(tab_vis)
+        with panels["LeaderBoard"]:
+            snowflake_visibility.render_leaderboard(data)
+        loaded["LeaderBoard"] = True
+
+        def _on_tab_change(e: object) -> None:
+            name = getattr(e, "value", None)
+            if name == "Visibility" and name not in loaded:
+                loaded[name] = True
+                with panels["Visibility"]:
+                    snowflake_visibility.render(data)
+
+        tabs.on_value_change(_on_tab_change)
+
+    # Explicit /snowflake before the catch-all: always the Visibility/LeaderBoard stack
+    # (live ACCOUNT_USAGE or synthetic Parquet), not the FOCUS provider_focus hybrid.
     @ui.page("/snowflake")
     def _snowflake_page() -> None:
-        label = provider_label("snowflake")
         with gold_session(), shell("/snowflake"):
             sync_in_progress_banner("snowflake")
-            if "snowflake" in discover_provider_groups() and has_data():
-                _render_snowflake_page(label)
-            else:
-                snowflake_empty_state()
+            _render_snowflake_visibility_only()
 
     # One parameterized route, not one @ui.page per group discovered right now —
     # discover_provider_groups() reads gold/ live, so it can (and does) return a
@@ -559,16 +576,13 @@ def build_pages() -> None:
     # instead means a group's page and its nav link agree at all times.
     @ui.page("/{group}")
     def _provider_page(group: str) -> None:
-        # /snowflake is registered explicitly above.
+        # /snowflake is registered explicitly above (visibility stack before GOLD).
         # Starlette matches in registration order, so this catch-all should not see it;
         # if it does, mirror the dedicated page rather than 404.
         if group == "snowflake":
-            label = provider_label("snowflake")
             with gold_session(), shell("/snowflake"):
-                if "snowflake" in discover_provider_groups() and has_data():
-                    _render_snowflake_page(label)
-                else:
-                    snowflake_empty_state()
+                sync_in_progress_banner("snowflake")
+                _render_snowflake_visibility_only()
             return
         published_groups = set(discover_provider_groups())
         syncing = group in ingest_runner.active_provider_groups()
